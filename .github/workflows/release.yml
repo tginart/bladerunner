@@ -1,0 +1,418 @@
+name: Release
+
+# Tag pushes publish the Apple Silicon macOS CLI archive. Manual runs
+# build and verify the identical artifact matrix without publishing a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Version to preflight; must match VERSION
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DIST_CODEGEN_UNITS: "16"
+  MAX_RELEASE_BINARY_BYTES: "268435456"
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  LINUX_GLIBC_FLOOR: "2.17"
+  ZIG_VERSION: "0.14.1"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker system prune --all --force || true
+          df -h /
+
+      - name: Force LF for text files (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config core.autocrlf false
+          git config core.eol lf
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          git reset --hard HEAD
+
+      - name: Resolve and validate version
+        shell: bash
+        env:
+          PREFLIGHT_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          elif [ -n "${PREFLIGHT_VERSION}" ]; then
+            version="${PREFLIGHT_VERSION#v}"
+          else
+            version="$file_version"
+          fi
+          [ "$version" = "$file_version" ] || {
+            echo "requested version $version does not match VERSION ($file_version)" >&2
+            exit 1
+          }
+          min_wire="0.1.202"
+          printf '%s\n' "$min_wire" "$version" | sort -V -C || {
+            echo "VERSION $version is below the xAI wire minimum $min_wire" >&2
+            exit 1
+          }
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          # This inherited build variable supplies the provider wire version.
+          echo "GROK_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Check CMake
+        run: cmake --version
+
+      - name: Add build target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild (Linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install dotslash
+        run: cargo install dotslash --locked
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile protoc.zip
+          Expand-Archive protoc.zip -DestinationPath "$env:USERPROFILE\protoc" -Force
+          $protoc = Join-Path $env:USERPROFILE "protoc\bin\protoc.exe"
+          if (-not (Test-Path $protoc)) { throw "protoc.exe missing at $protoc" }
+          Add-Content $env:GITHUB_PATH (Join-Path $env:USERPROFILE "protoc\bin")
+          Add-Content $env:GITHUB_ENV "PROTOC=$protoc"
+
+      - name: Fetch pinned ripgrep (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tmp/rg
+          curl -fsSL -o tmp/rg.zip \
+            https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip
+          python3 - <<'PY'
+          import pathlib, zipfile
+          archive = zipfile.ZipFile("tmp/rg.zip")
+          member = next((name for name in archive.namelist() if name.endswith("rg.exe")), None)
+          if member is None:
+              raise SystemExit("rg.exe not found")
+          pathlib.Path("tmp/rg/rg.exe").write_bytes(archive.read(member))
+          PY
+          echo "GROK_TOOLS_BUNDLE_RG_PATH=${GITHUB_WORKSPACE}/tmp/rg/rg.exe" >> "$GITHUB_ENV"
+          echo "GROK_SHELL_BUNDLE_RG_PATH=${GITHUB_WORKSPACE}/tmp/rg/rg.exe" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}-glibc-${{ env.LINUX_GLIBC_FLOOR }}
+
+      - name: Test Linux sandbox
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test -p xai-grok-sandbox --locked --lib
+
+      - name: Test Codex model catalog
+        run: cargo test -p xai-grok-models --lib codex_catalog_only_offers_requested_gpt6_models --locked
+
+      - name: Build Bladerunner
+        env:
+          GROK_VERSION: ${{ env.GROK_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          common=(--profile release-dist -p xai-grok-pager-bin --features community-build --locked)
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo zigbuild "${common[@]}" --target "${{ matrix.target }}.${LINUX_GLIBC_FLOOR}"
+          else
+            cargo build "${common[@]}" --target "${{ matrix.target }}"
+          fi
+
+      - name: Verify release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          [ "${{ runner.os }}" != "Windows" ] || suffix=".exe"
+          src="target/${{ matrix.target }}/release-dist/bladerunner${suffix}"
+          [ -f "$src" ] || { echo "missing release binary $src" >&2; exit 1; }
+          bytes="$(wc -c < "$src" | tr -d '[:space:]')"
+          [ "$bytes" -le "$MAX_RELEASE_BINARY_BYTES" ] || {
+            echo "release binary exceeds $MAX_RELEASE_BINARY_BYTES bytes" >&2
+            exit 1
+          }
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            readelf -SW "$src" > "$RUNNER_TEMP/bladerunner-sections.txt"
+            ! grep -Eq '\.(z)?debug_|\.gnu_debuglink' "$RUNNER_TEMP/bladerunner-sections.txt"
+            max_glibc="$(objdump -T "$src" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+            [ -n "$max_glibc" ]
+            printf '%s\n' "$max_glibc" "$LINUX_GLIBC_FLOOR" | sort -V -C
+          fi
+
+      - name: Verify public source and built CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/public-source"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/public-source"
+          python3 -B "$RUNNER_TEMP/public-source/tools_verify_release.py" \
+            --output "$RUNNER_TEMP/release-check" \
+            --binary "$GITHUB_WORKSPACE/target/${{ matrix.target }}/release-dist/bladerunner"
+
+      - name: Package archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep macOS AppleDouble metadata out of the release archive.
+          export COPYFILE_DISABLE=1
+          archive="bladerunner-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release-dist/bladerunner" "$staging/bladerunner"
+          chmod 0755 "$staging/bladerunner"
+          cp LICENSE "$staging/"
+          cp -R bundled "$staging/"
+          # Remove local Python caches from bundled skills and agents.
+          find "$staging/bundled" -type d -name __pycache__ -prune -exec rm -rf {} +
+          find "$staging/bundled" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          [ ! -f NOTICE ] || cp NOTICE "$staging/"
+          for file in THIRD-PARTY-NOTICES THIRD-PARTY-NOTICES.md; do
+            [ ! -f "$file" ] || cp "$file" "$staging/"
+          done
+          tar -C "$staging" -czf "$archive" .
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Package archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "bladerunner-$env:RELEASE_VERSION-${{ matrix.target }}.zip"
+          $staging = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "staging")
+          Copy-Item "target/${{ matrix.target }}/release-dist/bladerunner.exe" (Join-Path $staging "bladerunner.exe")
+          Copy-Item LICENSE $staging
+          Copy-Item bundled $staging -Recurse
+          Get-ChildItem (Join-Path $staging "bundled") -Directory -Recurse -Filter "__pycache__" | Remove-Item -Recurse -Force
+          Get-ChildItem (Join-Path $staging "bundled") -File -Recurse -Include "*.pyc", "*.pyo" | Remove-Item -Force
+          $textExt = @(".md", ".py", ".txt", ".json", ".toml", ".yml", ".yaml", ".sh", ".rhai", ".rs", ".skill")
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          Get-ChildItem (Join-Path $staging "bundled") -File -Recurse | ForEach-Object {
+            if ($textExt -contains $_.Extension.ToLowerInvariant()) {
+              $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($_.FullName))
+              [System.IO.File]::WriteAllText($_.FullName, (($text -replace "`r`n", "`n") -replace "`r", "`n"), $utf8)
+            }
+          }
+          if (Test-Path NOTICE) { Copy-Item NOTICE $staging }
+          foreach ($file in @("THIRD-PARTY-NOTICES", "THIRD-PARTY-NOTICES.md")) {
+            if (Test-Path $file) { Copy-Item $file $staging }
+          }
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive
+          Add-Content $env:GITHUB_ENV "ARCHIVE=$archive"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  installer-contract:
+    name: installer contract (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker system prune --all --force || true
+          df -h /
+      - run: rustup show
+      - run: cargo install dotslash --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: installer-contract-${{ matrix.os }}
+      - name: Run updater and installer contract tests
+        run: cargo test -p xai-grok-update --features community-build,community-update-test-hooks --test test_community_update --locked -- --nocapture
+
+  verify:
+    name: verify release set
+    needs: [build, installer-contract]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve version
+        shell: bash
+        env:
+          PREFLIGHT_VERSION: ${{ inputs.release_version }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          elif [ -n "${PREFLIGHT_VERSION}" ]; then
+            version="${PREFLIGHT_VERSION#v}"
+          else
+            version="$(tr -d '[:space:]' < VERSION)"
+          fi
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assert release asset set and checksums
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          expected=(
+            "bladerunner-${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz"
+          )
+          mapfile -t found < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t want < <(printf '%s\n' "${expected[@]}" | sort)
+          diff -u <(printf '%s\n' "${want[@]}") <(printf '%s\n' "${found[@]}")
+          sha256sum "${expected[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - run: cargo install dotslash --locked
+      - name: Verify archives fit installer budgets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import re
+          import tarfile
+
+          installer = open("install.sh", encoding="utf-8").read()
+          limits = {
+              name: int(value)
+              for name, value in re.findall(r"^(MAX_[A-Z_]+)=([0-9]+)$", installer, re.MULTILINE)
+          }
+          required = {
+              "MAX_ARCHIVE_ENTRIES",
+              "MAX_BUNDLE_FILES",
+              "MAX_BUNDLE_FILE_BYTES",
+              "MAX_BUNDLE_TOTAL_BYTES",
+          }
+          assert required <= limits.keys(), f"missing installer budgets: {required - limits.keys()}"
+
+          for archive in glob.glob("dist/*.tar.gz"):
+              with tarfile.open(archive, "r:gz") as package:
+                  members = package.getmembers()
+              bundled = [
+                  member
+                  for member in members
+                  if member.isfile() and member.name.removeprefix("./").startswith("bundled/")
+              ]
+              checks = {
+                  "MAX_ARCHIVE_ENTRIES": len(members),
+                  "MAX_BUNDLE_FILES": len(bundled),
+                  "MAX_BUNDLE_FILE_BYTES": max((member.size for member in bundled), default=0),
+                  "MAX_BUNDLE_TOTAL_BYTES": sum(member.size for member in bundled),
+              }
+              for name, actual in checks.items():
+                  assert actual <= limits[name], (
+                      f"{archive}: {name} requires {actual}, install.sh allows {limits[name]}"
+                  )
+          PY
+      - name: Verify all archives together
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p xai-grok-update --features community-build --bin bladerunner-verify-release-archive --locked
+          verifier=target/debug/bladerunner-verify-release-archive
+          # Verify the harness archive and release checksum.
+          archive="bladerunner-${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz"
+          "$verifier" --sums dist/SHA256SUMS \
+            --archive "${archive}=dist/${archive}"
+      - name: Upload verified release set
+        uses: actions/upload-artifact@v6
+        with:
+          name: bladerunner-release-set
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish public GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Require release tag commit on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "release tag commit is not contained in origin/main: $GITHUB_SHA" >&2
+            exit 1
+          }
+      - uses: actions/download-artifact@v7
+        with:
+          name: bladerunner-release-set
+          path: dist
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          draft: false
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Bladerunner `${{ github.ref_name }}`
+
+            Terminal coding-agent harness for OpenAI Codex and Palantir AIP.
+
+            Public Apple Silicon macOS CLI beta. Download with GitHub CLI or the installer:
+
+            ```sh
+            gh release download ${{ github.ref_name }} --repo tginart/bladerunner
+            ```
+
+            The release contains an Apple Silicon macOS CLI archive
+            and `SHA256SUMS`. Desktop, Intel macOS, Linux, and Windows binary releases are not included.

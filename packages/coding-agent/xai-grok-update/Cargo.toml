@@ -1,0 +1,63 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-update"
+version = "0.1.220-alpha.4"
+edition.workspace = true
+
+[[bin]]
+name = "bladerunner-verify-release-archive"
+path = "src/bin/bladerunner_verify_release_archive.rs"
+required-features = ["community-build"]
+
+[dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true }
+indicatif = { workspace = true }
+reqwest = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["fs", "process", "io-util", "macros", "time"] }
+tracing = { workspace = true }
+url = { workspace = true }
+xai-grok-shell = { workspace = true }
+xai-grok-telemetry = { workspace = true }
+xai-grok-tools = { workspace = true }
+xai-grok-version = { workspace = true }
+
+# Community updater dependencies are optional so official/default builds keep
+# their existing updater graph and behavior unchanged.
+dunce = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+fs2 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+zip = { version = "3", default-features = false, features = ["deflate-flate2"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[features]
+default = []
+community-build = ["dep:dunce", "dep:flate2", "dep:fs2", "dep:sha2", "dep:tar", "dep:zip"]
+# Test-only install failpoints for transactional rollback coverage. Never enable
+# in release/distribution builds.
+community-update-test-hooks = ["community-build"]
+
+[dev-dependencies]
+semver = { workspace = true }
+serde_json = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util"] }
+wiremock = { workspace = true }
+dunce = { workspace = true }
+# Integration tests build release-shaped tar.gz / zip fixtures.
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
+sha2 = { workspace = true }
+futures = { workspace = true }

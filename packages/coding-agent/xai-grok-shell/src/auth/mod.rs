@@ -1,0 +1,78 @@
+pub mod anthropic_claude;
+pub(crate) mod api_key_probe;
+pub(crate) mod attribution;
+mod auth_provider;
+mod config;
+pub mod credential_provider;
+#[path = "devbox_login_stub.rs"]
+pub(crate) mod devbox_login;
+pub(crate) mod device_code;
+pub mod error;
+mod external_auth;
+mod flow;
+pub mod github_copilot;
+mod jwt;
+pub mod kimi;
+pub(crate) mod manager;
+mod model;
+pub mod oidc;
+pub mod openai_codex;
+pub mod palantir_aip;
+pub(crate) mod platform_refresh_sticky;
+pub mod radius;
+pub(crate) mod recovery;
+pub(crate) mod refresh;
+pub(crate) mod single_flight;
+mod storage;
+mod token_output;
+pub(crate) mod token_type;
+pub(crate) use api_key_probe::{
+    DEFAULT_PROBE_TIMEOUT, first_party_env_key_allows_advertise, should_probe_first_party_env_key,
+};
+pub use auth_provider::{AUTH_PROVIDER_SIGNED_OUT_EXIT_CODE, AuthProviderConfig, AuthProviderRef};
+pub(crate) use auth_provider::{
+    PROVIDER_TIMEOUT_CEILING_SECS, PROVIDER_TOKEN_EXPIRY_SKEW_SECS, ProviderRefreshOutcome,
+};
+#[cfg(test)]
+pub(crate) use auth_provider::{test_backdate_provider_mint, test_counting_provider};
+pub(crate) use config::LEGACY_AUTH_SCOPE;
+pub use config::{
+    ForceLoginTeam, GrokComConfig, OAuth2ProviderConfig, OidcAuthConfig, PreferredAuthMethod,
+    XAI_OAUTH2_ISSUER, is_xai_oauth2_issuer, xai_oauth2_issuer,
+};
+pub(crate) use external_auth::{parse_output, refresh_with_command};
+pub(crate) use flow::{
+    AuthChannels, mint_session_noninteractive, run_auth_flow, run_auth_flow_with_stderr_bridge,
+    try_noninteractive_auth_no_mint,
+};
+pub use flow::{
+    AuthUrlInfo, AuthUrlMode, LoginTransportOverride, LogoutResult, ensure_authenticated,
+    ensure_authenticated_or_noninteractive, ensure_authenticated_with_override, perform_logout,
+    run_cli_login, run_cli_logout, run_cli_logout_all, run_cli_logout_anthropic_claude,
+    run_cli_logout_github_copilot, run_cli_logout_kimi, run_cli_logout_openai_codex,
+    run_cli_logout_radius, try_ensure_fresh_auth,
+};
+pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
+mod meta;
+pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
+pub use manager::{AuthManager, shared_api_key_provider};
+pub(crate) use manager::{AuthRemedy, SilentRefresh};
+pub use meta::{AuthMeta, GateInfo};
+pub use model::{
+    AMAZON_BEDROCK_AUTH_SCOPE, ANTHROPIC_CLAUDE_OAUTH_SCOPE, AuthMode, GITHUB_COPILOT_OAUTH_SCOPE,
+    GrokAuth, KIMI_CODE_OAUTH_SCOPE, OPENAI_CODEX_OAUTH_SCOPE, RADIUS_OAUTH_SCOPE, lookup_auth,
+    platform_api_key_scope,
+};
+pub(crate) use model::{TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired};
+pub(crate) use refresh::DiagnosticUploader;
+pub use storage::{
+    auth_json_path, clear_anthropic_claude_auth, clear_api_key, clear_bedrock_auth,
+    clear_github_copilot_auth, clear_kimi_code_auth, clear_openai_codex_auth,
+    clear_platform_api_key, clear_platform_api_keys, clear_radius_auth, read_anthropic_claude_auth,
+    read_api_key, read_auth_json, read_bedrock_auth_marker, read_bedrock_profile,
+    read_github_copilot_auth, read_kimi_code_auth, read_openai_codex_auth, read_platform_api_key,
+    read_platform_base_url, read_radius_auth, read_token_by_scope, store_anthropic_claude_auth,
+    store_api_key, store_bedrock_credential_chain, store_bedrock_profile,
+    store_github_copilot_auth, store_kimi_code_auth, store_openai_codex_auth,
+    store_platform_api_key, store_radius_auth,
+};

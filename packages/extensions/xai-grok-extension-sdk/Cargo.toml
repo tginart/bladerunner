@@ -1,0 +1,15 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-extension-sdk"
+version = "0.1.0"
+edition.workspace = true
+description = "Author SDK for Hyper WASM extensions (Rust-first): hide bootstrap ABI behind safe helpers"
+publish = false
+
+[dependencies]
+# Compiled for the host toolchain only; generated guests keep the small
+# wasm32 runtime surface in this crate.
+xai-grok-extension-macros.workspace = true
+
+[lints]
+workspace = true

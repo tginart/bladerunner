@@ -1,0 +1,36 @@
+Summarize the conversation so work can continue after earlier turns are removed.
+{user_context_section}
+Preserve current intent, constraints, decisions, working state, and unresolved tasks. Prefer actionable information over historical completeness. Omit superseded requests, routine tool output, recoverable file contents, and resolved details that no longer affect the work.
+
+Carry forward still-relevant information from previous compaction summaries. Do not attempt to preserve everything.
+
+Return a single <summary>...</summary> block with these sections:
+
+1. Primary Request and Intent
+   State the current objective, constraints, and unresolved requests.
+
+2. Key Technical Concepts
+   Record concepts and decisions needed to continue.
+
+3. Files and Code Sections
+   List relevant files, symbols, and changes. Include code only when it cannot be recovered from the repository.
+
+4. Errors and Fixes
+   Record unresolved blockers and past errors that affect the next action.
+
+5. Problem Solving
+   Record important conclusions, rejected approaches, and uncertainty.
+
+6. User Guidance
+   Preserve lasting preferences, corrections, and changes in direction.
+
+7. Pending Tasks
+   List explicitly requested work that remains incomplete.
+
+8. Current Work
+   State the exact stopping point and verified repository or runtime state.
+
+9. Next Step
+   Give the most direct continuation, or "None" if the work is complete.
+
+Do not call tools. Output only the <summary>...</summary> block.

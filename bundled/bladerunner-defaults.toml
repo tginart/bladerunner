@@ -1,0 +1,56 @@
+# Blade Runner's provider defaults ship in the binary and release bundle.
+# The config loader reads this as its lowest-priority layer, then applies system,
+# managed, and user settings. Keep credentials out of this file: sign-in state
+# lives under ~/.bladerunner/credentials on each machine.
+
+[models]
+default = "openai-codex/gpt-6.1-sol"
+allowed_models = ["openai-codex/*", "palantir-aip/*"]
+disabled_models = ["grok-*", "xai-direct/*"]
+web_search = "openai-codex/gpt-6.1-sol"
+session_summary = "openai-codex/gpt-6-luna"
+image_description = "openai-codex/gpt-6.1-sol"
+prompt_suggestion = "openai-codex/gpt-6-luna"
+
+# Palantir AIP (Foundry). Bladerunner ships no Foundry address: each user sets
+# their own with `/login palantir-aip` or `bladerunner login --palantir-aip`,
+# which saves `[palantir_aip] hostname` (and, for browser sign-in, the client
+# ID of the Bladerunner OAuth app registered on that Foundry; see
+# docs/foundry-app.md) to config.toml. `FOUNDRY_HOSTNAME` also works. The
+# palantir-aip provider's base URL follows the hostname.
+
+# The helper prints the OAuth access token (refreshing it when needed), else a
+# saved personal token, else `FOUNDRY_TOKEN`.
+[auth_provider.palantir-aip]
+command = "$BLADERUNNER_EXE"
+args = ["auth", "palantir-aip-token"]
+# Room for the helper's whole refresh: up to 45s waiting on another process's
+# refresh, then the token request. Killing it mid-refresh could lose Foundry's
+# rotated refresh token.
+timeout_secs = 120
+# The helper skips a token Foundry just rejected and falls back to another.
+rejection_aware = true
+
+[model_providers.palantir-aip]
+api_backend = "messages"
+auth_provider = "palantir-aip"
+
+[model."palantir-aip/claude-opus-5.5"]
+model = "ri.language-model-service..language-model.anthropic-claude-5-5-opus"
+name = "Claude Opus 5.5"
+model_provider = "palantir-aip"
+context_window = 512000
+max_completion_tokens = 32768
+api_backend = "messages"
+extra_headers = { "anthropic-version" = "2023-06-01" }
+request_compat = { messages = { supports_temperature = false } }
+
+[model."palantir-aip/claude-sonnet-5.5"]
+model = "ri.language-model-service..language-model.anthropic-claude-5-5-sonnet"
+name = "Claude Sonnet 5.5"
+model_provider = "palantir-aip"
+context_window = 1000000
+max_completion_tokens = 128000
+api_backend = "messages"
+extra_headers = { "anthropic-version" = "2023-06-01" }
+request_compat = { messages = { supports_temperature = false } }
