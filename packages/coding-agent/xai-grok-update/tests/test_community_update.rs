@@ -1536,7 +1536,13 @@ fn install_sh_keeps_injection_markers_and_no_failpoint_env() {
 #[test]
 fn root_installers_contain_no_unauthorized_background_downloads() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    for name in ["install.sh", "install.ps1", "install-desktop.sh"] {
+    let mut installers = vec!["install.sh", "install.ps1"];
+    // The public CLI snapshot excludes the inherited desktop installer.
+    // Both CLI installers remain mandatory; inspect desktop whenever shipped.
+    if root.join("install-desktop.sh").exists() {
+        installers.push("install-desktop.sh");
+    }
+    for name in installers {
         let body = std::fs::read_to_string(root.join(name)).unwrap();
         assert!(
             !body.contains("buildwithknexus.xyz"),

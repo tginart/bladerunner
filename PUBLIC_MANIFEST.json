@@ -7090,8 +7090,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-update/tests/test_community_update.rs",
-      "bytes": 61508,
-      "sha256": "91362af836fa1eeda2a8b0d65ad52fb7ee6e853fc33797bd7ac6acff9f7dd3b3",
+      "bytes": 61782,
+      "sha256": "e4859ddb499d28c90a3618a71868c4c2ba273ecb1c879a66041a0a960b77d6b1",
       "mode": "0644"
     },
     {
