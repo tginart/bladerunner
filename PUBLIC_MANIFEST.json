@@ -11626,8 +11626,14 @@
     },
     {
       "path": "packages/tools/xai-grok-workspace/src/permission/policy.rs",
-      "bytes": 89205,
-      "sha256": "edb952e834c0ac626f1d085a9c4d00690bfd66f26afd84b8e9ad250ec2705c2d",
+      "bytes": 92182,
+      "sha256": "aefe6ba3b686cb1d7a0cea2b12b40444adcb3f6a931b1d1b7bbb5eab64e1f0c4",
+      "mode": "0644"
+    },
+    {
+      "path": "packages/tools/xai-grok-workspace/src/permission/policy_path_match_tests.rs",
+      "bytes": 8553,
+      "sha256": "ff8368e1b84a521b40d1633f082429b2643763ffbb4f86b3de242731c987859f",
       "mode": "0644"
     },
     {
@@ -11650,8 +11656,8 @@
     },
     {
       "path": "packages/tools/xai-grok-workspace/src/permission/shell_access.rs",
-      "bytes": 125135,
-      "sha256": "ffe78349fc544c5e88ca6983ef716b9aa3b7a533b0a8eae62285c10f80bb1ec7",
+      "bytes": 125820,
+      "sha256": "d900e0b35734834b9803d77d4ab834afc8ed185356f1c52b8fda228863eb21a5",
       "mode": "0644"
     },
     {
