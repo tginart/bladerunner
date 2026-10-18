@@ -1,3 +1,8 @@
+//! Purpose: Evaluate permission rules for tools and file paths.
+//! Input: Permission rules, tool access, and an optional workspace directory.
+//! Output: The applicable permission decision, with deny before ask before allow.
+
+use std::cell::OnceCell;
 use std::path::{Component, Path, PathBuf};
 
 use crate::permission::bash_command_splitting::{
@@ -72,6 +77,53 @@ enum MatchContext {
 struct CompiledRule<'a> {
     rule: &'a PermissionRule,
     matcher: Option<&'a glob::Pattern>,
+}
+
+/// Purpose: Anchor relative rules to the written and physical workspace paths.
+/// Input: The workspace directory from the caller.
+/// Output: A shared rule base with a lazy physical path cache.
+pub(crate) struct RuleBase<'a> {
+    /// The cwd as the caller wrote it
+    pub(crate) lexical: &'a Path,
+    lexical_normalized: PathBuf,
+    /// The distinct physical cwd, resolved on first use; None on failure.
+    physical: OnceCell<Option<PathBuf>>,
+}
+
+impl<'a> RuleBase<'a> {
+    pub(crate) fn new(cwd: &'a Path) -> Self {
+        RuleBase {
+            lexical: cwd,
+            lexical_normalized: normalize_lexically(cwd),
+            physical: OnceCell::new(),
+        }
+    }
+
+    /// Purpose: Withhold physical forms after a path lost its original `..` components.
+    /// Input: The current rule base.
+    /// Output: A rule base that permits only the written workspace path.
+    pub(crate) fn without_physical(&self) -> Self {
+        RuleBase {
+            lexical: self.lexical,
+            lexical_normalized: self.lexical_normalized.clone(),
+            physical: OnceCell::from(None),
+        }
+    }
+
+    /// Purpose: Resolve the workspace path once for all rules in an evaluation.
+    /// Input: The written workspace directory.
+    /// Output: The distinct physical directory, or None if resolution fails.
+    fn physical(&self) -> Option<&Path> {
+        self.physical
+            .get_or_init(|| {
+                self.lexical
+                    .is_absolute()
+                    .then_some(self.lexical)
+                    .and_then(resolve_following_symlinks)
+                    .filter(|physical| *physical != self.lexical_normalized)
+            })
+            .as_deref()
+    }
 }
 
 /// Permission policy with pre-compiled glob patterns.
@@ -229,44 +281,53 @@ impl CompiledPolicy {
         self.evaluate_with_cwd(access, None)
     }
 
-    /// Like [`Self::evaluate`], but joins relative tool paths to `cwd` before the path-glob match.
-    /// Native Read/Edit/Grep also re-check the followed symlink target for deny/ask only (allow on the target is not granted).
+    /// Purpose: Evaluate path rules under the written and physical workspace paths.
+    /// Input: Tool access and an optional workspace directory.
+    /// Output: The strongest direct decision, tightened by symlink target restrictions.
+    /// Note: A symlink target cannot grant access.
     pub fn evaluate_with_cwd(&self, access: &AccessKind, cwd: Option<&Path>) -> Option<Decision> {
         self.evaluate_with_cwd_details(access, cwd).0
     }
 
-    /// Match the requested path, then check its physical destination for restrictions.
-    ///
-    /// Main callers: permission preflight and native Read/Edit/Grep checks.
-    /// Why this exists: a harmless-looking repository link can point at a denied
-    /// file. Following a link can tighten permission, but cannot grant access.
+    /// Purpose: Match the requested path, then apply physical target restrictions.
+    /// Input: Tool access and an optional workspace directory.
+    /// Output: A decision and whether an unresolved symlink requires a prompt.
+    /// Note: A symlink target can tighten permission, but cannot grant access.
     pub(crate) fn evaluate_with_cwd_details(
         &self,
         access: &AccessKind,
         cwd: Option<&Path>,
     ) -> (Option<Decision>, bool) {
-        let lexical = self.evaluate_lexical_with_cwd(access, cwd);
+        let base = cwd.map(RuleBase::new);
+        let direct = self.evaluate_rules_with_base(access, base.as_ref());
         let Some(path) = native_file_path(access) else {
-            return (lexical, false);
+            return (direct, false);
         };
         let Some(raw_absolute) = raw_absolute_tool_path(path, cwd) else {
-            return (lexical, false);
+            return (direct, false);
         };
         let lexical_abs = path_match_string(&absolute_normalized_path(path, cwd));
-        match follow_absolute_symlink(&raw_absolute, &lexical_abs) {
+        let follow = match follow_absolute_symlink(&raw_absolute, &lexical_abs) {
+            // A `..` path can gain physical forms only in the restrictive re-check.
+            SymlinkFollow::None if path_has_parent_dir(Path::new(path)) => {
+                SymlinkFollow::Target(lexical_abs)
+            }
+            follow => follow,
+        };
+        match follow {
             SymlinkFollow::Target(resolved) => {
                 let resolved_decision = match self
-                    .evaluate_lexical_with_cwd(&access_with_path(access, resolved), cwd)
+                    .evaluate_rules_with_base(&access_with_path(access, resolved), base.as_ref())
                 {
                     Some(decision @ (Decision::Reject(_) | Decision::Ask)) => Some(decision),
                     _ => None,
                 };
-                (combine_decisions(lexical, resolved_decision), false)
+                (combine_decisions(direct, resolved_decision), false)
             }
             SymlinkFollow::Unresolvable if self.native_path_restrictions_apply(access) => {
-                (combine_decisions(lexical, Some(Decision::Ask)), true)
+                (combine_decisions(direct, Some(Decision::Ask)), true)
             }
-            SymlinkFollow::Unresolvable | SymlinkFollow::None => (lexical, false),
+            SymlinkFollow::Unresolvable | SymlinkFollow::None => (direct, false),
         }
     }
 
@@ -278,11 +339,13 @@ impl CompiledPolicy {
         })
     }
 
-    /// Lexical rule match only. Callers re-check symlink targets through this so follow cannot recurse.
-    pub(crate) fn evaluate_lexical_with_cwd(
+    /// Purpose: Match rules without a recursive symlink target check.
+    /// Input: Tool access and the written and physical workspace paths.
+    /// Output: The strongest direct rule decision.
+    pub(crate) fn evaluate_rules_with_base(
         &self,
         access: &AccessKind,
-        cwd: Option<&Path>,
+        base: Option<&RuleBase<'_>>,
     ) -> Option<Decision> {
         let mut matched_ask = false;
         let mut matched_allow = false;
@@ -295,7 +358,7 @@ impl CompiledPolicy {
                 rule,
                 matcher: matcher.as_ref(),
             };
-            if !pattern_matches(access, &cr, cwd) {
+            if !pattern_matches(access, &cr, base) {
                 continue;
             }
             match rule.action {
@@ -645,7 +708,11 @@ pub fn bash_pattern_is_broad(pattern: &str) -> bool {
     pattern == "*" || !pattern.contains(char::is_whitespace)
 }
 
-fn pattern_matches(access: &AccessKind, cr: &CompiledRule<'_>, cwd: Option<&Path>) -> bool {
+fn pattern_matches(
+    access: &AccessKind,
+    cr: &CompiledRule<'_>,
+    base: Option<&RuleBase<'_>>,
+) -> bool {
     let pattern = match cr.rule.pattern.as_deref() {
         Some(p) => p,
         None => return true,
@@ -662,13 +729,13 @@ fn pattern_matches(access: &AccessKind, cr: &CompiledRule<'_>, cwd: Option<&Path
             let cmd = cmd.trim_start();
             cmd.starts_with(pattern) || glob_matches(cmd, MatchContext::Freeform, cr.matcher)
         }
-        AccessKind::Edit(path) => path_context_matches(path, cr, cwd),
+        AccessKind::Edit(path) => path_context_matches(path, cr, base),
         AccessKind::Read(path) => match path {
-            Some(p) => path_context_matches(p, cr, cwd),
+            Some(p) => path_context_matches(p, cr, base),
             None => false,
         },
         AccessKind::Grep { path, .. } => match path {
-            Some(p) => path_context_matches(p, cr, cwd),
+            Some(p) => path_context_matches(p, cr, base),
             None => false,
         },
         AccessKind::MCPTool { name, .. } => glob_matches(name, MatchContext::Freeform, cr.matcher),
@@ -682,29 +749,39 @@ fn pattern_matches(access: &AccessKind, cr: &CompiledRule<'_>, cwd: Option<&Path
     }
 }
 
-/// Match Read/Edit/Grep after lexical normalize (+ cwd-join). Rooted patterns
-/// are self-containing: `..` never survives normalization, and the
-/// cwd-relative spellings are generated only for paths genuinely under the
-/// cwd, so `Read(./**)` / `Read(src/**)` cannot be escaped via traversal.
-/// Unrooted patterns (`*`, leading `**`) keep their documented any-depth
-/// meaning.
-fn path_context_matches(path: &str, cr: &CompiledRule<'_>, cwd: Option<&Path>) -> bool {
-    path_match_forms(path, cwd)
+/// Purpose: Match file rules against normalized forms under either workspace path.
+/// Input: A tool path, a compiled rule, and an optional rule base.
+/// Output: Whether at least one path form matches the rule.
+fn path_context_matches(path: &str, cr: &CompiledRule<'_>, base: Option<&RuleBase<'_>>) -> bool {
+    path_match_forms(path, base)
         .iter()
         .any(|text| glob_matches(text, MatchContext::Path, cr.matcher))
 }
 
-/// Normalized absolute form, plus cwd-relative and `./`-prefixed spellings when
-/// the path stays under cwd (so `Read(./**)` matches bare `src/main.rs`).
-/// Normalization never leaves `.`/`..` in the forms, so a relative spelling is
-/// produced only for paths genuinely under the cwd. Tilde paths are matched
-/// literally only (see [`is_tilde_path`]).
-fn path_match_forms(path: &str, cwd: Option<&Path>) -> Vec<String> {
-    let abs = absolute_normalized_path(path, cwd);
+/// Purpose: Produce path forms for rules under either workspace path.
+/// Input: A tool path and an optional rule base.
+/// Output: Absolute and workspace-relative path forms without `.` or `..` components.
+/// Note: A path with `..` gets physical forms only through the restrictive target check.
+fn path_match_forms(path: &str, base: Option<&RuleBase<'_>>) -> Vec<String> {
+    let abs = absolute_normalized_path(path, base.map(|base| base.lexical));
     let mut forms = vec![path_match_string(&abs)];
 
-    if let Some(cwd) = cwd {
-        if let Ok(rel) = abs.strip_prefix(normalize_lexically(cwd)) {
+    if let Some(base) = base {
+        let rel = abs.strip_prefix(&base.lexical_normalized).ok().or_else(|| {
+            // Textual `..` collapse does not establish physical workspace membership.
+            if path_has_parent_dir(Path::new(path)) {
+                return None;
+            }
+            let rel = abs.strip_prefix(base.physical()?).ok()?;
+            let written: PathBuf = base
+                .lexical_normalized
+                .components()
+                .chain(rel.components())
+                .collect();
+            forms.push(path_match_string(&written));
+            Some(rel)
+        });
+        if let Some(rel) = rel {
             let rel_s = path_match_string(rel);
             if rel_s.is_empty() || rel_s == "." {
                 forms.extend([".".to_owned(), "./".to_owned()]);
@@ -753,7 +830,7 @@ fn path_match_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn path_has_parent_dir(path: &Path) -> bool {
+pub(crate) fn path_has_parent_dir(path: &Path) -> bool {
     path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
@@ -994,7 +1071,7 @@ mod tests {
             rule: &policy.config.rules[0],
             matcher: policy.matchers[0].as_ref(),
         };
-        pattern_matches(access, &cr, cwd)
+        pattern_matches(access, &cr, cwd.map(RuleBase::new).as_ref())
     }
 
     #[test]
@@ -2354,3 +2431,7 @@ mod tests {
         assert!(fail_closed);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "policy_path_match_tests.rs"]
+mod path_match_tests;
