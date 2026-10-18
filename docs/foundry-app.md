@@ -1,17 +1,15 @@
-# Register the Bladerunner app in Foundry
+# Set up Foundry browser sign-in
 
 Bladerunner signs in to Palantir AIP in one of two ways:
 
-- **Personal token.** No setup in Foundry. Each user creates a token under
-  Account > Settings > Tokens and pastes it at sign-in.
-- **Browser sign-in (OAuth).** Tokens refresh automatically and nobody handles
-  long-lived tokens. This needs the Bladerunner app registered once on your
-  Foundry, as described below.
+- **Personal token.** No administrator setup required. Each user creates a token
+  under Account > Settings > Tokens and pastes it at sign-in.
+- **Browser sign-in (OAuth).** Opens your browser and refreshes tokens
+  automatically. An administrator registers Bladerunner once on your Foundry
+  using the steps below.
 
-The app is only settings in Foundry; it has no source code. Bladerunner itself
-is the OAuth client. Foundry has no API for creating OAuth clients, so an admin
-enters these settings in Developer Console once per Foundry. Every user on that
-Foundry then shares the app's client ID.
+An administrator creates the app in **Developer Console**, then shares its
+client ID with users who want browser sign-in.
 
 ## Who can do this
 
@@ -29,7 +27,7 @@ In **Developer Console**, create a new application with these settings:
 | Description | Coding agent that calls AIP language models on behalf of the signed-in user. |
 | Save location | Any project you control. It decides who can edit the app's settings, not what Bladerunner can access. |
 | Ontology SDK | None ("No, I will not use an Ontology SDK"), if the wizard asks. |
-| Client type | **Public client** (native or single-page application). Bladerunner ships no client secret. |
+| Client type | **Public client** (native or single-page application). |
 | Grant types | **Authorization code** only. Leave client credentials off. |
 | Redirect URLs | `http://127.0.0.1/` and `https://<your-foundry-hostname>/multipass/api/oauth2/callback` |
 | Restrictions | **Unrestricted**. Don't add ontology, dataset, or admin permissions. |
@@ -75,7 +73,7 @@ hostname = "acme.palantirfoundry.com"
 client_id = "<client-id>"
 ```
 
-## Without the app
+## Sign in with a personal token
 
 ```text
 /login palantir-aip token acme.palantirfoundry.com

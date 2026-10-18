@@ -1,26 +1,22 @@
 # Privacy and permissions
 
-Bladerunner sends prompts, selected workspace context, and tool results to the
-configured model provider. Codex requests go to OpenAI; AIP requests go to the
-Foundry hostname configured by the user. Their account policies, access controls,
-and usage limits apply. Do not give the harness access to data you cannot send
-to that provider.
+Bladerunner sends your messages, file content it reads, and tool results to
+your selected model provider. Codex requests go to OpenAI; AIP requests go to
+your Foundry. Your provider's privacy policies and access controls apply.
+Only give Bladerunner access to data you can share with that provider.
 
 Sessions, configuration, credentials, and logs are local under `~/.bladerunner`
-unless `BLADERUNNER_HOME` is set. Credentials are stored in owner-restricted
-files; do not copy this directory into a public repository. Local session and
-diagnostic files can contain prompts, source code, and tool output. Review and
-redact them before sharing. Logging is not a guarantee of secret removal.
+unless `BLADERUNNER_HOME` is set. Saved credentials are in `credentials/`.
+Do not share this directory. Session files and logs can contain messages,
+source code, and tool output. Review and redact them before sharing.
 
-Product telemetry defaults to disabled. No telemetry collector, Mixpanel token,
-or Sentry DSN is bundled. Users or administrators can explicitly configure
-telemetry and external OpenTelemetry exporters. Their configuration determines
-the destination and enabled content; inspect it before enabling export.
+Product telemetry is off by default. You or your administrator can enable it.
+Review what data it sends and where before enabling it.
 
 Tools, shell commands, plugins, hooks, extensions, and MCP servers can access
-resources permitted by the runtime and operating system. Review permissions and
-trust settings before allowing execution. Prefer restrictive permissions and a
-disposable workspace for untrusted projects.
+files and run commands with the permissions you grant. Review permission
+requests before allowing execution. Use restrictive permissions and a separate
+workspace for untrusted projects.
 
 `bladerunner logout --openai` and `bladerunner logout --palantir-aip` remove the
 corresponding saved sign-in. Revoke provider-side access separately when needed.

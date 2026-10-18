@@ -1,9 +1,7 @@
 # Updates and removal
 
-The installer and built-in updater use releases from
-[tginart/bladerunner](https://github.com/tginart/bladerunner/releases). Downloads
-are checked against the release's `SHA256SUMS`. Keep the installed executable,
-bundled files, and license notices together.
+The installer and built-in updater download verified releases from
+[GitHub Releases](https://github.com/tginart/bladerunner/releases).
 
 Re-run the installer to install the latest release:
 

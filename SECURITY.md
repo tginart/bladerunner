@@ -7,7 +7,7 @@ If that route is unavailable, contact the maintainer through the
 before sharing details. Do not put tokens, private code, or exploit details in a
 public issue.
 
-The harness can read workspace files and execute tools with the permissions you
-grant. Use a separate workspace and restrictive permissions for untrusted code,
+Bladerunner can read files and run commands with the permissions you grant.
+Use a separate workspace and restrictive permissions for untrusted code,
 skills, hooks, extensions, and MCP servers. Provider requests can contain source
 code and tool output. Review [privacy and permissions](docs/privacy.md).

@@ -1,8 +1,7 @@
 # Bladerunner
 
 Bladerunner is a terminal coding agent for OpenAI Codex and Palantir AIP
-(Foundry), forked from [Grok Build](https://github.com/xai-org/grok-build).
-It edits files, runs commands, and works with MCP servers and skills.
+(Foundry). It edits files, runs commands, and works with MCP servers and skills.
 
 ## Install
 
@@ -40,12 +39,12 @@ available models and usage limits.
 
 ## Configuration and data
 
-Sessions and settings live under `~/.bladerunner`, or `BLADERUNNER_HOME` when set.
-Settings in `config.toml` override the bundled defaults. Credentials are stored separately
-under `credentials/`. See [privacy and permissions](docs/privacy.md) and
+Edit `~/.bladerunner/config.toml` to change your settings. Saved sign-ins and
+sessions also live under `~/.bladerunner`. Set `BLADERUNNER_HOME` to use a
+different directory. See [privacy and permissions](docs/privacy.md) and
 [updates and removal](docs/updates.md).
 
-To connect from an ACP-compatible editor:
+To connect from an editor that supports the Agent Client Protocol (ACP):
 
 ```sh
 bladerunner agent stdio
@@ -55,6 +54,8 @@ For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
 ## License
 
-Licensed under Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
-[third-party notices](THIRD-PARTY-NOTICES). Bladerunner is independently
-maintained and is not an official OpenAI, Palantir, or xAI product.
+Bladerunner is an independently maintained fork of
+[Grok Build](https://github.com/xai-org/grok-build), licensed under Apache-2.0.
+See [LICENSE](LICENSE), [NOTICE](NOTICE), and
+[third-party notices](THIRD-PARTY-NOTICES). It is not an official OpenAI,
+Palantir, or xAI product.

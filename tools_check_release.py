@@ -29,8 +29,7 @@ SYNTHETIC_FIXTURES = {
     "packages/platform/xai-grok-secrets/src/sanitizer.rs": "446e92a068e3bda23becca3e48b611bfea975cb4670bd128c8e08fa84347f07b",
 }
 PRIMARY_DOCS = {"README.md", "CONTRIBUTING.md", "SECURITY.md",
-                "docs/foundry-app.md", "docs/privacy.md", "docs/updates.md",
-                "docs/public-docs-cleanup.md"}
+                "docs/foundry-app.md", "docs/privacy.md", "docs/updates.md"}
 
 
 def safe_name(name):

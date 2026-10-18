@@ -9,33 +9,20 @@ under Apache-2.0. Report vulnerabilities privately as described in [SECURITY.md]
 
 Install the Rust toolchain specified in `rust-toolchain.toml`, a C/C++ compiler,
 CMake, and [DotSlash](https://dotslash-cli.com/). On macOS, install Xcode Command
-Line Tools. DotSlash resolves the protobuf compiler in `bin/protoc`.
+Line Tools.
 
 ```sh
-GROK_VERSION="$(cat VERSION)" cargo build -p xai-grok-pager-bin --features community-build --release --locked
+GROK_VERSION="$(cat VERSION)" cargo build \
+    -p xai-grok-pager-bin --features community-build --release --locked
 target/release/bladerunner --version
 ```
 
 Prebuilt beta releases support Apple Silicon macOS.
 
-## Verify changes
+## Pull requests
 
-Include updated `PUBLIC_MANIFEST.json` entries with source changes. Use
-`tools_check_release.py` with `--refresh-manifest` and the source archive's path,
-then copy the manifest back into your checkout. Keep Git metadata and build
-output out of the archive.
+Explain the problem, your change, and how you tested it. Run the tests for the
+packages you change and include the results in your pull request.
 
-To verify a committed change:
-
-```sh
-BLADERUNNER_CHECK_SOURCE=$(mktemp -d)
-BLADERUNNER_CHECK_OUTPUT=$(mktemp -d)
-git archive HEAD | tar -x -C "$BLADERUNNER_CHECK_SOURCE"
-python3 -B "$BLADERUNNER_CHECK_SOURCE/tools_verify_release.py" \
-  --output "$BLADERUNNER_CHECK_OUTPUT" --build --tests
-```
-
-The verifier builds the CLI and checks source integrity, authentication
-contracts, and installer behavior. It does not make signed-in provider requests.
-Use synthetic fixtures; keep credentials, local Foundry settings, and real user
-sessions out of tests and commits.
+Use synthetic test data. Keep credentials, local Foundry settings, and real user
+sessions out of commits.
