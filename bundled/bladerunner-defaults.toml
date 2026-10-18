@@ -1,4 +1,4 @@
-# Blade Runner's provider defaults ship in the binary and release bundle.
+# Bladerunner's provider defaults ship in the binary and release bundle.
 # The config loader reads this as its lowest-priority layer, then applies system,
 # managed, and user settings. Keep credentials out of this file: sign-in state
 # lives under ~/.bladerunner/credentials on each machine.

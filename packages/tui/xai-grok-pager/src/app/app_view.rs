@@ -1792,7 +1792,7 @@ impl AppView {
     /// Mirrors `apply_session_recap_available` for `/recap`.
     pub fn apply_voice_mode_enabled(&mut self, _requested_enabled: bool) {
         // Keep upstream voice internals covered by unit tests while production
-        // Blade Runner hides xAI dictation. /live has a separate gate.
+        // Bladerunner hides xAI dictation. /live has a separate gate.
         #[cfg(not(test))]
         let enabled = false;
         #[cfg(test)]

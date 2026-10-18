@@ -127,26 +127,6 @@ Ollama Cloud roster) appear without waiting for a catalog update.
 
 ---
 
-## Refreshing the catalog from Pi
-
-On a checkout of [earendil-works/pi](https://github.com/earendil-works/pi):
-
-```bash
-cd packages/ai && npm run generate-models -- --pretty
-# then re-run the import script used in hyper-grok-build development
-# (copies providers/data/*.json → platform_catalog.json)
-```
-
-Shipped files:
-
-- `xai-grok-models/platform_catalog.json` — models
-- `xai-grok-models/platform_registry.json` — platform metadata
-
-We do **not** auto-fetch OpenAI/Anthropic/OpenRouter org `/models` at runtime
-(too large). Kimi Code + Moonshot still live-sync when credentials exist.
-
----
-
 ## Notes
 
 - Anthropic: Messages + `x-api-key` + `anthropic-version: 2023-06-01`.

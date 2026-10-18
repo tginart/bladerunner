@@ -1355,7 +1355,7 @@ pub async fn run_single_turn(
 /// Keep signal cleanup responsive if the agent's ACP dispatcher or log writer is stuck.
 const SIGNAL_CLEANUP_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Blade Runner's normal agent shutdown is graceful and does not settle an unfinished turn.
+/// Bladerunner's normal agent shutdown is graceful and does not settle an unfinished turn.
 /// Queue the existing ACP cancel first so shutdown persists Cancelled rather than EndTurn.
 async fn cancel_prompt_for_signal(acp_tx: &AcpAgentTx, session_id: &acp::SessionId) {
     let request = acp::CancelNotification::new(session_id.clone()).meta(

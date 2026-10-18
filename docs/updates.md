@@ -18,9 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/tginart/bladerunner/main/install.sh
 sh /tmp/bladerunner-install.sh --version v1.1.20
 ```
 
-The binary release beta supports Apple Silicon macOS. The presence of inherited
-Linux/Windows source and installer code does not mean those binaries are
-published or verified for the beta.
+Prebuilt beta releases support Apple Silicon macOS.
 
 For removal, sign out, remove `~/.bladerunner/bin` from your shell PATH, and remove
 the installed binary link, downloads, and bundled files under `~/.bladerunner`.

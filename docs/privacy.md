@@ -1,6 +1,6 @@
 # Privacy and permissions
 
-Blade Runner sends prompts, selected workspace context, and tool results to the
+Bladerunner sends prompts, selected workspace context, and tool results to the
 configured model provider. Codex requests go to OpenAI; AIP requests go to the
 Foundry hostname configured by the user. Their account policies, access controls,
 and usage limits apply. Do not give the harness access to data you cannot send

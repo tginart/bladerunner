@@ -2468,7 +2468,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 } else if bedrock {
                     run_bedrock_cli_login(profile.as_deref(), chain)?;
                 } else if oauth {
-                    anyhow::bail!("Grok / xAI login is disabled in Blade Runner.");
+                    anyhow::bail!("Grok / xAI login is disabled in Bladerunner.");
                 } else {
                     anyhow::bail!(
                         "Choose an account: `bladerunner login --openai` or `bladerunner login --palantir-aip`."

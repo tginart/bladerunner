@@ -1634,8 +1634,8 @@ pub(crate) async fn run(
                 return Ok(finish_run(&mut app));
             }
         }
-        // Blade Runner hides the x.ai release notes, including the welcome preview.
-        // Restore FetchChangelog here when Blade Runner has its own notes.
+        // Bladerunner hides the x.ai release notes, including the welcome preview.
+        // Restore FetchChangelog here when Bladerunner has its own notes.
         // let effs = vec![super::actions::Effect::FetchChangelog];
         // if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
         //     return Ok(finish_run(&mut app));

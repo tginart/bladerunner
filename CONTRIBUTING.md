@@ -5,12 +5,27 @@ Report reproducible bugs and propose focused changes through
 Keep third-party licenses and attribution with their source. Contributions are
 under Apache-2.0. Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
-## Verification
+## Build from source
 
-The source manifest excludes Git metadata and generated build output. After
-updating reviewed source files, archive the working tree to a fresh directory,
-refresh the manifest there, and run the checker. Commit the resulting manifest
-along with the source changes. To verify an existing commit:
+Install the Rust toolchain specified in `rust-toolchain.toml`, a C/C++ compiler,
+CMake, and [DotSlash](https://dotslash-cli.com/). On macOS, install Xcode Command
+Line Tools. DotSlash resolves the protobuf compiler in `bin/protoc`.
+
+```sh
+GROK_VERSION="$(cat VERSION)" cargo build -p xai-grok-pager-bin --features community-build --release --locked
+target/release/bladerunner --version
+```
+
+Prebuilt beta releases support Apple Silicon macOS.
+
+## Verify changes
+
+Include updated `PUBLIC_MANIFEST.json` entries with source changes. Use
+`tools_check_release.py` with `--refresh-manifest` and the source archive's path,
+then copy the manifest back into your checkout. Keep Git metadata and build
+output out of the archive.
+
+To verify a committed change:
 
 ```sh
 BLADERUNNER_CHECK_SOURCE=$(mktemp -d)
@@ -20,18 +35,7 @@ python3 -B "$BLADERUNNER_CHECK_SOURCE/tools_verify_release.py" \
   --output "$BLADERUNNER_CHECK_OUTPUT" --build --tests
 ```
 
-The verifier checks source hashes, file modes, public documentation links,
-credential markers, workspace metadata, Python utilities, Codex/AIP
-authentication contracts, CLI parsing, and installer/updater behavior. It builds
-the CLI and executes credential-free help, version, and model-list checks.
-Source archives have normalized metadata and reproducible hashes.
-
-These checks do not exercise paid provider requests, every harness feature, or
-unsupported binary platforms. Never add account credentials, local installation
-state, private tenant identifiers, or real user sessions to a test fixture.
-Credential-detection tests may contain reviewed synthetic token strings; the
-checker pins their exact file hashes.
-
-Public and development histories are separate. Accepted public changes must be
-carried into the canonical development source before the next exported release;
-public releases should never merge unrelated development history.
+The verifier builds the CLI and checks source integrity, authentication
+contracts, and installer behavior. It does not make signed-in provider requests.
+Use synthetic fixtures; keep credentials, local Foundry settings, and real user
+sessions out of tests and commits.

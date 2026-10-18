@@ -89,7 +89,7 @@ impl SlashCommand for LoginCommand {
                 Err(message) => CommandResult::Error(message),
             }
         } else if matches!(arg.as_str(), "xai" | "grok") {
-            CommandResult::Error("Grok / xAI login is disabled in Blade Runner.".into())
+            CommandResult::Error("Grok / xAI login is disabled in Bladerunner.".into())
         } else if matches!(arg.as_str(), "claude" | "anthropic" | "anthropic-claude") {
             CommandResult::Action(Action::LoginAnthropicClaude)
         } else if matches!(arg.as_str(), "github" | "github-copilot" | "copilot") {
