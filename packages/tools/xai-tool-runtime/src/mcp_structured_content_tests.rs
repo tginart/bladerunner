@@ -89,3 +89,39 @@ fn different_json_block_is_not_inlined() {
         part(folders(), &[r#"{"count":9}"#])
     );
 }
+
+/// Purpose: Verify that prose delimiters do not hide a later copy of the payload.
+/// Input: Object and array payloads after malformed JSON candidates.
+/// Output: Only text that contains the complete payload suppresses the extra JSON.
+#[test]
+fn invalid_delimiters_before_matching_json_do_not_hide_the_payload() {
+    for (payload, prefix) in [
+        (folders(), "Use {placeholder} for the folder: "),
+        (
+            json!([{"id": "p1"}, {"id": "c1"}]),
+            "At [step], folders are: ",
+        ),
+    ] {
+        assert_eq!(Some(payload.to_string()), part(payload.clone(), &[prefix]));
+        let text = format!("{prefix}{payload}");
+        assert_eq!(None, part(payload, &[&text]), "{text}");
+    }
+}
+
+/// Purpose: Verify that a different JSON document does not hide a later payload copy.
+/// Input: Object and array payloads after valid, unrelated JSON documents.
+/// Output: Only text that contains the complete payload suppresses the extra JSON.
+#[test]
+fn different_json_before_matching_json_does_not_hide_the_payload() {
+    for (payload, prefix) in [
+        (folders(), "Metadata: {\"count\":9}. Folders: "),
+        (
+            json!([{"id": "p1"}, {"id": "c1"}]),
+            "Steps: [1,2]. Folders: ",
+        ),
+    ] {
+        assert_eq!(Some(payload.to_string()), part(payload.clone(), &[prefix]));
+        let text = format!("{prefix}{payload}");
+        assert_eq!(None, part(payload, &[&text]), "{text}");
+    }
+}

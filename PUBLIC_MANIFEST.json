@@ -11992,14 +11992,14 @@
     },
     {
       "path": "packages/tools/xai-tool-runtime/src/mcp_structured_content.rs",
-      "bytes": 1508,
-      "sha256": "8408107fdb17af915fd6a02a0e071f2e37ec6e0343e617f15ed182a3fff7d5f2",
+      "bytes": 1862,
+      "sha256": "145f618581722ee1fea13e09634dcae5ea64fdc4c88ef28e444b66185c141575",
       "mode": "0644"
     },
     {
       "path": "packages/tools/xai-tool-runtime/src/mcp_structured_content_tests.rs",
-      "bytes": 2952,
-      "sha256": "1a222726a076020a53bb9bc5c23c660601f8f30bff35d63dd2886f7185462194",
+      "bytes": 4407,
+      "sha256": "5f1a8be3a055d104c34d4b55eaaca64480af4681467544edcc4bc3c8deffb3ec",
       "mode": "0644"
     },
     {
