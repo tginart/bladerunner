@@ -828,7 +828,16 @@ pub async fn call_mcp_tool(
         .map_err(|_| format!("tool '{}' timed out after {}s", tool_name, tool_timeout_sec))?
         .map_err(|e| format!("tool call failed: {}", e))?;
 
-    let content = result
+    Ok(mcp_call_response_from_result(result))
+}
+
+/*
+Purpose: Preserve structured MCP data in direct extension responses.
+Input: A completed MCP tool result.
+Output: The extension response with unique structured JSON and the original error flag.
+*/
+fn mcp_call_response_from_result(result: rmcp::model::CallToolResult) -> McpCallResponse {
+    let mut content: Vec<McpContentBlock> = result
         .content
         .iter()
         .filter_map(|c| match c {
@@ -846,10 +855,20 @@ pub async fn call_mcp_tool(
         })
         .collect();
 
-    Ok(McpCallResponse {
+    if let Some(text) = xai_tool_runtime::render_structured_content(
+        result.structured_content.as_ref(),
+        content.iter().map(|block| block.text.as_str()),
+    ) {
+        content.push(McpContentBlock {
+            kind: "text".to_owned(),
+            text,
+        });
+    }
+
+    McpCallResponse {
         content,
         is_error: result.is_error,
-    })
+    }
 }
 
 // ── mcp/list handler ────────────────────────────────────────────────
@@ -1912,6 +1931,34 @@ async fn handle_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_mcp_result_preserves_structured_content_and_error() {
+        let payload = serde_json::json!({"document_id": "abc123"});
+        let mut result = rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "partial result",
+        )]);
+        result.structured_content = Some(payload.clone());
+        let response = mcp_call_response_from_result(result);
+        assert_eq!(response.is_error, Some(true));
+        assert_eq!(response.content.len(), 2);
+        assert_eq!(response.content[1].kind, "text");
+        assert_eq!(response.content[1].text, payload.to_string());
+    }
+
+    #[test]
+    fn direct_mcp_result_does_not_repeat_structured_content() {
+        let payload = serde_json::json!({"document_id": "abc123"});
+        let inlined = format!("Created document: {payload}");
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                inlined.clone(),
+            )]);
+        result.structured_content = Some(payload);
+        let response = mcp_call_response_from_result(result);
+        assert_eq!(response.content.len(), 1);
+        assert_eq!(response.content[0].text, inlined);
+    }
 
     /// The emit-only reverse method (`x.ai/mcp/sdk_call`) shares the `x.ai/mcp/`
     /// prefix, so `mvp_agent`'s dispatcher routes an inbound copy of it to this

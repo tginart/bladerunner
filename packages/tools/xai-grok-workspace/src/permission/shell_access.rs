@@ -10,8 +10,8 @@ use crate::permission::bash_command_splitting::{
     try_parse_shell, unwrap_wrappers,
 };
 use crate::permission::policy::{
-    CompiledPolicy, GateDecision, InlineShellScript, ShellWord, combine_gate_decisions,
-    shell_dash_c_script,
+    CompiledPolicy, GateDecision, InlineShellScript, RuleBase, ShellWord, combine_gate_decisions,
+    path_has_parent_dir, shell_dash_c_script,
 };
 use crate::permission::types::{AccessKind, Decision};
 
@@ -34,13 +34,17 @@ impl CompiledPolicy {
         if !self.has_file_restrictions {
             return None;
         }
-        self.evaluate_shell_file_access_inner(cmd, cwd, MAX_INLINE_SHELL_DEPTH, false, false)
+        let base = RuleBase::new(cwd);
+        self.evaluate_shell_file_access_inner(cmd, &base, MAX_INLINE_SHELL_DEPTH, false, false)
     }
 
+    /// Purpose: Apply file restrictions to each shell operand and inline script.
+    /// Input: A command, a shared rule base, and the shell analysis state.
+    /// Output: The strongest restriction or a prompt for uncertain file access.
     fn evaluate_shell_file_access_inner(
         &self,
         cmd: &str,
-        cwd: &Path,
+        base: &RuleBase<'_>,
         inline_depth_remaining: usize,
         cwd_unpinned: bool,
         entered_inline: bool,
@@ -70,7 +74,7 @@ impl CompiledPolicy {
                     || cwd_unpinned_before(&cwd_changes, redirect.start_byte, redirect.scope);
                 decision = combine_gate_decisions(
                     decision,
-                    self.evaluate_shell_path(&path, cwd, redirect.mode, path_cwd_unpinned),
+                    self.evaluate_shell_path(&path, base, redirect.mode, path_cwd_unpinned),
                 );
             }
         }
@@ -99,7 +103,7 @@ impl CompiledPolicy {
                             decision,
                             self.evaluate_shell_file_access_inner(
                                 inner,
-                                cwd,
+                                base,
                                 inline_depth_remaining - 1,
                                 invocation_cwd_unpinned,
                                 true,
@@ -141,7 +145,7 @@ impl CompiledPolicy {
                 }
                 decision = combine_gate_decisions(
                     decision,
-                    self.evaluate_shell_path(&path, cwd, mode, invocation_cwd_unpinned),
+                    self.evaluate_shell_path(&path, base, mode, invocation_cwd_unpinned),
                 );
             }
             if program_lower == "dd" {
@@ -154,7 +158,7 @@ impl CompiledPolicy {
                     }
                     decision = combine_gate_decisions(
                         decision,
-                        self.evaluate_shell_path(path, cwd, mode, invocation_cwd_unpinned),
+                        self.evaluate_shell_path(path, base, mode, invocation_cwd_unpinned),
                     );
                 }
                 continue;
@@ -174,7 +178,7 @@ impl CompiledPolicy {
                 for &mode in modes {
                     decision = combine_gate_decisions(
                         decision,
-                        self.evaluate_shell_path(token, cwd, mode, invocation_cwd_unpinned),
+                        self.evaluate_shell_path(token, base, mode, invocation_cwd_unpinned),
                     );
                 }
             }
@@ -185,31 +189,37 @@ impl CompiledPolicy {
         combine_gate_decisions(decision, forced_ask.then_some(GateDecision::AskFailClosed))
     }
 
+    /// Purpose: Match a shell operand and its physical destination against file rules.
+    /// Input: The operand, workspace rule base, access mode, and cwd certainty.
+    /// Output: A restriction or a prompt, without an automatic allow decision.
     fn evaluate_shell_path(
         &self,
         token: &str,
-        cwd: &Path,
+        base: &RuleBase<'_>,
         mode: ShellFileMode,
         cwd_unpinned: bool,
     ) -> Option<GateDecision> {
+        let cwd = base.lexical;
         let path = normalize_shell_path(token);
+        let raw = normalize_shell_path_raw(token);
         let is_absolute = is_absolute_shell_path(&path);
-        // Cwd-aware rule match mirrors the direct Read/Edit tool gate, so a
-        // rooted rule like `Read(src/**)` also keys on the same file spelled
-        // absolutely. An unpinned cwd anchors nothing: relative operands then
-        // keep text-only matching (absolute operands are cwd-independent).
-        let rule_cwd = (is_absolute || !cwd_unpinned).then_some(cwd);
+        // An unpinned cwd permits only text matches for relative operands.
+        // Absolute operands still use the workspace bases, as native tools do.
+        let rule_base = (is_absolute || !cwd_unpinned).then_some(base);
+        // Only the resolved re-check can infer physical forms after `..` collapse.
+        let has_parent_dir = path_has_parent_dir(Path::new(&raw));
+        let lexical_base = has_parent_dir.then(|| base.without_physical());
+        let path_rule_base = rule_base.map(|base| lexical_base.as_ref().unwrap_or(base));
         // Escalate only: drop Allow so a file allow-rule can't auto-approve here.
-        let escalate = |access: &AccessKind| match self.evaluate_with_cwd(access, rule_cwd) {
+        let escalate = |access: &AccessKind, rule_base: Option<&RuleBase<'_>>| match self
+            .evaluate_rules_with_base(access, rule_base)
+        {
             Some(Decision::Reject(reason)) => Some(GateDecision::Reject(reason)),
             Some(Decision::Ask) => Some(GateDecision::AskRuleMatch),
             _ => None,
         };
-        // Also re-check the resolved symlink target so a deny keyed on the real
-        // path can't be dodged via an in-workspace symlink (`ln -s /etc x`).
-        // Resolve the *uncollapsed* operand so a `..` after a link is applied
-        // physically, not erased textually before the link is followed.
-        let raw = normalize_shell_path_raw(token);
+        // Resolve the original operand so `..` after a link applies physically.
+        // A target restriction must also cover access through an innocent alias.
         let raw_absolute = if is_absolute_shell_path(&raw) {
             Some(raw)
         } else if cwd_unpinned {
@@ -224,15 +234,15 @@ impl CompiledPolicy {
                 normalize_shell_path(&cwd.join(&path).to_string_lossy())
             };
             match resolve_symlink_target(&raw_absolute) {
-                Some(resolved) if resolved != absolute => escalate(&shell_access(mode, resolved)),
+                Some(resolved) if resolved != absolute => {
+                    escalate(&shell_access(mode, resolved), rule_base)
+                }
+                Some(_) if has_parent_dir => escalate(&shell_access(mode, absolute), rule_base),
                 Some(_) => None,
-                // Unresolvable (depth/cycle/error): fail closed to Ask when any
-                // component of the operand is a symlink, rather than silently
-                // allowing it (covers mid-path chains, not just the leaf).
                 None => path_has_symlink(&raw_absolute).then_some(GateDecision::AskFailClosed),
             }
         });
-        let path_decision = escalate(&shell_access(mode, path.clone()));
+        let path_decision = escalate(&shell_access(mode, path.clone()), path_rule_base);
         // WHY: unknown cwd permits text matches only, never original-cwd resolution.
         let anchored_decision = if cwd_unpinned && !is_absolute {
             None
@@ -242,7 +252,10 @@ impl CompiledPolicy {
             } else {
                 normalize_shell_path(&cwd.join(&path).to_string_lossy())
             };
-            combine_gate_decisions(escalate(&shell_access(mode, absolute)), resolved_decision)
+            combine_gate_decisions(
+                escalate(&shell_access(mode, absolute), path_rule_base),
+                resolved_decision,
+            )
         };
         let decision = combine_gate_decisions(path_decision, anchored_decision);
         combine_gate_decisions(
@@ -679,7 +692,7 @@ fn cwd_poison_positions(root: Node<'_>, src: &str) -> Vec<CwdPoison> {
                 scope: execution_scope(node),
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -775,7 +788,7 @@ enum ArgText {
 fn node_has_expansion(node: Node<'_>) -> bool {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
-        for i in 0..n.child_count() {
+        for i in 0..n.child_count() as u32 {
             let Some(child) = n.child(i) else { continue };
             if matches!(
                 child.kind(),
@@ -897,7 +910,7 @@ fn shell_command_invocations(root: Node<'_>, src: &str) -> Vec<ShellInvocation> 
     while let Some(node) = stack.pop() {
         if node.kind() == "command" {
             let mut words = Vec::new();
-            for i in 0..node.named_child_count() {
+            for i in 0..node.named_child_count() as u32 {
                 let Some(child) = node.named_child(i) else {
                     continue;
                 };
@@ -929,7 +942,7 @@ fn shell_command_invocations(root: Node<'_>, src: &str) -> Vec<ShellInvocation> 
                 wrapper_words,
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -977,7 +990,7 @@ fn shell_redirect_targets(root: Node<'_>, src: &str) -> Vec<ShellRedirectTarget>
                 ambiguous,
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -988,7 +1001,7 @@ fn shell_redirect_targets(root: Node<'_>, src: &str) -> Vec<ShellRedirectTarget>
 
 fn shell_redirect_one(node: Node<'_>, src: &str) -> Option<(Option<String>, ShellFileMode, bool)> {
     let mut redirect = None;
-    for i in 0..node.child_count() {
+    for i in 0..node.child_count() as u32 {
         let kind = node.child(i)?.kind();
         // `<<`/`<<<` read from inline text, not a file.
         if kind.contains("<<") {

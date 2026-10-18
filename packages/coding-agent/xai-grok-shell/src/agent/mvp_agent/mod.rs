@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 /// 2. All access happens on the **same** `LocalSet` thread (no `Send`).
 /// 3. The `LocalRef` does not outlive the `LocalSet`.
 ///
-/// These invariants are upheld by construction: `LocalRef` is `!Send`
-/// (via `*const T`) and only used inside `spawn_local` closures on the
-/// agent's `LocalSet`.
+/// `LocalRef` is `!Send` (via `*const T`) and only used inside `spawn_local`
+/// closures on the agent's `LocalSet`. Each entrypoint must retain an `Rc`
+/// declared before the `LocalSet`. This keeps the agent alive until all tasks
+/// are destroyed, both on normal exit and on unwind.
 pub(crate) struct LocalRef<T> {
     ptr: *const T,
 }
@@ -2460,3 +2461,6 @@ mod replay_tests;
 mod tests;
 #[cfg(test)]
 mod prompt_response_meta_tests;
+
+#[cfg(test)]
+mod lifetime_tests;

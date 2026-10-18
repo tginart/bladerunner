@@ -221,16 +221,16 @@ pub fn extract_content_blocks(value: &Value) -> Vec<ContentBlock> {
         {
             // Surface `structuredContent` so IDs/handles the server
             // expects the model to round-trip aren't dropped.
-            let structured = obj
-                .get("structuredContent")
-                .filter(|v| !v.is_null())
-                .map(|v| ContentBlock::Text {
-                    text: v.to_string(),
-                });
-            let mut blocks = Vec::with_capacity(arr.len() + structured.is_some() as usize);
-            blocks.extend(structured);
-            blocks.extend(arr.iter().map(value_to_block));
-            return blocks;
+            let content: Vec<ContentBlock> = arr.iter().map(value_to_block).collect();
+            let structured = crate::render_structured_content(
+                obj.get("structuredContent"),
+                content.iter().filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }),
+            )
+            .map(|text| ContentBlock::Text { text });
+            return structured.into_iter().chain(content).collect();
         }
 
         // 4. Mixed object -> pull block-shaped field values out; collect
@@ -615,6 +615,20 @@ mod tests {
             "structuredContent must surface drawing_id, got: {text}"
         );
         assert!(matches!(&blocks[1], ContentBlock::Resource { .. }));
+    }
+
+    #[test]
+    fn extract_content_does_not_repeat_structured_json_in_text() {
+        let payload = json!({"document_id": "abc123"});
+        let inlined = format!("Created document:\n```json\n{payload}\n```");
+        let value = json!({
+            "content": [{"type": "text", "text": inlined}],
+            "structuredContent": payload,
+        });
+        assert_eq!(
+            extract_content_blocks(&value),
+            vec![ContentBlock::Text { text: inlined }],
+        );
     }
 
     #[test]

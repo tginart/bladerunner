@@ -268,10 +268,13 @@ async fn spawn_agent_thread_direct(
     Ok(thread::Builder::new()
         .name("acp-agent-worker".into())
         .spawn(move || -> Result<()> {
+            // The router owns MvpAgent. Keep it alive until all LocalRef tasks are destroyed.
+            let mut keepalive: Option<Rc<ProviderRouterAgent>> = None;
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async move {
+            let result = local.block_on(&rt, async {
                 let client_tx = channel.tx.clone();
                 let agent_rc = spawn_agent(client_tx)?;
+                keepalive = Some(Rc::clone(&agent_rc));
 
                 // Direct dispatch: RPC requests go straight to the agent
                 let gw_rx =
@@ -324,7 +327,10 @@ async fn spawn_agent_thread_direct(
                 cancel.cancelled().await;
                 agent_rc.flush_all_sessions(SESSION_FLUSH_GRACE).await;
                 anyhow::Result::Ok(())
-            })
+            });
+            drop(local);
+            drop(keepalive);
+            result
         })?)
 }
 
