@@ -200,20 +200,19 @@ fn gateway_response_to_output(
     result: serde_json::Value,
 ) -> ToolOutput {
     let is_error = gateway_result_is_error(&result);
+    let structured_content = result
+        .get("structuredContent")
+        .or_else(|| result.get("structured_content"))
+        .filter(|value| !value.is_null())
+        .cloned();
     let text = gateway_result_to_text(result);
-    if is_error {
-        ToolOutput::MCP(MCPOutput::errored(
-            tool_name.to_owned(),
-            source.connector_name,
-            text,
-        ))
+    let mut output = if is_error {
+        MCPOutput::errored(tool_name.to_owned(), source.connector_name, text)
     } else {
-        ToolOutput::MCP(MCPOutput::okay_output(
-            tool_name.to_owned(),
-            source.connector_name,
-            text,
-        ))
-    }
+        MCPOutput::okay_output(tool_name.to_owned(), source.connector_name, text)
+    };
+    output.structured_content = structured_content;
+    ToolOutput::MCP(output)
 }
 
 pub async fn dispatch_mcp_tool(
@@ -1668,6 +1667,60 @@ mod tests {
             "should NOT contain the corrective error text"
         );
         assert!(captured_args.lock().unwrap().is_none());
+    }
+
+    /// Purpose: Keep structured IDs visible after the gateway output cap.
+    /// Input: Success and error results with absent or late inline JSON copies.
+    /// Output: The capped body contains the payload without a session dump.
+    #[tokio::test]
+    async fn gateway_structured_content_survives_output_cap() {
+        use crate::types::context::TruncationConfig;
+        use crate::types::output::MCPOutputDetails;
+        use crate::types::resources::TruncationCfg;
+
+        let limit = 128;
+        let payload = serde_json::json!({"document_id": "doc-123"});
+        for is_error in [false, true] {
+            for is_inlined in [false, true] {
+                let mut content = "x".repeat(512);
+                if is_inlined {
+                    content.push_str(&format!("\n{payload}"));
+                }
+                let resources = gateway_resources(
+                    Arc::new(std::sync::Mutex::new(None)),
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": content}],
+                        "structuredContent": payload,
+                        "isError": is_error,
+                    }),
+                );
+                let mut config = TruncationConfig::default();
+                config
+                    .per_tool_max_output_bytes
+                    .insert("use_tool".into(), limit);
+                resources.lock().await.insert(TruncationCfg(config));
+                let output = xai_tool_runtime::Tool::run(
+                    &UseTool,
+                    ctx_with_dispatch_and_resources(NotFoundDispatch, resources),
+                    UseToolInput {
+                        tool_name: "grafana__search_dashboards".into(),
+                        tool_input: serde_json::json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+                let ToolOutput::MCP(mcp) = output else {
+                    panic!("expected MCP");
+                };
+                assert_eq!(mcp.is_error, is_error);
+                let text = match mcp.output() {
+                    MCPOutputDetails::OkayOutput(text) | MCPOutputDetails::Error(text) => text,
+                };
+                let body = text.split("\n\n[MCP output truncated:").next().unwrap();
+                assert!(body.len() <= limit, "{body}");
+                assert!(body.contains(&payload.to_string()), "{body}");
+            }
+        }
     }
 }
 

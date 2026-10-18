@@ -120,3 +120,52 @@ fn format_mcp_image_expose_raw_block_has_no_data_prefix() {
     let out = format_mcp_image("image/jpeg", "ZZZZ", true);
     assert_eq!(1, out.matches("data:image/").count());
 }
+
+/// Purpose: Keep native MCP structured IDs after hub serialization and the output cap.
+/// Input: Large success and error results with absent or late inline payload copies.
+/// Output: The capped body contains the payload without a session dump.
+#[tokio::test]
+async fn native_structured_content_survives_output_cap() {
+    use xai_grok_tools::types::context::TruncationConfig;
+    use xai_grok_tools::types::output::ToolOutput;
+    use xai_grok_tools::types::resources::{Resources, TruncationCfg};
+    use xai_grok_tools::util::mcp_truncate::{McpTruncateContext, truncate_tool_output};
+
+    let limit = 128;
+    let payload = serde_json::json!({"document_id": "doc-123"});
+    let mut config = TruncationConfig::default();
+    config
+        .per_tool_max_output_bytes
+        .insert("use_tool".into(), limit);
+    let mut resources = Resources::new();
+    resources.insert(TruncationCfg(config));
+    let mut ctx = xai_tool_runtime::ToolCallContext::default();
+    ctx.extensions.insert(resources.into_shared());
+    let trunc_ctx = McpTruncateContext::from_tool_ctx(&ctx, "use_tool").await;
+    for is_error in [false, true] {
+        for is_inlined in [false, true] {
+            let mut content = "x".repeat(512);
+            if is_inlined {
+                content.push_str(&format!("\n{payload}"));
+            }
+            let output = mcp_output_from_call_result(
+                "t".into(),
+                "s".into(),
+                call_tool_result(is_error, &[&content], Some(payload.clone())),
+                false,
+            );
+            let serialized = serde_json::to_value(ToolOutput::MCP(output)).unwrap();
+            let output = serde_json::from_value(serialized).unwrap();
+            let ToolOutput::MCP(mcp) = truncate_tool_output(output, &trunc_ctx).await else {
+                panic!("expected MCP");
+            };
+            assert_eq!(mcp.is_error, is_error);
+            let text = match mcp.output() {
+                MCPOutputDetails::OkayOutput(text) | MCPOutputDetails::Error(text) => text,
+            };
+            let body = text.split("\n\n[MCP output truncated:").next().unwrap();
+            assert!(body.len() <= limit, "{body}");
+            assert!(body.contains(&payload.to_string()), "{body}");
+        }
+    }
+}

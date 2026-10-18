@@ -44,11 +44,15 @@ pub(crate) fn mcp_output_from_call_result(
     ));
 
     let text = parts.join("\n");
-    if is_error {
+    let mut output = if is_error {
         MCPOutput::errored(tool, server, text)
     } else {
         MCPOutput::okay_output(tool, server, text)
-    }
+    };
+    output.structured_content = call_result
+        .structured_content
+        .filter(|value| !value.is_null());
+    output
 }
 
 /// The wrapper has no `data:image/` prefix, so the image-extraction regex skips it.

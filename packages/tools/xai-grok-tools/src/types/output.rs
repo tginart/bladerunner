@@ -1276,6 +1276,10 @@ pub struct MCPOutput {
     pub is_timeout: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Structured data retained through inner dispatch until the inline preview is bounded.
+    /// The truncator consumes this field so final output does not retain a second payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
     /// Pre-truncation image captures for session harvest (same contract as
     /// [`FileContent::extracted_images`]). Must survive ToolDyn hub
     /// `to_value`/`from_value`; session drains before PostToolUse and ACP.
@@ -1293,6 +1297,7 @@ impl MCPOutput {
             is_timeout: false,
             is_error: false,
             extracted_images: Vec::new(),
+            structured_content: None,
         }
     }
     pub fn errored(tool_name: String, server_name: String, error: String) -> Self {
@@ -1305,6 +1310,7 @@ impl MCPOutput {
             is_timeout: false,
             is_error: true,
             extracted_images: Vec::new(),
+            structured_content: None,
         }
     }
     pub fn output(&self) -> &MCPOutputDetails {
