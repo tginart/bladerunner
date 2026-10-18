@@ -30,7 +30,10 @@
 //!
 //! Unix-only: the leader transport here is a unix socket.
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -58,6 +61,23 @@ use crate::scrollback::block::RenderBlock;
 
 const PUMP_TICK: Duration = Duration::from_millis(10);
 const TURN_BUDGET: Duration = Duration::from_secs(60);
+
+type AgentKeepalives = Rc<RefCell<Vec<Rc<xai_grok_shell::agent::MvpAgent>>>>;
+
+/// Purpose: Destroy all cluster tasks before their agents, also on unwind.
+/// Input: A scenario that stores every agent in the supplied owner.
+/// Output: The completed scenario.
+fn run_cluster_scenario<Fut: Future<Output = ()>>(scenario: impl FnOnce(AgentKeepalives) -> Fut) {
+    let agent_keepalives = AgentKeepalives::default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, scenario(Rc::clone(&agent_keepalives)));
+    drop(local);
+    drop(agent_keepalives);
+}
 
 /// Await a bring-up step with a hard budget so an on-demand run that hangs
 /// names its phase instead of parking until the test-runner kill.
@@ -267,6 +287,7 @@ struct PagerLeaderCluster {
     /// agent on the same BLADERUNNER_HOME (two agents on one updates.jsonl is the
     /// corruption class the real leader's flock exists to prevent).
     generation_tasks: Vec<tokio::task::JoinHandle<()>>,
+    agent_keepalives: AgentKeepalives,
     client_count: Arc<AtomicUsize>,
     workdir: TempDir,
     authenticated: bool,
@@ -284,8 +305,8 @@ struct PagerLeaderCluster {
 
 impl PagerLeaderCluster {
     /// Stand up the cluster. Callers MUST be `#[serial_test::serial(BLADERUNNER_HOME)]`
-    /// (env mutation) and run inside a current-thread `LocalSet`.
-    async fn start() -> Self {
+    /// (env mutation) and run inside `run_cluster_scenario` with its keepalive owner.
+    async fn start(agent_keepalives: AgentKeepalives) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let server = MockInferenceServer::start().await.expect("mock server");
@@ -320,6 +341,7 @@ impl PagerLeaderCluster {
             server,
             server_cancel: CancellationToken::new(),
             generation_tasks: Vec::new(),
+            agent_keepalives,
             client_count,
             workdir,
             authenticated: false,
@@ -373,10 +395,9 @@ impl PagerLeaderCluster {
             .await;
         }));
 
-        generation_tasks.extend(xai_grok_shell::leader::in_process::spawn_agent(
-            acp_rx,
-            response_tx,
-        ));
+        let agent = xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx).await;
+        generation_tasks.extend(agent.tasks);
+        self.agent_keepalives.borrow_mut().push(agent.keepalive);
         self.generation_tasks = generation_tasks;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

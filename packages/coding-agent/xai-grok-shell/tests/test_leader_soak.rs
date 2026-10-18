@@ -128,6 +128,7 @@ async fn leader_soak_churning_clients_no_leaks_no_zombies() {
     let max_thread_growth = env_u64("LEADER_SOAK_MAX_THREAD_GROWTH", 64) as usize;
     let send_failed_before = send_failed_count();
 
+    let mut agent_keepalive = None;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -166,7 +167,9 @@ async fn leader_soak_churning_clients_no_leaks_no_zombies() {
 
             // Hold a sender for the whole soak: the leader's response channel
             // must not close when the agent's output ends.
-            xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx.clone());
+            let agent =
+                xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx.clone()).await;
+            agent_keepalive = Some(agent.keepalive);
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             while !sock_path.exists() && tokio::time::Instant::now() < deadline {
