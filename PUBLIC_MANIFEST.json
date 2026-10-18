@@ -11656,8 +11656,8 @@
     },
     {
       "path": "packages/tools/xai-grok-workspace/src/permission/shell_access.rs",
-      "bytes": 125135,
-      "sha256": "ffe78349fc544c5e88ca6983ef716b9aa3b7a533b0a8eae62285c10f80bb1ec7",
+      "bytes": 125177,
+      "sha256": "69b00d764f8c7b07f4e5db0743e1ad36108e5fa1cb38cb44cbeaa8c3f9768112",
       "mode": "0644"
     },
     {
