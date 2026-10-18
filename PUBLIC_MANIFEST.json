@@ -14872,14 +14872,14 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/leader_cluster/mod.rs",
-      "bytes": 23274,
-      "sha256": "600b3f2d4b5ff7929c70c4222f4615ca6badac2741f097373c35517ed07cff54",
+      "bytes": 23865,
+      "sha256": "0b7e0b6d53f2b82193e24d56a096528d35023f4642700da91fe14182c49ac700",
       "mode": "0644"
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/leader_cluster/scenarios.rs",
-      "bytes": 15004,
-      "sha256": "9cc16068ac9994897b7bdbe778d7c33133a3be807694841ff52a403558c71cb3",
+      "bytes": 17255,
+      "sha256": "01020b27611c8bf70e48ad5adbded1026e07f58dc1bfba696c78d5639dc9e33a",
       "mode": "0644"
     },
     {

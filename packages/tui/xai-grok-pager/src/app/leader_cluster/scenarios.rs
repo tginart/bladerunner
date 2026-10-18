@@ -15,8 +15,8 @@ const T2: &str = "CLUSTER_SENTINEL_T2";
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
 #[serial_test::serial(BLADERUNNER_HOME)]
 fn two_clients_share_session_and_stream_both_ways() {
-    run_cluster_scenario(|agent_keepalives| async move {
-        let mut cluster = PagerLeaderCluster::start(agent_keepalives).await;
+    run_cluster_scenario(async {
+        let mut cluster = PagerLeaderCluster::start().await;
         let mut a = cluster.client("cluster-a", false).await;
 
         cluster.server.set_response(format!("{T1} first turn."));
@@ -73,8 +73,8 @@ fn two_clients_share_session_and_stream_both_ways() {
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
 #[serial_test::serial(BLADERUNNER_HOME)]
 fn n_client_fan_out_without_replay_duplication() {
-    run_cluster_scenario(|agent_keepalives| async move {
-        let mut cluster = PagerLeaderCluster::start(agent_keepalives).await;
+    run_cluster_scenario(async {
+        let mut cluster = PagerLeaderCluster::start().await;
         let mut driver = cluster.client("cluster-driver", false).await;
 
         cluster.server.set_response(format!("{T1} fan-out seed."));
@@ -149,8 +149,8 @@ fn n_client_fan_out_without_replay_duplication() {
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
 #[serial_test::serial(BLADERUNNER_HOME)]
 fn reattach_completion_roundtrips_durable_log() {
-    run_cluster_scenario(|agent_keepalives| async move {
-        let mut cluster = PagerLeaderCluster::start(agent_keepalives).await;
+    run_cluster_scenario(async {
+        let mut cluster = PagerLeaderCluster::start().await;
         let mut a = cluster.client("cluster-a", false).await;
 
         cluster.server.set_response(format!("{T1} durable turn."));
@@ -225,18 +225,56 @@ fn reattach_completion_roundtrips_durable_log() {
 #[ignore = "leader-cluster: needs single-process isolation (process-global env + grok_home OnceLock in the shared lib test binary); run: cargo test -p xai-grok-pager --lib -- app::leader_cluster --ignored --test-threads=1"]
 #[serial_test::serial(BLADERUNNER_HOME)]
 fn leader_kill_reconnect_reloads_without_duplicating_history() {
-    run_cluster_scenario(|agent_keepalives| async move {
-        let mut cluster = PagerLeaderCluster::start(agent_keepalives).await;
+    run_cluster_scenario(async {
+        let mut cluster = PagerLeaderCluster::start().await;
         let mut a = cluster.client("cluster-reconnect", true).await;
 
         cluster.server.set_response(format!("{T1} pre-crash turn."));
         let sid = a.new_session().await;
         a.run_turn("go", T1).await;
+        bounded("pre-crash turn persisted", async {
+            loop {
+                let recorded = find_session_updates_file(&sid).is_some_and(|updates| {
+                    let text = std::fs::read_to_string(updates).unwrap();
+                    text.contains(T1) && text.contains("turn_completed")
+                });
+                if recorded {
+                    break;
+                }
+                tokio::time::sleep(PUMP_TICK).await;
+            }
+        })
+        .await;
+        let inference_before_crash = cluster.inference_request_count();
 
         // Kill the leader generation, respawn at the same path; the
         // bridge's reconnector adopts the new in-process server.
-        cluster.kill_leader().await;
+        let debug = acp::ExtRequest::new(
+            "x.ai/debug/agent",
+            serde_json::value::to_raw_value(&serde_json::json!({}))
+                .unwrap()
+                .into(),
+        );
+        let response = bounded("pre-crash resident actors", acp_send(debug, &a.app.acp_tx))
+            .await
+            .unwrap();
+        let debug: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(debug["result"]["registries"]["sessions"], 1);
+        assert_eq!(debug["result"]["registries"]["session_threads"], 1);
+        let old_pid = cluster.generation.as_ref().unwrap().child.id();
+        let status = cluster.kill_leader().await;
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "crash must skip graceful actor shutdown"
+        );
+        assert!(
+            cluster.generation.is_none(),
+            "old process must be reaped before respawn"
+        );
         cluster.respawn_leader().await;
+        assert_ne!(cluster.generation.as_ref().unwrap().child.id(), old_pid);
 
         let mut status_rx = a.status_rx.clone().expect("reconnecting client");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -324,14 +362,9 @@ fn leader_kill_reconnect_reloads_without_duplicating_history() {
         )
         .await;
         let ok = load.is_ok();
-        // Drain the replay the load unicast to this client BEFORE
-        // finalizing, mirroring the production replay-then-finalize order.
-        a.pump_until("reload replay lands", move |app| {
-            app.agents
-                .values()
-                .any(|agent| agent_message_text(agent).contains(T1))
-        })
-        .await;
+        // A cursor can yield an empty replay. Finalization then restores the
+        // stashed transcript, so do not wait for old text in the fresh buffer.
+        a.pump_once();
         a.app
             .agents
             .get_mut(&agent_id)
@@ -344,6 +377,29 @@ fn leader_kill_reconnect_reloads_without_duplicating_history() {
             1,
             "reconnect reload must not duplicate history"
         );
+
+        // A fresh viewer has no client stash. Its full replay proves that the
+        // replacement process reads the pre-crash conversation from disk.
+        let mut fresh = cluster.client("cluster-post-crash-viewer", false).await;
+        fresh.load_session(&sid).await;
+        fresh
+            .pump_until("fresh client replays persisted turn", |app| {
+                app.agents
+                    .values()
+                    .any(|agent| agent_message_text(agent).contains(T1))
+            })
+            .await;
+        assert_eq!(
+            occurrences(&agent_message_text(fresh.agent_for_session(&sid)), T1),
+            1,
+            "the replacement process must replay the durable turn exactly once",
+        );
+        assert_eq!(
+            cluster.inference_request_count(),
+            inference_before_crash,
+            "recovery must read persisted history without another inference request",
+        );
+        fresh.sever();
 
         // The reconnected generation serves new turns.
         cluster

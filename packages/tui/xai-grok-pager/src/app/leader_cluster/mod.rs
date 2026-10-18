@@ -1,8 +1,9 @@
-//! In-process multi-client leader cluster: a REAL leader IPC server fronting a
-//! REAL `MvpAgent`, with each test client being a full pager view-model
+//! Multi-client leader cluster: a REAL leader IPC server fronting a REAL
+//! `MvpAgent` in a child test process, with each client a full pager view-model
 //! (`AppView`) wired through the production leader bridge. Deterministically
 //! exercises the multi-client surface the PTY `LeaderCluster` covers, one
-//! layer down — no subprocesses, no terminals, no screen scraping.
+//! layer down, without terminals or screen captures. Each leader generation
+//! occupies its own process so a crash ends every local task and session thread.
 //!
 //! Per client: `LeaderClient::connect(sock).into_channels()` →
 //! [`bridge_channels`] → one `AppView`; inbound ACP is pumped through
@@ -30,10 +31,9 @@
 //!
 //! Unix-only: the leader transport here is a unix socket.
 
-use std::cell::RefCell;
 use std::future::Future;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -62,21 +62,100 @@ use crate::scrollback::block::RenderBlock;
 const PUMP_TICK: Duration = Duration::from_millis(10);
 const TURN_BUDGET: Duration = Duration::from_secs(60);
 
-type AgentKeepalives = Rc<RefCell<Vec<Rc<xai_grok_shell::agent::MvpAgent>>>>;
+const GENERATION_CHILD_ENV: &str = "BLADERUNNER_CLUSTER_GENERATION";
+const GENERATION_TEST: &str = "app::leader_cluster::generation_worker";
 
-/// Purpose: Destroy all cluster tasks before their agents, also on unwind.
-/// Input: A scenario that stores every agent in the supplied owner.
-/// Output: The completed scenario.
-fn run_cluster_scenario<Fut: Future<Output = ()>>(scenario: impl FnOnce(AgentKeepalives) -> Fut) {
-    let agent_keepalives = AgentKeepalives::default();
+/// Purpose: Drive a scenario and its pager clients on one local runtime.
+/// Input: The scenario future.
+/// Output: The completed scenario after all child generations have been reaped.
+fn run_cluster_scenario(scenario: impl Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, scenario(Rc::clone(&agent_keepalives)));
+    local.block_on(&rt, scenario);
+}
+
+/// Purpose: Own every task and actor of one leader generation through its process.
+/// Input: The child test process.
+/// Output: A process owner that kills and reaps the child before its environment is removed.
+struct LeaderGeneration {
+    child: Child,
+}
+
+impl LeaderGeneration {
+    fn kill_and_wait(&mut self) -> ExitStatus {
+        if self
+            .child
+            .try_wait()
+            .expect("inspect generation exit")
+            .is_none()
+        {
+            self.child.kill().expect("kill leader generation");
+        }
+        self.child.wait().expect("reap leader generation")
+    }
+}
+
+impl Drop for LeaderGeneration {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+/// Purpose: Run the real leader server and agent in an isolated child process.
+/// Input: The inherited mock-server configuration and sandbox socket path.
+/// Output: A live generation that the parent can crash without any graceful shutdown writes.
+#[test]
+#[ignore = "child entrypoint; started by PagerLeaderCluster"]
+fn generation_worker() {
+    if std::env::var_os(GENERATION_CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let sock_path = PathBuf::from(std::env::var_os(LEADER_SOCKET_ENV).expect("generation socket"));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut keepalive = None;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (acp_tx, acp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let control_state = LeaderServerControlState::new(LeaderServerMetadata {
+            pid: std::process::id(),
+            socket_path: sock_path.clone(),
+            lock_path: sock_path.with_extension("lock"),
+            ws_url_suffix: String::new(),
+            leader_binary_version: xai_grok_version::VERSION.to_string(),
+        });
+        let server = tokio::task::spawn_local(async move {
+            run_leader_server(
+                sock_path,
+                acp_tx,
+                response_rx,
+                CancellationToken::new(),
+                true,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicBool::new(false)),
+                xai_grok_shell::agent::activity::AgentActivity::default(),
+                tokio::sync::watch::channel(true).1,
+                tokio::sync::watch::channel(false).0,
+                tokio::sync::watch::channel(xai_grok_shell::leader::ShutdownReason::Manual).0,
+                None,
+                control_state,
+            )
+            .await
+            .expect("generation leader server");
+        });
+        let agent = xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx).await;
+        keepalive = Some(agent.keepalive);
+        server.await.expect("generation server task");
+    });
     drop(local);
-    drop(agent_keepalives);
+    drop(keepalive);
 }
 
 /// Await a bring-up step with a hard budget so an on-demand run that hangs
@@ -281,14 +360,8 @@ async fn pump_clients_until(
 struct PagerLeaderCluster {
     sock_path: PathBuf,
     server: MockInferenceServer,
-    server_cancel: CancellationToken,
-    /// The current generation's server/agent/bridge tasks. `kill_leader`
-    /// aborts + drains them so a respawn can never race a still-running old
-    /// agent on the same BLADERUNNER_HOME (two agents on one updates.jsonl is the
-    /// corruption class the real leader's flock exists to prevent).
-    generation_tasks: Vec<tokio::task::JoinHandle<()>>,
-    agent_keepalives: AgentKeepalives,
-    client_count: Arc<AtomicUsize>,
+    // Drop order keeps the process dead before the flock, environment, and temp home disappear.
+    generation: Option<LeaderGeneration>,
     workdir: TempDir,
     authenticated: bool,
     /// Held for the cluster's lifetime so a `LeaderReconnector`-driven
@@ -305,8 +378,8 @@ struct PagerLeaderCluster {
 
 impl PagerLeaderCluster {
     /// Stand up the cluster. Callers MUST be `#[serial_test::serial(BLADERUNNER_HOME)]`
-    /// (env mutation) and run inside `run_cluster_scenario` with its keepalive owner.
-    async fn start(agent_keepalives: AgentKeepalives) -> Self {
+    /// (env mutation) and run inside `run_cluster_scenario`.
+    async fn start() -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let server = MockInferenceServer::start().await.expect("mock server");
@@ -335,14 +408,10 @@ impl PagerLeaderCluster {
         );
         flock.write_pid().expect("stamp cluster flock");
 
-        let client_count = Arc::new(AtomicUsize::new(0));
         let mut cluster = Self {
             sock_path,
             server,
-            server_cancel: CancellationToken::new(),
-            generation_tasks: Vec::new(),
-            agent_keepalives,
-            client_count,
+            generation: None,
             workdir,
             authenticated: false,
             _flock: flock,
@@ -353,88 +422,52 @@ impl PagerLeaderCluster {
         cluster
     }
 
-    /// Bind a fresh leader-server generation at the fixed socket path and
-    /// wire a fresh REAL agent behind it.
+    /// Purpose: Start a generation only after the previous process has been reaped.
+    /// Input: The cluster's fixed socket and inherited sandbox configuration.
+    /// Output: A real server and agent with no tasks shared with an earlier generation.
     async fn spawn_leader_generation(&mut self) {
-        let _ = std::fs::remove_file(&self.sock_path);
-        let (acp_tx, acp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let cancel = CancellationToken::new();
-        self.server_cancel = cancel.clone();
-
-        let control_state = LeaderServerControlState::new(LeaderServerMetadata {
-            pid: std::process::id(),
-            socket_path: self.sock_path.clone(),
-            lock_path: self.sock_path.with_extension("lock"),
-            ws_url_suffix: String::new(),
-            // MUST be the client-side comparison source (xai_grok_version), not
-            // this crate's version: a reconnecting client evicts strictly-older
-            // leaders, and "evict" here would signal THIS test process.
-            leader_binary_version: xai_grok_version::VERSION.to_string(),
-        });
-        let sock_for_server = self.sock_path.clone();
-        let cancel_for_server = cancel.clone();
-        let client_count_for_server = self.client_count.clone();
-        let mut generation_tasks = Vec::new();
-        generation_tasks.push(tokio::task::spawn_local(async move {
-            let _ = run_leader_server(
-                sock_for_server,
-                acp_tx,
-                response_rx,
-                cancel_for_server,
-                true,
-                client_count_for_server,
-                Arc::new(AtomicBool::new(false)),
-                xai_grok_shell::agent::activity::AgentActivity::default(),
-                tokio::sync::watch::channel(true).1,
-                tokio::sync::watch::channel(false).0,
-                tokio::sync::watch::channel(xai_grok_shell::leader::ShutdownReason::Manual).0,
-                None,
-                control_state,
-            )
-            .await;
-        }));
-
-        let agent = xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx).await;
-        generation_tasks.extend(agent.tasks);
-        self.agent_keepalives.borrow_mut().push(agent.keepalive);
-        self.generation_tasks = generation_tasks;
+        assert!(
+            self.generation.is_none(),
+            "previous generation is still owned"
+        );
+        let log_path = self._grok_home.path().join("leader-generation.log");
+        let log = std::fs::File::create(&log_path).expect("create generation log");
+        let child = Command::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", GENERATION_TEST, "--ignored", "--nocapture"])
+            .env(GENERATION_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().expect("clone generation log"))
+            .stderr(log)
+            .spawn()
+            .expect("spawn leader generation");
+        self.generation = Some(LeaderGeneration { child });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !self.sock_path.exists() && tokio::time::Instant::now() < deadline {
+            let status = self.generation.as_mut().unwrap().child.try_wait().unwrap();
+            assert!(
+                status.is_none(),
+                "leader generation exited before bind: {status:?}\n{}",
+                std::fs::read_to_string(&log_path).unwrap(),
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(self.sock_path.exists(), "leader socket never bound");
     }
 
-    /// Kill the current leader generation (server + agent die together, like
-    /// a real leader process crash) and wait for the socket to vanish.
-    async fn kill_leader(&mut self) {
-        self.server_cancel.cancel();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while self.sock_path.exists() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    /// Purpose: Crash the generation and reap every local task and resident actor before replacement.
+    /// Input: The current generation's child process.
+    /// Output: Its confirmed exit status and a vacant socket path.
+    async fn kill_leader(&mut self) -> ExitStatus {
+        let mut generation = self.generation.take().expect("live leader generation");
+        let status = generation.kill_and_wait();
+        match std::fs::remove_file(&self.sock_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove crashed generation socket: {error}"),
         }
-        // Fail HERE if the old generation never released the socket: its late
-        // shutdown cleanup would otherwise delete the respawned generation's
-        // fresh socket from under it (same-path race), which surfaces as a
-        // confusing reconnect-budget expiry downstream.
-        assert!(
-            !self.sock_path.exists(),
-            "old leader generation never released the socket"
-        );
-        // Abort + drain the generation's agent/bridge tasks (the server task
-        // has already run its socket cleanup above). Channel-closure teardown
-        // is only eventual; without this drain an old agent task could still
-        // be running against the same BLADERUNNER_HOME when the next generation's
-        // agent starts — two writers on one updates.jsonl, the corruption
-        // class the real leader's flock prevents.
-        for task in self.generation_tasks.drain(..) {
-            task.abort();
-            let _ = task.await;
-        }
-        // The next generation's agent must re-authenticate its ACP surface.
         self.authenticated = false;
+        status
     }
 
     async fn respawn_leader(&mut self) {
@@ -570,12 +603,8 @@ impl PagerLeaderCluster {
 
 impl Drop for PagerLeaderCluster {
     fn drop(&mut self) {
-        self.server_cancel.cancel();
-        // Best-effort (Drop cannot await): stop the generation's tasks so they
-        // never outlive the env guards / temp dirs dropping right after.
-        for task in self.generation_tasks.drain(..) {
-            task.abort();
-        }
+        // Reap the process before field destruction restores the environment and removes its home.
+        drop(self.generation.take());
     }
 }
 
