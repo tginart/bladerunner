@@ -11,9 +11,9 @@
 //! effects run through the real `effects::execute` (the same loop
 //! `event_loop::run` performs, minus the terminal).
 //!
-//! Env sandboxing follows this crate's `serial(BLADERUNNER_HOME)` idiom; note
-//! `grok_home()` is process-cached (OnceLock), so disk assertions always go
-//! through [`effective_grok_home`] rather than assuming the temp dir won.
+//! Env sandboxing follows this crate's `serial(BLADERUNNER_HOME)` idiom.
+//! Disk assertions use the current cluster's explicit home because each child
+//! process resolves its own home.
 //!
 //! The scenarios are `#[ignore]`d in the shared lib test binary: the harness
 //! mutates process-global env (proxy URLs, `XAI_API_KEY`,
@@ -164,12 +164,6 @@ async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T 
     tokio::time::timeout(Duration::from_secs(30), fut)
         .await
         .unwrap_or_else(|_| panic!("leader-cluster bring-up timed out: {what}"))
-}
-
-/// The grok home the agent actually persisted under: `grok_home()` is
-/// process-cached, so an earlier test in this binary may have pinned it.
-fn effective_grok_home() -> PathBuf {
-    xai_grok_config::grok_home()
 }
 
 /// Concatenated agent-message text across a view's scrollback (copy of the

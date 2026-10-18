@@ -2,6 +2,8 @@
 //! `mod.rs`). New multi-client scenarios land here so the harness and its
 //! consumers grow independently.
 
+use std::path::Path;
+
 use super::*;
 
 const T1: &str = "CLUSTER_SENTINEL_T1";
@@ -167,11 +169,12 @@ fn reattach_completion_roundtrips_durable_log() {
         // (the PTY port does the same via wait_for_turn_completed).
         let durable_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let recorded = find_session_updates_file(&sid).is_some_and(|updates| {
-                std::fs::read_to_string(&updates)
-                    .unwrap_or_default()
-                    .contains("turn_completed")
-            });
+            let recorded =
+                find_session_updates_file(cluster._grok_home.path(), &sid).is_some_and(|updates| {
+                    std::fs::read_to_string(&updates)
+                        .unwrap_or_default()
+                        .contains("turn_completed")
+                });
             if recorded {
                 break;
             }
@@ -234,10 +237,11 @@ fn leader_kill_reconnect_reloads_without_duplicating_history() {
         a.run_turn("go", T1).await;
         bounded("pre-crash turn persisted", async {
             loop {
-                let recorded = find_session_updates_file(&sid).is_some_and(|updates| {
-                    let text = std::fs::read_to_string(updates).unwrap();
-                    text.contains(T1) && text.contains("turn_completed")
-                });
+                let recorded = find_session_updates_file(cluster._grok_home.path(), &sid)
+                    .is_some_and(|updates| {
+                        let text = std::fs::read_to_string(updates).unwrap();
+                        text.contains(T1) && text.contains("turn_completed")
+                    });
                 if recorded {
                     break;
                 }
@@ -415,11 +419,11 @@ fn leader_kill_reconnect_reloads_without_duplicating_history() {
     });
 }
 
-/// Locate `<grok_home>/sessions/<enc-cwd>/<sid>/updates.jsonl` without the
-/// (internal) cwd encoder: scan one level of cwd dirs (same approach as
-/// session_load_perf's `locate_session_dir`).
-fn find_session_updates_file(sid: &str) -> Option<PathBuf> {
-    let sessions = effective_grok_home().join("sessions");
+/// Purpose: Find the current cluster's persisted session updates.
+/// Input: The child process's configured home and session ID.
+/// Output: The updates path, if it exists.
+fn find_session_updates_file(grok_home: &Path, sid: &str) -> Option<PathBuf> {
+    let sessions = grok_home.join("sessions");
     for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
         let candidate = entry.path().join(sid).join("updates.jsonl");
         if candidate.is_file() {
