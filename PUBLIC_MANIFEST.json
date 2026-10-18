@@ -40,8 +40,8 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 411383,
-      "sha256": "466dbbb3ad09e36a6544cc6f92c42e96367a65125ecc7640c691d3db255db63b",
+      "bytes": 411384,
+      "sha256": "98bf45f39690c6ecb2f68678a6e32106bfac030b56cd585b847913020f04bb76",
       "mode": "0644"
     },
     {
@@ -7559,7 +7559,7 @@
     {
       "path": "packages/platform/xai-codebase-graph/Cargo.toml",
       "bytes": 2036,
-      "sha256": "639e4caea86d4566788ad74e60c47619eb0a71371fb44305815d8adbbb1808c6",
+      "sha256": "f40fd1aef1cc4ae27863d4bda75cf06a7ecf4c52f7d50e7a2ea774f1b912f97a",
       "mode": "0644"
     },
     {
@@ -7728,6 +7728,12 @@
       "path": "packages/platform/xai-codebase-graph/tests/memory_integration.rs",
       "bytes": 23119,
       "sha256": "ccb23363277f4fd8b30509e7db05519442d2bdd0ae58d8acd03a550cefb9b461",
+      "mode": "0644"
+    },
+    {
+      "path": "packages/platform/xai-codebase-graph/tests/parser_compatibility.rs",
+      "bytes": 2453,
+      "sha256": "85f27db075c8e5e0d32546f4d100e1e547bf644dca1287e642ad4a76eb1d2b59",
       "mode": "0644"
     },
     {
@@ -11207,7 +11213,7 @@
     {
       "path": "packages/tools/xai-grok-workspace/Cargo.toml",
       "bytes": 5591,
-      "sha256": "6f59099c2fa35690c746b8fe59eb5e79d70a4ad74b78a63b5c92dc75d5e44ffb",
+      "sha256": "e2afcca0710fc8e18333347cea60466b02e421a8148e8067f97a5b6325280865",
       "mode": "0644"
     },
     {
@@ -11644,8 +11650,8 @@
     },
     {
       "path": "packages/tools/xai-grok-workspace/src/permission/shell_access.rs",
-      "bytes": 125135,
-      "sha256": "ffe78349fc544c5e88ca6983ef716b9aa3b7a533b0a8eae62285c10f80bb1ec7",
+      "bytes": 125177,
+      "sha256": "69b00d764f8c7b07f4e5db0743e1ad36108e5fa1cb38cb44cbeaa8c3f9768112",
       "mode": "0644"
     },
     {
