@@ -384,7 +384,7 @@ url = "https://mcp.example.com/mcp"
 bearer_token_file = "~/.config/internal-tools/token"
 ```
 
-Blade Runner reads the file on every GET, POST, and DELETE request, including
+Bladerunner reads the file on every GET, POST, and DELETE request, including
 reconnects. Atomic replacement and in-place updates take effect on the next
 request. `${VAR}` expansion is supported. The file overrides static
 `Authorization` headers and `bearer_token_env_var`, and skips OAuth discovery.

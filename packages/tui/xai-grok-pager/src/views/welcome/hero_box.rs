@@ -29,7 +29,7 @@ const LOGO_H_PAD: u16 = 3;
 const UPGRADE_CTA_ROWS: u16 = 2;
 
 #[cfg(feature = "community-build")]
-const HERO_SUBTITLE: &str = "Blade Runner is ready.";
+const HERO_SUBTITLE: &str = "Bladerunner is ready.";
 #[cfg(not(feature = "community-build"))]
 const HERO_SUBTITLE: &str = "Thanks for trying Bladerunner, give feedback with /feedback!";
 

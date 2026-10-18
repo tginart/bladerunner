@@ -1,9 +1,7 @@
 # Updates and removal
 
-The installer and built-in updater use releases from
-[tginart/bladerunner](https://github.com/tginart/bladerunner/releases). Downloads
-are checked against the release's `SHA256SUMS`. Keep the installed executable,
-bundled files, and license notices together.
+The installer and built-in updater download verified releases from
+[GitHub Releases](https://github.com/tginart/bladerunner/releases).
 
 Re-run the installer to install the latest release:
 
@@ -18,9 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/tginart/bladerunner/main/install.sh
 sh /tmp/bladerunner-install.sh --version v1.1.20
 ```
 
-The binary release beta supports Apple Silicon macOS. The presence of inherited
-Linux/Windows source and installer code does not mean those binaries are
-published or verified for the beta.
+Prebuilt beta releases support Apple Silicon macOS.
 
 For removal, sign out, remove `~/.bladerunner/bin` from your shell PATH, and remove
 the installed binary link, downloads, and bundled files under `~/.bladerunner`.

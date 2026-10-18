@@ -1,10 +1,12 @@
 //! A real agent behind a leader server, in this process rather than a child.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, simplex};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use xai_acp_lib::{
@@ -17,22 +19,41 @@ use crate::agent::mvp_agent::MvpAgent;
 
 const SIMPLEX_BUF: usize = 8 * 1024 * 1024;
 
-/// Spawns an agent on the current `LocalSet`, reading requests from `to_agent`
-/// and writing responses to `from_agent`. Returns the task handles so a caller
-/// can end the agent. Panics if the ambient configuration cannot build one.
-pub fn spawn_agent(
+/// Purpose: Own the agent I/O tasks and retain its allocation.
+/// Input: The task handles and an agent reference.
+/// Output: An owner whose `keepalive` must outlive the ambient `LocalSet`.
+/// Note: Abort the I/O tasks to end a connection. Destroy the `LocalSet` before `keepalive`.
+pub struct InProcessAgent {
+    pub tasks: Vec<JoinHandle<()>>,
+    pub keepalive: Rc<MvpAgent>,
+}
+
+/// Purpose: Start a real agent on the current `LocalSet`.
+/// Input: The request receiver and the response sender.
+/// Output: The I/O tasks and an agent reference. Retain the reference past the `LocalSet`.
+/// Note: This function panics if the configuration cannot construct an agent.
+pub async fn spawn_agent(
     mut to_agent: UnboundedReceiver<String>,
     from_agent: UnboundedSender<String>,
-) -> Vec<JoinHandle<()>> {
+) -> InProcessAgent {
     let (agent_in_read, mut agent_in_write) = simplex(SIMPLEX_BUF);
     let (agent_out_read, agent_out_write) = simplex(SIMPLEX_BUF);
 
-    let agent = tokio::task::spawn_local(async move {
+    let (keepalive_tx, keepalive_rx) = oneshot::channel();
+
+    // The bootstrap future stays on the task heap to limit the caller stack size.
+    let connection = tokio::task::spawn_local(async move {
         let config = AgentConfig::default();
         let auth_manager = Arc::new(config.create_auth_manager());
         let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-        let agent = MvpAgent::new(GatewaySender::new(gateway_tx), &config, auth_manager, None)
-            .expect("valid agent config");
+        let agent = Rc::new(
+            MvpAgent::new(GatewaySender::new(gateway_tx), &config, auth_manager, None)
+                .expect("valid agent config"),
+        );
+        // Do not start agent tasks if the caller cannot retain their owner.
+        if keepalive_tx.send(Rc::clone(&agent)).is_err() {
+            return;
+        }
         let incoming = LineBufferedRead::spawn_local(agent_in_read.compat());
         let (conn, handle_io) =
             acp::AgentSideConnection::new(agent, agent_out_write.compat_write(), incoming, |fut| {
@@ -73,5 +94,11 @@ pub fn spawn_agent(
         }
     });
 
-    vec![agent, requests, responses]
+    let keepalive = keepalive_rx
+        .await
+        .expect("in-process agent task ended before it built an agent");
+    InProcessAgent {
+        tasks: vec![connection, requests, responses],
+        keepalive,
+    }
 }

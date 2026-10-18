@@ -692,7 +692,7 @@ fn cwd_poison_positions(root: Node<'_>, src: &str) -> Vec<CwdPoison> {
                 scope: execution_scope(node),
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -788,7 +788,7 @@ enum ArgText {
 fn node_has_expansion(node: Node<'_>) -> bool {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
-        for i in 0..n.child_count() {
+        for i in 0..n.child_count() as u32 {
             let Some(child) = n.child(i) else { continue };
             if matches!(
                 child.kind(),
@@ -910,7 +910,7 @@ fn shell_command_invocations(root: Node<'_>, src: &str) -> Vec<ShellInvocation> 
     while let Some(node) = stack.pop() {
         if node.kind() == "command" {
             let mut words = Vec::new();
-            for i in 0..node.named_child_count() {
+            for i in 0..node.named_child_count() as u32 {
                 let Some(child) = node.named_child(i) else {
                     continue;
                 };
@@ -942,7 +942,7 @@ fn shell_command_invocations(root: Node<'_>, src: &str) -> Vec<ShellInvocation> 
                 wrapper_words,
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -990,7 +990,7 @@ fn shell_redirect_targets(root: Node<'_>, src: &str) -> Vec<ShellRedirectTarget>
                 ambiguous,
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -1001,7 +1001,7 @@ fn shell_redirect_targets(root: Node<'_>, src: &str) -> Vec<ShellRedirectTarget>
 
 fn shell_redirect_one(node: Node<'_>, src: &str) -> Option<(Option<String>, ShellFileMode, bool)> {
     let mut redirect = None;
-    for i in 0..node.child_count() {
+    for i in 0..node.child_count() as u32 {
         let kind = node.child(i)?.kind();
         // `<<`/`<<<` read from inline text, not a file.
         if kind.contains("<<") {

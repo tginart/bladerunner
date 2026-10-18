@@ -177,6 +177,11 @@ pub(crate) async fn run_auto_update_checker(
     }
 }
 
+/// Purpose: Keep the agent alive until all tasks on its `LocalSet` are destroyed.
+/// Input: The agent allocated by an entrypoint.
+/// Output: A retained agent reference. Declare this owner before the `LocalSet`.
+type AgentKeepalive = Rc<std::cell::RefCell<Option<Rc<MvpAgent>>>>;
+
 /// Spawn the agent inside a LocalSet and return a handle to the I/O future.
 fn spawn_agent_local(
     agent_config: AgentConfig,
@@ -185,6 +190,7 @@ fn spawn_agent_local(
     memory_config: Option<crate::config::MemoryConfig>,
     outgoing: impl futures::AsyncWrite + Unpin + 'static,
     incoming: impl futures::AsyncRead + Unpin + 'static,
+    keepalive: &AgentKeepalive,
 ) -> impl std::future::Future<Output = Result<(), acp::Error>> {
     let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
     let gateway = GatewaySender::new(gw_tx);
@@ -195,6 +201,8 @@ fn spawn_agent_local(
     if let Some(mc) = memory_config {
         agent.set_memory_config(mc);
     }
+    let agent = Rc::new(agent);
+    *keepalive.borrow_mut() = Some(Rc::clone(&agent));
     let incoming = LineBufferedRead::spawn_local(incoming);
     let (conn, handle_io) = acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
         tokio::task::spawn_local(fut);
@@ -355,7 +363,9 @@ pub async fn run_stdio_agent(
 
     let _skills_watcher = spawn_skills_file_watcher(&acp_incoming_tx, &agent_config.skills.paths);
 
+    let agent_keepalive = AgentKeepalive::default();
     let local_set = tokio::task::LocalSet::new();
+    let keepalive_for_spawn = Rc::clone(&agent_keepalive);
     let result = local_set
         .run_until(async move {
             // Shut down the simplex writer on the LocalSet so it's cooperative with ACP handlers.
@@ -389,11 +399,14 @@ pub async fn run_stdio_agent(
                 memory_config,
                 outgoing,
                 incoming,
+                &keepalive_for_spawn,
             );
             handle_io.await?;
             Ok::<(), anyhow::Error>(())
         })
         .await;
+    drop(local_set);
+    drop(agent_keepalive);
     // Kill PTY child processes so they don't outlive the agent.
     crate::terminal::pty_session::close_all().await;
 
@@ -548,7 +561,9 @@ pub async fn run_headless(
     );
 
     // Spawn the agent in a LocalSet that lives for the entire process
+    let agent_keepalive = AgentKeepalive::default();
     let local_set = tokio::task::LocalSet::new();
+    let keepalive_for_spawn = Rc::clone(&agent_keepalive);
     let agent_config_clone = agent_config.clone();
     let memory_config_for_first = memory_config;
     let agent_cancel = cancel.clone();
@@ -571,6 +586,8 @@ pub async fn run_headless(
                 if let Some(mc) = memory_config_for_first {
                     agent.set_memory_config(mc);
                 }
+                let agent = Rc::new(agent);
+                *keepalive_for_spawn.borrow_mut() = Some(Rc::clone(&agent));
                 let incoming = LineBufferedRead::spawn_local(incoming);
                 let (conn, handle_io) =
                     acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
@@ -645,6 +662,8 @@ pub async fn run_headless(
             anyhow::Ok(())
         })
         .await?;
+    drop(local_set);
+    drop(agent_keepalive);
 
     // Brief grace period for the upload queue worker to finish in-flight uploads.
     // The worker runs on the tokio runtime (not the LocalSet), so it continues
@@ -1236,7 +1255,9 @@ pub async fn run_leader(
 
     // ── Phase 8: LocalSet — agent, bridges, relay, config watcher ────────────
 
+    let agent_keepalive = AgentKeepalive::default();
     let local_set = tokio::task::LocalSet::new();
+    let keepalive_for_spawn = Rc::clone(&agent_keepalive);
     let mut agent_config_for_spawn = agent_config.clone();
     agent_config_for_spawn.remote_settings = remote_settings;
     crate::util::config::sync_campaign_fields(&mut agent_config_for_spawn);
@@ -1344,6 +1365,8 @@ pub async fn run_leader(
                 if let Some(tx) = agent_config_watcher_path_tx {
                     agent.set_config_watcher_path_tx(tx);
                 }
+                let agent = Rc::new(agent);
+                *keepalive_for_spawn.borrow_mut() = Some(Rc::clone(&agent));
                 let incoming = LineBufferedRead::spawn_local(incoming);
                 let (conn, handle_io) =
                     acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
@@ -1816,6 +1839,8 @@ pub async fn run_leader(
             anyhow::Ok(())
         })
         .await?;
+    drop(local_set);
+    drop(agent_keepalive);
 
     // Brief grace period for the upload queue worker to finish in-flight uploads.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

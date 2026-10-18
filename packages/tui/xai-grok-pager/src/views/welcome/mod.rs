@@ -732,7 +732,7 @@ pub fn render_welcome(
             let palantir_text =
                 rust_i18n::t!("welcome.login_with", label = "Palantir AIP").to_string();
             let quit_text = rust_i18n::t!("welcome.quit").to_string();
-            // Blade Runner exposes only its two first-class provider families.
+            // Bladerunner exposes only its two first-class provider families.
             let community_hint = if cfg!(feature = "community-build") {
                 Some((
                     "Choose OpenAI Codex or Palantir AIP below, or use /login",
@@ -1776,7 +1776,7 @@ fn render_welcome_done(
     } else {
         0
     };
-    // x.ai release notes are temporarily hidden in Blade Runner.
+    // x.ai release notes are temporarily hidden in Bladerunner.
     let show_changelog_action = false;
 
     // Menu label bindings must outlive `menu_items` (borrowed by both

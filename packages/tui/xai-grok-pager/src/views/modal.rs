@@ -421,7 +421,7 @@ pub(crate) fn default_palette_entries(
             shortcut: "/resume".into(),
             command: PaletteCommand::SlashCommand("/resume".into()),
         },
-        // Temporarily hidden in Blade Runner while sharing is unavailable.
+        // Temporarily hidden in Bladerunner while sharing is unavailable.
         // PaletteEntry {
         //     label: crate::i18n::tr_or("palette.share_session", "Share Session").into(),
         //     shortcut: "/share".into(),
@@ -1355,7 +1355,7 @@ mod palette_sharing_tests {
         let entries = default_palette_entries(true, &slash(crate::app::ScreenMode::Fullscreen));
         assert!(
             !has_share(&entries),
-            "/share stays hidden in Blade Runner"
+            "/share stays hidden in Bladerunner"
         );
     }
     #[test]

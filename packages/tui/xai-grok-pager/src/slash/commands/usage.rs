@@ -1,4 +1,4 @@
-//! `/usage` shows session tokens and cost across Blade Runner providers.
+//! `/usage` shows session tokens and cost across Bladerunner providers.
 //! Consumer billing management stays in the source but is not exposed here.
 
 use crate::app::actions::Action;

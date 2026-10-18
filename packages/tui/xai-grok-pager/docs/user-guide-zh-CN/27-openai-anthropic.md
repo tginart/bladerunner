@@ -126,26 +126,6 @@ Ollama Cloud 名单）无需等待目录更新即可出现。
 
 ---
 
-## 从 Pi 刷新目录
-
-在 [earendil-works/pi](https://github.com/earendil-works/pi) 的检出中：
-
-```bash
-cd packages/ai && npm run generate-models -- --pretty
-# then re-run the import script used in hyper-grok-build development
-# (copies providers/data/*.json → platform_catalog.json)
-```
-
-随附文件：
-
-- `xai-grok-models/platform_catalog.json` — 模型
-- `xai-grok-models/platform_registry.json` — 平台元数据
-
-我们**不会**在运行时自动拉取 OpenAI/Anthropic/OpenRouter 组织的 `/models`
-（体量过大）。Kimi Code + Moonshot 在凭证存在时仍会实时同步。
-
----
-
 ## 说明
 
 - Anthropic：Messages + `x-api-key` + `anthropic-version: 2023-06-01`。

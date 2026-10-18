@@ -1,7 +1,7 @@
 //! Config file loading for Grok.
 //!
 //! Merge order (lowest → highest priority):
-//! 1. Bundled Blade Runner provider defaults, with no credentials
+//! 1. Bundled Bladerunner provider defaults, with no credentials
 //! 2. `/etc/grok/managed_config.toml`
 //! 3. `$BLADERUNNER_HOME/managed_config.toml`
 //! 4. `$BLADERUNNER_HOME/config.toml`

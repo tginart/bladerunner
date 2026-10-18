@@ -132,7 +132,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(plugin::PluginsCommand),
         Arc::new(plugin::MarketplaceCommand),
         Arc::new(plugin::SkillsCommand),
-        // Keep this upstream command compiled for unit coverage while hidden in Blade Runner.
+        // Keep this upstream command compiled for unit coverage while hidden in Bladerunner.
         #[cfg(test)]
         Arc::new(share::ShareCommand),
         Arc::new(session_info::SessionInfoCommand),
@@ -155,7 +155,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(doctor::DoctorCommand),
         Arc::new(readiness::ReadinessCommand),
         Arc::new(changes::ChangesCommand),
-        // Keep this upstream command compiled for unit coverage while hidden in Blade Runner.
+        // Keep this upstream command compiled for unit coverage while hidden in Bladerunner.
         #[cfg(test)]
         Arc::new(voice::VoiceCommand),
         #[cfg(feature = "codex-live")]
@@ -185,14 +185,14 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(usage::UsageCommand),
         Arc::new(queue::QueueCommand),
         Arc::new(tasks::TasksCommand),
-        // Keep this upstream command compiled for unit coverage while hidden in Blade Runner.
+        // Keep this upstream command compiled for unit coverage while hidden in Bladerunner.
         #[cfg(test)]
         Arc::new(release_notes::ReleaseNotesCommand),
         Arc::new(tutorial::TutorialCommand),
         Arc::new(config_agents::ConfigAgentsCommand),
         Arc::new(personas::PersonasCommand),
         // Hidden easter egg: never listed, runs on bare `/gboom`.
-        // Keep this upstream command compiled for unit coverage while hidden in Blade Runner.
+        // Keep this upstream command compiled for unit coverage while hidden in Bladerunner.
         #[cfg(test)]
         Arc::new(gboom::GboomCommand),
         // Hidden diagnostic: never listed, toggles the scroll-debug HUD.

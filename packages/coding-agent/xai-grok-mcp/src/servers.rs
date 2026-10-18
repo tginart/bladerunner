@@ -30,10 +30,11 @@ use rmcp::{
     },
 };
 
+use crate::call_result::mcp_output_from_call_result;
 use crate::oauth_config::McpOAuthConfig;
 
 use xai_grok_tools::types::{
-    output::{MCPOutput, MCPOutputDetails, ToolOutput},
+    output::{MCPOutputDetails, ToolOutput},
     tool::{ToolKind, ToolNamespace},
     tool_metadata::ToolMetadata,
 };
@@ -1045,7 +1046,7 @@ pub struct McpServerMetaConfig {
     /// Also keep the raw base64 in tool-result text (in addition to the
     /// vision-token rendering) so the agent can decode + forward it via
     /// path-based tools like `send_file`. Costs ~2× tokens per image.
-    /// Default `false`. See [`format_mcp_image`].
+    /// Default `false`. Images retain a data URI and an optional raw base64 block.
     #[serde(default)]
     pub expose_image_base64: Option<bool>,
 }
@@ -1474,47 +1475,12 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         };
 
         let is_error = call_result.is_error.unwrap_or(false);
-        let mut output = if is_error {
-            let error_msg = call_result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            ToolOutput::MCP(MCPOutput::errored(tool.clone(), server.clone(), error_msg))
-        } else {
-            let expose_base64 = client.expose_image_base64();
-            let parts: Vec<String> = call_result
-                .content
-                .into_iter()
-                .filter_map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => Some(t.text),
-                    rmcp::model::ContentBlock::Image(img) => {
-                        Some(format_mcp_image(&img.mime_type, &img.data, expose_base64))
-                    }
-                    rmcp::model::ContentBlock::Resource(r) => match &r.resource {
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            mime_type,
-                            blob,
-                            ..
-                        } if mime_type
-                            .as_deref()
-                            .is_some_and(|m| m.starts_with("image/")) =>
-                        {
-                            let mime = mime_type.as_deref().unwrap();
-                            Some(format_mcp_image(mime, blob, expose_base64))
-                        }
-                        _ => serde_json::to_string(&r).ok(),
-                    },
-                    _ => None,
-                })
-                .collect();
-            let text = parts.join("\n");
-            ToolOutput::MCP(MCPOutput::okay_output(tool.clone(), server.clone(), text))
-        };
+        let mut output = ToolOutput::MCP(mcp_output_from_call_result(
+            tool.clone(),
+            server.clone(),
+            call_result,
+            client.expose_image_base64(),
+        ));
 
         if let ToolOutput::MCP(ref mut mcp_out) = output {
             mcp_out.auth_retry_attempted = auth_retry_attempted;
@@ -1554,24 +1520,6 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             duration_ms,
         });
         Ok(output)
-    }
-}
-
-/// Render an MCP image content block. The data URI is consumed by the
-/// session-layer `extract_base64_images` and rendered as vision tokens.
-/// When `expose_base64`, also emit a `<mcp_image_base64>` wrapper that
-/// survives extraction (wrapper has no `data:image/` prefix → regex skips
-/// it), exposing the raw bytes to the agent for path-based forwarding.
-fn format_mcp_image(mime: &str, base64_data: &str, expose_base64: bool) -> String {
-    if expose_base64 {
-        format!(
-            "data:{mime};base64,{base64_data}\n\
-             <mcp_image_base64 mime=\"{mime}\">\n\
-             {base64_data}\n\
-             </mcp_image_base64>"
-        )
-    } else {
-        format!("data:{mime};base64,{base64_data}")
     }
 }
 
@@ -7231,27 +7179,6 @@ mod tests {
             }
             .is_auth_rejection()
         );
-    }
-
-    #[test]
-    fn format_mcp_image_default_emits_only_data_uri() {
-        let out = format_mcp_image("image/png", "AAAA", false);
-        assert_eq!(out, "data:image/png;base64,AAAA");
-        assert!(!out.contains("<mcp_image_base64"));
-    }
-
-    #[test]
-    fn format_mcp_image_expose_emits_data_uri_and_raw_block() {
-        let out = format_mcp_image("image/png", "AAAA", true);
-        assert!(out.contains("data:image/png;base64,AAAA"));
-        assert!(out.contains("<mcp_image_base64 mime=\"image/png\">\nAAAA\n</mcp_image_base64>"));
-    }
-
-    /// Wrapper must not re-match the extractor regex, else the raw copy gets stripped too.
-    #[test]
-    fn format_mcp_image_expose_raw_block_has_no_data_prefix() {
-        let out = format_mcp_image("image/jpeg", "ZZZZ", true);
-        assert_eq!(out.matches("data:image/").count(), 1);
     }
 
     #[test]

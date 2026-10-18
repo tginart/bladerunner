@@ -682,7 +682,7 @@ pub(super) fn handle_auth_complete(
         if app.usage_visible {
             effects.push(Effect::FetchAppBilling);
         }
-        // Blade Runner release notes are temporarily hidden.
+        // Bladerunner release notes are temporarily hidden.
         // effects.push(Effect::FetchChangelog);
 
         // ZDR-blocked users stay on the welcome screen — discard any
