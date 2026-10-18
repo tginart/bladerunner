@@ -197,9 +197,14 @@ fn sanitized_stem(call_id: &str) -> String {
         .collect()
 }
 
-/// Truncate `text` in place when over the limit, dumping the full payload to
-/// the session `mcp/` dir (when available) with a pointer appended.
-async fn truncate_mcp_text(text: &mut String, trunc_ctx: &McpTruncateContext) {
+/// Purpose: Save full MCP text and keep a bounded inline preview.
+/// Input: Full text, truncation settings, and an optional structured payload.
+/// Output: Text contains the preview, fitting structured data, and a truncation notice.
+async fn truncate_mcp_text(
+    text: &mut String,
+    trunc_ctx: &McpTruncateContext,
+    structured: Option<&serde_json::Value>,
+) {
     if text.len() <= trunc_ctx.max_output_bytes {
         return;
     }
@@ -234,21 +239,52 @@ async fn truncate_mcp_text(text: &mut String, trunc_ctx: &McpTruncateContext) {
         String::new()
     };
 
-    let truncated =
-        crate::util::truncate::truncate_str(text.as_str(), trunc_ctx.max_output_bytes).to_owned();
+    let structured_preview = structured_mcp_preview(text, structured, trunc_ctx.max_output_bytes);
+    let preview_label = if structured_preview.is_some() {
+        "showing"
+    } else {
+        "showing first"
+    };
+    let truncated = structured_preview.unwrap_or_else(|| {
+        crate::util::truncate::truncate_str(text, trunc_ctx.max_output_bytes).to_owned()
+    });
     let steer = if file_hint.is_empty() {
         String::new()
     } else {
         kind.steer(&trunc_ctx.shell_tool, QueryTools::detect())
     };
     *text = format!(
-        "{}\n\n[MCP output truncated: showing first {} of {}.{}{}]",
+        "{}\n\n[MCP output truncated: {} {} of {}.{}{}]",
         truncated,
+        preview_label,
         format_bytes(trunc_ctx.max_output_bytes as u64),
         format_bytes(total_bytes as u64),
         file_hint,
         steer,
     );
+}
+
+/// Purpose: Reserve preview bytes for structured JSON that the ordinary prefix would omit.
+/// Input: Full text, an optional structured payload, and the inline byte limit.
+/// Output: A bounded preview, or None when the ordinary prefix is sufficient.
+/// Note: Oversized structured payloads follow the usual prefix and full-dump policy.
+fn structured_mcp_preview(
+    text: &str,
+    structured: Option<&serde_json::Value>,
+    max_output_bytes: usize,
+) -> Option<String> {
+    let prefix = crate::util::truncate::truncate_str(text, max_output_bytes);
+    let payload = xai_tool_runtime::render_structured_content(structured, [prefix])?;
+    if payload.len() > max_output_bytes {
+        return None;
+    }
+    let prefix_bytes = max_output_bytes.saturating_sub(payload.len() + 1);
+    let prefix = crate::util::truncate::truncate_str(text, prefix_bytes);
+    if prefix.is_empty() {
+        Some(payload)
+    } else {
+        Some(format!("{prefix}\n{payload}"))
+    }
 }
 
 /// Bound the `MCP`/`Text` variants to the inline size limit, keeping a preview
@@ -266,7 +302,8 @@ pub async fn truncate_tool_output(
             };
             let ExtractionResult { mut text, images } = extract_base64_images(raw);
             mcp.extracted_images = images;
-            truncate_mcp_text(&mut text, trunc_ctx).await;
+            let structured = mcp.structured_content.take();
+            truncate_mcp_text(&mut text, trunc_ctx, structured.as_ref()).await;
             match mcp.output_mut() {
                 MCPOutputDetails::OkayOutput(t) | MCPOutputDetails::Error(t) => {
                     *t = text;
@@ -274,7 +311,7 @@ pub async fn truncate_tool_output(
             }
         }
         ToolOutput::Text(text_out) => {
-            truncate_mcp_text(&mut text_out.text, trunc_ctx).await;
+            truncate_mcp_text(&mut text_out.text, trunc_ctx, None).await;
         }
         _ => {}
     }
@@ -285,6 +322,131 @@ pub async fn truncate_tool_output(
 mod tests {
     use super::*;
     use crate::util::base64_images::IMAGE_CONTENT_PLACEHOLDER;
+
+    /// Purpose: Keep structured previews within tiny and multibyte byte budgets.
+    /// Input: A small payload, a large payload, and text with early or late JSON copies.
+    /// Output: Only a missing payload that fits the cap receives reserved bytes.
+    #[test]
+    fn structured_preview_respects_existing_copy_and_utf8() {
+        let payload = serde_json::json!({"id": "图"});
+        let json = payload.to_string();
+        let text = "é".repeat(100);
+        let preview = structured_mcp_preview(&text, Some(&payload), 16).unwrap();
+        assert!(preview.len() <= 16);
+        assert!(preview.ends_with(&json));
+        assert_eq!(
+            structured_mcp_preview(&text, Some(&payload), json.len()),
+            Some(json.clone())
+        );
+        assert_eq!(structured_mcp_preview(&text, Some(&payload), 1), None);
+        assert_eq!(structured_mcp_preview(&text, Some(&payload), 0), None);
+        let early_copy = format!("{json}\n{text}");
+        assert_eq!(
+            structured_mcp_preview(&early_copy, Some(&payload), 32),
+            None
+        );
+    }
+
+    /// Purpose: Preserve the original dump and image while the preview reserves structured IDs.
+    /// Input: A large MCP result with an image and a small structured payload.
+    /// Output: Bounded text retains the IDs, the full dump stays complete, and metadata is consumed.
+    #[tokio::test]
+    async fn structured_content_preview_preserves_dump_and_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_folder(dir.path().to_path_buf(), 128);
+        let payload = serde_json::json!({"document_id": "doc-123"});
+        let image_payload = "A".repeat(2048);
+        let full = format!(
+            "data:image/png;base64,{image_payload} {}\n{payload}",
+            "x".repeat(512)
+        );
+        let expected_dump = extract_base64_images(full.clone()).text;
+        let mut mcp = crate::types::output::MCPOutput::okay_output("t".into(), "s".into(), full);
+        mcp.structured_content = Some(payload.clone());
+        let output = truncate_tool_output(ToolOutput::MCP(mcp), &cfg).await;
+        let ToolOutput::MCP(mcp) = output else {
+            panic!("expected MCP");
+        };
+        assert!(mcp.structured_content.is_none());
+        assert_eq!(mcp.extracted_images.len(), 1);
+        assert_eq!(mcp.extracted_images[0].data, image_payload);
+        let MCPOutputDetails::OkayOutput(text) = mcp.output() else {
+            panic!("expected success");
+        };
+        let body = text.split("\n\n[MCP output truncated:").next().unwrap();
+        assert!(body.len() <= cfg.max_output_bytes);
+        assert!(body.contains(&payload.to_string()));
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("mcp/call-test.txt"))
+                .await
+                .unwrap(),
+            expected_dump
+        );
+    }
+
+    /// Purpose: Keep oversized structured data bounded after the inner dispatch metadata is consumed.
+    /// Input: A payload larger than tiny output caps, without a session directory.
+    /// Output: The usual text prefix stays bounded and serialized output has no hidden full payload.
+    #[tokio::test]
+    async fn oversized_structured_content_stays_bounded_without_dump() {
+        let payload = serde_json::json!({"data": "x".repeat(512)});
+        for limit in [0, 1, 2, 16] {
+            let cfg = McpTruncateContext {
+                max_output_bytes: limit,
+                session_folder: None,
+                shell_tool: "bash".into(),
+                call_id: "call-test".into(),
+            };
+            let mut mcp = crate::types::output::MCPOutput::okay_output(
+                "t".into(),
+                "s".into(),
+                format!("summary\n{payload}"),
+            );
+            mcp.structured_content = Some(payload.clone());
+            let output = truncate_tool_output(ToolOutput::MCP(mcp), &cfg).await;
+            let serialized = serde_json::to_value(&output).unwrap();
+            assert!(serialized.get("structured_content").is_none());
+            assert!(!serialized.to_string().contains(&"x".repeat(512)));
+            let ToolOutput::MCP(mcp) = output else {
+                panic!("expected MCP");
+            };
+            let MCPOutputDetails::OkayOutput(text) = mcp.output() else {
+                panic!("expected success");
+            };
+            assert!(
+                text.split("\n\n[MCP output truncated:")
+                    .next()
+                    .unwrap()
+                    .len()
+                    <= limit
+            );
+        }
+    }
+
+    /// Purpose: Retain one early JSON copy without unnecessary preview changes.
+    /// Input: A payload already present before the output cap.
+    /// Output: The ordinary prefix remains unchanged and contains one payload copy.
+    #[tokio::test]
+    async fn structured_content_in_retained_prefix_is_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_folder(dir.path().to_path_buf(), 128);
+        let payload = serde_json::json!({"document_id": "doc-123"});
+        let full = format!("{payload}\n{}", "x".repeat(512));
+        let mut mcp =
+            crate::types::output::MCPOutput::okay_output("t".into(), "s".into(), full.clone());
+        mcp.structured_content = Some(payload.clone());
+        let output = truncate_tool_output(ToolOutput::MCP(mcp), &cfg).await;
+        let ToolOutput::MCP(mcp) = output else {
+            panic!("expected MCP");
+        };
+        assert!(mcp.structured_content.is_none());
+        let MCPOutputDetails::OkayOutput(text) = mcp.output() else {
+            panic!("expected success");
+        };
+        let body = text.split("\n\n[MCP output truncated:").next().unwrap();
+        assert_eq!(body, &full[..128]);
+        assert_eq!(body.matches(&payload.to_string()).count(), 1);
+    }
 
     fn cfg_with_folder(folder: PathBuf, max: usize) -> McpTruncateContext {
         McpTruncateContext {
