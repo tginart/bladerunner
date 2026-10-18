@@ -1,3 +1,7 @@
+//! Purpose: Store session records as JSONL files with explicit disk barriers.
+//! Input: Session records and the required append durability.
+//! Output: Stored records and errors that identify whether each append committed.
+
 use super::{PersistedData, SessionUpdateEnvelope, StorageAdapter};
 use crate::sampling::types::ChatRequestMessage;
 use crate::sampling::{ContentPart, ConversationItem};
@@ -29,9 +33,50 @@ pub struct JsonlStorageAdapter {
     dir_mode: SessionDirMode,
     #[cfg(test)]
     update_append_probe: Option<std::sync::Arc<AppendProbe>>,
+    #[cfg(test)]
+    session_sync_probe: Option<std::sync::Arc<SessionSyncProbe>>,
+    #[cfg(test)]
+    file_sync_probe: Option<std::sync::Arc<FileSyncProbe>>,
+    #[cfg(test)]
+    parent_sync_probe: Option<std::sync::Arc<ParentSyncProbe>>,
 }
 #[cfg(test)]
 type AppendProbe = dyn Fn(AppendDurability) -> io::Result<()> + Send + Sync;
+#[cfg(test)]
+type SessionSyncProbe = dyn Fn(super::SessionFileSet) -> io::Result<()> + Send + Sync;
+#[cfg(test)]
+type FileSyncProbe = dyn Fn() -> io::Result<()> + Send + Sync;
+#[cfg(test)]
+type ParentSyncProbe = dyn Fn() -> io::Result<()> + Send + Sync;
+/// Outcome of a single JSONL append after the write attempt.
+///
+/// `Committed` means `write_all` succeeded: the record is in the file (at
+/// least the page cache) and a later fsync can still make it durable.
+#[derive(Debug)]
+enum AppendLineError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+impl AppendLineError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error,
+        }
+    }
+    fn into_update_error(self) -> super::AppendUpdateError {
+        match self {
+            Self::NotCommitted(error) => super::AppendUpdateError::NotCommitted(error),
+            Self::Committed(error) => super::AppendUpdateError::Committed(error),
+        }
+    }
+}
+impl std::fmt::Display for AppendLineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error.fmt(formatter),
+        }
+    }
+}
 impl Default for JsonlStorageAdapter {
     fn default() -> Self {
         Self::new()
@@ -43,6 +88,12 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(crate::util::grok_home::grok_home()),
             #[cfg(test)]
             update_append_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
+            #[cfg(test)]
+            file_sync_probe: None,
+            #[cfg(test)]
+            parent_sync_probe: None,
         }
     }
     pub fn with_root(root_dir: PathBuf) -> Self {
@@ -50,6 +101,12 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::FromRoot(root_dir),
             #[cfg(test)]
             update_append_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
+            #[cfg(test)]
+            file_sync_probe: None,
+            #[cfg(test)]
+            parent_sync_probe: None,
         }
     }
     /// Create an adapter that writes directly to `session_dir`, bypassing
@@ -61,6 +118,12 @@ impl JsonlStorageAdapter {
             dir_mode: SessionDirMode::Explicit(session_dir),
             #[cfg(test)]
             update_append_probe: None,
+            #[cfg(test)]
+            session_sync_probe: None,
+            #[cfg(test)]
+            file_sync_probe: None,
+            #[cfg(test)]
+            parent_sync_probe: None,
         }
     }
     #[cfg(test)]
@@ -71,7 +134,45 @@ impl JsonlStorageAdapter {
         Self {
             dir_mode: SessionDirMode::Explicit(session_dir),
             update_append_probe: Some(std::sync::Arc::new(append_probe)),
+            session_sync_probe: None,
+            file_sync_probe: None,
+            parent_sync_probe: None,
         }
+    }
+    /// [`Self::with_update_append_probe`] plus a probe observing (and able to
+    /// fail) every [`StorageAdapter::sync_session_files_selected`] barrier,
+    /// receiving the file set the barrier flushes.
+    #[cfg(test)]
+    pub(crate) fn with_probes(
+        session_dir: PathBuf,
+        append_probe: impl Fn(AppendDurability) -> io::Result<()> + Send + Sync + 'static,
+        session_sync_probe: impl Fn(super::SessionFileSet) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dir_mode: SessionDirMode::Explicit(session_dir),
+            update_append_probe: Some(std::sync::Arc::new(append_probe)),
+            session_sync_probe: Some(std::sync::Arc::new(session_sync_probe)),
+            file_sync_probe: None,
+            parent_sync_probe: None,
+        }
+    }
+    /// Fail (or observe) the per-append file barrier after `write_all`.
+    #[cfg(test)]
+    pub(crate) fn with_file_sync_probe(
+        mut self,
+        file_sync_probe: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.file_sync_probe = Some(std::sync::Arc::new(file_sync_probe));
+        self
+    }
+    /// Fail (or observe) the first-create `summary.json` parent-directory sync.
+    #[cfg(test)]
+    pub(crate) fn with_parent_sync_probe(
+        mut self,
+        parent_sync_probe: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.parent_sync_probe = Some(std::sync::Arc::new(parent_sync_probe));
+        self
     }
     /// Load chat history from a specific directory.
     /// Used by fork bootstrap to load the copied parent conversation.
@@ -91,14 +192,22 @@ impl JsonlStorageAdapter {
             SessionDirMode::Explicit(dir) => dir.clone(),
         }
     }
-    /// Create `info`'s session dir owner-only. `FromRoot` also ensures the
-    /// `<encoded-cwd>` shield + root; `Explicit` parents are caller-owned.
+    /// Create `info`'s session dir owner-only and durable. `FromRoot` also
+    /// ensures the `<encoded-cwd>` shield + root; `Explicit` parents are
+    /// caller-owned.
     fn create_session_dir_owner_only(&self, info: &Info) -> io::Result<PathBuf> {
         let dir = self.session_dir(info);
-        if let SessionDirMode::FromRoot(root) = &self.dir_mode {
-            let _ = crate::util::grok_home::ensure_sessions_cwd_dir_in(root, &info.cwd);
-        }
-        crate::util::grok_home::create_dir_all_owner_only(&dir)?;
+        super::create_dir_all_durable(&dir, |dir| match &self.dir_mode {
+            SessionDirMode::FromRoot(root) => {
+                if let Ok(cwd_dir) =
+                    crate::util::grok_home::ensure_sessions_cwd_dir_in(root, &info.cwd)
+                {
+                    super::sync_cwd_marker_if_present(&cwd_dir)?;
+                }
+                crate::util::grok_home::create_dir_all_owner_only(dir)
+            }
+            SessionDirMode::Explicit(_) => crate::util::grok_home::create_dir_all_owner_only(dir),
+        })?;
         Ok(dir)
     }
     pub(super) fn updates_file(&self, info: &Info) -> PathBuf {
@@ -263,6 +372,14 @@ impl JsonlStorageAdapter {
             .await
             .map_err(io::Error::other)?
     }
+    async fn sync_file_path_durable(path: PathBuf) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            Self::sync_file_durable(&file)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
     /// Append one JSONL record, healing a torn tail before writing.
     ///
     /// Appends are not crash-atomic: a process kill / `ENOSPC` mid-`write_all`
@@ -278,14 +395,6 @@ impl JsonlStorageAdapter {
     /// the torn record is terminated as its own (single) corrupt line. This
     /// bounds the damage of any torn write to exactly one record, which the
     /// lenient readers (e.g. [`Self::read_chat_history_sync`]) then skip.
-    async fn sync_file_path_durable(path: PathBuf) -> io::Result<()> {
-        tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new().read(true).open(&path)?;
-            Self::sync_file_durable(&file)
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
     fn append_jsonl_line_sync(
         path: &Path,
         line: Vec<u8>,
@@ -294,6 +403,7 @@ impl JsonlStorageAdapter {
         Self::append_jsonl_line_sync_with(path, line, durability, Self::sync_file_durable, || {
             Self::sync_parent_directory(path)
         })
+        .map_err(AppendLineError::into_io_error)
     }
     fn append_jsonl_line_sync_with(
         path: &Path,
@@ -301,20 +411,26 @@ impl JsonlStorageAdapter {
         durability: AppendDurability,
         mut sync_file: impl FnMut(&std::fs::File) -> io::Result<()>,
         mut sync_parent: impl FnMut() -> io::Result<()>,
-    ) -> io::Result<()> {
+    ) -> Result<(), AppendLineError> {
         debug_assert!(line.ends_with(b"\n"), "JSONL record must end with \\n");
-        let lock = Self::lock_append(path)?;
+        let lock = Self::lock_append(path).map_err(AppendLineError::NotCommitted)?;
         let result = (|| {
             let mut file = OpenOptions::new()
                 .read(true)
                 .create(true)
                 .append(true)
-                .open(path)?;
-            let len = file.metadata()?.len();
+                .open(path)
+                .map_err(AppendLineError::NotCommitted)?;
+            let len = file
+                .metadata()
+                .map_err(AppendLineError::NotCommitted)?
+                .len();
             if len > 0 {
-                file.seek(io::SeekFrom::Start(len - 1))?;
+                file.seek(io::SeekFrom::Start(len - 1))
+                    .map_err(AppendLineError::NotCommitted)?;
                 let mut last = [0u8; 1];
-                file.read_exact(&mut last)?;
+                file.read_exact(&mut last)
+                    .map_err(AppendLineError::NotCommitted)?;
                 if last[0] != b'\n' {
                     tracing::warn!(
                         path = %path.display(),
@@ -323,12 +439,13 @@ impl JsonlStorageAdapter {
                     line.insert(0, b'\n');
                 }
             }
-            file.write_all(&line)?;
-            file.flush()?;
+            file.write_all(&line)
+                .map_err(AppendLineError::NotCommitted)?;
+            file.flush().map_err(AppendLineError::Committed)?;
             if matches!(durability, AppendDurability::Durable) {
-                sync_file(&file)?;
+                sync_file(&file).map_err(AppendLineError::Committed)?;
                 drop(file);
-                sync_parent()?;
+                sync_parent().map_err(AppendLineError::Committed)?;
             } else {
                 drop(file);
             }
@@ -478,23 +595,8 @@ impl JsonlStorageAdapter {
     fn sync_file_durable(file: &std::fs::File) -> io::Result<()> {
         super::sync_file_durable(file)
     }
-    #[cfg(unix)]
     fn sync_parent_directory(path: &Path) -> io::Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "update has no parent"))?;
-        std::fs::File::open(parent)?.sync_all()
-    }
-    #[cfg(windows)]
-    fn sync_parent_directory(_path: &Path) -> io::Result<()> {
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    fn sync_parent_directory(_path: &Path) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable directory sync is unsupported on this platform",
-        ))
+        super::sync_parent_dir_durable(path)
     }
     /// Write a full JSONL file (rewriting all items), crash-atomically: serialize
     /// to a temp file then rename over the target, so a crash / `ENOSPC` mid-write
@@ -520,23 +622,46 @@ impl JsonlStorageAdapter {
         }
         Ok(items)
     }
-    /// Append a session update to the updates.jsonl file, wrapping it in an envelope with timestamp.
+    /// Purpose: Append a timestamped update and preserve its commit status.
+    /// Input: The update path, record, and required durability.
+    /// Output: Success, an error before commit, or an error after commit.
     pub(super) async fn append_update_to_file(
         &self,
         path: PathBuf,
         update: &super::SessionUpdate,
         durability: AppendDurability,
-    ) -> io::Result<()> {
+    ) -> Result<(), super::AppendUpdateError> {
         #[cfg(test)]
         if let Some(append_probe) = &self.update_append_probe {
-            append_probe(durability)?;
+            append_probe(durability).map_err(super::AppendUpdateError::NotCommitted)?;
         }
-        let envelope = SessionUpdateEnvelope::from_update(update)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut line = serde_json::to_vec(&envelope)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let envelope = SessionUpdateEnvelope::from_update(update).map_err(|e| {
+            super::AppendUpdateError::NotCommitted(io::Error::new(io::ErrorKind::InvalidData, e))
+        })?;
+        let mut line = serde_json::to_vec(&envelope).map_err(|e| {
+            super::AppendUpdateError::NotCommitted(io::Error::new(io::ErrorKind::InvalidData, e))
+        })?;
         line.push(b'\n');
-        Self::append_jsonl_line_blocking(path, line, durability).await
+        #[cfg(test)]
+        let file_sync_probe = self.file_sync_probe.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::append_jsonl_line_sync_with(
+                &path,
+                line,
+                durability,
+                |file| {
+                    #[cfg(test)]
+                    if let Some(probe) = &file_sync_probe {
+                        probe()?;
+                    }
+                    Self::sync_file_durable(file)
+                },
+                || Self::sync_parent_directory(&path),
+            )
+            .map_err(AppendLineError::into_update_error)
+        })
+        .await
+        .map_err(|error| super::AppendUpdateError::NotCommitted(io::Error::other(error)))?
     }
     async fn append_update_with_bookkeeping(
         &self,
@@ -545,8 +670,7 @@ impl JsonlStorageAdapter {
         durability: AppendDurability,
     ) -> Result<(), super::AppendUpdateError> {
         self.append_update_to_file(self.updates_file(info), update, durability)
-            .await
-            .map_err(super::AppendUpdateError::NotCommitted)?;
+            .await?;
         self.apply_summary_patch(
             info,
             super::summary_write::SummaryPatch {
@@ -605,6 +729,36 @@ impl JsonlStorageAdapter {
             );
         }
         Ok(updates)
+    }
+    /// A first `summary.json` create that renamed then failed its parent-dir
+    /// sync leaves the file in place. Retrying `init_session` would otherwise
+    /// load it as an existing session and never re-run that sync. Occupied
+    /// dirs (chat/updates) already paid later parent syncs; skip them so a
+    /// normal resume does not fsync (network home / macOS F_FULLFSYNC).
+    fn sync_parent_if_first_create_summary(
+        &self,
+        info: &Info,
+        summary_path: &Path,
+    ) -> io::Result<()> {
+        let lock_name = format!("{}.lock", super::SUMMARY_FILE);
+        let only_first_create = std::fs::read_dir(self.session_dir(info))
+            .map(|entries| {
+                entries.flatten().all(|entry| {
+                    matches!(
+                        entry.file_name().to_str(),
+                        Some(name) if name == super::SUMMARY_FILE || name == lock_name
+                    )
+                })
+            })
+            .unwrap_or(false);
+        if !only_first_create {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(probe) = &self.parent_sync_probe {
+            probe()?;
+        }
+        super::sync_parent_dir_durable(summary_path)
     }
     /// Write summary to disk atomically (sync version for `spawn_blocking`).
     ///
@@ -992,6 +1146,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         let summary_path = self.summary_file(info);
         if Path::new(&summary_path).exists() {
             tracing::info!("Loading existing session from JSONL");
+            self.sync_parent_if_first_create_summary(info, &summary_path)?;
             let bytes = tokio::fs::read(&summary_path).await?;
             serde_json::from_slice::<Summary>(&bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -1073,7 +1228,18 @@ impl StorageAdapter for JsonlStorageAdapter {
             .await
     }
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()> {
-        self.append_jsonl(self.chat_file(info), message).await?;
+        self.append_chat_message_commit_aware(info, message)
+            .await
+            .map_err(super::AppendChatError::into_io_error)
+    }
+    async fn append_chat_message_commit_aware(
+        &self,
+        info: &Info,
+        message: &ConversationItem,
+    ) -> Result<(), super::AppendChatError> {
+        self.append_jsonl(self.chat_file(info), message)
+            .await
+            .map_err(super::AppendChatError::NotCommitted)?;
         self.apply_summary_patch(
             info,
             super::summary_write::SummaryPatch {
@@ -1084,6 +1250,7 @@ impl StorageAdapter for JsonlStorageAdapter {
             },
         )
         .await
+        .map_err(super::AppendChatError::Committed)
     }
     async fn append_cwd_switch_commit_aware(
         &self,
@@ -1158,7 +1325,7 @@ impl StorageAdapter for JsonlStorageAdapter {
     async fn write_plan_state(&self, info: &Info, state: &TodoState) -> io::Result<()> {
         let state_json = serde_json::to_vec_pretty(state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        tokio::fs::write(self.plan_file(info), state_json).await
+        super::write_bytes_atomic_async(&self.plan_file(info), state_json).await
     }
     async fn write_plan_mode_state(
         &self,
@@ -1429,27 +1596,45 @@ impl StorageAdapter for JsonlStorageAdapter {
         self.write_jsonl(self.rewind_points_file(info), &merged)
             .await
     }
-    async fn sync_session_files(&self, info: &Info) -> io::Result<()> {
+    /// Purpose: Sync each selected session file and its directory to disk.
+    /// Input: The session identity and the selected file set.
+    /// Output: The first file or directory disk barrier error, or success.
+    async fn sync_session_files_selected(
+        &self,
+        info: &Info,
+        files: super::SessionFileSet,
+    ) -> io::Result<()> {
         let info_clone = info.clone();
         let adapter_clone = self.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             use std::fs::OpenOptions;
             let adapter = adapter_clone;
+            #[cfg(test)]
+            if let Some(session_sync_probe) = &adapter.session_sync_probe {
+                session_sync_probe(files)?;
+            }
             let files_to_sync = [
-                adapter.updates_file(&info_clone),
-                adapter.chat_file(&info_clone),
-                adapter.summary_file(&info_clone),
-                adapter.plan_file(&info_clone),
-                adapter.rewind_points_file(&info_clone),
+                (files.updates, adapter.updates_file(&info_clone)),
+                (files.chat, adapter.chat_file(&info_clone)),
+                (files.summary, adapter.summary_file(&info_clone)),
+                (files.plan, adapter.plan_file(&info_clone)),
+                (files.rewind_points, adapter.rewind_points_file(&info_clone)),
             ];
-            for file_path in &files_to_sync {
-                if file_path.exists()
-                    && let Ok(file) = OpenOptions::new().write(true).open(file_path)
-                {
-                    let _ = file.sync_all();
+            for (selected, file_path) in &files_to_sync {
+                if !selected {
+                    continue;
+                }
+                match OpenOptions::new().write(true).open(file_path) {
+                    Ok(file) => super::sync_file_durable(&file)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
                 }
             }
-            Ok(())
+            match super::sync_dir_durable(&adapter.session_dir(&info_clone)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
         })
         .await
         .map_err(io::Error::other)?
