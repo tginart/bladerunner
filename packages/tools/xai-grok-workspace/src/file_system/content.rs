@@ -44,8 +44,7 @@ fn build_ripgrep_command(root: &Path, params: &ContentSearchParams) -> Command {
     cmd.current_dir(root);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
-    cmd.stdin(Stdio::null());
-    xai_grok_tools::util::detach_command(&mut cmd);
+    xai_grok_tools::util::detach_search_command(&mut cmd);
 
     cmd.arg("--json");
     cmd.arg("--line-number");
@@ -231,9 +230,11 @@ where
 
     let cancelled = cancel.load(Ordering::Relaxed);
     if hit_limit || cancelled {
-        let _ = child.kill().await;
+        let _ = child.start_kill();
+        xai_grok_tools::util::reap_killed_search_child(&mut child).await;
+    } else {
+        let _ = child.wait().await;
     }
-    let _ = child.wait().await;
 
     if cancelled {
         let total_files = files.len();
@@ -271,4 +272,47 @@ where
         total_files,
         truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Purpose: Verify that a dropped workspace search child cannot remain active.
+    /// Input: A search child whose stdout pipe has enough data to block.
+    /// Output: The child stops after the test drops its handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_spawned_search_child_kills_rg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Overflow the stdout pipe (rg caps 50 matches/file, so use many files) so rg blocks on write and stays alive until killed
+        let line = format!("needle {}\n", "x".repeat(120));
+        for i in 0..200 {
+            std::fs::write(tmp.path().join(format!("f{i}.txt")), line.repeat(50)).unwrap();
+        }
+
+        let params = ContentSearchParams {
+            pattern: "needle".to_string(),
+            ..Default::default()
+        };
+        let mut cmd = build_ripgrep_command(tmp.path(), &params);
+        // rg is hermetic under Bazel and on PATH locally; spawn failure is a real bug.
+        #[allow(clippy::disallowed_methods)] // test child, killed on drop below
+        let mut child = cmd.spawn().expect("spawn rg");
+        let pid = child.id().expect("child pid");
+
+        // Hold the read end open (no EPIPE death) and drop the child mid-run.
+        let stdout_pipe = child.stdout.take();
+        drop(child);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !xai_tty_utils::process_not_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rg (pid {pid}) still running 5s after its Child was dropped — leaked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(stdout_pipe);
+    }
 }
