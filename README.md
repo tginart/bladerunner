@@ -1,7 +1,10 @@
 # Bladerunner
 
-Bladerunner is a terminal coding agent for OpenAI Codex and Palantir AIP
-(Foundry). It edits files, runs commands, and works with MCP servers and skills.
+Bladerunner is a fork of the open source
+[Grok Build](https://github.com/xai-org/grok-build) terminal agent.
+
+It supports OpenAI Codex and Palantir AIP (Foundry). It edits files, runs
+commands, and works with MCP servers and skills.
 
 ## Install
 
@@ -54,8 +57,7 @@ For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
 ## License
 
-Bladerunner is an independently maintained fork of
-[Grok Build](https://github.com/xai-org/grok-build), licensed under Apache-2.0.
+Bladerunner is independently maintained and licensed under Apache-2.0.
 See [LICENSE](LICENSE), [NOTICE](NOTICE), and
 [third-party notices](THIRD-PARTY-NOTICES). It is not an official OpenAI,
 Palantir, or xAI product.
