@@ -131,26 +131,8 @@ impl SessionActor {
         let (diff, event_tx, previous_client) = {
             let mut state = self.mcp_state.lock().await;
             let previous_client = state.get_client(server_name).cloned();
-            let mut configs = state.configs.clone();
-            if enabled {
-                if let Some(config) = server_config {
-                    configs.retain(|server| mcp_server_name(server) != server_name);
-                    configs.push(config);
-                } else if !configs
-                    .iter()
-                    .any(|server| mcp_server_name(server) == server_name)
-                {
-                    return Err(acp::Error::invalid_params()
-                        .data(format!("server '{server_name}' not found in config")));
-                }
-            } else {
-                configs.retain(|server| mcp_server_name(server) != server_name);
-            }
-            (
-                state.update_configs_diff(configs),
-                state.client_event_tx(),
-                previous_client,
-            )
+            let diff = update_enabled_server(&mut state, server_name, enabled, server_config)?;
+            (diff, state.client_event_tx(), previous_client)
         };
         self.events
             .emit(xai_file_utils::events::Event::McpServerToggled {
@@ -189,6 +171,49 @@ impl SessionActor {
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         Ok(())
     }
+}
+
+/// Purpose: Apply a server toggle and permit a new attempt after a failed init.
+/// Input: The MCP state, server name, requested state, and optional definition.
+/// Output: A config diff or an error for an unknown server.
+fn update_enabled_server(
+    state: &mut McpState,
+    server_name: &str,
+    enabled: bool,
+    server_config: Option<acp::McpServer>,
+) -> Result<Option<crate::session::mcp_servers::McpConfigDiff>, acp::Error> {
+    let mut configs = state.configs.clone();
+    if enabled {
+        if let Some(config) = server_config {
+            configs.retain(|server| mcp_server_name(server) != server_name);
+            configs.push(config);
+        } else if !configs
+            .iter()
+            .any(|server| mcp_server_name(server) == server_name)
+        {
+            return Err(acp::Error::invalid_params()
+                .data(format!("server '{server_name}' not found in config")));
+        }
+    } else {
+        configs.retain(|server| mcp_server_name(server) != server_name);
+    }
+    let mut diff = state.update_configs_diff(configs.clone());
+    if diff.is_none()
+        && enabled
+        && !state.is_server_handshaking(server_name)
+        && (state.get_client(server_name).is_none() || state.init_failed.contains_key(server_name))
+    {
+        // An identical definition does not reset a completed failed init.
+        // Evict only this server, then let the normal initializer retry it.
+        let mut without_server = configs.clone();
+        without_server.retain(|server| mcp_server_name(server) != server_name);
+        state.update_configs_diff(without_server);
+        diff = state.update_configs_diff(configs);
+        if let Some(diff) = &mut diff {
+            diff.removed.push(server_name.to_string());
+        }
+    }
+    Ok(diff)
 }
 
 fn driver_server(path: &Path) -> acp::McpServer {
@@ -268,3 +293,7 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     true
 }
+
+#[cfg(all(test, unix))]
+#[path = "computer_use_tests.rs"]
+mod tests;
