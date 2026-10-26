@@ -4966,14 +4966,14 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/computer_use.rs",
-      "bytes": 12408,
-      "sha256": "88948d4d93986cd7a340085432b9426b60a5599e1fd7837911c78268592d6b6c",
+      "bytes": 13286,
+      "sha256": "fbb73b9158047de79fa54c40067e4f2edd350d04455e1ee0723118907c10a996",
       "mode": "0644"
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/computer_use_tests.rs",
-      "bytes": 13291,
-      "sha256": "ff0a7764a8036202df1a7a6ca58ab53da9eedec07a0cb81731943828362d5b57",
+      "bytes": 16141,
+      "sha256": "677a190cfd344ea00c48dd72713bd40511e14f5ae0312e781ee44f7e1cd9c429",
       "mode": "0644"
     },
     {

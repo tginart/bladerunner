@@ -140,7 +140,28 @@ impl SessionActor {
     /// Purpose: Change a live MCP server and refresh the tool catalog.
     /// Input: A server name, the requested state, and an optional server definition.
     /// Output: The state change result. The user preference is saved.
+    /// Note: The toggle task remains active if the caller cancels its wait.
     pub(super) async fn set_mcp_server_enabled(
+        self: &Arc<Self>,
+        server_name: &str,
+        enabled: bool,
+        server_config: Option<acp::McpServer>,
+    ) -> Result<(), acp::Error> {
+        let session = Arc::clone(self);
+        let server_name = server_name.to_string();
+        tokio::task::spawn_local(async move {
+            session
+                .apply_mcp_server_enabled(&server_name, enabled, server_config)
+                .await
+        })
+        .await
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+    }
+
+    /// Purpose: Complete a server toggle outside the caller's cancellation scope.
+    /// Input: The server name, requested state, and optional definition.
+    /// Output: Updated clients, tools, and saved preference, or an error.
+    async fn apply_mcp_server_enabled(
         self: &Arc<Self>,
         server_name: &str,
         enabled: bool,

@@ -158,6 +158,71 @@ async fn enable_retries_an_identical_config_after_spawn_failure() {
         .await;
 }
 
+/// Purpose: Keep MCP startup active after the caller cancels a server toggle.
+/// Input: A synthetic server and a toggle future dropped at its first suspension.
+/// Output: A ready client and a successful identical enable without a state reset.
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_computer_use_enable_does_not_abandon_initialization() {
+    const CHILD: &str = "BLADERUNNER_TEST_COMPUTER_USE_CANCEL";
+    if std::env::var_os(CHILD).is_none() {
+        let sandbox = xai_grok_test_support::TestSandbox::new();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        sandbox.apply_to_std_command(&mut command);
+        let output = command
+            .args([
+                "canceled_computer_use_enable_does_not_abandon_initialization",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(sandbox.workspace())
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let config_path = crate::util::config::user_config_path();
+            std::fs::write(&config_path, "disabled_mcp_servers = ['computer-use']\n").unwrap();
+            let actor = actor(root.path()).await;
+            let config = server(root.path(), SERVER_NAME, Path::new("/usr/bin/env"), None);
+            let mut enable =
+                Box::pin(actor.set_mcp_server_enabled(SERVER_NAME, true, Some(config.clone())));
+            assert!(futures::poll!(enable.as_mut()).is_pending());
+            drop(enable);
+
+            let client = wait_ready(&actor, SERVER_NAME).await;
+            assert!(actor.mcp_state.lock().await.is_initialized());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while std::fs::read_to_string(&config_path)
+                    .unwrap()
+                    .contains(SERVER_NAME)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the detached toggle must finish its preference save");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                actor.set_mcp_server_enabled(SERVER_NAME, true, Some(config)),
+            )
+            .await
+            .expect("an identical enable must not wait for abandoned initialization")
+            .unwrap();
+            client.shutdown().await;
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 /// Purpose: Verify independent tool availability before a slow server completes.
 /// Input: A fast computer-use fixture and a second fixture with a closed gate.
