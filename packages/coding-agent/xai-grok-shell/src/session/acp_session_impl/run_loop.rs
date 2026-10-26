@@ -1393,106 +1393,12 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
-                            session.events.emit(xai_file_utils::events::Event::McpServerToggled {
-                                server_name: server_name.clone(),
-                                enabled,
-                            });
-                            let mut mcp_state = session.mcp_state.lock().await;
-                            let mut configs = mcp_state.configs.clone();
-
-                            if enabled {
-                                if let Some(config) = server_config {
-                                    // Replace any prior entry so setup → enable can
-                                    // swap an unresolved placeholder for a resolved URL.
-                                    configs.retain(|c| {
-                                        crate::session::mcp_servers::mcp_server_name(c)
-                                            != server_name
-                                    });
-                                    configs.push(config);
-                                } else {
-                                    let already_present = configs.iter().any(|c| {
-                                        crate::session::mcp_servers::mcp_server_name(c)
-                                            == server_name
-                                    });
-                                    if already_present {
-                                        drop(mcp_state);
-                                        let _ = respond_to.send(Ok(()));
-                                        continue;
-                                    }
-                                    drop(mcp_state);
-                                    let _ = respond_to.send(Err(acp::Error::invalid_params()
-                                        .data(format!("server '{}' not found in config", server_name))));
-                                    continue;
-                                }
-                            } else {
-                                configs.retain(|c| crate::session::mcp_servers::mcp_server_name(c) != server_name);
-                            }
-
-                            let diff = mcp_state.update_configs_diff(configs);
-                            // Snapshot the dispatcher
-                            // sender BEFORE dropping the lock so the
-                            // emit below survives any later mutation.
-                            let dispatch_event_tx = mcp_state.client_event_tx();
-                            drop(mcp_state);
-
-                            let Some(diff) = diff else {
-                                let _ = respond_to.send(Ok(()));
-                                continue;
-                            };
-
-                            // ToggleMcpServer mirrors
-                            // UpdateMcpServers — fan out per-server
-                            // status via the dispatcher (`ConfigAdded`
-                            // / `ConfigRemoved` reason codes on
-                            // `mcp/server_status`).
-                            if (!diff.added.is_empty() || !diff.removed.is_empty())
-                                && let Some(tx) = &dispatch_event_tx
-                            {
-                                let _ = tx.send(
-                                    xai_grok_mcp::servers::McpClientEvent::ConfigDiff {
-                                        added: diff.added.clone(),
-                                        removed: diff.removed.clone(),
-                                    },
-                                );
-                            }
-
-                            for name in &diff.removed {
-                                let prefix = format!(
-                                    "{}{}",
-                                    name,
-                                    crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER
-                                );
-                                let removed_count = session
-                                    .agent
-                                    .borrow()
-                                    .tool_bridge()
-                                    .unregister_tools_by_prefix(&prefix);
-                                tracing::info!(
-                                    server = name.as_str(),
-                                    tools_removed = removed_count,
-                                    "Unregistered tools for toggled MCP server"
-                                );
-                            }
-
                             let session_for_mcp = session.clone();
-                            let sname = server_name.clone();
-                            let session_cwd = session.session_info.cwd.clone();
                             tokio::task::spawn_local(async move {
-                                session_for_mcp.ensure_mcp_tools_initialized().await;
-                                if let Err(e) = crate::util::config::save_mcp_server_enabled_in(
-                                    &sname,
-                                    enabled,
-                                    std::path::Path::new(&session_cwd),
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        server = sname.as_str(),
-                                        error = %e,
-                                        "Failed to persist server enabled state to config"
-                                    );
-                                }
-                                let _ = respond_to.send(Ok(()));
+                                let result = session_for_mcp
+                                    .set_mcp_server_enabled(&server_name, enabled, server_config)
+                                    .await;
+                                let _ = respond_to.send(result);
                             });
                         }
                         SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, respond_to } => {

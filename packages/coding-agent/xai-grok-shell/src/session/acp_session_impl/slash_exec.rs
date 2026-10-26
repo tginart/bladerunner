@@ -13,6 +13,14 @@ impl SessionActor {
             args_provided: action.args_provided(),
         });
         match action {
+            BuiltinAction::ComputerUse { args } => {
+                let message = match self.configure_computer_use(&args).await {
+                    Ok(message) => message,
+                    Err(error) => format!("Computer use: {error}"),
+                };
+                self.send_host_turn_slash_command_output(&message).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::Compact { user_context } => {
                 self.run_compact(user_context).await?;
                 ok_end_turn(0, None)

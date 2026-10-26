@@ -46,6 +46,16 @@ pub(crate) enum BuiltinGate {
 /// All built-in slash commands. Order here = display order in autocomplete.
 pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
+        name: "computer-use",
+        description: "Toggle browser and desktop control through Cua Driver",
+        argument_hint: Some("on | off | status"),
+        aliases: &["cua"],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |args| BuiltinAction::ComputerUse {
+            args: args.trim().to_string(),
+        },
+    },
+    BuiltinCommand {
         name: "compact",
         description: "Compress conversation history to save context window",
         argument_hint: Some("optional context about what to preserve"),
@@ -1225,6 +1235,9 @@ pub(super) enum SlashCommandOutcome {
 }
 #[derive(Debug)]
 pub(super) enum BuiltinAction {
+    ComputerUse {
+        args: String,
+    },
     Compact {
         user_context: Option<String>,
     },
@@ -1303,6 +1316,7 @@ pub(super) enum BuiltinAction {
 impl BuiltinAction {
     pub(crate) fn command_name(&self) -> &str {
         match self {
+            BuiltinAction::ComputerUse { .. } => "computer-use",
             BuiltinAction::Compact { .. } => "compact",
             BuiltinAction::Deadline { .. } => "deadline",
             BuiltinAction::SetYolo { .. } => "yolo",
@@ -1339,6 +1353,7 @@ impl BuiltinAction {
     }
     pub(crate) fn args_provided(&self) -> bool {
         match self {
+            BuiltinAction::ComputerUse { args } => !args.is_empty(),
             BuiltinAction::Compact { user_context } => user_context.is_some(),
             BuiltinAction::Deadline { duration } => !duration.is_empty(),
             BuiltinAction::SetYolo { .. } => true,
@@ -2277,6 +2292,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "computer-use",
                 "compact",
                 "deadline",
                 "always-approve",
@@ -3150,6 +3166,29 @@ mod tests {
             outcome,
             SlashCommandOutcome::Builtin(BuiltinAction::MemoryToggle { enabled: false })
         ));
+    }
+    #[test]
+    fn computer_use_and_cua_resolve_without_a_feature_flag() {
+        for command in ["/computer-use", "/computer-use status", "/cua off"] {
+            let outcome = resolve(
+                vec![text_block(command)],
+                &[],
+                CommandAvailability::default(),
+                SkillSlashRewrite::default(),
+                &[],
+            )
+            .unwrap_err();
+            assert!(matches!(
+                outcome,
+                SlashCommandOutcome::Builtin(BuiltinAction::ComputerUse { args })
+                    if args == command.split_once(' ').map_or("", |(_, args)| args)
+            ));
+        }
+        assert!(
+            advertised_names(CommandAvailability::default())
+                .iter()
+                .any(|name| name == "computer-use")
+        );
     }
     #[test]
     fn memory_resolves_when_disabled_but_configured() {
