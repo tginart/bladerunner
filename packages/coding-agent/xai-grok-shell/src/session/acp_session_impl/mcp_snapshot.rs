@@ -236,6 +236,31 @@ pub(crate) async fn refresh_mcp_snapshot_for_test_with_disabled(
 }
 
 impl SessionActor {
+    /// Purpose: Wait for complete MCP initialization within one fixed deadline.
+    /// Input: The total wait budget.
+    /// Output: True for completion. False when the deadline expires.
+    pub(super) async fn wait_for_mcp_handshake_completion(
+        &self,
+        timeout: std::time::Duration,
+    ) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.mcp_handshakes_done.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let state = self.mcp_state.lock().await;
+                    if state.configs.is_empty() || state.is_initialized() {
+                        return;
+                    }
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// Block the templated user prefix until MCP handshakes have finished populating
     /// [`McpState::clients`], or until a timeout elapses.
     ///
@@ -252,12 +277,6 @@ impl SessionActor {
         if matches!(template, UserMessageTemplate::Default) {
             return;
         }
-
-        // Register the notification future *before* checking state so we
-        // cannot miss a signal that fires between releasing the lock and
-        // entering the wait.
-        let notified = self.mcp_handshakes_done.notified();
-        tokio::pin!(notified);
 
         let (configs_empty, already_ready, initializing_count, client_count, finished_init) = {
             let s = self.mcp_state.lock().await;
@@ -296,12 +315,10 @@ impl SessionActor {
             "wait_for_mcp_templated_prefix_ready: waiting for MCP handshakes"
         );
 
-        // Wait for `mcp_handshakes_done` (signalled after
-        // `mark_all_servers_ready()` in the bg handshake task) or the
-        // timeout, whichever comes first.
-        let outcome = tokio::select! {
-            () = &mut notified => "notified",
-            () = tokio::time::sleep(TIMEOUT) => "timed_out",
+        let outcome = if self.wait_for_mcp_handshake_completion(TIMEOUT).await {
+            "completed"
+        } else {
+            "timed_out"
         };
 
         // Only acquire the post-wait snapshot when INFO tracing is active;
@@ -323,9 +340,6 @@ impl SessionActor {
     }
 
     pub(super) async fn wait_for_mcp_handshakes_bounded(&self, timeout: std::time::Duration) {
-        let notified = self.mcp_handshakes_done.notified();
-        tokio::pin!(notified);
-
         let (configs_empty, already_ready) = {
             let s = self.mcp_state.lock().await;
             (s.configs.is_empty(), s.is_initialized())
@@ -341,9 +355,10 @@ impl SessionActor {
             "wait_for_mcp_handshakes_bounded: waiting"
         );
 
-        let outcome = tokio::select! {
-            () = &mut notified => "notified",
-            () = tokio::time::sleep(timeout) => "timed_out",
+        let outcome = if self.wait_for_mcp_handshake_completion(timeout).await {
+            "completed"
+        } else {
+            "timed_out"
         };
 
         tracing::info!(

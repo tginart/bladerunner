@@ -241,25 +241,14 @@ impl SessionActor {
             }
             self.inject_deny_read_globs().await;
         }
+        if !self
+            .wait_for_mcp_handshake_completion(std::time::Duration::from_secs(5))
+            .await
         {
-            let notified = self.mcp_handshakes_done.notified();
-            tokio::pin!(notified);
-            let needs_wait = {
-                let s = self.mcp_state.lock().await;
-                !s.configs.is_empty() && !s.is_initialized()
-            };
-            if needs_wait {
-                const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-                tokio::select! {
-                    () = &mut notified => {}
-                    () = tokio::time::sleep(TIMEOUT) => {
-                        tracing::warn!(
-                            session_id = %self.session_info.id.0,
-                            "handle_rebuild_agent_for_definition: timed out waiting for MCP handshakes"
-                        );
-                    }
-                }
-            }
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                "handle_rebuild_agent_for_definition: timed out waiting for MCP handshakes"
+            );
         }
         self.re_register_mcp_tools_on_rebuilt_bridge().await;
         if let Some(old_handle) = self.deferred_prefix.take() {

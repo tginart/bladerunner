@@ -3,6 +3,7 @@
 //! Output: A live MCP connection or a status message.
 
 use super::*;
+use crate::session::mcp_servers::McpClient;
 use crate::util::config::{McpServerConfig, McpServerTransportConfig};
 use std::path::PathBuf;
 
@@ -58,26 +59,7 @@ impl SessionActor {
             .await
             .map_err(|error| error.to_string())?;
 
-        // The ordinary MCP initializer returns before background handshakes end.
-        // Wait for this server before the command reports a successful connection.
-        let ready = tokio::time::timeout(Duration::from_secs(35), async {
-            loop {
-                let notified = self.mcp_handshakes_done.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let state = self.mcp_state.lock().await;
-                let is_starting = state
-                    .handshaking_servers_iter()
-                    .any(|name| name == SERVER_NAME);
-                if !is_starting {
-                    return state.get_client(SERVER_NAME).cloned();
-                }
-                drop(state);
-                notified.await;
-            }
-        })
-        .await;
-        if let Ok(Some(client)) = ready
+        if let Some(client) = self.wait_for_computer_use_ready().await
             && client.ensure_initialized().await.is_ok()
         {
             return Ok("Computer use is on. Cua uses the host application's permissions. Run /computer-use off to stop it.".to_string());
@@ -89,6 +71,36 @@ impl SessionActor {
             "Cua Driver could not connect. Computer use remains off; check /mcps for diagnostics."
                 .to_string(),
         )
+    }
+
+    /// Purpose: Wait for the transport and tool registration result of computer use.
+    /// Input: The live MCP state and per-server completion notifications.
+    /// Output: A connected client only when its tool registration succeeds.
+    async fn wait_for_computer_use_ready(&self) -> Option<Arc<McpClient>> {
+        tokio::time::timeout(Duration::from_secs(35), async {
+            loop {
+                let notified = self.mcp_handshakes_done.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let state = self.mcp_state.lock().await;
+                let is_starting = state
+                    .handshaking_servers_iter()
+                    .any(|name| name == SERVER_NAME);
+                if !is_starting {
+                    if state.init_failed.contains_key(SERVER_NAME)
+                        || state.auth_required.contains(SERVER_NAME)
+                    {
+                        return None;
+                    }
+                    return state.get_client(SERVER_NAME).cloned();
+                }
+                drop(state);
+                notified.await;
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Purpose: Report the connection state without a tool call or permission prompt.
@@ -109,7 +121,13 @@ impl SessionActor {
         {
             return "Computer use is connecting. Check /mcps for its status.".to_string();
         }
-        let client = state.get_client(SERVER_NAME).cloned();
+        let client = if state.init_failed.contains_key(SERVER_NAME)
+            || state.auth_required.contains(SERVER_NAME)
+        {
+            None
+        } else {
+            state.get_client(SERVER_NAME).cloned()
+        };
         drop(state);
         if let Some(client) = client
             && client.state_kind().await == xai_grok_mcp::servers::ClientStateKind::Ready

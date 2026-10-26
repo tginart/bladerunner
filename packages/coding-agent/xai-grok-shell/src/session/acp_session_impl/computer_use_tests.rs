@@ -8,6 +8,7 @@ use crate::session::mcp_servers::McpClient;
 
 const SERVER_SCRIPT: &str = r#"
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -24,6 +25,12 @@ for line in sys.stdin:
             'serverInfo': {'name': 'fixture', 'version': '1'},
         }
     elif method == 'tools/list':
+        if os.environ.get('FIXTURE_FAIL_TOOLS_LIST') == '1':
+            print(json.dumps({
+                'jsonrpc': '2.0', 'id': request['id'],
+                'error': {'code': -32603, 'message': 'Synthetic list failure'},
+            }), flush=True)
+            continue
         if len(sys.argv) > 1:
             gate = Path(sys.argv[1])
             gate.with_suffix('.started').touch()
@@ -148,6 +155,44 @@ async fn healthy_computer_use_becomes_ready_before_an_unrelated_handshake() {
             );
             std::fs::write(gate, "release").unwrap();
             wait_ready(&actor, "slow").await.shutdown().await;
+            client.shutdown().await;
+        })
+        .await;
+}
+
+/// Purpose: Reject an initialized transport whose tool list failed.
+/// Input: A fixture that accepts initialize but rejects tools/list.
+/// Output: No ready computer-use client and an unavailable status.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_list_failure_does_not_report_computer_use_ready() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            let mut config = server(root.path(), SERVER_NAME, Path::new("/usr/bin/env"), None);
+            let acp::McpServer::Stdio(config) = &mut config else {
+                unreachable!();
+            };
+            config
+                .env
+                .push(acp::EnvVariable::new("FIXTURE_FAIL_TOOLS_LIST", "1"));
+            actor.mcp_state.lock().await.configs = vec![acp::McpServer::Stdio(config.clone())];
+            actor.ensure_mcp_tools_initialized().await;
+            let client = wait_ready(&actor, SERVER_NAME).await;
+            assert_eq!(
+                client.state_kind().await,
+                xai_grok_mcp::servers::ClientStateKind::Ready
+            );
+            assert!(
+                actor
+                    .mcp_state
+                    .lock()
+                    .await
+                    .init_failed
+                    .contains_key(SERVER_NAME)
+            );
+            assert!(actor.wait_for_computer_use_ready().await.is_none());
+            assert!(actor.computer_use_status().await.contains("unavailable"));
             client.shutdown().await;
         })
         .await;

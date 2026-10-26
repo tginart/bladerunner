@@ -4930,8 +4930,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session.rs",
-      "bytes": 109553,
-      "sha256": "55845afb144b54ecb7d43f4964246d76fd0c171e72cb60dffa0499f41e600db7",
+      "bytes": 109522,
+      "sha256": "fd93e78a3617843f3dddbce96c3eb477804f6181c7a53fc96454a311e0ea47d8",
       "mode": "0644"
     },
     {
@@ -4966,14 +4966,14 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/computer_use.rs",
-      "bytes": 11771,
-      "sha256": "5be5c3c0b9ecbb9386f86bba805b51aa194875b7c023441906cf7b2643f4f47a",
+      "bytes": 12408,
+      "sha256": "88948d4d93986cd7a340085432b9426b60a5599e1fd7837911c78268592d6b6c",
       "mode": "0644"
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/computer_use_tests.rs",
-      "bytes": 6522,
-      "sha256": "25db0036d762e9538b7b6ff90ca3d74768f57c2a05d93a57bf88926db376ce53",
+      "bytes": 8418,
+      "sha256": "f4aa7fe5cc6a3c10307cdcb2441f93448013d27d353ebc3cc23190029af38e7b",
       "mode": "0644"
     },
     {
@@ -5062,8 +5062,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/mcp_snapshot.rs",
-      "bytes": 17760,
-      "sha256": "0aeecf91adca91e19dc05d93bbffdff904b643274ed2716e49ebe5ac8b166d7d",
+      "bytes": 18081,
+      "sha256": "8de51416b53c84851768da97cf2293c02badb704a5c165adda4cf1ef1bf3debd",
       "mode": "0644"
     },
     {
@@ -5074,8 +5074,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/model_switch.rs",
-      "bytes": 15794,
-      "sha256": "c8d59ba17b41c18d34a008b3b1a23ca3e27d5ccbc69a0b86a67b315c687193df",
+      "bytes": 15299,
+      "sha256": "aaf1378ae6ebc3e918e292dada3abbb2cb096823f984945233ac3c8ea7f36839",
       "mode": "0644"
     },
     {
@@ -5548,8 +5548,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_tests/wait_for_mcp_prefix_tests.rs",
-      "bytes": 2352,
-      "sha256": "dcacedc067b64e9cf95ea5c0a8c92629f475984247eff67cad22c826dda97aba",
+      "bytes": 5311,
+      "sha256": "8274701ef59dee4154ffdeb1ae029c977bd8a39ee03c43e4277fb069c0f85195",
       "mode": "0644"
     },
     {
