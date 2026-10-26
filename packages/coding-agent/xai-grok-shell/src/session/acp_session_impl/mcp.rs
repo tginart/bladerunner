@@ -1473,6 +1473,7 @@ impl SessionActor {
                     elapsed_ms = handshake_start.elapsed().as_millis() as u64,
                     "mcp_bg_handshake: client inserted, calling notify_waiters"
                 );
+                let mcp_initialized = mcp_state.is_initialized();
                 drop(mcp_state);
                 mcp_handshakes_done.notify_waiters();
                 refresh_mcp_snapshot_and_schedule_reminder_with(
@@ -1481,7 +1482,7 @@ impl SessionActor {
                     managed_mcp_handle.clone(),
                     tool_snapshot.clone(),
                     Arc::clone(&mcp_reminder_dirty),
-                    true,
+                    mcp_initialized,
                     &disabled_gateway_tools_bg,
                     mcps_root_bg.clone(),
                 )

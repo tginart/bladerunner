@@ -2,9 +2,11 @@
 //! Input: Synthetic stdio servers with a file gate for a slow handshake.
 //! Output: Regression assertions without Cua or desktop access.
 
-use super::super::support::create_test_actor;
+use super::super::support::{create_test_actor, test_agent_with_tools};
 use super::*;
 use crate::session::mcp_servers::McpClient;
+use crate::session::tool_index::{Bm25ToolSearchIndex, ToolMetadataSnapshot};
+use xai_grok_tools::types::tool_index::ToolSearchIndex;
 
 const SERVER_SCRIPT: &str = r#"
 import json
@@ -40,6 +42,8 @@ for line in sys.stdin:
             'name': 'proof', 'description': 'Synthetic proof tool',
             'inputSchema': {'type': 'object', 'properties': {}},
         }]}
+        if os.environ.get('FIXTURE_EMPTY_TOOLS') == '1':
+            result['tools'] = []
     else:
         result = {}
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
@@ -97,6 +101,30 @@ async fn wait_ready(actor: &SessionActor, name: &str) -> Arc<McpClient> {
     .expect("server must become ready independently")
 }
 
+/// Purpose: Observe the published snapshot after a named tool becomes available.
+/// Input: An actor and a qualified fixture tool name.
+/// Output: The snapshot that contains the tool.
+async fn wait_for_tool_snapshot(actor: &SessionActor, name: &str) -> ToolMetadataSnapshot {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = {
+                let snapshot = actor.tool_metadata_snapshot.lock().unwrap();
+                snapshot
+                    .tools
+                    .iter()
+                    .any(|tool| tool.qualified_name == name)
+                    .then(|| snapshot.clone())
+            };
+            if let Some(snapshot) = snapshot {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connected fixture tool must reach the snapshot")
+}
+
 #[tokio::test(flavor = "current_thread")]
 /// Purpose: Verify a successful retry after the same executable path becomes valid.
 /// Input: A missing executable that the fixture later creates.
@@ -147,6 +175,8 @@ async fn healthy_computer_use_becomes_ready_before_an_unrelated_handshake() {
             actor.ensure_mcp_tools_initialized().await;
             let client = wait_ready(&actor, SERVER_NAME).await;
             assert!(actor.mcp_state.lock().await.is_server_handshaking("slow"));
+            let snapshot = wait_for_tool_snapshot(&actor, "computer-use__proof").await;
+            assert!(!snapshot.mcp_initialized);
             let definitions = actor.agent.borrow().tool_bridge().tool_definitions().await;
             assert!(
                 definitions
@@ -155,6 +185,11 @@ async fn healthy_computer_use_becomes_ready_before_an_unrelated_handshake() {
             );
             std::fs::write(gate, "release").unwrap();
             wait_ready(&actor, "slow").await.shutdown().await;
+            assert!(
+                wait_for_tool_snapshot(&actor, "slow__proof")
+                    .await
+                    .mcp_initialized
+            );
             client.shutdown().await;
         })
         .await;
@@ -194,6 +229,74 @@ async fn tool_list_failure_does_not_report_computer_use_ready() {
             assert!(actor.wait_for_computer_use_ready().await.is_none());
             assert!(actor.computer_use_status().await.contains("unavailable"));
             client.shutdown().await;
+        })
+        .await;
+}
+
+/// Purpose: Keep discovery tools visible while a late server can still supply tools.
+/// Input: An empty or failed first server and a second server behind a gate.
+/// Output: An incomplete empty index, visible discovery tools, and final readiness.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_or_failed_early_server_keeps_computer_use_discovery_available() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for environment in ["FIXTURE_EMPTY_TOOLS", "FIXTURE_FAIL_TOOLS_LIST"] {
+                let root = tempfile::tempdir().unwrap();
+                let actor = actor(root.path()).await;
+                *actor.agent.borrow_mut() = test_agent_with_tools(vec![
+                    xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                        xai_grok_tools::implementations::search_tool::SearchTool,
+                    >(),
+                    xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                        xai_grok_tools::implementations::use_tool::UseTool,
+                    >(),
+                ])
+                .await;
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                bridge
+                    .update_resource(xai_grok_tools::types::tool_index::ToolIndex(Arc::new(
+                        Bm25ToolSearchIndex::new(actor.tool_metadata_snapshot.clone()),
+                    )))
+                    .await;
+                let gate = root.path().join("release");
+                let mut first = server(root.path(), SERVER_NAME, Path::new("/usr/bin/env"), None);
+                let acp::McpServer::Stdio(config) = &mut first else {
+                    unreachable!();
+                };
+                config.env.push(acp::EnvVariable::new(environment, "1"));
+                actor.mcp_state.lock().await.configs = vec![
+                    first,
+                    server(root.path(), "slow", Path::new("/usr/bin/env"), Some(&gate)),
+                ];
+                actor.ensure_mcp_tools_initialized().await;
+                let client = wait_ready(&actor, SERVER_NAME).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !actor
+                        .mcp_reminder_dirty
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let index = Bm25ToolSearchIndex::new(actor.tool_metadata_snapshot.clone());
+                let snapshot = index.search_snapshot("", 0);
+                assert!(!snapshot.is_ready, "{environment}");
+                assert_eq!(snapshot.total_hidden_tools, 0);
+                let definitions = bridge.tool_definitions().await;
+                for name in ["search_tool", "use_tool"] {
+                    assert!(definitions.iter().any(|tool| tool.function.name == name));
+                }
+                std::fs::write(gate, "release").unwrap();
+                wait_ready(&actor, "slow").await.shutdown().await;
+                assert!(
+                    wait_for_tool_snapshot(&actor, "slow__proof")
+                        .await
+                        .mcp_initialized
+                );
+                client.shutdown().await;
+            }
         })
         .await;
 }
