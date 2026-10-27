@@ -2206,8 +2206,8 @@
     },
     {
       "path": "packages/ai/xai-grok-models/src/platforms.rs",
-      "bytes": 154205,
-      "sha256": "6e2629363bd8b7cb2908d2ce17814523be44c7cbf361a30edade2c6ebf9c7274",
+      "bytes": 154418,
+      "sha256": "59685637a767fc2f081fee941f03ef2672f3957c0db6f7c267d9e6a5ab41b35a",
       "mode": "0644"
     },
     {
@@ -3634,8 +3634,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/agent/config.rs",
-      "bytes": 671047,
-      "sha256": "90cc9d76a8d1fe4843b0d95d8f465b38c3c47ae3ed2a74b706f3839fa8842ef8",
+      "bytes": 671460,
+      "sha256": "c61842298bf456df60265f77646163b0aae0f44d8a47423a6ba85e81dcbc3492",
       "mode": "0644"
     },
     {
