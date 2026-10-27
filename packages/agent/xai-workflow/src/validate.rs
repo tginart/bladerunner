@@ -87,6 +87,8 @@ pub fn validate_script_with_agent_budget(
                         cancelled: false,
                         tokens_used: 1,
                         duration_ms: 1,
+                        worktree_path: None,
+                        worktree_changes: None,
                     }));
                 }
                 R::BudgetQuery { reply } => {

@@ -33,6 +33,32 @@ The first native screenshot may also show macOS's direct-capture consent dialog
 for the host app. The integration permits that native dialog; macOS still enforces
 the permission decision.
 
+### `/n-shot <N> <prompt>`
+
+Fork the conversation into N parallel attempts (1-10) at the same prompt. Each
+shot starts from a copy of this conversation and works in its own git worktree,
+so the shots cannot step on each other or on your working tree.
+
+```
+/n-shot 3 fix the flaky login test
+```
+
+The shots run in the background as a workflow. Bladerunner opens a side-by-side
+view with one column per shot: live status, model, elapsed time, tokens, and the
+tail of that shot's transcript. Use `←`/`→` to move between columns, `Enter` (or
+a click) to open a shot's full transcript, and `Esc` to return to the chat. You
+can keep talking to the session while the shots run. To reopen the columns, run
+`/workflows` and open the n-shot run.
+
+When every shot finishes, the session wakes up with a report: each shot's final
+message, worktree path, and changed files. It compares the shots and recommends
+one. Then tell it what to keep, for example "take shot 2" or "use shot 1 but port
+the retry logic from shot 3". It applies the result to your working tree. The
+worktrees stay on disk until you remove them.
+
+The agent can also start an n-shot run itself through the workflow tool, with a
+different prompt or model for each shot. Needs workflows to be enabled.
+
 ### `/new`
 
 Start a fresh session and clear the current conversation. Alias: `/clear`.

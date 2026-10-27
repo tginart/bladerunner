@@ -178,7 +178,15 @@ pub(super) fn ingest_workflow_update(agent: &mut AgentView, update: XaiSessionUp
             .find(|run| run.run_id == run_id)
         {
             Some(existing) => *existing = snapshot,
-            None => agent.workflow_runs.push(snapshot),
+            None => {
+                // A fresh n-shot run opens straight into its side-by-side columns.
+                let opens_columns =
+                    snapshot.is_active() && crate::views::n_shot::is_n_shot_run(&snapshot);
+                agent.workflow_runs.push(snapshot);
+                if opens_columns {
+                    agent.open_workflow_detail_by_run_id(&run_id);
+                }
+            }
         }
     }
     let active = agents.iter().filter(|a| a.state == "running").count() as u32;

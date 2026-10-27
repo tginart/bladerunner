@@ -21,6 +21,55 @@ mod builtin_tests {
         }
     }
 
+    fn n_shot_script() -> &'static str {
+        super::registry::BUILTIN_WORKFLOWS
+            .iter()
+            .find(|builtin| builtin.name == "n-shot")
+            .map(|builtin| builtin.script)
+            .expect("n-shot builtin registered")
+    }
+
+    #[test]
+    fn n_shot_completes_for_identical_and_per_shot_args() {
+        let max_shots = crate::session::slash_commands::N_SHOT_MAX_SHOTS;
+        assert!(n_shot_script().contains(&format!("let max_shots = {max_shots};")));
+        let cases = [
+            serde_json::json!({ "n": 3, "prompt": "fix the bug" }),
+            serde_json::json!({ "shots": [
+                { "prompt": "fix it simply", "model": "fast-model" },
+                { "prompt": "fix it robustly", "label": "robust" },
+            ] }),
+        ];
+        for args in cases {
+            let report = xai_workflow::validate_script(n_shot_script(), Some(args.clone()))
+                .unwrap_or_else(|e| panic!("{args}: {e}"));
+            assert!(
+                report.outcome_summary.starts_with("completed:"),
+                "{args}: {}",
+                report.outcome_summary
+            );
+        }
+    }
+
+    #[test]
+    fn n_shot_pauses_on_bad_args() {
+        let cases = [
+            serde_json::json!({ "n": 2 }),
+            serde_json::json!({ "n": 0, "prompt": "x" }),
+            serde_json::json!({ "n": 11, "prompt": "x" }),
+            serde_json::json!({ "shots": [{ "model": "m" }] }),
+        ];
+        for args in cases {
+            let report = xai_workflow::validate_script(n_shot_script(), Some(args.clone()))
+                .unwrap_or_else(|e| panic!("{args}: {e}"));
+            assert!(
+                report.outcome_summary.starts_with("paused"),
+                "{args}: {}",
+                report.outcome_summary
+            );
+        }
+    }
+
     #[test]
     fn deep_research_binds_shards_and_renders_verified_claims() {
         let script = super::registry::BUILTIN_WORKFLOWS

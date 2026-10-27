@@ -39,6 +39,18 @@ fn resolve_management_command(
     })
 }
 
+/// Agent ids of the shot columns when `run` is an n-shot run, else empty.
+fn n_shot_agent_ids(run: Option<&crate::views::workflows::WorkflowRunSnapshot>) -> Vec<String> {
+    run.filter(|run| crate::views::n_shot::is_n_shot_run(run))
+        .map(|run| {
+            crate::views::n_shot::shots(run)
+                .iter()
+                .map(|shot| shot.agent_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn transcript_target(
     run: &crate::views::workflows::WorkflowRunSnapshot,
     phase: Option<&str>,
@@ -95,7 +107,24 @@ impl AgentView {
                 let manage_target = view
                     .detail_run(&runs)
                     .or_else(|| runs.get(view.selected_run).copied());
+                let shot_ids = n_shot_agent_ids(view.detail_run(&runs));
                 let outcome = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') if !shot_ids.is_empty() => {
+                        view.n_shot_focus = view.n_shot_focus.saturating_sub(1);
+                        self.workflows_view = view;
+                        InputOutcome::Changed
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if !shot_ids.is_empty() => {
+                        view.n_shot_focus = (view.n_shot_focus + 1).min(shot_ids.len() - 1);
+                        self.workflows_view = view;
+                        InputOutcome::Changed
+                    }
+                    KeyCode::Enter if !shot_ids.is_empty() => {
+                        let focus = view.n_shot_focus.min(shot_ids.len() - 1);
+                        self.open_subagent_fullscreen(shot_ids[focus].clone());
+                        self.workflows_view = view;
+                        InputOutcome::Changed
+                    }
                     KeyCode::Esc | KeyCode::Char('q') => {
                         if in_detail && runs.len() > 1 {
                             view.detail_run_id = None;

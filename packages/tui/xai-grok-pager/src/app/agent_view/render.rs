@@ -4490,8 +4490,24 @@ impl AgentView {
                     )
                 })
                 .collect();
-            let popup =
-                crate::views::workflows::render_workflows(buf, area, &runs, &mut view, tick, &live);
+            let scrollbacks: crate::views::n_shot::WorkflowAgentScrollbacks<'_> = self
+                .subagent_sessions
+                .iter()
+                .filter(|(_, info)| info.workflow_run_id.is_some())
+                .filter_map(|(id, _)| {
+                    let child = self.subagent_views.get(id)?;
+                    Some((id.clone(), &child.scrollback))
+                })
+                .collect();
+            let popup = crate::views::workflows::render_workflows_with_scrollbacks(
+                buf,
+                area,
+                &runs,
+                &mut view,
+                tick,
+                &live,
+                &scrollbacks,
+            );
             self.workflows_view = view;
             if let Some(popup) = popup {
                 self.frame_occluder_rects.push(popup);

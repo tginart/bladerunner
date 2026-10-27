@@ -35,6 +35,12 @@ pub struct AgentResult {
     pub cancelled: bool,
     pub tokens_used: u64,
     pub duration_ms: u64,
+    /// Worktree root of an `isolation_worktree` agent, kept after the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    /// `git status --short` plus `git diff --shortstat HEAD` for that worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_changes: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

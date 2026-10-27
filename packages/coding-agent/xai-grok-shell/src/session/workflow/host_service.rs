@@ -682,6 +682,10 @@ impl HostService {
         );
         self.tick();
 
+        let worktree_changes = match result.worktree_path.as_deref() {
+            Some(path) => worktree_change_summary(Path::new(path)).await,
+            None => None,
+        };
         Ok(AgentResult {
             agent_id: id,
             success: result.success,
@@ -689,6 +693,8 @@ impl HostService {
             cancelled: result.cancelled,
             tokens_used: total_tokens,
             duration_ms: total_duration,
+            worktree_path: result.worktree_path.clone(),
+            worktree_changes,
         })
     }
 
@@ -953,6 +959,56 @@ impl HostService {
         }
         Ok(text)
     }
+}
+
+/// Purpose: Describe the changes that an isolated agent left in its worktree.
+/// Input: The worktree root.
+/// Output: `git status --short` lines and the `git diff --shortstat HEAD` line,
+/// or `None` when git fails.
+/// Note: Untracked files show in the status lines but not in the shortstat.
+async fn worktree_change_summary(worktree: &Path) -> Option<String> {
+    const STATUS_CAP_BYTES: usize = 8 * 1024;
+    let status = run_git_in(worktree, &["status", "--short"]).await?;
+    let shortstat = run_git_in(worktree, &["diff", "--shortstat", "HEAD"]).await?;
+    let status = xai_grok_tools::util::truncate_str_with_marker(&status, STATUS_CAP_BYTES);
+    let shortstat = shortstat.trim();
+    if status.trim().is_empty() {
+        return Some("no changes".to_string());
+    }
+    Some(format!("{}\n{shortstat}", status.trim_end()))
+}
+
+async fn run_git_in(dir: &Path, args: &[&str]) -> Option<String> {
+    const GIT_TIMEOUT: Duration = Duration::from_secs(20);
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .envs(xai_tty_utils::pager_env());
+    xai_tty_utils::detach_command(&mut cmd);
+    let output = match tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::warn!(?dir, ?args, %error, "workflow worktree git command failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(?dir, ?args, "workflow worktree git command timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            ?dir,
+            ?args,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "workflow worktree git command exited non-zero"
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]

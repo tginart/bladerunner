@@ -492,6 +492,7 @@ mod tests {
         "footer.search",
         "footer.select",
         "footer.select_compact",
+        "footer.shot_transcript",
         "footer.space_enter_toggle",
         "footer.space_toggle",
         "footer.t_toggle",

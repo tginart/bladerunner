@@ -67,6 +67,52 @@ impl SessionActor {
         }
     }
 
+    /// Purpose: Start the built-in `n-shot` workflow for `/n-shot <N> <prompt>`.
+    /// Input: The number of shots, the prompt for each shot, and the raw command args.
+    /// Output: The message to show to the user.
+    /// Note: The run continues in the background. Its completion wakes this session.
+    pub(crate) async fn launch_n_shot(self: &Arc<Self>, n: u64, prompt: &str, raw: &str) -> String {
+        let resolved = match crate::session::workflow::registry::resolve_by_name("n-shot", None) {
+            Ok(r) => r,
+            Err(e) => return format!("n-shot workflow unavailable: {e}"),
+        };
+        let spec = crate::session::workflow::manager::LaunchSpec {
+            objective: prompt.to_string(),
+            args: serde_json::json!({ "n": n, "prompt": prompt }),
+            agent_budget: None,
+            resume_run_id: None,
+        };
+        let launched = self.workflow_manager.lock().await.launch(resolved, spec);
+        let (run_id, outcome_rx) = match launched {
+            Ok(launched) => launched,
+            Err(e) => return format!("Could not start n-shot: {e}"),
+        };
+        let display = self
+            .workflow_tracker()
+            .await
+            .lock()
+            .get(&run_id)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "n-shot".to_string());
+        self.push_workflow_launch_reminder(
+            &display,
+            &run_id,
+            prompt,
+            &format!("/n-shot {raw}"),
+            false,
+        );
+        tokio::spawn(async move {
+            if let Ok(outcome) = outcome_rx.await {
+                tracing::info!(run_id, ?outcome, "n-shot finished");
+            }
+        });
+        format!(
+            "Forked this conversation into {n} shots, each in its own git worktree. They run \
+             in the background; this session compares them when all finish. Reopen the \
+             side-by-side view with /workflows."
+        )
+    }
+
     pub(crate) async fn manage_workflow_run(self: &Arc<Self>, run_id: &str, op: &str) -> String {
         use crate::session::workflow::tracker::WorkflowRunStatus;
 

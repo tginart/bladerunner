@@ -5,6 +5,8 @@ use std::sync::LazyLock;
 use xai_grok_tools::implementations::grok_build::LoopFireMode;
 use xai_grok_tools::implementations::skills::skill::format_skill_name;
 use xai_grok_tools::implementations::skills::types::SkillInfo;
+/// Upper bound on `/n-shot` forks. Keep in sync with `workflows/n_shot.rhai`.
+pub(super) const N_SHOT_MAX_SHOTS: u64 = 10;
 /// A built-in slash command.
 pub(crate) struct BuiltinCommand {
     pub name: &'static str,
@@ -260,6 +262,16 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         gate: BuiltinGate::WorkflowLaunches,
         resolve: |args| BuiltinAction::DeepResearch {
             query: args.trim().to_string(),
+        },
+    },
+    BuiltinCommand {
+        name: "n-shot",
+        description: "Fork this conversation into N parallel attempts in separate worktrees, then compare them",
+        argument_hint: Some("<N> <prompt>"),
+        aliases: &[],
+        gate: BuiltinGate::WorkflowLaunches,
+        resolve: |args| BuiltinAction::NShot {
+            args: args.trim().to_string(),
         },
     },
     BuiltinCommand {
@@ -1298,6 +1310,9 @@ pub(super) enum BuiltinAction {
     DeepResearch {
         query: String,
     },
+    NShot {
+        args: String,
+    },
     WorkflowManage {
         run_id: String,
         op: String,
@@ -1346,6 +1361,7 @@ impl BuiltinAction {
             | BuiltinAction::GoalResume
             | BuiltinAction::GoalClear => "goal",
             BuiltinAction::DeepResearch { .. } => "deep-research-workflow",
+            BuiltinAction::NShot { .. } => "n-shot",
             BuiltinAction::WorkflowManage { .. } => "workflow",
             BuiltinAction::WorkflowLaunch { .. } => "workflow",
             BuiltinAction::WasmCommand { name, .. } => name.as_str(),
@@ -1383,6 +1399,7 @@ impl BuiltinAction {
             | BuiltinAction::GoalResume
             | BuiltinAction::GoalClear => false,
             BuiltinAction::DeepResearch { .. } => true,
+            BuiltinAction::NShot { args } => !args.is_empty(),
             BuiltinAction::WorkflowManage { .. } => true,
             BuiltinAction::WorkflowLaunch { input, .. } => !input.is_empty(),
             BuiltinAction::WasmCommand { args, .. } => !args.is_empty(),
@@ -1654,6 +1671,26 @@ pub(super) fn resolve(
         }));
     }
     Ok(prompt_blocks)
+}
+/// Purpose: Parse the arguments of `/n-shot`.
+/// Input: The text after the command name, in the form `<N> <prompt>`.
+/// Output: The number of shots and the prompt, or a usage message.
+pub(super) fn parse_n_shot_args(args: &str) -> Result<(u64, String), String> {
+    let usage = format!(
+        "Usage: /n-shot <N> <prompt>\nFork this conversation into N (1-{N_SHOT_MAX_SHOTS}) \
+         parallel attempts, each in its own git worktree. When all finish, this session \
+         compares them and helps you pick one or combine them."
+    );
+    let args = args.trim();
+    let (count, prompt) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let Ok(n) = count.parse::<u64>() else {
+        return Err(usage);
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() || n == 0 || n > N_SHOT_MAX_SHOTS {
+        return Err(usage);
+    }
+    Ok((n, prompt.to_string()))
 }
 /// Extract `(name, args)` if the first text block starts with `/`.
 ///
@@ -2310,6 +2347,7 @@ mod tests {
                 "session-info",
                 "feedback",
                 "deep-research-workflow",
+                "n-shot",
                 "workflow",
                 "goal",
                 "loop",
@@ -3189,6 +3227,34 @@ mod tests {
                 .iter()
                 .any(|name| name == "computer-use")
         );
+    }
+    #[test]
+    fn n_shot_resolves_and_parses_count_and_prompt() {
+        let outcome = resolve(
+            vec![text_block("/n-shot 3 fix the flaky test")],
+            &[],
+            all_gated(),
+            SkillSlashRewrite::default(),
+            &[],
+        )
+        .unwrap_err();
+        let SlashCommandOutcome::Builtin(BuiltinAction::NShot { args }) = outcome else {
+            panic!("expected NShot, got {outcome:?}");
+        };
+        assert_eq!(
+            parse_n_shot_args(&args),
+            Ok((3, "fix the flaky test".to_string()))
+        );
+        assert_eq!(
+            parse_n_shot_args("2\nmulti\nline"),
+            Ok((2, "multi\nline".to_string()))
+        );
+        for bad in ["", "3", "three do it", "0 do it", "11 do it", "-1 do it"] {
+            assert!(
+                parse_n_shot_args(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
     #[test]
     fn memory_resolves_when_disabled_but_configured() {
