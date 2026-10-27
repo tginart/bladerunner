@@ -6238,8 +6238,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/tool_index.rs",
-      "bytes": 97234,
-      "sha256": "5d4abb41f7168cb526ffe705adc47d55a5620483c2e0677ae7c47847c724a400",
+      "bytes": 106240,
+      "sha256": "3b5c8b0d1dbb409364dd8d1bf962bb3d0d5bf8d41c5f28a67a90078c6a34bfa7",
       "mode": "0644"
     },
     {
@@ -10396,8 +10396,8 @@
     },
     {
       "path": "packages/tools/xai-grok-tools/src/implementations/search_tool/types.rs",
-      "bytes": 629,
-      "sha256": "305f3f4cb2cc35d633f68691b16d403a87119305534c8f4ec95a4eba076a04f2",
+      "bytes": 1745,
+      "sha256": "35246c26fad6a1272839c67da0b3a32d2e07caa1e15c6bf66da6914bfa4e9856",
       "mode": "0644"
     },
     {

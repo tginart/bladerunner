@@ -166,13 +166,20 @@ impl ToolSearchIndex for Bm25ToolSearchIndex {
             };
         }
 
-        // Fast path: exact match on qualified name or bare tool name.
-        // When the model already knows the tool name (e.g. "grafana-ai__SearchDashboards"
-        // or "SearchDashboards"), skip BM25 entirely and return the match directly.
+        // Skip BM25 when the model supplies an exact name, optionally with its server.
+        // Require exactly two tokens for the server form to preserve prose searches.
         let query_lower = query.trim().to_lowercase();
+        let mut query_parts = query_lower.split_whitespace();
+        let server_tool = match (query_parts.next(), query_parts.next(), query_parts.next()) {
+            (Some(server), Some(tool), None) => Some((server, tool)),
+            _ => None,
+        };
         if let Some(exact) = snapshot.tools.iter().find(|t| {
             t.qualified_name.to_lowercase() == query_lower
                 || t.tool_name.to_lowercase() == query_lower
+                || server_tool.is_some_and(|(server, tool)| {
+                    t.server_name.to_lowercase() == server && t.tool_name.to_lowercase() == tool
+                })
         }) {
             return SearchSnapshot {
                 results: vec![ToolSearchResult {
@@ -675,6 +682,197 @@ mod tests {
     }
 
     // -- exact match tests --
+
+    /// Purpose: Provide short distractors before a verbose exact-name target.
+    /// Input: None.
+    /// Output: Synthetic tool metadata that exposes BM25 document-length effects.
+    fn computer_use_tools() -> Vec<ToolMetadata> {
+        vec![
+            ToolMetadata {
+                qualified_name: "computer-use__get_session_state".into(),
+                server_name: "computer-use".into(),
+                tool_name: "get_session_state".into(),
+                description: "Get session and window state".into(),
+                parameters: vec![],
+                input_schema: serde_json::json!({}),
+            },
+            ToolMetadata {
+                qualified_name: "computer-use__inspect_window".into(),
+                server_name: "computer-use".into(),
+                tool_name: "inspect_window".into(),
+                description: "Alias for get_window_state".into(),
+                parameters: vec![],
+                input_schema: serde_json::json!({}),
+            },
+            ToolMetadata {
+                qualified_name: "computer-use__get_window_state".into(),
+                server_name: "computer-use".into(),
+                tool_name: "get_window_state".into(),
+                description: "Return the requested window's accessibility tree, visible \
+                    controls, labels, roles, values, child elements, application metadata, \
+                    focus details, geometry, and incremental changes. "
+                    .repeat(16),
+                parameters: vec!["pid".into(), "window_id".into(), "query".into()],
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pid": {"type": "integer"},
+                        "window_id": {"type": "integer"},
+                        "query": {"type": "string"}
+                    },
+                    "required": ["pid", "window_id"]
+                }),
+            },
+        ]
+    }
+
+    /// Purpose: Verify that exact names bypass BM25 for every supported query form.
+    /// Input: A verbose target and short distractors.
+    /// Output: Assertions for one exact result at each result limit.
+    #[test]
+    fn search_exact_name_beats_short_distractors() {
+        let index = Bm25ToolSearchIndex::new(make_snapshot(computer_use_tools()));
+
+        for query in [
+            "get_window_state",
+            "computer-use__get_window_state",
+            "computer-use get_window_state",
+        ] {
+            for limit in [1, 5] {
+                let snap = index.search_snapshot(query, limit);
+                assert_eq!(snap.results.len(), 1, "query: {query}, limit: {limit}");
+                assert_eq!(
+                    snap.results[0].tool_name, "computer-use__get_window_state",
+                    "query: {query}, limit: {limit}"
+                );
+                assert_eq!(snap.results[0].score, 1.0, "query: {query}");
+            }
+        }
+    }
+
+    /// Purpose: Verify server-prefixed exact names across case, whitespace, and identifier formats.
+    /// Input: Tool metadata with different server and tool name formats.
+    /// Output: Assertions for the canonical result and exact score.
+    #[test]
+    fn search_server_prefixed_exact_identifier_formats() {
+        let tools = mcp_format_tools();
+        let index = Bm25ToolSearchIndex::new(make_snapshot(tools.clone()));
+
+        for tool in tools {
+            for query in [
+                format!("{} {}", tool.server_name, tool.tool_name),
+                format!(
+                    " \t{}  \t{}\n ",
+                    tool.server_name.to_uppercase(),
+                    tool.tool_name.to_uppercase()
+                ),
+            ] {
+                let snap = index.search_snapshot(&query, 5);
+                assert_eq!(snap.results.len(), 1, "query: {query:?}");
+                assert_eq!(snap.results[0].tool_name, tool.qualified_name);
+                assert_eq!(snap.results[0].score, 1.0);
+            }
+        }
+    }
+
+    /// Purpose: Verify that a server prefix selects the tool from that server.
+    /// Input: Two servers with the same bare tool name.
+    /// Output: Assertions for server-specific exact results and unchanged bare-name priority.
+    #[test]
+    fn search_server_prefixed_exact_disambiguates_duplicate_names() {
+        let mut tools = computer_use_tools();
+        let mut duplicate = tools.last().unwrap().clone();
+        duplicate.server_name = "other-server".into();
+        duplicate.qualified_name = "other-server__get_window_state".into();
+        tools.insert(0, duplicate);
+        let index = Bm25ToolSearchIndex::new(make_snapshot(tools));
+
+        for server in ["computer-use", "other-server"] {
+            let snap = index.search_snapshot(&format!("{server} get_window_state"), 5);
+            assert_eq!(snap.results.len(), 1);
+            assert_eq!(
+                snap.results[0].tool_name,
+                format!("{server}__get_window_state")
+            );
+            assert_eq!(snap.results[0].server_name, server);
+            assert_eq!(snap.results[0].score, 1.0);
+        }
+
+        let snap = index.search_snapshot("get_window_state", 5);
+        assert_eq!(snap.results.len(), 1);
+        assert_eq!(snap.results[0].tool_name, "other-server__get_window_state");
+    }
+
+    /// Purpose: Verify that exact lookup preserves tool metadata and snapshot state.
+    /// Input: A canonical name that differs from the search names and both readiness states.
+    /// Output: Assertions for all result fields, catalog count, and readiness.
+    #[test]
+    fn search_server_prefixed_exact_preserves_metadata_and_readiness() {
+        let mut tools = computer_use_tools();
+        let target = tools.last_mut().unwrap();
+        target.qualified_name = "connector-17__tool-42".into();
+        let expected = target.clone();
+        let total_hidden_tools = tools.len();
+        let snapshot = make_snapshot(tools);
+        let index = Bm25ToolSearchIndex::new(snapshot.clone());
+
+        for is_ready in [true, false] {
+            snapshot.lock().unwrap().mcp_initialized = is_ready;
+            let snap = index.search_snapshot("computer-use get_window_state", 5);
+            assert_eq!(snap.is_ready, is_ready);
+            assert_eq!(snap.total_hidden_tools, total_hidden_tools);
+            assert_eq!(snap.results.len(), 1);
+            let result = &snap.results[0];
+            assert_eq!(result.tool_name, expected.qualified_name);
+            assert_eq!(result.server_name, expected.server_name);
+            assert_eq!(result.description, expected.description);
+            assert_eq!(result.parameters, expected.parameters);
+            assert_eq!(result.input_schema, expected.input_schema);
+            assert_eq!(result.score, 1.0);
+        }
+    }
+
+    /// Purpose: Verify that queries without an exact server-tool pair retain BM25 results.
+    /// Input: Extra words, unknown names, a mismatched server, and natural language.
+    /// Output: Assertions that results and scores equal direct BM25 search results.
+    #[test]
+    fn search_nonexact_server_prefixed_queries_keep_bm25_fallback() {
+        let mut tools = computer_use_tools();
+        tools.extend(linear_tools());
+        let documents: Vec<String> = tools.iter().map(|t| t.to_document()).collect();
+        let engine = SearchEngineBuilder::<u32>::with_corpus(Language::English, documents).build();
+        let index = Bm25ToolSearchIndex::new(make_snapshot(tools.clone()));
+
+        for query in [
+            "computer-use get_window_state details",
+            "please computer-use get_window_state",
+            "unknown-server get_window_state",
+            "computer-use get_window_stte",
+            "computer-use save_issue",
+            "linear get_window_state",
+            "get_window_state computer-use",
+            "window state",
+        ] {
+            let expected: Vec<_> = engine
+                .search(&normalize_query(query), 5)
+                .into_iter()
+                .map(|result| {
+                    (
+                        tools[result.document.id as usize].qualified_name.as_str(),
+                        result.score,
+                    )
+                })
+                .collect();
+            let snap = index.search_snapshot(query, 5);
+            let actual: Vec<_> = snap
+                .results
+                .iter()
+                .map(|result| (result.tool_name.as_str(), result.score))
+                .collect();
+            assert!(!expected.is_empty(), "query: {query}");
+            assert_eq!(actual, expected, "query: {query}");
+        }
+    }
 
     #[test]
     fn search_exact_qualified_name() {
