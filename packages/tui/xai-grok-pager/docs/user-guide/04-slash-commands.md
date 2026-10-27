@@ -10,6 +10,29 @@ Every command below lists its aliases where it has them. A few commands only app
 
 ## Session Management
 
+### `/computer-use [on|off|status]`
+
+Toggle browser and desktop control through [Cua Driver](https://cua.ai/docs/cua-driver/quickstart).
+Alias: `/cua`. No startup flag or manual MCP configuration is needed.
+
+Install Cua Driver once, then run `/computer-use` to enable it. The command finds
+`cua-driver` on PATH or in its standard installation directory and saves the
+`computer-use` MCP definition. Your on/off preference carries across sessions.
+`/computer-use off` disconnects that server and removes its tools from the session.
+Normal tool approval rules and organization MCP policies still apply.
+
+On macOS, Bladerunner starts a private embedded Cua daemon and MCP proxy as direct
+children. The daemon supplies the agent cursor overlay. A dedicated lifetime pipe
+makes it shut down when Bladerunner exits, including a forced kill.
+`/computer-use off` closes the connection and stops its daemon too.
+Accessibility and Screen Recording belong to the host app, usually Terminal or
+iTerm. Grant those permissions to that app in System Settings, then restart
+Bladerunner. This mode does not launch the standalone CuaDriver app.
+When launched from an IDE or another app, that app may own the permissions instead.
+The first native screenshot may also show macOS's direct-capture consent dialog
+for the host app. The integration permits that native dialog; macOS still enforces
+the permission decision.
+
 ### `/new`
 
 Start a fresh session and clear the current conversation. Alias: `/clear`.

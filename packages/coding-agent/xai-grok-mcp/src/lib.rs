@@ -39,3 +39,5 @@ pub mod wire;
 
 mod bearer_token_file;
 mod call_result;
+#[cfg(target_os = "macos")]
+mod embedded_cua;

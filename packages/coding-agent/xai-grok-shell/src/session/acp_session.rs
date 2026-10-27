@@ -132,6 +132,8 @@ mod mcp;
 mod model_switch;
 #[path = "acp_session_impl/slash_exec.rs"]
 mod slash_exec;
+#[path = "acp_session_impl/computer_use.rs"]
+mod computer_use;
 use super::PromptOrigin;
 use super::acp_types;
 use super::chat_persistence;
@@ -956,9 +958,8 @@ pub(crate) struct SessionActor {
     /// Cleared by `maybe_inject_mcp_reminder` after injecting.
     pub(crate) mcp_reminder_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) mcp_connecting_reminder_injected: std::cell::Cell<bool>,
-    /// Wakes waiters when MCP background handshakes finish and
-    /// `initializing_servers` is cleared. Used by
-    /// `wait_for_mcp_templated_prefix_ready` to avoid polling.
+    /// Wakes waiters after each MCP background handshake completes.
+    /// Consumers recheck the required server or batch state after every wake.
     pub(crate) mcp_handshakes_done: Arc<tokio::sync::Notify>,
     /// Background-computed user-message prefix, injected before the first prompt.
     pub(crate) deferred_prefix: TaskSlot<String>,

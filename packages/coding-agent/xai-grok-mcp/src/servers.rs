@@ -2089,6 +2089,8 @@ pub struct SafeTokioChildProcess {
     /// Strong `Arc` owner; the scope holds only a `Weak`, dropped on reap.
     process_group: Option<Arc<ProcessGroup>>,
     transport: ResilientRwTransport<tokio::process::ChildStdout, tokio::process::ChildStdin>,
+    #[cfg(target_os = "macos")]
+    embedded_cua: Option<crate::embedded_cua::CuaDaemon>,
 }
 
 impl SafeTokioChildProcess {
@@ -2162,6 +2164,8 @@ impl SafeTokioChildProcess {
                 child: Some(child),
                 process_group,
                 transport: ResilientRwTransport::new(stdout, stdin, server_name, event_writer),
+                #[cfg(target_os = "macos")]
+                embedded_cua: None,
             },
             stderr,
         ))
@@ -2182,6 +2186,8 @@ impl SafeTokioChildProcess {
     }
 
     async fn graceful_shutdown(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        drop(self.embedded_cua.take());
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
@@ -3122,6 +3128,21 @@ impl McpClient {
         {
             let mut guard = self.state.lock().await;
             *guard = new_state;
+        }
+        self.init_done.notify_waiters();
+    }
+
+    /// Purpose: Close an active transport even when another task retains the client.
+    /// Input: The live MCP client.
+    /// Output: A cancelled service and no reusable transport.
+    pub async fn shutdown(&self) {
+        self.set_liveness_handle(None);
+        let previous = {
+            let mut state = self.state.lock().await;
+            std::mem::replace(&mut *state, ClientState::Empty)
+        };
+        if let ClientState::Ready(service) = previous {
+            service.cancellation_token().cancel();
         }
         self.init_done.notify_waiters();
     }
@@ -4236,6 +4257,30 @@ pub async fn start_mcp_server(
                     which::which(c).ok()
                 }
             });
+            #[cfg(target_os = "macos")]
+            let embedded_cua =
+                if crate::embedded_cua::is_embedded_cua(&name, &command_str, &spawn_args) {
+                    Some(
+                        crate::embedded_cua::CuaDaemon::start(
+                            &program,
+                            &env,
+                            std::time::Duration::from_secs(startup_timeout),
+                            ctx.scope,
+                        )
+                        .await
+                        .map_err(|source| McpError::SpawnFailed {
+                            server: name.clone(),
+                            source,
+                        })?,
+                    )
+                } else {
+                    None
+                };
+            #[cfg(target_os = "macos")]
+            let spawn_args = embedded_cua
+                .as_ref()
+                .map(|daemon| daemon.proxy_args())
+                .unwrap_or(spawn_args);
             let mut cmd = Command::new(&program);
             cmd.kill_on_drop(true).args(&spawn_args);
             for env_variable in &env {
@@ -4265,6 +4310,12 @@ pub async fn start_mcp_server(
                 }
             })?;
 
+            #[cfg(target_os = "macos")]
+            let transport = {
+                let mut transport = transport;
+                transport.embedded_cua = embedded_cua;
+                transport
+            };
             tracing::debug!("MCP server '{}' spawned: PID={:?}", name, transport.id());
 
             if let Some(stderr) = stderr_handle {
@@ -7885,6 +7936,25 @@ mod cancellation_port_tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_transport_while_service_is_retained() {
+        let (service, _) = recording_service(false).await;
+        let retained = service.clone();
+        let client = McpClient::stub("retained-shutdown");
+        *client.state.lock().await = ClientState::Ready(service);
+
+        client.shutdown().await;
+
+        assert_eq!(client.state_kind().await, ClientStateKind::Empty);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !retained.is_transport_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must close the transport despite the retained service");
     }
 
     async fn recording_service_with_write_gate(
