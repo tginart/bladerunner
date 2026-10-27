@@ -35,7 +35,7 @@
     {
       "path": "Cargo.lock",
       "bytes": 411384,
-      "sha256": "a4493918b8710040d55ec9d42120d4d7d782b221b080a2e2c6699080f0df03c5",
+      "sha256": "8763bf0c48ddba268121fa95e52d04604cca4fb88434a3582be9248830fdbf9a",
       "mode": "0644"
     },
     {
@@ -83,7 +83,7 @@
     {
       "path": "VERSION",
       "bytes": 7,
-      "sha256": "9b3b81e5314efb5d2f9c0897cfd1621c3aaa2b83e900ad599d07a28b314b5b80",
+      "sha256": "b07bb892d144e091a2e472e8c6b03b9635543840bbc61f8ababda8ee9cee2627",
       "mode": "0644"
     },
     {
@@ -3401,7 +3401,7 @@
     {
       "path": "packages/coding-agent/xai-grok-pager-bin/Cargo.toml",
       "bytes": 4451,
-      "sha256": "3e6492c39e21ba049ed836f402df945bffae95267a28f2b17206b6a9178b186b",
+      "sha256": "b7dc36ddcfa4c59a1a33aeacf24d2b5d546d238a3eafdfd3286c02c01a0f92f9",
       "mode": "0644"
     },
     {
@@ -3569,7 +3569,7 @@
     {
       "path": "packages/coding-agent/xai-grok-shell/Cargo.toml",
       "bytes": 10709,
-      "sha256": "1785aadf74983fb252e17ffd8e6a29e5c630aac74298924bbda2a829eed7920e",
+      "sha256": "d9cf80b7e6df6046209f2f247ab6ca81704f083ed396e3612bcca9148dd99b6d",
       "mode": "0644"
     },
     {
@@ -8681,7 +8681,7 @@
     {
       "path": "packages/platform/xai-grok-version/Cargo.toml",
       "bytes": 221,
-      "sha256": "1ba046f5447838369d5548bd9ba9025a1930fe5a86875096a5e0f9918039e5d0",
+      "sha256": "6d13d2fcbf2202dbabc061fb71914cb165f65354dacd32b2f7f74b43a2caab75",
       "mode": "0644"
     },
     {
@@ -13397,7 +13397,7 @@
     {
       "path": "packages/tui/xai-grok-pager/Cargo.toml",
       "bytes": 11509,
-      "sha256": "e9c70785991d4c19ac68e12d80c03f1ed182472e09c3d243bece958ae2c0a2b5",
+      "sha256": "5c12569c8c1a036846c0a31efa4610505334699c521a306ab9b00891cb076c10",
       "mode": "0644"
     },
     {
