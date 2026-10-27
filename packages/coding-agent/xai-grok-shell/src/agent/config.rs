@@ -4094,8 +4094,10 @@ fn openai_codex_catalog_efforts(
     let with_ultra = [LOW, MEDIUM, HIGH, XHIGH, MAX, ULTRA];
 
     let (default, rows) = match model {
-        // Codex catalog (2026): all three GPT-6 models default to medium.
-        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" => (E::Medium, with_ultra.as_slice()),
+        // Codex catalog (2026): all GPT-6 models default to medium.
+        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6.1-terra" => {
+            (E::Medium, with_ultra.as_slice())
+        }
         "gpt-6-luna" => (E::Medium, with_max.as_slice()),
         // Older explicit model ids retain their effort menus, even though they
         // are no longer in the built-in model picker.
@@ -8608,6 +8610,17 @@ reasoning_effort = "low"
         assert!(
             !luna_vals.contains(&ReasoningEffort::Ultra),
             "Luna has max but not ultra in Codex catalog"
+        );
+        let terra = catalog
+            .get("openai-codex/gpt-6.1-terra")
+            .expect("terra present");
+        assert_eq!(terra.info.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert!(
+            terra
+                .info
+                .reasoning_efforts
+                .iter()
+                .any(|o| o.value == ReasoningEffort::Max)
         );
         assert!(!catalog.contains_key("openai-codex/gpt-5.6-terra"));
     }

@@ -2393,6 +2393,11 @@ fn openai_codex_offline_fallbacks() -> Vec<BuiltinPlatformModel> {
             "Frontier agentic coding model (ChatGPT subscription)"
         ),
         codex!(
+            "gpt-6.1-terra",
+            "GPT-6.1 Terra (ChatGPT)",
+            "Balanced agentic coding model (ChatGPT subscription)"
+        ),
+        codex!(
             "gpt-6-luna",
             "GPT-6 Luna (ChatGPT)",
             "Fast and affordable agentic coding model (ChatGPT subscription)"
@@ -2849,7 +2854,10 @@ mod tests {
             .filter(|m| m.legacy_platform() == Some(PlatformId::OpenAiCodex))
             .map(|m| m.model.as_str())
             .collect();
-        assert_eq!(ids, ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"]);
+        assert_eq!(
+            ids,
+            ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"]
+        );
     }
 
     #[test]
