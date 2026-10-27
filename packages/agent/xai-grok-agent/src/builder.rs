@@ -188,9 +188,9 @@ fn apply_workflow_tool_gates(
             .tools
             .retain(|tool| tool.kind != Some(ToolKind::GoalUpdate));
     } else {
-        tool_config
-            .tools
-            .retain(|tool| tool.kind != Some(ToolKind::Workflow));
+        tool_config.tools.retain(|tool| {
+            tool.kind != Some(ToolKind::Workflow) && tool.kind != Some(ToolKind::NShot)
+        });
     }
 }
 impl AgentBuilder {

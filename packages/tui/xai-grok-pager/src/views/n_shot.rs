@@ -339,15 +339,15 @@ mod tests {
 
     #[test]
     fn shot_outcome_reads_the_overview_line() {
-        let summary = "# n-shot\n\n- shot-1: done; worktree /w/1; 2 files changed\n\
-                       - shot-10: failed; worktree (none); unknown\n";
+        let summary = "# n-shot\n\n- shot-1: done; 2 files changed; worktree /w/1\n\
+                       - shot-10: failed; unknown; worktree (none)\n";
         assert_eq!(
             shot_outcome(Some(summary), "shot-1").as_deref(),
-            Some("done; worktree /w/1; 2 files changed")
+            Some("done; 2 files changed; worktree /w/1")
         );
         assert_eq!(
             shot_outcome(Some(summary), "shot-10").as_deref(),
-            Some("failed; worktree (none); unknown")
+            Some("failed; unknown; worktree (none)")
         );
         assert_eq!(shot_outcome(Some(summary), "shot-2"), None);
         assert_eq!(shot_outcome(None, "shot-1"), None);

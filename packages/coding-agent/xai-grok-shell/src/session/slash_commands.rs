@@ -44,6 +44,9 @@ pub(crate) enum BuiltinGate {
     Goal,
     WorkflowLaunches,
     WorkflowManagement,
+    /// The background workflow engine runs, even when the model-facing
+    /// `workflow` tool is not registered (as in Bladerunner).
+    BackgroundWorkflows,
 }
 /// All built-in slash commands. Order here = display order in autocomplete.
 pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -269,7 +272,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Fork this conversation into N parallel attempts in separate worktrees, then compare them",
         argument_hint: Some("<N> <prompt>"),
         aliases: &[],
-        gate: BuiltinGate::WorkflowLaunches,
+        gate: BuiltinGate::BackgroundWorkflows,
         resolve: |args| BuiltinAction::NShot {
             args: args.trim().to_string(),
         },
@@ -398,6 +401,8 @@ pub(crate) struct CommandAvailability {
     pub goal: bool,
     pub workflows: bool,
     pub workflow_management: bool,
+    /// The background workflow engine is enabled for this session.
+    pub background_workflows: bool,
 }
 impl CommandAvailability {
     /// `true` if commands gated on `gate` should be advertised this session.
@@ -413,6 +418,7 @@ impl CommandAvailability {
             BuiltinGate::Goal => self.goal,
             BuiltinGate::WorkflowLaunches => self.workflows,
             BuiltinGate::WorkflowManagement => self.workflows || self.workflow_management,
+            BuiltinGate::BackgroundWorkflows => self.background_workflows,
         }
     }
     /// Test helper: every gate satisfied (matches the legacy "feedback only"
@@ -429,6 +435,7 @@ impl CommandAvailability {
             goal: true,
             workflows: true,
             workflow_management: true,
+            background_workflows: true,
         }
     }
 }
@@ -554,6 +561,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "sessions",
     "settings",
     "share",
+    "shots",
     "show-plan",
     "skills",
     "summarize",
@@ -3255,6 +3263,31 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+    #[test]
+    fn n_shot_needs_the_engine_not_the_workflow_tool() {
+        let without_tool = CommandAvailability {
+            workflows: false,
+            workflow_management: false,
+            ..CommandAvailability::all_enabled()
+        };
+        assert!(advertised_names(without_tool).iter().any(|n| n == "n-shot"));
+        let without_engine = CommandAvailability {
+            background_workflows: false,
+            ..CommandAvailability::all_enabled()
+        };
+        assert!(!advertised_names(without_engine).iter().any(|n| n == "n-shot"));
+        assert!(
+            resolve(
+                vec![text_block("/n-shot 2 do it")],
+                &[],
+                without_engine,
+                SkillSlashRewrite::default(),
+                &[],
+            )
+            .is_ok(),
+            "expected pass-through when the engine is off",
+        );
     }
     #[test]
     fn memory_resolves_when_disabled_but_configured() {

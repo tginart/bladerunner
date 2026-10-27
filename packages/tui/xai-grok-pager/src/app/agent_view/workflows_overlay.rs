@@ -89,6 +89,25 @@ impl AgentView {
         self.show_goal_detail = false;
     }
 
+    /// Open the newest n-shot run in its column view, or the run list when
+    /// this session has no n-shot run.
+    pub(crate) fn open_latest_n_shot(&mut self) {
+        let latest = self
+            .workflow_runs
+            .iter()
+            .rev()
+            .find(|run| crate::views::n_shot::is_n_shot_run(run))
+            .map(|run| run.run_id.clone());
+        match latest {
+            Some(run_id) => self.open_workflow_detail_by_run_id(&run_id),
+            None => {
+                self.workflows_view.reset();
+                self.show_workflows = true;
+                self.show_goal_detail = false;
+            }
+        }
+    }
+
     pub(super) fn handle_workflows_overlay_input(&mut self, ev: &Event) -> Option<InputOutcome> {
         if self.show_workflows {
             if let Event::Key(key) = ev

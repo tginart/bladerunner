@@ -47,8 +47,8 @@ The shots run in the background as a workflow. Bladerunner opens a side-by-side
 view with one column per shot: live status, model, elapsed time, tokens, and the
 tail of that shot's transcript. Use `←`/`→` to move between columns, `Enter` (or
 a click) to open a shot's full transcript, and `Esc` to return to the chat. You
-can keep talking to the session while the shots run. To reopen the columns, run
-`/workflows` and open the n-shot run.
+can keep talking to the session while the shots run. Run `/shots` to reopen the
+columns for the latest run.
 
 When every shot finishes, the session wakes up with a report: each shot's final
 message, worktree path, and changed files. It compares the shots and recommends
@@ -56,8 +56,9 @@ one. Then tell it what to keep, for example "take shot 2" or "use shot 1 but por
 the retry logic from shot 3". It applies the result to your working tree. The
 worktrees stay on disk until you remove them.
 
-The agent can also start an n-shot run itself through the workflow tool, with a
-different prompt or model for each shot. Needs workflows to be enabled.
+The agent can also start an n-shot run itself with its `n_shot` tool, with a
+different prompt or model for each shot. Needs background workflows, which are on
+by default (`[workflows] enabled`).
 
 ### `/new`
 

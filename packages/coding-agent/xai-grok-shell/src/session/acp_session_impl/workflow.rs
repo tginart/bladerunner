@@ -109,7 +109,7 @@ impl SessionActor {
         format!(
             "Forked this conversation into {n} shots, each in its own git worktree. They run \
              in the background; this session compares them when all finish. Reopen the \
-             side-by-side view with /workflows."
+             side-by-side view with /shots."
         )
     }
 

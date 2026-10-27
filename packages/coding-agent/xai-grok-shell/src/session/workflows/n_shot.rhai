@@ -24,7 +24,9 @@ fn usage() {
 
 fn last_line(text) {
     let lines = text.split("\n");
-    lines[lines.len() - 1]
+    let line = lines[lines.len() - 1];
+    line.trim();
+    line
 }
 
 if args == () {
@@ -126,8 +128,8 @@ for r in results {
         output = json_encode(output);
     }
 
-    overview += "- " + shot.label + ": " + status + "; worktree " + worktree + "; "
-        + last_line(changes) + "\n";
+    overview += "- " + shot.label + ": " + status + "; " + last_line(changes)
+        + "; worktree " + worktree + "\n";
     full += heading + "\n\n- Status: " + status + "\n- Worktree: " + worktree + "\n";
     if shot.prompt != args.prompt {
         full += "- Prompt:\n\n" + shot.prompt + "\n\n";

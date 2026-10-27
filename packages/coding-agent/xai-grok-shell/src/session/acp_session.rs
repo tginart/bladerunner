@@ -1272,6 +1272,7 @@ impl SessionActor {
                 n == xai_grok_tools::implementations::grok_build::workflow::WORKFLOW_TOOL_NAME
             }),
             workflow_management: has_workflow_runs,
+            background_workflows: self.background_workflows_enabled,
         }
     }
     /// Names of every tool registered with the session's tool bridge.

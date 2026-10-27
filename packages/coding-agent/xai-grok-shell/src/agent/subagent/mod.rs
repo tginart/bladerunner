@@ -2767,8 +2767,11 @@ pub(crate) fn subagent_temp_worktree_base() -> std::path::PathBuf {
 /// - no group/world write unless root-owned + sticky (`/tmp`)
 ///
 /// If the directory is newly created, `chmod 0700` **must** succeed (`Err` on
-/// failure). Existing insecure leaves/parents are **rejected**, never
-/// auto-chmod'd into acceptance.
+/// failure). An existing leaf that only has group/world read or execute bits
+/// (such as `0o755` from `create_dir_all` under the default umask) is
+/// tightened to `0o700`: no other user could write into it, so nothing in it
+/// can have been planted. Leaves with group/world write bits and insecure
+/// parents are **rejected**, never auto-chmod'd into acceptance.
 ///
 /// **Windows:** only non-symlink directory existence; NTFS ACLs degraded.
 pub(crate) fn ensure_real_dir(path: &std::path::Path) -> Result<(), String> {
@@ -2860,12 +2863,21 @@ pub(crate) fn ensure_real_dir(path: &std::path::Path) -> Result<(), String> {
         }
         let mode = meta.mode();
         if !unix_mode_is_owner_only(mode) {
-            return Err(format!(
-                "managed worktree base '{}' mode {:o} has group/world bits; \
-                 refusing (expected owner-only 0700; will not auto-chmod)",
-                path.display(),
-                mode & 0o777
-            ));
+            if !unix_mode_no_group_world_write(mode) {
+                return Err(format!(
+                    "managed worktree base '{}' mode {:o} is group/world writable; \
+                     refusing (expected owner-only 0700; will not auto-chmod)",
+                    path.display(),
+                    mode & 0o777
+                ));
+            }
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                format!(
+                    "failed to tighten managed worktree base '{}' to 0700: {e}",
+                    path.display()
+                )
+            })?;
         }
         // Parent chain again after create (intermediates may have appeared).
         validate_unix_parent_chain(path)?;

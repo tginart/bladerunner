@@ -1079,6 +1079,8 @@ pub enum Action {
     /// Toggle the expanded goal detail overlay.
     ToggleGoalDetail,
     ToggleWorkflows,
+    /// Open the side-by-side columns of the latest n-shot run.
+    OpenShots,
     Rewind,
     RewindShowPicker,
     RewindPickerSelect(usize),

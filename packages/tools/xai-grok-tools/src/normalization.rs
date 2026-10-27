@@ -131,6 +131,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::SchedulerList(_)
         | ToolInput::UpdateGoal(_)
         | ToolInput::Workflow(_)
+        | ToolInput::NShot(_)
         | ToolInput::AgentHub(_)
         | ToolInput::DapDebug(_)
         | ToolInput::GitRead(_)

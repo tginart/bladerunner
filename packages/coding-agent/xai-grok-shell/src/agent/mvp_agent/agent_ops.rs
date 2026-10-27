@@ -641,6 +641,7 @@ impl MvpAgent {
         crate::session::slash_commands::CommandAvailability {
             goal: self.cfg.borrow().resolve_goal().value,
             workflows: self.cfg.borrow().resolve_workflows().value,
+            background_workflows: self.cfg.borrow().resolve_workflows().value,
             ..crate::session::slash_commands::CommandAvailability::default()
         }
     }
