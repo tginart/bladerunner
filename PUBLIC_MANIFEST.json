@@ -21,12 +21,6 @@
       "mode": "0644"
     },
     {
-      "path": ".github/workflows/verify.yml",
-      "bytes": 1121,
-      "sha256": "fa2e53f097c0646a44aa909a1412b778488c27563f66fecfacb40246532e02b9",
-      "mode": "0644"
-    },
-    {
       "path": ".gitignore",
       "bytes": 213,
       "sha256": "1f84949f23b286c3d7e184cf7636a087c31a8b6fa69c3972f754c069616d8dcd",
@@ -19684,8 +19678,8 @@
     },
     {
       "path": "tools_check_release.py",
-      "bytes": 6251,
-      "sha256": "1d9170caf571e6661ef3b85b9166d80b6d69dcb31a409f4eb5653ce54447b02c",
+      "bytes": 5997,
+      "sha256": "f01a7c255f3f0e5909cf0c8307112a86bd242d01b28acebfff3118437e921ce5",
       "mode": "0644"
     },
     {

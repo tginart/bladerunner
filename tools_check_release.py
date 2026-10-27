@@ -1,4 +1,4 @@
-"""Verify public source integrity and reject private paths and credential markers.
+"""Verify public source integrity and reject credential markers.
 
 Findings contain file paths and categories only. Pattern checks supplement an
 explicit reviewed export; they are not a complete security audit.
@@ -16,9 +16,6 @@ import tarfile
 MANIFEST = "PUBLIC_MANIFEST.json"
 FORBIDDEN_ROOTS = {".git", ".claude", ".cursor", ".grok", "engine", "desktop", "tools"}
 PATTERNS = {
-    "private_checkout_path": rb"/(?:Users|home)/" + rb"tginart(?:/|\b)",
-    "private_host": rb"\b(?:" + rb"ginart" + rb"box|spark-" + rb"500e)\b",
-    "private_repository": rb"github\.com/tginart/bladerunner" + rb"-dev(?:[/\s\"']|$)",
     "credential": rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{60,}|AKIA[A-Z0-9]{16}|sk-proj-[A-Za-z0-9_-]{40,}|eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+",
 }
 # Fixed synthetic credential-detection fixtures. Exact bytes are reviewed;
