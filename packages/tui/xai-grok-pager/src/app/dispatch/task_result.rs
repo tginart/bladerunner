@@ -19,6 +19,7 @@ use super::prompt::{
     defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
     handle_suggestion_debounce_expired,
 };
+use super::ctx::with_active_agent;
 use super::queue::push_and_page_flip;
 use super::rewind::{
     dispatch_rewind_success, handle_rewind_execute_failed, handle_rewind_points_loaded,
@@ -1616,6 +1617,12 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
                 session_id,
                 post_action: true,
             }]
+        }
+        TaskResult::SovereignComplete { message } => {
+            with_active_agent(app, |agent| {
+                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(message));
+            });
+            vec![]
         }
         TaskResult::LogoutKimiComplete { message }
         | TaskResult::LogoutOpenAiCodexComplete { message }

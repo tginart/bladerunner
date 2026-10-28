@@ -27,6 +27,8 @@ pub mod input;
 pub mod input_log;
 pub mod mcp_cmd;
 pub mod memory_cmd;
+pub mod sovereign_cmd;
+pub mod tailnet;
 pub mod memory_release;
 pub mod memory_trace;
 mod scoped_models;

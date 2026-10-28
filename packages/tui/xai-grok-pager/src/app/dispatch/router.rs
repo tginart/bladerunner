@@ -1260,6 +1260,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PermissionCancel => dispatch_permission_cancel(app),
         Action::Logout => dispatch_logout(app),
         Action::LogoutKimi => vec![Effect::LogoutKimi],
+        Action::Sovereign(task) => {
+            app.show_toast(&task.start_label());
+            vec![Effect::Sovereign(task)]
+        }
         Action::LogoutOpenAiCodex => vec![Effect::LogoutOpenAiCodex],
         Action::LogoutAnthropicClaude => vec![Effect::LogoutAnthropicClaude],
         Action::LogoutGitHubCopilot => vec![Effect::LogoutGitHubCopilot],
