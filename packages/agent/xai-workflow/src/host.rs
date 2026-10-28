@@ -38,7 +38,10 @@ pub struct AgentResult {
     /// Worktree root of an `isolation_worktree` agent, kept after the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
-    /// `git status --short` plus `git diff --shortstat HEAD` for that worktree.
+    /// Original commit of a newly created worktree, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base_commit: Option<String>,
+    /// Tracked changes relative to the original commit, plus untracked files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_changes: Option<String>,
 }

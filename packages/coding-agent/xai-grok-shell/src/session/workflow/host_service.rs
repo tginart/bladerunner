@@ -559,6 +559,7 @@ impl HostService {
         let mut resume_child: Option<String> = opts.resume_from.clone();
         let mut next_prompt = prompt;
         let mut fork_context = opts.fork_context;
+        let mut worktree_base_commit = None;
 
         let (result, output) = loop {
             attempts += 1;
@@ -611,6 +612,9 @@ impl HostService {
                     "subagent coordinator channel closed before completion".into(),
                 ));
             };
+            if attempts == 1 {
+                worktree_base_commit = result.worktree_base_commit.clone();
+            }
             total_tokens = total_tokens.saturating_add(result.total_tokens_used);
             total_duration += result.duration_ms;
             if self.params.cancel.is_cancelled() {
@@ -682,9 +686,12 @@ impl HostService {
         );
         self.tick();
 
-        let worktree_changes = match result.worktree_path.as_deref() {
-            Some(path) => worktree_change_summary(Path::new(path)).await,
-            None => None,
+        let worktree_changes = match (
+            result.worktree_path.as_deref(),
+            worktree_base_commit.as_deref(),
+        ) {
+            (Some(path), Some(base)) => worktree_change_summary(Path::new(path), base).await,
+            _ => None,
         };
         Ok(AgentResult {
             agent_id: id,
@@ -694,6 +701,7 @@ impl HostService {
             tokens_used: total_tokens,
             duration_ms: total_duration,
             worktree_path: result.worktree_path.clone(),
+            worktree_base_commit,
             worktree_changes,
         })
     }
@@ -961,21 +969,38 @@ impl HostService {
     }
 }
 
-/// Purpose: Describe the changes that an isolated agent left in its worktree.
-/// Input: The worktree root.
-/// Output: `git status --short` lines and the `git diff --shortstat HEAD` line,
-/// or `None` when git fails.
-/// Note: Untracked files show in the status lines but not in the shortstat.
-async fn worktree_change_summary(worktree: &Path) -> Option<String> {
+/// Purpose: Describe the final worktree state relative to its original commit.
+/// Input: The worktree root and its base commit.
+/// Output: Tracked file changes, untracked files, and tracked change statistics.
+/// Note: Untracked files are not included in the statistics.
+async fn worktree_change_summary(worktree: &Path, base: &str) -> Option<String> {
     const STATUS_CAP_BYTES: usize = 8 * 1024;
-    let status = run_git_in(worktree, &["status", "--short"]).await?;
-    let shortstat = run_git_in(worktree, &["diff", "--shortstat", "HEAD"]).await?;
-    let status = xai_grok_tools::util::truncate_str_with_marker(&status, STATUS_CAP_BYTES);
-    let shortstat = shortstat.trim();
-    if status.trim().is_empty() {
+    let tracked = run_git_in(
+        worktree,
+        &["diff", "--no-ext-diff", "--name-status", base, "--"],
+    )
+    .await?;
+    let untracked = run_git_in(worktree, &["ls-files", "--others", "--exclude-standard"]).await?;
+    let shortstat = run_git_in(
+        worktree,
+        &["diff", "--no-ext-diff", "--shortstat", base, "--"],
+    )
+    .await?;
+    if tracked.trim().is_empty() && untracked.trim().is_empty() {
         return Some("no changes".to_string());
     }
-    Some(format!("{}\n{shortstat}", status.trim_end()))
+    let details = format!(
+        "Tracked changes:\n{}\nUntracked files:\n{}",
+        tracked.trim_end(),
+        untracked.trim_end()
+    );
+    let details = xai_grok_tools::util::truncate_str_with_marker(&details, STATUS_CAP_BYTES);
+    let stat = if shortstat.trim().is_empty() {
+        "no tracked changes"
+    } else {
+        shortstat.trim()
+    };
+    Some(format!("{details}\n{stat}"))
 }
 
 async fn run_git_in(dir: &Path, args: &[&str]) -> Option<String> {
@@ -1018,6 +1043,50 @@ mod tests {
     use crate::session::workflow::notify::WorkflowNotifySender;
     use crate::session::workflow::store::WorkflowRunStore;
     use crate::session::workflow::tracker::WorkflowTracker;
+
+    /// Purpose: Verify that summaries include committed and uncommitted final changes.
+    /// Input: A git repository with a base commit and several worktree states.
+    /// Output: Summaries that match the final state and reject an invalid base.
+    #[tokio::test]
+    async fn worktree_change_summary_includes_commits_and_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        async fn git(repo: &Path, args: &[&str]) -> String {
+            run_git_in(repo, args).await.unwrap()
+        }
+        git(repo, &["init", "-q"]).await;
+        git(repo, &["config", "user.email", "test@example.com"]).await;
+        git(repo, &["config", "user.name", "Test"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(repo, &["add", "tracked"]).await;
+        git(repo, &["commit", "-qm", "base"]).await;
+        let base = git(repo, &["rev-parse", "HEAD"]).await.trim().to_owned();
+        assert_eq!(
+            worktree_change_summary(repo, &base).await.as_deref(),
+            Some("no changes")
+        );
+
+        std::fs::write(repo.join("tracked"), "committed\n").unwrap();
+        git(repo, &["commit", "-qam", "shot"]).await;
+        let summary = worktree_change_summary(repo, &base).await.unwrap();
+        assert!(summary.contains("tracked"), "{summary}");
+        assert!(summary.contains("1 file changed"), "{summary}");
+        assert!(git(repo, &["status", "--short"]).await.is_empty());
+
+        std::fs::write(repo.join("staged"), "staged\n").unwrap();
+        git(repo, &["add", "staged"]).await;
+        std::fs::write(repo.join("tracked"), "committed and unstaged\n").unwrap();
+        std::fs::write(repo.join("untracked"), "new\n").unwrap();
+        let summary = worktree_change_summary(repo, &base).await.unwrap();
+        for expected in ["tracked", "staged", "untracked", "2 files changed"] {
+            assert!(summary.contains(expected), "{summary}");
+        }
+        assert!(
+            worktree_change_summary(repo, "invalid-base")
+                .await
+                .is_none()
+        );
+    }
 
     /// Everything but the per-test tracker and subagent channel; the returned
     /// receiver keeps the persistence channel open for the test's lifetime.

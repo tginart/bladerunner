@@ -891,6 +891,7 @@ mod tests {
             tokens_used: 10,
             duration_ms: 5,
             worktree_path: None,
+            worktree_base_commit: None,
             worktree_changes: None,
         }
     }

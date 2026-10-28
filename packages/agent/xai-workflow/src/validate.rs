@@ -88,6 +88,7 @@ pub fn validate_script_with_agent_budget(
                         tokens_used: 1,
                         duration_ms: 1,
                         worktree_path: None,
+                        worktree_base_commit: None,
                         worktree_changes: None,
                     }));
                 }

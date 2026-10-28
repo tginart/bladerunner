@@ -15,6 +15,12 @@ use super::registry::{ResolvedWorkflow, WorkflowSource};
 use super::store::WorkflowRunStore;
 use super::tracker::WorkflowTracker;
 
+fn is_builtin_script(script: &str) -> bool {
+    super::registry::BUILTIN_WORKFLOWS
+        .iter()
+        .any(|builtin| builtin.script == script)
+}
+
 pub(crate) const WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION: usize = 4;
 pub(crate) const WORKFLOW_DEFAULT_AGENT_BUDGET: u64 = xai_workflow::DEFAULT_AGENT_BUDGET;
 
@@ -127,7 +133,7 @@ impl WorkflowManager {
             return Err(LaunchError::TooManyActiveRuns);
         }
 
-        let allow_fork_context = resolved.source == WorkflowSource::Builtin;
+        let mut allow_fork_context = resolved.source == WorkflowSource::Builtin;
         let mut execution_script = resolved.script;
         let (run_id, journal, state) = match &spec.resume_run_id {
             Some(run_id) => {
@@ -160,6 +166,12 @@ impl WorkflowManager {
                 execution_script = self.store.script_for(run_id).ok_or_else(|| {
                     LaunchError::Store("immutable workflow script is missing".into())
                 })?;
+                allow_fork_context = self.store.is_builtin(run_id);
+                if allow_fork_context && !is_builtin_script(&execution_script) {
+                    return Err(LaunchError::Store(
+                        "persisted built-in workflow no longer matches the trusted source; start a new run".into(),
+                    ));
+                }
                 let mut journal = match existing
                     .journal_path
                     .as_ref()
@@ -206,7 +218,7 @@ impl WorkflowManager {
                 let run_id = format!("wf_{}", uuid::Uuid::now_v7().simple());
                 let agent_budget = spec.agent_budget.unwrap_or(WORKFLOW_DEFAULT_AGENT_BUDGET);
                 self.store
-                    .register(&run_id, &execution_script, &spec.args)
+                    .register(&run_id, &execution_script, &spec.args, allow_fork_context)
                     .map_err(|error| LaunchError::Store(error.to_string()))?;
                 let journal_rel = format!("workflows/{run_id}/journal.jsonl");
                 let journal_path = self.session_dir.as_ref().map(|d| d.join(&journal_rel));
@@ -813,6 +825,17 @@ mod tests {
     use crate::session::persistence::PersistenceMsg;
     use crate::session::workflow::registry::resolve_inline;
 
+    #[test]
+    fn builtin_script_verification_requires_exact_source() {
+        let script = super::super::registry::BUILTIN_WORKFLOWS
+            .iter()
+            .find(|builtin| builtin.name == "n-shot")
+            .unwrap()
+            .script;
+        assert!(super::is_builtin_script(script));
+        assert!(!super::is_builtin_script(&format!("{script}\n")));
+    }
+
     type SubagentEventRx = mpsc::UnboundedReceiver<
         xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
     >;
@@ -1013,6 +1036,7 @@ mod tests {
                 &run_id,
                 "let meta = #{ name: \"t\", description: \"d\" };",
                 &serde_json::json!({}),
+                false,
             )
             .unwrap();
         manager.tracker.lock().start_run(
@@ -1299,6 +1323,7 @@ mod tests {
                 &run_id,
                 "let meta = #{ name: \"t\", description: \"d\" };",
                 &serde_json::json!({}),
+                false,
             )
             .unwrap();
         manager.tracker.lock().start_run(

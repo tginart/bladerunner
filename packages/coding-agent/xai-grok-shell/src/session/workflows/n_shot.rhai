@@ -90,15 +90,17 @@ phase("Join");
 let overview = "# n-shot: " + shots.len().to_string() + " shots finished\n\n";
 let full = overview;
 full += "Each shot started from a copy of this conversation and worked in its own git "
-    + "worktree. Worktree diffs are relative to the worktree HEAD, so they also contain "
-    + "uncommitted changes that the parent had when the shots started.\n\n"
+    + "worktree. Diffs use each shot's base commit and include committed and uncommitted "
+    + "tracked changes, including changes the parent had when the shot started. "
+    + "Untracked files are listed separately and are not in the diff.\n\n"
     + "Guidance for the parent session:\n"
-    + "- Compare and contrast the shots for the user. Name the strengths, weaknesses, and "
-    + "risks of each, and give a recommendation.\n"
-    + "- Inspect a shot with git in its worktree (for example `git -C <worktree> diff HEAD`).\n"
+    + "- Compare and contrast the shots for the user, then give a recommendation.\n"
+    + "- Inspect each shot with `git -C <worktree> diff --binary <base-commit> --` "
+    + "and inspect its untracked files. If the base is unknown, do not assume there are no changes.\n"
     + "- Do not change the parent working tree until the user selects a shot or a combination.\n"
-    + "- To take a shot, apply its tracked diff (`git -C <worktree> diff HEAD | git apply "
-    + "--3way`) and copy its untracked files. To combine shots, port the selected parts by hand.\n"
+    + "- Before adoption, inspect the parent state and avoid overwriting existing changes. "
+    + "Apply or port the selected tracked changes relative to the base commit and copy selected "
+    + "untracked files. Resolve overlaps with parent changes explicitly.\n"
     + "- Keep the worktrees until the user is done with them.\n\n";
 
 let idx = 0;
@@ -122,6 +124,7 @@ for r in results {
         succeeded += 1;
     }
     let worktree = if r != () && r.worktree_path != () { r.worktree_path } else { "(none)" };
+    let base = if r != () && r.worktree_base_commit != () { r.worktree_base_commit } else { "unknown" };
     let changes = if r != () && r.worktree_changes != () { r.worktree_changes } else { "unknown" };
     let output = if r != () && r.output != () { r.output } else { "" };
     if type_of(output) != "string" {
@@ -130,7 +133,8 @@ for r in results {
 
     overview += "- " + shot.label + ": " + status + "; " + last_line(changes)
         + "; worktree " + worktree + "\n";
-    full += heading + "\n\n- Status: " + status + "\n- Worktree: " + worktree + "\n";
+    full += heading + "\n\n- Status: " + status + "\n- Worktree: " + worktree
+        + "\n- Base commit: " + base + "\n";
     if shot.prompt != args.prompt {
         full += "- Prompt:\n\n" + shot.prompt + "\n\n";
     }

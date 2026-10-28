@@ -488,6 +488,8 @@ pub struct SubagentResult {
     pub output_usage_incomplete: bool,
     /// Path to the isolated worktree if one was created.
     pub worktree_path: Option<String>,
+    /// Commit at which a new isolated worktree was created.
+    pub worktree_base_commit: Option<String>,
     /// Set when a blocking subagent exceeded its await budget and was
     /// auto-backgrounded: the child is still running (result via auto-wake /
     /// `get_command_or_subagent_output`), so the tool returns a `task_id` notice
@@ -513,6 +515,7 @@ impl Default for SubagentResult {
             total_tokens_used: 0,
             output_usage_incomplete: false,
             worktree_path: None,
+            worktree_base_commit: None,
             backgrounded: false,
         }
     }

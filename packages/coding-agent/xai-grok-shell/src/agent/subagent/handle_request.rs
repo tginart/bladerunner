@@ -275,6 +275,7 @@ pub(crate) async fn run_shell_child(
     // Resume paths additionally reject symlinks and paths outside managed
     // worktree bases (see `validate_subagent_worktree_path`).
     let source_cwd_for_wt = parent_source_cwd(&ctx);
+    let mut worktree_base_commit = None;
     let worktree_path = if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
             && source.worktree_path.is_none()
@@ -473,6 +474,7 @@ pub(crate) async fn run_shell_child(
                             commit = %report.commit,
                             "Created isolated worktree for subagent"
                         );
+                        worktree_base_commit = Some(report.commit);
                         Some(identity)
                     }
                     Err(e) => {
@@ -1553,6 +1555,7 @@ pub(crate) async fn run_shell_child(
                         worktree_path: worktree_path
                             .as_ref()
                             .map(|p| p.to_string_lossy().to_string()),
+                        worktree_base_commit: None,
                         backgrounded: false,
                     }
                 }
@@ -1584,6 +1587,7 @@ pub(crate) async fn run_shell_child(
                     worktree_path: worktree_path
                         .as_ref()
                         .map(|p| p.to_string_lossy().to_string()),
+                    worktree_base_commit: None,
                     backgrounded: false,
                 },
                 Ok(Ok(crate::session::commands::PromptTurnOk {
@@ -1681,6 +1685,7 @@ pub(crate) async fn run_shell_child(
             }
         }
     };
+    result.worktree_base_commit = worktree_base_commit;
     if let Some(trace_gcs_config) = gcs_upload_ctx.upload_method.as_ref().map(|method| {
         crate::session::repo_changes::TraceExportConfig {
             bucket_url: gcs_upload_ctx.bucket_url.clone(),
