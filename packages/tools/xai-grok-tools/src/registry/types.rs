@@ -696,6 +696,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::DapDebugTool>();
         b.register::<grok_build::UpdateGoalTool>();
         b.register::<grok_build::WorkflowTool>();
+        b.register::<grok_build::NShotTool>();
         b.register::<grok_build::TaskOutputTool>();
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();

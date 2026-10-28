@@ -67,6 +67,7 @@ pub mod scroll_debug;
 pub mod session_info;
 pub mod settings_cmd;
 pub mod share;
+pub mod shots;
 pub mod tasks;
 pub mod theme;
 pub mod timeline;
@@ -151,6 +152,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(mcps::McpsCommand),
         #[cfg(not(feature = "community-build"))]
         Arc::new(workflows::WorkflowsCommand),
+        Arc::new(shots::ShotsCommand),
         Arc::new(btw::BtwCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(doctor::DoctorCommand),
@@ -389,6 +391,7 @@ mod tests {
             "settings",
             "share",
             "enabled-models",
+            "shots",
             "show-plan",
             "skills",
             "sovereign",

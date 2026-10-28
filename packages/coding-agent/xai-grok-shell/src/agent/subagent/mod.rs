@@ -422,6 +422,13 @@ impl SubagentSpawnContext {
             .resolve()
             .value
     }
+    /// Purpose: Decide if completion can snapshot and remove this child's worktree.
+    /// Input: The spawn request and the resolved snapshot feature gate.
+    /// Output: False when the caller requires the worktree for later inspection.
+    pub(crate) fn should_snapshot_subagent_worktree(&self, request: &SubagentRequest) -> bool {
+        !request.runtime_overrides.retain_worktree
+            && self.resolve_subagent_worktree_snapshot_enabled()
+    }
     /// Per-tool params for the child's spawn. The ask_user_question timeout is
     /// session-level config, so it is resolved from the same tiers as the
     /// parent (requirements/env/user/managed from disk; remote from the
@@ -725,6 +732,20 @@ fn community_default_subagent_effort(
     }
     None
 }
+/// Purpose: Select the model for a new context fork.
+/// Input: The spawn request and the parent model ID.
+/// Output: The explicit workflow model, or the parent model for all other forks.
+/// Note: The child runner validates tool model overrides before this call.
+fn fork_model_override(request: &SubagentRequest, parent_model: &str) -> String {
+    if request.owner.is_workflow()
+        && request.runtime_overrides.model_override_provenance == ModelOverrideProvenance::Tool
+        && let Some(model) = &request.runtime_overrides.model
+    {
+        return model.clone();
+    }
+    parent_model.to_string()
+}
+
 /// Resolve a subagent's effective sampling config + model id, honoring the
 /// model-resolution precedence (Key Decision #16).
 ///
@@ -1530,16 +1551,35 @@ async fn bootstrap_initial_context(
             verbatim_fork: false,
         });
     }
-    let live_items = match ctx.parent_chat_state.as_ref() {
-        Some(chat_state) => {
-            let items = chat_state.get_conversation().await;
-            if items.is_empty() { None } else { Some(items) }
+    let frozen = request.runtime_overrides.fork_snapshot.as_ref();
+    let live_items = if let Some(snapshot) = frozen {
+        match serde_json::from_value(snapshot.conversation.clone()) {
+            Ok(items) => Some(items),
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot read frozen launch conversation: {error}"
+                ));
+            }
         }
-        None => None,
+    } else {
+        match ctx.parent_chat_state.as_ref() {
+            Some(chat_state) => {
+                let items = chat_state.get_conversation().await;
+                if items.is_empty() { None } else { Some(items) }
+            }
+            None => None,
+        }
     };
     if let Some(items) = live_items {
         let image_paths = fork_image_paths(&items).await;
-        let initial = verbatim_or_normalize_fork(items, child_context_window);
+        let initial = if frozen.is_some() {
+            // Normalize every shot identically, independent of its model's context window.
+            forked_initial_context(items)
+        } else {
+            verbatim_or_normalize_fork(items, child_context_window)
+        };
+        let frozen_had_context =
+            frozen.is_some() && matches!(initial.source, InitialContextSource::Forked);
         let source_info = ctx
             .parent_session_info
             .clone()
@@ -1558,6 +1598,15 @@ async fn bootstrap_initial_context(
             image_paths,
         )
         .await;
+        if frozen_had_context && !matches!(ctx_out.source, InitialContextSource::Forked) {
+            return BootstrapInitialContext::ResumeAbort(format!(
+                "Cannot bootstrap frozen launch conversation: {}",
+                ctx_out
+                    .copy_error
+                    .as_deref()
+                    .unwrap_or("inherited context unavailable")
+            ));
+        }
         tracing::info!(
             subagent_id = %request.id,
             subagent_type = %request.subagent_type,
@@ -1684,6 +1733,23 @@ fn resolve_child_cwd(
         .map(Path::to_path_buf)
         .or_else(|| override_cwd.filter(|s| !s.is_empty()).map(PathBuf::from))
         .unwrap_or_else(|| parent_cwd.to_path_buf())
+}
+/// Purpose: Remap inherited parent paths only for a new isolated context fork.
+/// Input: The context source, child worktree, and actual parent cwd.
+/// Output: The parent worktree root, or no display cwd for other sessions.
+/// Note: A child worktree contains the full repository, even for a nested parent cwd.
+fn resolve_child_prompt_display_cwd(
+    source: &InitialContextSource,
+    worktree_path: Option<&Path>,
+    parent_cwd: &Path,
+) -> Option<String> {
+    if *source != InitialContextSource::Forked || worktree_path.is_none() {
+        return None;
+    }
+    // Use the parent's worktree, not the durable source repository or main repo.
+    let parent_root = xai_grok_workspace::session::git::find_git_root_from_path(parent_cwd)
+        .unwrap_or_else(|_| parent_cwd.to_path_buf());
+    Some(parent_root.to_string_lossy().into_owned())
 }
 /// The cwd a resumed child inherits from its source subagent, or `None` when
 /// there is nothing to inherit (the caller then falls back to the parent cwd).
@@ -2767,8 +2833,11 @@ pub(crate) fn subagent_temp_worktree_base() -> std::path::PathBuf {
 /// - no group/world write unless root-owned + sticky (`/tmp`)
 ///
 /// If the directory is newly created, `chmod 0700` **must** succeed (`Err` on
-/// failure). Existing insecure leaves/parents are **rejected**, never
-/// auto-chmod'd into acceptance.
+/// failure). An existing leaf that only has group/world read or execute bits
+/// (such as `0o755` from `create_dir_all` under the default umask) is
+/// tightened to `0o700`: no other user could write into it, so nothing in it
+/// can have been planted. Leaves with group/world write bits and insecure
+/// parents are **rejected**, never auto-chmod'd into acceptance.
 ///
 /// **Windows:** only non-symlink directory existence; NTFS ACLs degraded.
 pub(crate) fn ensure_real_dir(path: &std::path::Path) -> Result<(), String> {
@@ -2860,12 +2929,21 @@ pub(crate) fn ensure_real_dir(path: &std::path::Path) -> Result<(), String> {
         }
         let mode = meta.mode();
         if !unix_mode_is_owner_only(mode) {
-            return Err(format!(
-                "managed worktree base '{}' mode {:o} has group/world bits; \
-                 refusing (expected owner-only 0700; will not auto-chmod)",
-                path.display(),
-                mode & 0o777
-            ));
+            if !unix_mode_no_group_world_write(mode) {
+                return Err(format!(
+                    "managed worktree base '{}' mode {:o} is group/world writable; \
+                     refusing (expected owner-only 0700; will not auto-chmod)",
+                    path.display(),
+                    mode & 0o777
+                ));
+            }
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                format!(
+                    "failed to tighten managed worktree base '{}' to 0700: {e}",
+                    path.display()
+                )
+            })?;
         }
         // Parent chain again after create (intermediates may have appeared).
         validate_unix_parent_chain(path)?;

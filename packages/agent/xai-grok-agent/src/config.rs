@@ -303,6 +303,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             (&grok_build::UpdateGoalTool).into(),
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::WorkflowTool).into(),
+            (&grok_build::NShotTool).into(),
         ],
         behavior_preset: None,
     }
@@ -328,6 +329,7 @@ fn grok_build_concise_toolset() -> ToolServerConfig {
             (&grok_build::UpdateGoalTool).into(),
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::WorkflowTool).into(),
+            (&grok_build::NShotTool).into(),
         ],
         behavior_preset: None,
     }
@@ -360,6 +362,7 @@ pub fn grok_build_hashline_toolset(
         (&grok_build::UpdateGoalTool).into(),
         #[cfg(not(feature = "bladerunner-product"))]
         (&grok_build::WorkflowTool).into(),
+        (&grok_build::NShotTool).into(),
     ]);
     ToolServerConfig {
         tools,
@@ -456,6 +459,7 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             (&grok_build::UpdateGoalTool).into(),
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::WorkflowTool).into(),
+            (&grok_build::NShotTool).into(),
             // Plan mode tools
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
@@ -497,6 +501,7 @@ fn orchestrator_toolset() -> ToolServerConfig {
         (&grok_build::UpdateGoalTool).into(),
         #[cfg(not(feature = "bladerunner-product"))]
         (&grok_build::WorkflowTool).into(),
+        (&grok_build::NShotTool).into(),
         // Scheduling and monitoring
         (&grok_build::SchedulerCreateTool).into(),
         (&grok_build::SchedulerDeleteTool).into(),
@@ -553,6 +558,7 @@ fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
             (&grok_build::UpdateGoalTool).into(),
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::WorkflowTool).into(),
+            (&grok_build::NShotTool).into(),
             // Plan mode tools
             (&grok_build::EnterPlanModeTool).into(),
             (&grok_build::ExitPlanModeTool).into(),
@@ -591,6 +597,7 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             (&grok_build::UpdateGoalTool).into(),
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::WorkflowTool).into(),
+            (&grok_build::NShotTool).into(),
             // Ask user tool (without plan mode)
             (&grok_build::AskUserQuestionTool).into(),
         ],

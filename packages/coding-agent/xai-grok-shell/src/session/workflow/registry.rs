@@ -12,10 +12,16 @@ pub(crate) struct BuiltinWorkflow {
     pub script: &'static str,
 }
 
-pub(crate) const BUILTIN_WORKFLOWS: &[BuiltinWorkflow] = &[BuiltinWorkflow {
-    name: "deep-research",
-    script: include_str!("../workflows/deep_research.rhai"),
-}];
+pub(crate) const BUILTIN_WORKFLOWS: &[BuiltinWorkflow] = &[
+    BuiltinWorkflow {
+        name: "deep-research",
+        script: include_str!("../workflows/deep_research.rhai"),
+    },
+    BuiltinWorkflow {
+        name: "n-shot",
+        script: include_str!("../workflows/n_shot.rhai"),
+    },
+];
 
 pub(crate) struct ResolvedWorkflow {
     pub meta: WorkflowMeta,

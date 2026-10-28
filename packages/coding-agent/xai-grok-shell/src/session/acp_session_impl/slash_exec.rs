@@ -900,6 +900,14 @@ impl SessionActor {
                 }
                 ok_end_turn(0, None)
             }
+            BuiltinAction::NShot { args } => {
+                let msg = match slash_commands::parse_n_shot_args(&args) {
+                    Ok((n, prompt)) => self.launch_n_shot(n, &prompt, &args).await,
+                    Err(usage) => usage,
+                };
+                self.send_host_turn_slash_command_output(&msg).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::WorkflowManage { run_id, op } => {
                 let msg = self.manage_workflow_run(&run_id, &op).await;
                 self.send_host_turn_slash_command_output(&msg).await;

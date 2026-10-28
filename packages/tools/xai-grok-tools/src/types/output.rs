@@ -713,6 +713,7 @@ pub enum ToolOutput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListOutput),
     UpdateGoal(crate::implementations::grok_build::update_goal::UpdateGoalOutput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolOutput),
+    NShot(crate::implementations::grok_build::n_shot::NShotToolOutput),
     /// Dynamic output for runtime-registered tools (MCP, test tools, etc.)
     Dynamic(DynamicOutput),
     /// Generic text output for tools that produce simple formatted text
@@ -1074,6 +1075,7 @@ impl ToolOutput {
             }
             ToolOutput::UpdateGoal(o) => o.summary.clone(),
             ToolOutput::Workflow(o) => o.message.clone(),
+            ToolOutput::NShot(o) => o.message.clone(),
             ToolOutput::Dynamic(v) => serde_json::to_string_pretty(&v.value).unwrap_or_default(),
             ToolOutput::Text(text) => text.text.clone(),
             ToolOutput::ImageGen(m) => m.prompt_text("Image generated"),

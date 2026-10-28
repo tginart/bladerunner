@@ -12,6 +12,8 @@ use xai_grok_tools::implementations::grok_build::task::coordinator::{
 };
 use xai_tool_types::SubagentReasoningEffort;
 
+mod frozen_bootstrap;
+
 #[tokio::test]
 async fn live_fork_without_images_keeps_inherited_request_evidence() {
     use crate::session::storage::StorageAdapter;
@@ -441,6 +443,29 @@ fn prepare_secure_temp_base() -> std::path::PathBuf {
         }
     }
     base
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_real_dir_tightens_read_only_exposure_but_rejects_writable_bases() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    // macOS temp dirs sit under the `/var` symlink, which the parent check rejects.
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let readable = root_path.join("readable");
+    std::fs::create_dir(&readable).unwrap();
+    std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    super::ensure_real_dir(&readable).expect("0755 base is tightened, not refused");
+    let mode = std::fs::metadata(&readable).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    let writable = root_path.join("writable");
+    std::fs::create_dir(&writable).unwrap();
+    std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = super::ensure_real_dir(&writable).unwrap_err();
+    assert!(err.contains("group/world writable"), "{err}");
+    let mode = std::fs::metadata(&writable).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o775, "a writable base is left untouched");
 }
 
 #[test]

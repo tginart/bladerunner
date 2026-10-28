@@ -158,8 +158,19 @@ pub enum ModelOverrideProvenance {
     Tool,
 }
 
+/// Purpose: Hold the immutable workspace and conversation for one internal fork launch.
+/// Input: A managed workspace path and serialized parent conversation.
+/// Output: Shared launch data, also persisted for workflow resume.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubagentForkSnapshot {
+    pub workspace_path: std::path::PathBuf,
+    pub conversation: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRuntimeOverrides {
+    /// Internal launch snapshot. Never exposed as a model tool argument.
+    pub fork_snapshot: Option<Arc<SubagentForkSnapshot>>,
     /// Override the model (e.g. "test-model").
     pub model: Option<String>,
     /// Whether `model` came from a model-facing Task call or internal harness logic.
@@ -173,6 +184,9 @@ pub struct SubagentRuntimeOverrides {
     /// Isolation mode for child execution environment.
     /// `None` means "use role/persona default" (which itself defaults to `None`/shared workspace).
     pub isolation: Option<SubagentIsolationMode>,
+    /// Keep the completed worktree for inspection instead of snapshot cleanup.
+    /// Internal caller policy; not exposed on `TaskToolInput`.
+    pub retain_worktree: bool,
     /// `/goal`-only harness override: the `agent_type` (e.g. `"cursor"`,
     /// `"grok-build-plan"`) whose `AgentDefinition` decides the child's harness
     /// flavor — system prompt + toolset — applied
@@ -488,6 +502,8 @@ pub struct SubagentResult {
     pub output_usage_incomplete: bool,
     /// Path to the isolated worktree if one was created.
     pub worktree_path: Option<String>,
+    /// Commit at which a new isolated worktree was created.
+    pub worktree_base_commit: Option<String>,
     /// Set when a blocking subagent exceeded its await budget and was
     /// auto-backgrounded: the child is still running (result via auto-wake /
     /// `get_command_or_subagent_output`), so the tool returns a `task_id` notice
@@ -513,6 +529,7 @@ impl Default for SubagentResult {
             total_tokens_used: 0,
             output_usage_incomplete: false,
             worktree_path: None,
+            worktree_base_commit: None,
             backgrounded: false,
         }
     }

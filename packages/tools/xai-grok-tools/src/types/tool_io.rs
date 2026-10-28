@@ -103,6 +103,7 @@ pub enum ToolInput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListInput),
     UpdateGoal(UpdateGoalInput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
+    NShot(crate::implementations::grok_build::n_shot::NShotToolInput),
     AgentHub(AgentHubInput),
     DapDebug(DapDebugInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)

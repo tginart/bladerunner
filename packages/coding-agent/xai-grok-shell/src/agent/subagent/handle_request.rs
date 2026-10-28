@@ -275,6 +275,7 @@ pub(crate) async fn run_shell_child(
     // Resume paths additionally reject symlinks and paths outside managed
     // worktree bases (see `validate_subagent_worktree_path`).
     let source_cwd_for_wt = parent_source_cwd(&ctx);
+    let mut worktree_base_commit = None;
     let worktree_path = if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
             && source.worktree_path.is_none()
@@ -442,7 +443,10 @@ pub(crate) async fn run_shell_child(
                 super::subagent_temp_worktree_base().join(format!("subagent-{}", request.id))
             }
         };
-        let source_clone = source_cwd;
+        let fork_snapshot = request.runtime_overrides.fork_snapshot.clone();
+        let source_clone = fork_snapshot
+            .as_ref()
+            .map_or(source_cwd, |snapshot| snapshot.workspace_path.clone());
         let subagent_id = request.id.clone();
         let creation_mode: xai_fast_worktree::CreationMode = ctx.worktree_type.into();
         let btrfs_delegate = crate::session::worktree::btrfs_delegate_from_env();
@@ -473,6 +477,7 @@ pub(crate) async fn run_shell_child(
                             commit = %report.commit,
                             "Created isolated worktree for subagent"
                         );
+                        worktree_base_commit = Some(report.commit);
                         Some(identity)
                     }
                     Err(e) => {
@@ -609,7 +614,7 @@ pub(crate) async fn run_shell_child(
         });
     }
     if request.fork_context {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
+        effective_runtime.model = Some(fork_model_override(&request, ctx.model_id.0.as_ref()));
     }
     let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
         effective_runtime.model.as_deref(),
@@ -730,7 +735,21 @@ pub(crate) async fn run_shell_child(
     let verbatim_mirror_fork =
         context_source == InitialContextSource::Forked && context_verbatim_fork;
     let context_normalized = fork_context_normalized(&context_source, &forked_conversation);
-    let task_prompt_text = prompt.clone();
+    let prompt_display_cwd = resolve_child_prompt_display_cwd(
+        &context_source,
+        worktree_path.as_deref(),
+        &ctx.parent_cwd,
+    );
+    let task_prompt_text = if prompt_display_cwd.is_some() {
+        format!(
+            "<system-reminder>\nThis task runs in the isolated workspace at {}. \
+             Run terminal commands in this directory and use relative workspace paths. \
+             Do not switch to parent paths from inherited history.\n</system-reminder>\n\n{prompt}",
+            child_session_info.cwd,
+        )
+    } else {
+        prompt.clone()
+    };
     let (mut forked_conversation, mut inherited_prefix_len) =
         (forked_conversation, inherited_prefix_len.unwrap_or(0));
     if context_source != InitialContextSource::Resumed
@@ -1328,7 +1347,7 @@ pub(crate) async fn run_shell_child(
         ctx.workflow_max_concurrent_agents,
         ctx.ask_user_question_enabled,
         ctx.client_hooks.clone(),
-        None,
+        prompt_display_cwd,
         std::collections::HashMap::new(),
         Vec::new(),
         xai_grok_agent::prompt::context::PromptAudience::Subagent,
@@ -1553,6 +1572,7 @@ pub(crate) async fn run_shell_child(
                         worktree_path: worktree_path
                             .as_ref()
                             .map(|p| p.to_string_lossy().to_string()),
+                        worktree_base_commit: None,
                         backgrounded: false,
                     }
                 }
@@ -1584,6 +1604,7 @@ pub(crate) async fn run_shell_child(
                     worktree_path: worktree_path
                         .as_ref()
                         .map(|p| p.to_string_lossy().to_string()),
+                    worktree_base_commit: None,
                     backgrounded: false,
                 },
                 Ok(Ok(crate::session::commands::PromptTurnOk {
@@ -1681,6 +1702,7 @@ pub(crate) async fn run_shell_child(
             }
         }
     };
+    result.worktree_base_commit = worktree_base_commit;
     if let Some(trace_gcs_config) = gcs_upload_ctx.upload_method.as_ref().map(|method| {
         crate::session::repo_changes::TraceExportConfig {
             bucket_url: gcs_upload_ctx.bucket_url.clone(),
@@ -1856,7 +1878,7 @@ pub(crate) async fn run_shell_child(
     completion_data.set_persisted_output_dir(persist_subagent_output(&subagent_meta_dir, &result));
     persist_subagent_completion(&subagent_meta_dir, &result, &gcs_upload_ctx);
     let final_status = result.status().to_string();
-    let snapshot_dispose_enabled = ctx.resolve_subagent_worktree_snapshot_enabled();
+    let snapshot_dispose_enabled = ctx.should_snapshot_subagent_worktree(&request);
     let telemetry_tokens = if result.tool_calls > 0 || result.success {
         child_handle.chat_state_handle.get_total_tokens().await
     } else {

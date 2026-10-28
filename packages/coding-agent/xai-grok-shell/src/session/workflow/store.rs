@@ -20,6 +20,8 @@ pub struct WorkflowRunManifest {
     pub version: u8,
     pub state: WorkflowRunState,
     pub script_revision: u32,
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,7 @@ struct RunSource {
     script: String,
     args: serde_json::Value,
     revision: u32,
+    builtin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +97,7 @@ impl WorkflowRunStore {
                         script: run.script,
                         args: run.args,
                         revision: run.manifest.script_revision,
+                        builtin: run.manifest.builtin,
                     },
                 );
                 let mut state = run.manifest.state;
@@ -121,6 +125,7 @@ impl WorkflowRunStore {
         run_id: &str,
         script: &str,
         args: &serde_json::Value,
+        builtin: bool,
     ) -> io::Result<()> {
         validate_run_id(run_id)?;
         if self.sources.lock().contains_key(run_id) {
@@ -145,21 +150,20 @@ impl WorkflowRunStore {
                 script: script.to_owned(),
                 args: args.clone(),
                 revision: 0,
+                builtin,
             },
         );
         Ok(())
     }
 
     fn manifest_for(&self, state: &WorkflowRunState) -> Option<WorkflowRunManifest> {
-        let revision = self
-            .sources
-            .lock()
-            .get(&state.run_id)
-            .map(|source| source.revision)?;
+        let sources = self.sources.lock();
+        let source = sources.get(&state.run_id)?;
         Some(WorkflowRunManifest {
             version: WORKFLOW_RUN_MANIFEST_VERSION,
             state: state.clone(),
-            script_revision: revision,
+            script_revision: source.revision,
+            builtin: source.builtin,
         })
     }
 
@@ -247,6 +251,13 @@ impl WorkflowRunStore {
             .lock()
             .get(run_id)
             .map(|source| source.script.clone())
+    }
+
+    pub(crate) fn is_builtin(&self, run_id: &str) -> bool {
+        self.sources
+            .lock()
+            .get(run_id)
+            .is_some_and(|source| source.builtin)
     }
 
     pub(crate) fn args_for(&self, run_id: &str) -> Option<serde_json::Value> {
@@ -400,13 +411,44 @@ mod tests {
     use crate::session::workflow::tracker::WorkflowTracker;
 
     #[test]
+    fn builtin_provenance_survives_restore_and_legacy_defaults_to_untrusted() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = WorkflowRunStore::new(None, tx.clone());
+        let args = serde_json::json!({});
+        store.register("wf_1", "complete(1);", &args, true).unwrap();
+        let state = WorkflowTracker::default().start_run(
+            "wf_1".into(),
+            "demo".into(),
+            "objective".into(),
+            Vec::new(),
+            Some(1),
+            None,
+        );
+        let manifest = store.manifest_for(&state).unwrap();
+        assert!(manifest.builtin);
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy.as_object_mut().unwrap().remove("builtin");
+        let legacy: WorkflowRunManifest = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.builtin);
+        let restored = RestoredWorkflowRun {
+            manifest,
+            script: "complete(1);".into(),
+            args,
+        };
+        let (restored_store, _) = WorkflowRunStore::from_restored(None, tx, vec![restored]);
+        assert!(restored_store.is_builtin("wf_1"));
+    }
+
+    #[test]
     fn script_and_args_are_immutable() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let store = WorkflowRunStore::new(Some(dir.path().to_path_buf()), tx);
         let args = serde_json::json!({"objective": "ship"});
 
-        store.register("wf_1", "complete(1);", &args).unwrap();
+        store
+            .register("wf_1", "complete(1);", &args, false)
+            .unwrap();
         std::fs::write(
             dir.path().join("workflows/wf_1/script.rhai"),
             "complete(2);",
@@ -428,7 +470,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let store = WorkflowRunStore::new(None, tx);
         store
-            .register("wf_1", "complete(1);", &serde_json::json!({}))
+            .register("wf_1", "complete(1);", &serde_json::json!({}), false)
             .unwrap();
         let state = WorkflowTracker::default().start_run(
             "wf_1".into(),
@@ -469,6 +511,7 @@ mod tests {
                 version: WORKFLOW_RUN_MANIFEST_VERSION - 1,
                 state,
                 script_revision: 0,
+                builtin: false,
             },
             script: "complete(1);".into(),
             args: serde_json::json!({}),

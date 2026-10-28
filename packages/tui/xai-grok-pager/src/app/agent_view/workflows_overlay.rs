@@ -39,6 +39,18 @@ fn resolve_management_command(
     })
 }
 
+/// Agent ids of the shot columns when `run` is an n-shot run, else empty.
+fn n_shot_agent_ids(run: Option<&crate::views::workflows::WorkflowRunSnapshot>) -> Vec<String> {
+    run.filter(|run| crate::views::n_shot::is_n_shot_run(run))
+        .map(|run| {
+            crate::views::n_shot::shots(run)
+                .iter()
+                .map(|shot| shot.agent_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn transcript_target(
     run: &crate::views::workflows::WorkflowRunSnapshot,
     phase: Option<&str>,
@@ -75,6 +87,41 @@ impl AgentView {
         self.workflows_view.detail_run_id = Some(run_id.to_string());
         self.show_workflows = true;
         self.show_goal_detail = false;
+        self.replay_workflow_column_children();
+    }
+
+    /// Purpose: Load deferred child transcripts before the n-shot columns use them.
+    /// Input: The current workflow selection and the restored child sessions.
+    /// Output: The selected n-shot children have replayed scrollbacks. Other children stay deferred.
+    pub(crate) fn replay_workflow_column_children(&mut self) {
+        let child_ids = {
+            let runs = self.workflow_runs_newest_first();
+            let mut view = self.workflows_view.clone();
+            view.normalize(&runs);
+            n_shot_agent_ids(view.detail_run(&runs))
+        };
+        for child_id in child_ids {
+            crate::app::subagent::ensure_subagent_child_replayed(self, &child_id);
+        }
+    }
+
+    /// Open the newest n-shot run in its column view, or the run list when
+    /// this session has no n-shot run.
+    pub(crate) fn open_latest_n_shot(&mut self) {
+        let latest = self
+            .workflow_runs
+            .iter()
+            .rev()
+            .find(|run| crate::views::n_shot::is_n_shot_run(run))
+            .map(|run| run.run_id.clone());
+        match latest {
+            Some(run_id) => self.open_workflow_detail_by_run_id(&run_id),
+            None => {
+                self.workflows_view.reset();
+                self.show_workflows = true;
+                self.show_goal_detail = false;
+            }
+        }
     }
 
     pub(super) fn handle_workflows_overlay_input(&mut self, ev: &Event) -> Option<InputOutcome> {
@@ -95,7 +142,24 @@ impl AgentView {
                 let manage_target = view
                     .detail_run(&runs)
                     .or_else(|| runs.get(view.selected_run).copied());
+                let shot_ids = n_shot_agent_ids(view.detail_run(&runs));
                 let outcome = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') if !shot_ids.is_empty() => {
+                        view.n_shot_focus = view.n_shot_focus.saturating_sub(1);
+                        self.workflows_view = view;
+                        InputOutcome::Changed
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if !shot_ids.is_empty() => {
+                        view.n_shot_focus = (view.n_shot_focus + 1).min(shot_ids.len() - 1);
+                        self.workflows_view = view;
+                        InputOutcome::Changed
+                    }
+                    KeyCode::Enter if !shot_ids.is_empty() => {
+                        let focus = view.n_shot_focus.min(shot_ids.len() - 1);
+                        self.open_subagent_fullscreen(shot_ids[focus].clone());
+                        self.workflows_view = view;
+                        InputOutcome::Changed
+                    }
                     KeyCode::Esc | KeyCode::Char('q') => {
                         if in_detail && runs.len() > 1 {
                             view.detail_run_id = None;

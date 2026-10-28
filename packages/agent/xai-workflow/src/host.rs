@@ -17,6 +17,9 @@ pub struct AgentOpts {
     pub capability_mode: Option<String>,
     #[serde(default)]
     pub isolation_worktree: bool,
+    /// Keep the worktree after completion, even when snapshot cleanup is enabled.
+    #[serde(default)]
+    pub retain_worktree: bool,
     #[serde(default)]
     pub fork_context: bool,
     #[serde(default)]
@@ -35,6 +38,15 @@ pub struct AgentResult {
     pub cancelled: bool,
     pub tokens_used: u64,
     pub duration_ms: u64,
+    /// Worktree root of an `isolation_worktree` agent, kept after the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    /// Original commit of a newly created worktree, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base_commit: Option<String>,
+    /// Tracked changes relative to the original commit, plus untracked files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_changes: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
