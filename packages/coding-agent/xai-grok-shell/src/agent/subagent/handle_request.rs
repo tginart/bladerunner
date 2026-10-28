@@ -611,7 +611,7 @@ pub(crate) async fn run_shell_child(
         });
     }
     if request.fork_context {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
+        effective_runtime.model = Some(fork_model_override(&request, ctx.model_id.0.as_ref()));
     }
     let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
         effective_runtime.model.as_deref(),
@@ -1861,7 +1861,7 @@ pub(crate) async fn run_shell_child(
     completion_data.set_persisted_output_dir(persist_subagent_output(&subagent_meta_dir, &result));
     persist_subagent_completion(&subagent_meta_dir, &result, &gcs_upload_ctx);
     let final_status = result.status().to_string();
-    let snapshot_dispose_enabled = ctx.resolve_subagent_worktree_snapshot_enabled();
+    let snapshot_dispose_enabled = ctx.should_snapshot_subagent_worktree(&request);
     let telemetry_tokens = if result.tool_calls > 0 || result.success {
         child_handle.chat_state_handle.get_total_tokens().await
     } else {

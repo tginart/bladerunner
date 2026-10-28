@@ -597,6 +597,30 @@ fn subagent_worktree_snapshot_gate_local_enables() {
     ctx.agent_config = Some(config);
     assert!(ctx.resolve_subagent_worktree_snapshot_enabled());
 }
+/// Purpose: Keep shot worktrees available when snapshot cleanup is enabled.
+/// Input: A workflow request and enabled or disabled snapshot configuration.
+/// Output: Retained worktrees bypass cleanup, including on a resumed request.
+#[test]
+fn retained_worktree_overrides_snapshot_cleanup() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let mut request = bootstrap_test_request(true);
+    request.owner = SubagentOwner::workflow("wf_shots");
+    for enabled in [false, true] {
+        let mut config = crate::agent::config::Config::default();
+        config.features.subagent_worktree_snapshot = Some(enabled);
+        ctx.agent_config = Some(config);
+        request.fork_context = true;
+        request.resume_from = None;
+        request.runtime_overrides.retain_worktree = false;
+        assert_eq!(ctx.should_snapshot_subagent_worktree(&request), enabled);
+        request.runtime_overrides.retain_worktree = true;
+        assert!(!ctx.should_snapshot_subagent_worktree(&request));
+        request.fork_context = false;
+        request.resume_from = Some("previous-shot".into());
+        assert!(!ctx.should_snapshot_subagent_worktree(&request));
+    }
+}
+
 /// Subagent spawns carry concrete ask_user_question timeout params (the
 /// session-level config follows the child) while bash stays on tool
 /// defaults. Tier precedence itself is pinned by the resolver's own
@@ -2579,13 +2603,9 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
             "an unknown override falls through to the pin",
         );
 }
-/// A `fork_context = true` spawn must infer on the parent session model
-/// (`ctx.model_id`) for per-model radix reuse, even when a
-/// `[subagents.models]` pin and an `AgentDefinition.model` override are
-/// both present. `run_shell_child` forces
-/// `effective_runtime.model = Some(ctx.model_id)` on the fork path after
-/// other override sources; the runtime override wins in
-/// `resolve_effective_model_config`.
+/// Purpose: Keep non-workflow forks on the parent model for prefix reuse.
+/// Input: A fork request, a model pin, and an agent-definition model override.
+/// Output: The parent model wins over the other model sources.
 #[tokio::test]
 async fn fork_context_pins_parent_model_over_overrides() {
     use xai_grok_agent::config::ModelOverride;
@@ -2605,13 +2625,11 @@ async fn fork_context_pins_parent_model_over_overrides() {
     };
     let agent_def = ModelOverride::Override("agentdef-model".to_string());
     let ctx = build_ctx();
-    let fork_context = true;
-    let mut runtime_override: Option<String> = None;
-    if fork_context {
-        runtime_override = Some(ctx.model_id.0.to_string());
-    }
+    let mut request = bootstrap_test_request(true);
+    request.runtime_overrides.model = Some("pinned-model".into());
+    let runtime_override = fork_model_override(&request, ctx.model_id.0.as_ref());
     let (config, model_id) = resolve_effective_model_config(
-            runtime_override.as_deref(),
+            Some(&runtime_override),
             "general-purpose",
             &agent_def,
             &ctx,
@@ -2636,6 +2654,35 @@ async fn fork_context_pins_parent_model_over_overrides() {
         );
     assert_eq!(model_id.0.as_ref(), "pinned-model");
 }
+/// Purpose: Preserve an explicit per-shot model through context fork model selection.
+/// Input: Workflow fork requests with and without a validated model override.
+/// Output: The explicit model wins; an unspecified model still uses the parent.
+#[tokio::test]
+async fn workflow_fork_honors_explicit_model_overrides() {
+    use xai_grok_agent::config::ModelOverride;
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.model_id = acp::ModelId::new("parent-model");
+    for model in ["parent-model", "shot-model", "pinned-model"] {
+        ctx.available_models.insert(model.into(), test_model_entry(model));
+    }
+    ctx.subagent_model_overrides.insert("general-purpose".into(), "pinned-model".into());
+    let mut request = bootstrap_test_request(true);
+    request.owner = SubagentOwner::workflow("wf_shots");
+    request.runtime_overrides.model_override_provenance = ModelOverrideProvenance::Tool;
+    for (requested, expected) in [(Some("shot-model"), "shot-model"), (None, "parent-model")] {
+        request.runtime_overrides.model = requested.map(str::to_owned);
+        assert!(super::super::handle_request::task_model_override_error(
+            requested, ModelOverrideProvenance::Tool, false, &ctx.available_models, false,
+        ).is_none());
+        let model_override = fork_model_override(&request, ctx.model_id.0.as_ref());
+        let (config, model_id) = resolve_effective_model_config(
+            Some(&model_override), "general-purpose", &ModelOverride::Inherit, &ctx,
+        ).await;
+        assert_eq!(config.model, expected);
+        assert_eq!(model_id.0.as_ref(), expected);
+    }
+}
+
 /// With no explicit pin, the subagent inherits the parent model for any
 /// parent model, with no special-casing (a "heavy"/custom parent
 /// is treated identically to any other).

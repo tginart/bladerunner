@@ -77,6 +77,7 @@ for shot in shots {
         phase: "Shots",
         fork_context: true,
         isolation_worktree: true,
+        retain_worktree: true,
     };
     if shot.model != () && shot.model != "" {
         job.model = shot.model;

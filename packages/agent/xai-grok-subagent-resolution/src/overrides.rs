@@ -284,6 +284,7 @@ mod tests {
             persona: persona.map(String::from),
             capability_mode,
             isolation,
+            retain_worktree: false,
             harness_agent_type: None,
             completion_output_cap: None,
             spawn_depth: None,

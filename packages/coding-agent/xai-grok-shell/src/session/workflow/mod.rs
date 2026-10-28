@@ -69,6 +69,10 @@ mod builtin_tests {
                     }
                     WorkflowHostRequest::SpawnAgent { opts, reply } => {
                         let has_base = opts.label.as_deref() == Some("shot-1");
+                        assert!(opts.fork_context);
+                        assert!(opts.isolation_worktree);
+                        assert!(opts.retain_worktree);
+                        assert_eq!(opts.model.as_deref(), has_base.then_some("shot-model"));
                         let _ = reply.send(Ok(AgentResult {
                             agent_id: opts.label.unwrap(),
                             success: true,
@@ -94,7 +98,10 @@ mod builtin_tests {
         });
         let outcome = xai_workflow::run_workflow(xai_workflow::WorkflowRunParams {
             script: n_shot_script().into(),
-            args: serde_json::json!({"n": 2, "prompt": "fix it"}),
+            args: serde_json::json!({
+                "prompt": "fix it",
+                "shots": [{"model": "shot-model"}, {}],
+            }),
             journal: xai_workflow::Journal::new(None),
             host_tx,
             cancel: tokio_util::sync::CancellationToken::new(),

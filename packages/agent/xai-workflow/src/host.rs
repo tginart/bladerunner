@@ -17,6 +17,9 @@ pub struct AgentOpts {
     pub capability_mode: Option<String>,
     #[serde(default)]
     pub isolation_worktree: bool,
+    /// Keep the worktree after completion, even when snapshot cleanup is enabled.
+    #[serde(default)]
+    pub retain_worktree: bool,
     #[serde(default)]
     pub fork_context: bool,
     #[serde(default)]

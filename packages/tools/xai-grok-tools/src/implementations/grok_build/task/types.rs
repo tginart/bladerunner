@@ -173,6 +173,9 @@ pub struct SubagentRuntimeOverrides {
     /// Isolation mode for child execution environment.
     /// `None` means "use role/persona default" (which itself defaults to `None`/shared workspace).
     pub isolation: Option<SubagentIsolationMode>,
+    /// Keep the completed worktree for inspection instead of snapshot cleanup.
+    /// Internal caller policy; not exposed on `TaskToolInput`.
+    pub retain_worktree: bool,
     /// `/goal`-only harness override: the `agent_type` (e.g. `"cursor"`,
     /// `"grok-build-plan"`) whose `AgentDefinition` decides the child's harness
     /// flavor — system prompt + toolset — applied

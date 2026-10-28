@@ -422,6 +422,13 @@ impl SubagentSpawnContext {
             .resolve()
             .value
     }
+    /// Purpose: Decide if completion can snapshot and remove this child's worktree.
+    /// Input: The spawn request and the resolved snapshot feature gate.
+    /// Output: False when the caller requires the worktree for later inspection.
+    pub(crate) fn should_snapshot_subagent_worktree(&self, request: &SubagentRequest) -> bool {
+        !request.runtime_overrides.retain_worktree
+            && self.resolve_subagent_worktree_snapshot_enabled()
+    }
     /// Per-tool params for the child's spawn. The ask_user_question timeout is
     /// session-level config, so it is resolved from the same tiers as the
     /// parent (requirements/env/user/managed from disk; remote from the
@@ -725,6 +732,20 @@ fn community_default_subagent_effort(
     }
     None
 }
+/// Purpose: Select the model for a new context fork.
+/// Input: The spawn request and the parent model ID.
+/// Output: The explicit workflow model, or the parent model for all other forks.
+/// Note: The child runner validates tool model overrides before this call.
+fn fork_model_override(request: &SubagentRequest, parent_model: &str) -> String {
+    if request.owner.is_workflow()
+        && request.runtime_overrides.model_override_provenance == ModelOverrideProvenance::Tool
+        && let Some(model) = &request.runtime_overrides.model
+    {
+        return model.clone();
+    }
+    parent_model.to_string()
+}
+
 /// Resolve a subagent's effective sampling config + model id, honoring the
 /// model-resolution precedence (Key Decision #16).
 ///

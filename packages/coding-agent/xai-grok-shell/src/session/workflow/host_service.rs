@@ -541,6 +541,7 @@ impl HostService {
                         model_override_provenance: ModelOverrideProvenance::Tool,
                         capability_mode,
                         isolation,
+                        retain_worktree: opts.retain_worktree,
                         output_schema: None,
                         ..Default::default()
                     },
@@ -1242,6 +1243,78 @@ mod tests {
             "in-memory release must stick so resume does not double-charge"
         );
 
+        drop(host_tx);
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Purpose: Preserve shot model and worktree policies at the coordinator boundary.
+    /// Input: Workflow agent options with a model, context fork, and retained worktree.
+    /// Output: The child request carries each option without a default-policy override.
+    #[tokio::test]
+    async fn shot_options_reach_the_child_request() {
+        let run_id = "wf_shot_options";
+        let mut tracker = WorkflowTracker::default();
+        tracker.start_run(
+            run_id.into(),
+            "n-shot".into(),
+            "compare".into(),
+            vec![],
+            Some(2),
+            None,
+        );
+        let tracker = Arc::new(parking_lot::Mutex::new(tracker));
+        let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel();
+        let (mut params, _persist_rx) =
+            test_host_params(run_id, 1, "wf-scratch-shot-options", tracker, subagent_tx);
+        params.allow_fork_context = true;
+        let cancel = params.cancel.clone();
+        let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (handle, _drained) = spawn_workflow_host_service(params, host_rx);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::SpawnAgent {
+                opts: AgentOpts {
+                    prompt: "fix it".into(),
+                    model: Some("shot-model".into()),
+                    fork_context: true,
+                    isolation_worktree: true,
+                    retain_worktree: true,
+                    ..Default::default()
+                },
+                reply: reply_tx,
+            })
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), subagent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SubagentEvent::Spawn(spawn) = event else {
+            panic!("expected spawn");
+        };
+        assert!(spawn.fork_context);
+        assert!(spawn.owner.is_workflow());
+        assert_eq!(spawn.runtime_overrides.model.as_deref(), Some("shot-model"));
+        assert_eq!(
+            spawn.runtime_overrides.model_override_provenance,
+            ModelOverrideProvenance::Tool
+        );
+        assert_eq!(
+            spawn.runtime_overrides.isolation,
+            Some(xai_tool_types::SubagentIsolationMode::Worktree)
+        );
+        assert!(spawn.runtime_overrides.retain_worktree);
+        spawn
+            .respond_with(|request| {
+                xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
+                    success: true,
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    ..Default::default()
+                }
+            })
+            .unwrap();
+        assert!(reply_rx.await.unwrap().unwrap().success);
         drop(host_tx);
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
