@@ -4471,6 +4471,8 @@ impl AgentView {
             self.frame_occluder_rects.push(overlay_rect);
         }
         if self.show_workflows {
+            // List navigation and later notifications can reveal deferred children too.
+            self.replay_workflow_column_children();
             let runs = self.workflow_runs_newest_first();
             let mut view = self.workflows_view.clone();
             view.normalize(&runs);

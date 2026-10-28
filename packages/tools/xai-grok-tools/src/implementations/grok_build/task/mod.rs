@@ -539,6 +539,7 @@ impl xai_tool_runtime::Tool for TaskTool {
             resume_from,
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {
+                fork_snapshot: None,
                 model,
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,

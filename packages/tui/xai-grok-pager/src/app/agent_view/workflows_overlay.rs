@@ -87,6 +87,22 @@ impl AgentView {
         self.workflows_view.detail_run_id = Some(run_id.to_string());
         self.show_workflows = true;
         self.show_goal_detail = false;
+        self.replay_workflow_column_children();
+    }
+
+    /// Purpose: Load deferred child transcripts before the n-shot columns use them.
+    /// Input: The current workflow selection and the restored child sessions.
+    /// Output: The selected n-shot children have replayed scrollbacks. Other children stay deferred.
+    pub(crate) fn replay_workflow_column_children(&mut self) {
+        let child_ids = {
+            let runs = self.workflow_runs_newest_first();
+            let mut view = self.workflows_view.clone();
+            view.normalize(&runs);
+            n_shot_agent_ids(view.detail_run(&runs))
+        };
+        for child_id in child_ids {
+            crate::app::subagent::ensure_subagent_child_replayed(self, &child_id);
+        }
     }
 
     /// Open the newest n-shot run in its column view, or the run list when

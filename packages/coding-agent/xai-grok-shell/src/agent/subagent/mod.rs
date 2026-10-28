@@ -1551,16 +1551,35 @@ async fn bootstrap_initial_context(
             verbatim_fork: false,
         });
     }
-    let live_items = match ctx.parent_chat_state.as_ref() {
-        Some(chat_state) => {
-            let items = chat_state.get_conversation().await;
-            if items.is_empty() { None } else { Some(items) }
+    let frozen = request.runtime_overrides.fork_snapshot.as_ref();
+    let live_items = if let Some(snapshot) = frozen {
+        match serde_json::from_value(snapshot.conversation.clone()) {
+            Ok(items) => Some(items),
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot read frozen launch conversation: {error}"
+                ));
+            }
         }
-        None => None,
+    } else {
+        match ctx.parent_chat_state.as_ref() {
+            Some(chat_state) => {
+                let items = chat_state.get_conversation().await;
+                if items.is_empty() { None } else { Some(items) }
+            }
+            None => None,
+        }
     };
     if let Some(items) = live_items {
         let image_paths = fork_image_paths(&items).await;
-        let initial = verbatim_or_normalize_fork(items, child_context_window);
+        let initial = if frozen.is_some() {
+            // Normalize every shot identically, independent of its model's context window.
+            forked_initial_context(items)
+        } else {
+            verbatim_or_normalize_fork(items, child_context_window)
+        };
+        let frozen_had_context =
+            frozen.is_some() && matches!(initial.source, InitialContextSource::Forked);
         let source_info = ctx
             .parent_session_info
             .clone()
@@ -1579,6 +1598,15 @@ async fn bootstrap_initial_context(
             image_paths,
         )
         .await;
+        if frozen_had_context && !matches!(ctx_out.source, InitialContextSource::Forked) {
+            return BootstrapInitialContext::ResumeAbort(format!(
+                "Cannot bootstrap frozen launch conversation: {}",
+                ctx_out
+                    .copy_error
+                    .as_deref()
+                    .unwrap_or("inherited context unavailable")
+            ));
+        }
         tracing::info!(
             subagent_id = %request.id,
             subagent_type = %request.subagent_type,
@@ -1705,6 +1733,23 @@ fn resolve_child_cwd(
         .map(Path::to_path_buf)
         .or_else(|| override_cwd.filter(|s| !s.is_empty()).map(PathBuf::from))
         .unwrap_or_else(|| parent_cwd.to_path_buf())
+}
+/// Purpose: Remap inherited parent paths only for a new isolated context fork.
+/// Input: The context source, child worktree, and actual parent cwd.
+/// Output: The parent worktree root, or no display cwd for other sessions.
+/// Note: A child worktree contains the full repository, even for a nested parent cwd.
+fn resolve_child_prompt_display_cwd(
+    source: &InitialContextSource,
+    worktree_path: Option<&Path>,
+    parent_cwd: &Path,
+) -> Option<String> {
+    if *source != InitialContextSource::Forked || worktree_path.is_none() {
+        return None;
+    }
+    // Use the parent's worktree, not the durable source repository or main repo.
+    let parent_root = xai_grok_workspace::session::git::find_git_root_from_path(parent_cwd)
+        .unwrap_or_else(|_| parent_cwd.to_path_buf());
+    Some(parent_root.to_string_lossy().into_owned())
 }
 /// The cwd a resumed child inherits from its source subagent, or `None` when
 /// there is nothing to inherit (the caller then falls back to the parent cwd).

@@ -92,7 +92,7 @@ let overview = "# n-shot: " + shots.len().to_string() + " shots finished\n\n";
 let full = overview;
 full += "Each shot started from a copy of this conversation and worked in its own git "
     + "worktree. Diffs use each shot's base commit and include committed and uncommitted "
-    + "tracked changes, including changes the parent had when the shot started. "
+    + "tracked changes, including changes the parent had when the run started. "
     + "Untracked files are listed separately and are not in the diff.\n\n"
     + "Guidance for the parent session:\n"
     + "- Compare and contrast the shots for the user, then give a recommendation.\n"

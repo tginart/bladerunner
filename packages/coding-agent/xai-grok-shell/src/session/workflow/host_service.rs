@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
     ModelOverrideProvenance, SubagentCancelRequest, SubagentCancelTarget, SubagentEvent,
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    SubagentForkSnapshot, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 use xai_workflow::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 
@@ -85,6 +85,7 @@ pub(crate) struct WorkflowHostParams {
     >,
     pub parent_session_id: String,
     pub allow_fork_context: bool,
+    pub fork_snapshot: Option<Arc<SubagentForkSnapshot>>,
     pub templates: std::collections::HashMap<String, String>,
     pub telemetry: TelemetryHook,
     pub stats: Arc<WorkflowAgentStats>,
@@ -120,14 +121,15 @@ pub(crate) fn spawn_workflow_host_service(
                     Some(req) => req,
                     None => break,
                 },
-                _ = service.params.cancel.cancelled() => {
-                    while let Ok(req) = rx.try_recv() {
-                        reply_cancelled(req);
-                    }
-                    break;
-                }
+                _ = service.params.cancel.cancelled() => break,
             };
             service.clone().dispatch(req);
+        }
+        // The executor can release reservations after cancellation. Do not accept
+        // requests that this host can no longer answer while its join is pending.
+        rx.close();
+        while let Ok(req) = rx.try_recv() {
+            reply_cancelled(req);
         }
         let drain_outcome = service.cancel_and_drain_children().await;
         let _ = drained_tx.send(drain_outcome);
@@ -536,6 +538,9 @@ impl HostService {
                     resume_from,
                     cwd: None,
                     runtime_overrides: SubagentRuntimeOverrides {
+                        fork_snapshot: fork_context
+                            .then(|| self.params.fork_snapshot.clone())
+                            .flatten(),
                         model: opts.model.clone(),
                         output_token_budget: None,
                         model_override_provenance: ModelOverrideProvenance::Tool,
@@ -1121,6 +1126,7 @@ mod tests {
                 subagent_event_tx,
                 parent_session_id: "parent".into(),
                 allow_fork_context: false,
+                fork_snapshot: None,
                 templates: Default::default(),
                 telemetry: Arc::new(|_, _, _| {}),
                 stats: Arc::new(WorkflowAgentStats::default()),
@@ -1248,6 +1254,54 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
+    /// Purpose: Reject late executor requests while cancelled children drain.
+    /// Input: A cancelled host with its launch sender and join handle still alive.
+    /// Output: A late reservation release fails instead of waiting for a reply forever.
+    #[tokio::test]
+    async fn cancelled_host_closes_requests_before_child_drain() {
+        let run_id = "wf_late_release";
+        let mut tracker = WorkflowTracker::default();
+        tracker.start_run(
+            run_id.into(),
+            "test".into(),
+            "test".into(),
+            vec![],
+            Some(2),
+            None,
+        );
+        let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel();
+        let (params, _persist_rx) = test_host_params(
+            run_id,
+            1,
+            "wf-scratch-late-release",
+            Arc::new(parking_lot::Mutex::new(tracker)),
+            subagent_tx,
+        );
+        let cancel = params.cancel.clone();
+        let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (handle, drained) = spawn_workflow_host_service(params, host_rx);
+        cancel.cancel();
+        let event = tokio::time::timeout(Duration::from_secs(5), subagent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SubagentEvent::Cancel(request) = event else {
+            panic!("expected child drain request");
+        };
+        let (reply, _reply_rx) = oneshot::channel();
+        assert!(
+            host_tx
+                .send(WorkflowHostRequest::ReleaseAgentCalls { count: 1, reply })
+                .is_err(),
+            "a stopped host must not accept requests during child drain"
+        );
+        request.respond_to.send(
+            xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome::Cancelled,
+        ).unwrap();
+        assert_eq!(drained.await.unwrap(), HostDrainOutcome::Drained);
+        handle.await.unwrap();
+    }
+
     /// Purpose: Preserve shot model and worktree policies at the coordinator boundary.
     /// Input: Workflow agent options with a model, context fork, and retained worktree.
     /// Output: The child request carries each option without a default-policy override.
@@ -1268,6 +1322,11 @@ mod tests {
         let (mut params, _persist_rx) =
             test_host_params(run_id, 1, "wf-scratch-shot-options", tracker, subagent_tx);
         params.allow_fork_context = true;
+        let snapshot = Arc::new(SubagentForkSnapshot {
+            workspace_path: PathBuf::from("/frozen-launch"),
+            conversation: serde_json::json!([]),
+        });
+        params.fork_snapshot = Some(snapshot.clone());
         let cancel = params.cancel.clone();
         let (host_tx, host_rx) = mpsc::unbounded_channel();
         let (handle, _drained) = spawn_workflow_host_service(params, host_rx);
@@ -1304,6 +1363,10 @@ mod tests {
             Some(xai_tool_types::SubagentIsolationMode::Worktree)
         );
         assert!(spawn.runtime_overrides.retain_worktree);
+        assert!(Arc::ptr_eq(
+            spawn.runtime_overrides.fork_snapshot.as_ref().unwrap(),
+            &snapshot,
+        ));
         spawn
             .respond_with(|request| {
                 xai_grok_tools::implementations::grok_build::task::types::SubagentResult {

@@ -1100,6 +1100,111 @@ fn resolve_child_cwd_empty_override_falls_back_to_parent() {
     let result = resolve_child_cwd(None, Some(""), &parent);
     assert_eq!(result, parent);
 }
+/// Purpose: Check isolated fork paths with the same resolver that file tools use.
+/// Input: A parent cwd without Git metadata and a child worktree.
+/// Output: Parent absolute paths and relative paths resolve inside the child.
+#[test]
+fn isolated_fork_display_cwd_remaps_parent_paths() {
+    use xai_grok_tools::types::resources::resolve_model_path;
+    let parent = tempfile::tempdir().unwrap();
+    let child = Path::new("/isolated/child");
+    let display = resolve_child_prompt_display_cwd(
+        &InitialContextSource::Forked, Some(child), parent.path(),
+    ).unwrap();
+    assert_eq!(Path::new(&display), parent.path());
+    let absolute = parent.path().join("src/main.rs");
+    for input in [absolute.to_str().unwrap(), "src/main.rs"] {
+        assert_eq!(
+            resolve_model_path(child, Some(Path::new(&display)), input),
+            child.join("src/main.rs"),
+        );
+    }
+    assert_eq!(
+        resolve_model_path(child, Some(Path::new(&display)), "/outside/file.rs"),
+        PathBuf::from("/outside/file.rs"),
+    );
+}
+/// Purpose: Keep the repository suffix when the parent cwd is a subdirectory.
+/// Input: A Git repository with a nested parent cwd and a child worktree.
+/// Output: Both path forms resolve to the corresponding child repository path.
+#[test]
+fn isolated_fork_display_cwd_uses_parent_repository_root() {
+    use xai_grok_tools::types::resources::resolve_model_path;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    git2::Repository::init(&root).unwrap();
+    let parent_cwd = root.join("packages/app");
+    std::fs::create_dir_all(&parent_cwd).unwrap();
+    let child = Path::new("/isolated/child");
+    let display = resolve_child_prompt_display_cwd(
+        &InitialContextSource::Forked, Some(child), &parent_cwd,
+    ).unwrap();
+    assert_eq!(Path::new(&display), root);
+    let absolute = parent_cwd.join("src/main.rs");
+    for input in [absolute.to_str().unwrap(), "packages/app/src/main.rs"] {
+        assert_eq!(
+            resolve_model_path(child, Some(Path::new(&display)), input),
+            child.join("packages/app/src/main.rs"),
+        );
+    }
+}
+/// Purpose: Use the immediate parent's worktree instead of the durable main repository.
+/// Input: A nested cwd in a linked parent worktree and a second isolated worktree.
+/// Output: Inherited absolute paths resolve inside the second worktree.
+#[test]
+fn isolated_fork_display_cwd_uses_parent_worktree_not_main_repo() {
+    use xai_grok_tools::types::resources::resolve_model_path;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let repo = git2::Repository::init(root.join("main")).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let tree_id = repo.index().unwrap().write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[]).unwrap();
+    let parent = root.join("parent-worktree");
+    repo.worktree("parent", &parent, None).unwrap();
+    let parent_cwd = parent.join("packages/app");
+    std::fs::create_dir_all(&parent_cwd).unwrap();
+    let child = root.join("child-worktree");
+    let display = resolve_child_prompt_display_cwd(
+        &InitialContextSource::Forked, Some(&child), &parent_cwd,
+    ).unwrap();
+    assert_eq!(Path::new(&display), parent);
+    let absolute = parent_cwd.join("src/main.rs");
+    for input in [absolute.to_str().unwrap(), "packages/app/src/main.rs"] {
+        assert_eq!(
+            resolve_model_path(&child, Some(Path::new(&display)), input),
+            child.join("packages/app/src/main.rs"),
+        );
+    }
+}
+/// Purpose: Preserve path resolution for normal sessions, nonisolated forks, and resumes.
+/// Input: Context sources that must not enable parent path remap.
+/// Output: Absolute paths stay unchanged and relative paths use the child cwd.
+#[test]
+fn isolated_fork_display_cwd_preserves_other_sessions() {
+    use xai_grok_tools::types::resources::resolve_model_path;
+    let parent = Path::new("/parent/workspace");
+    let child = Path::new("/child/workspace");
+    for (source, worktree) in [
+        (InitialContextSource::New, None),
+        (InitialContextSource::New, Some(child)),
+        (InitialContextSource::Forked, None),
+        (InitialContextSource::Resumed, None),
+        (InitialContextSource::Resumed, Some(child)),
+    ] {
+        let display = resolve_child_prompt_display_cwd(&source, worktree, parent);
+        assert_eq!(display, None);
+        assert_eq!(
+            resolve_model_path(child, display.as_deref().map(Path::new), "/parent/workspace/file.rs"),
+            parent.join("file.rs"),
+        );
+        assert_eq!(
+            resolve_model_path(child, display.as_deref().map(Path::new), "file.rs"),
+            child.join("file.rs"),
+        );
+    }
+}
 #[test]
 fn resume_inherited_cwd_requires_existing_non_worktree_dir() {
     let dir = tempfile::TempDir::new().unwrap();

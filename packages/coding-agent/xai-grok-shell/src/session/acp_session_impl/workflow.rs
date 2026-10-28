@@ -31,7 +31,12 @@ impl SessionActor {
             agent_budget: None,
             resume_run_id: None,
         };
-        let launched = self.workflow_manager.lock().await.launch(resolved, spec);
+        let launched = self
+            .workflow_manager
+            .lock()
+            .await
+            .launch_with_context(resolved, spec, &self.chat_state_handle)
+            .await;
         match launched {
             Ok((run_id, outcome_rx)) => {
                 let (display, objective) = self
@@ -82,7 +87,12 @@ impl SessionActor {
             agent_budget: None,
             resume_run_id: None,
         };
-        let launched = self.workflow_manager.lock().await.launch(resolved, spec);
+        let launched = self
+            .workflow_manager
+            .lock()
+            .await
+            .launch_with_context(resolved, spec, &self.chat_state_handle)
+            .await;
         let (run_id, outcome_rx) = match launched {
             Ok(launched) => launched,
             Err(e) => return format!("Could not start n-shot: {e}"),
@@ -242,7 +252,13 @@ impl SessionActor {
                     agent_budget,
                     resume_run_id: Some(full_id.clone()),
                 };
-                match self.workflow_manager.lock().await.launch(resolved, spec) {
+                match self
+                    .workflow_manager
+                    .lock()
+                    .await
+                    .launch_with_context(resolved, spec, &self.chat_state_handle)
+                    .await
+                {
                     Ok((rid, outcome_rx)) => {
                         tokio::spawn(async move {
                             if let Ok(outcome) = outcome_rx.await {

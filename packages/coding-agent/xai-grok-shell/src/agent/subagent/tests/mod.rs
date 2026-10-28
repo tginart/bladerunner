@@ -12,6 +12,8 @@ use xai_grok_tools::implementations::grok_build::task::coordinator::{
 };
 use xai_tool_types::SubagentReasoningEffort;
 
+mod frozen_bootstrap;
+
 #[tokio::test]
 async fn live_fork_without_images_keeps_inherited_request_evidence() {
     use crate::session::storage::StorageAdapter;

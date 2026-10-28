@@ -1298,6 +1298,7 @@ pub(crate) async fn spawn_session_actor(
     >();
     {
         let manager = workflow_manager.clone();
+        let launch_chat_state = chat_state_handle.clone();
         let launch_cwd = std::path::PathBuf::from(session_info.cwd.as_str());
         let launch_session_dir = crate::session::persistence::session_dir(&session_info);
         tokio::spawn(async move {
@@ -1431,7 +1432,9 @@ pub(crate) async fn spawn_session_actor(
                 };
                 let launch_outcome = {
                     let mut mgr = manager.lock().await;
-                    let result = mgr.launch(resolved, spec);
+                    let result = mgr
+                        .launch_with_context(resolved, spec, &launch_chat_state)
+                        .await;
                     let script_path = result
                         .as_ref()
                         .ok()

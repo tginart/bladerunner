@@ -36,19 +36,19 @@ the permission decision.
 ### `/n-shot <N> <prompt>`
 
 Fork the conversation into N parallel attempts (1-10) at the same prompt. Each
-shot starts from a copy of this conversation and works in its own git worktree,
-so the shots cannot step on each other or on your working tree.
+shot starts from the same launch snapshot of this conversation and working tree,
+and works in its own git worktree. Later parent edits do not enter queued shots.
 
 ```
 /n-shot 3 fix the flaky login test
 ```
 
-The shots run in the background as a workflow. Bladerunner opens a side-by-side
-view with one column per shot: live status, model, elapsed time, tokens, and the
-tail of that shot's transcript. Use `←`/`→` to move between columns, `Enter` (or
-a click) to open a shot's full transcript, and `Esc` to return to the chat. You
-can keep talking to the session while the shots run. Run `/shots` to reopen the
-columns for the latest run.
+The shots run in the background as a workflow. Outside minimal mode, Bladerunner
+opens a side-by-side view with one column per shot: live status, model, elapsed
+time, tokens, and the tail of that shot's transcript. Use `←`/`→` to move between
+columns, `Enter` (or a click) to open a shot's full transcript, and `Esc` to return
+to the chat. You can keep talking to the session while the shots run. Switch to
+fullscreen and run `/shots` to reopen the columns for the latest run.
 
 When every shot finishes, the session wakes up with a report: each shot's final
 message, worktree path, and changed files. It compares the shots and recommends

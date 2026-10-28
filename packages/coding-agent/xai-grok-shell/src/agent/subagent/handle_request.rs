@@ -443,7 +443,10 @@ pub(crate) async fn run_shell_child(
                 super::subagent_temp_worktree_base().join(format!("subagent-{}", request.id))
             }
         };
-        let source_clone = source_cwd;
+        let fork_snapshot = request.runtime_overrides.fork_snapshot.clone();
+        let source_clone = fork_snapshot
+            .as_ref()
+            .map_or(source_cwd, |snapshot| snapshot.workspace_path.clone());
         let subagent_id = request.id.clone();
         let creation_mode: xai_fast_worktree::CreationMode = ctx.worktree_type.into();
         let btrfs_delegate = crate::session::worktree::btrfs_delegate_from_env();
@@ -732,7 +735,21 @@ pub(crate) async fn run_shell_child(
     let verbatim_mirror_fork =
         context_source == InitialContextSource::Forked && context_verbatim_fork;
     let context_normalized = fork_context_normalized(&context_source, &forked_conversation);
-    let task_prompt_text = prompt.clone();
+    let prompt_display_cwd = resolve_child_prompt_display_cwd(
+        &context_source,
+        worktree_path.as_deref(),
+        &ctx.parent_cwd,
+    );
+    let task_prompt_text = if prompt_display_cwd.is_some() {
+        format!(
+            "<system-reminder>\nThis task runs in the isolated workspace at {}. \
+             Run terminal commands in this directory and use relative workspace paths. \
+             Do not switch to parent paths from inherited history.\n</system-reminder>\n\n{prompt}",
+            child_session_info.cwd,
+        )
+    } else {
+        prompt.clone()
+    };
     let (mut forked_conversation, mut inherited_prefix_len) =
         (forked_conversation, inherited_prefix_len.unwrap_or(0));
     if context_source != InitialContextSource::Resumed
@@ -1330,7 +1347,7 @@ pub(crate) async fn run_shell_child(
         ctx.workflow_max_concurrent_agents,
         ctx.ask_user_question_enabled,
         ctx.client_hooks.clone(),
-        None,
+        prompt_display_cwd,
         std::collections::HashMap::new(),
         Vec::new(),
         xai_grok_agent::prompt::context::PromptAudience::Subagent,

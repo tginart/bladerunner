@@ -180,8 +180,9 @@ pub(super) fn ingest_workflow_update(agent: &mut AgentView, update: XaiSessionUp
             Some(existing) => *existing = snapshot,
             None => {
                 // A fresh n-shot run opens straight into its side-by-side columns.
-                let opens_columns =
-                    snapshot.is_active() && crate::views::n_shot::is_n_shot_run(&snapshot);
+                let opens_columns = !agent.is_minimal_mode()
+                    && snapshot.is_active()
+                    && crate::views::n_shot::is_n_shot_run(&snapshot);
                 agent.workflow_runs.push(snapshot);
                 if opens_columns {
                     agent.open_workflow_detail_by_run_id(&run_id);
@@ -202,4 +203,56 @@ pub(super) fn ingest_workflow_update(agent: &mut AgentView, update: XaiSessionUp
         elapsed_ms,
     );
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::ScreenMode;
+    use crate::app::agent_view::test_fixtures::make_agent;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    /// Purpose: Keep minimal-mode input available after a fresh n-shot notification.
+    /// Input: The same active run in each screen mode.
+    /// Output: Only full-TUI modes open columns. Minimal mode keeps prompt input.
+    #[test]
+    fn n_shot_auto_open_respects_screen_mode() {
+        for mode in [
+            ScreenMode::Minimal,
+            ScreenMode::Fullscreen,
+            ScreenMode::Inline,
+        ] {
+            let mut agent = make_agent();
+            agent.prompt.set_screen_mode(mode);
+            let update = serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "workflow_updated",
+                "run_id": "shots-1",
+                "name": "n-shot",
+                "objective": "Compare solutions",
+                "status": "active",
+                "elapsed_ms": 0
+            }))
+            .unwrap();
+
+            assert!(ingest_workflow_update(&mut agent, update));
+            assert_eq!(agent.show_workflows, !mode.is_minimal(), "{mode:?}");
+            assert_eq!(agent.workflow_runs.len(), 1);
+            assert_eq!(agent.workflow_blocks.len(), 1);
+            if mode.is_minimal() {
+                assert!(agent.workflows_view.detail_run_id.is_none());
+                let event = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                agent.handle_input(&event, &crate::actions::ActionRegistry::defaults());
+                assert_eq!(
+                    agent.prompt.text(),
+                    "x",
+                    "the hidden overlay must not own input"
+                );
+            } else {
+                assert_eq!(
+                    agent.workflows_view.detail_run_id.as_deref(),
+                    Some("shots-1")
+                );
+            }
+        }
+    }
 }

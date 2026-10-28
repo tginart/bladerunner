@@ -158,8 +158,19 @@ pub enum ModelOverrideProvenance {
     Tool,
 }
 
+/// Purpose: Hold the immutable workspace and conversation for one internal fork launch.
+/// Input: A managed workspace path and serialized parent conversation.
+/// Output: Shared launch data, also persisted for workflow resume.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubagentForkSnapshot {
+    pub workspace_path: std::path::PathBuf,
+    pub conversation: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRuntimeOverrides {
+    /// Internal launch snapshot. Never exposed as a model tool argument.
+    pub fork_snapshot: Option<Arc<SubagentForkSnapshot>>,
     /// Override the model (e.g. "test-model").
     pub model: Option<String>,
     /// Whether `model` came from a model-facing Task call or internal harness logic.
