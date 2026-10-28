@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use xai_grok_tools::implementations::grok_build::task::types::SubagentForkSnapshot;
 use xai_workflow::{Journal, WorkflowOutcome, WorkflowRunParams};
 
 use super::host_service::{
@@ -14,6 +15,12 @@ use super::notify::WorkflowNotifySender;
 use super::registry::{ResolvedWorkflow, WorkflowSource};
 use super::store::WorkflowRunStore;
 use super::tracker::WorkflowTracker;
+
+fn is_builtin_script(script: &str) -> bool {
+    super::registry::BUILTIN_WORKFLOWS
+        .iter()
+        .any(|builtin| builtin.script == script)
+}
 
 pub(crate) const WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION: usize = 4;
 pub(crate) const WORKFLOW_DEFAULT_AGENT_BUDGET: u64 = xai_workflow::DEFAULT_AGENT_BUDGET;
@@ -115,11 +122,80 @@ impl WorkflowManager {
         self.tracker.clone()
     }
 
+    /// Purpose: Capture n-shot launch inputs, or restore the original inputs for resume.
+    /// Input: The resolved workflow, launch options, and parent chat state.
+    /// Output: A launched workflow only after its snapshot is durable.
+    pub(crate) async fn launch_with_context(
+        &mut self,
+        resolved: ResolvedWorkflow,
+        spec: LaunchSpec,
+        chat_state: &xai_chat_state::ChatStateHandle,
+    ) -> Result<(String, oneshot::Receiver<WorkflowOutcome>), LaunchError> {
+        if !self.requires_launch_snapshot(&resolved, &spec) {
+            return self.launch(resolved, spec);
+        }
+        self.reap_terminal_runs();
+        if self.active.len().saturating_add(self.retiring.len())
+            >= WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION
+        {
+            return Err(LaunchError::TooManyActiveRuns);
+        }
+        let session_dir = self.session_dir.as_ref().ok_or_else(|| {
+            LaunchError::Store("n-shot requires a persistent session directory".into())
+        })?;
+        let snapshot = match &spec.resume_run_id {
+            Some(run_id) => super::snapshot::load(&session_dir.join("workflows").join(run_id)),
+            None => super::snapshot::capture(&self.cwd, chat_state).await,
+        }
+        .map_err(|error| LaunchError::Store(format!("n-shot launch snapshot: {error}")))?;
+        let is_new = spec.resume_run_id.is_none();
+        let result = self.launch_with_snapshot(resolved, spec, Some(snapshot.clone()));
+        if result.is_err() && is_new {
+            if let Err(error) =
+                super::super::worktree::remove_subagent_worktree(&snapshot.workspace_path).await
+            {
+                tracing::warn!(%error, "failed to remove unused n-shot launch snapshot");
+            }
+        }
+        result
+    }
+
+    /// Purpose: Limit launch snapshots to the trusted built-in n-shot source.
+    /// Input: The resolved source and the optional persisted run ID.
+    /// Output: True only when the original script matches the n-shot built-in.
+    fn requires_launch_snapshot(&self, resolved: &ResolvedWorkflow, spec: &LaunchSpec) -> bool {
+        let script = match &spec.resume_run_id {
+            Some(run_id) if self.store.is_builtin(run_id) => self.store.script_for(run_id),
+            Some(_) => None,
+            None if resolved.source == WorkflowSource::Builtin => Some(resolved.script.clone()),
+            None => None,
+        };
+        script.is_some_and(|script| {
+            super::registry::BUILTIN_WORKFLOWS
+                .iter()
+                .any(|builtin| builtin.name == "n-shot" && builtin.script == script)
+        })
+    }
+
     pub(crate) fn launch(
         &mut self,
         resolved: ResolvedWorkflow,
         spec: LaunchSpec,
     ) -> Result<(String, oneshot::Receiver<WorkflowOutcome>), LaunchError> {
+        self.launch_with_snapshot(resolved, spec, None)
+    }
+
+    fn launch_with_snapshot(
+        &mut self,
+        resolved: ResolvedWorkflow,
+        spec: LaunchSpec,
+        fork_snapshot: Option<Arc<SubagentForkSnapshot>>,
+    ) -> Result<(String, oneshot::Receiver<WorkflowOutcome>), LaunchError> {
+        if self.requires_launch_snapshot(&resolved, &spec) && fork_snapshot.is_none() {
+            return Err(LaunchError::Store(
+                "n-shot requires launch context; start a new run".into(),
+            ));
+        }
         self.reap_terminal_runs();
         if self.active.len().saturating_add(self.retiring.len())
             >= WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION
@@ -127,7 +203,7 @@ impl WorkflowManager {
             return Err(LaunchError::TooManyActiveRuns);
         }
 
-        let allow_fork_context = resolved.source == WorkflowSource::Builtin;
+        let mut allow_fork_context = resolved.source == WorkflowSource::Builtin;
         let mut execution_script = resolved.script;
         let (run_id, journal, state) = match &spec.resume_run_id {
             Some(run_id) => {
@@ -160,6 +236,12 @@ impl WorkflowManager {
                 execution_script = self.store.script_for(run_id).ok_or_else(|| {
                     LaunchError::Store("immutable workflow script is missing".into())
                 })?;
+                allow_fork_context = self.store.is_builtin(run_id);
+                if allow_fork_context && !is_builtin_script(&execution_script) {
+                    return Err(LaunchError::Store(
+                        "persisted built-in workflow no longer matches the trusted source; start a new run".into(),
+                    ));
+                }
                 let mut journal = match existing
                     .journal_path
                     .as_ref()
@@ -206,8 +288,26 @@ impl WorkflowManager {
                 let run_id = format!("wf_{}", uuid::Uuid::now_v7().simple());
                 let agent_budget = spec.agent_budget.unwrap_or(WORKFLOW_DEFAULT_AGENT_BUDGET);
                 self.store
-                    .register(&run_id, &execution_script, &spec.args)
+                    .register(&run_id, &execution_script, &spec.args, allow_fork_context)
                     .map_err(|error| LaunchError::Store(error.to_string()))?;
+                if let Some(snapshot) = &fork_snapshot {
+                    let run_dir = self
+                        .session_dir
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LaunchError::Store(
+                                "n-shot requires a persistent session directory".into(),
+                            )
+                        })?
+                        .join("workflows")
+                        .join(&run_id);
+                    if let Err(error) = super::snapshot::persist(&run_dir, snapshot) {
+                        self.store.remove(&run_id);
+                        return Err(LaunchError::Store(format!(
+                            "n-shot launch snapshot: {error}"
+                        )));
+                    }
+                }
                 let journal_rel = format!("workflows/{run_id}/journal.jsonl");
                 let journal_path = self.session_dir.as_ref().map(|d| d.join(&journal_rel));
                 let journal = Journal::new(journal_path);
@@ -273,6 +373,7 @@ impl WorkflowManager {
                 subagent_event_tx: self.subagent_event_tx.clone(),
                 parent_session_id: self.session_id.clone(),
                 allow_fork_context,
+                fork_snapshot,
                 templates: self.templates.clone(),
                 telemetry: self.telemetry.clone(),
                 stats: agent_stats.clone(),
@@ -813,6 +914,17 @@ mod tests {
     use crate::session::persistence::PersistenceMsg;
     use crate::session::workflow::registry::resolve_inline;
 
+    #[test]
+    fn builtin_script_verification_requires_exact_source() {
+        let script = super::super::registry::BUILTIN_WORKFLOWS
+            .iter()
+            .find(|builtin| builtin.name == "n-shot")
+            .unwrap()
+            .script;
+        assert!(super::is_builtin_script(script));
+        assert!(!super::is_builtin_script(&format!("{script}\n")));
+    }
+
     type SubagentEventRx = mpsc::UnboundedReceiver<
         xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
     >;
@@ -1013,6 +1125,7 @@ mod tests {
                 &run_id,
                 "let meta = #{ name: \"t\", description: \"d\" };",
                 &serde_json::json!({}),
+                false,
             )
             .unwrap();
         manager.tracker.lock().start_run(
@@ -1098,6 +1211,128 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// Purpose: Keep queued shots on the state captured before launch returns.
+    /// Input: Two shots, one concurrency slot, and a parent edit between dispatches.
+    /// Output: Both child requests share the original private workspace.
+    #[tokio::test]
+    async fn n_shot_queued_children_share_launch_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("repo");
+        let repo = git2::Repository::init(&source).unwrap();
+        std::fs::write(source.join("file.txt"), "launch contents").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+            .unwrap();
+        let (mut manager, mut events) = test_manager(Some(root.join("session")));
+        manager.cwd = source.clone();
+        manager.test_set_max_concurrent_agents(1);
+        let resolved = super::super::registry::resolve_by_name("n-shot", None).unwrap();
+        let (run_id, outcome) = manager
+            .launch_with_context(
+                resolved,
+                LaunchSpec {
+                    args: serde_json::json!({ "n": 2, "prompt": "work" }),
+                    ..spec()
+                },
+                &xai_chat_state::ChatStateHandle::noop(),
+            )
+            .await
+            .unwrap();
+        let first = recv_spawn(&mut events).await;
+        let snapshot = first.runtime_overrides.fork_snapshot.clone().unwrap();
+        assert!(
+            super::super::snapshot::load(&root.join("session/workflows").join(run_id)).is_ok(),
+            "the launch snapshot must be durable before dispatch"
+        );
+        std::fs::write(source.join("file.txt"), "later parent contents").unwrap();
+        std::fs::write(source.join("later.txt"), "later parent file").unwrap();
+        complete_spawn(first);
+        let second = recv_spawn(&mut events).await;
+        assert!(Arc::ptr_eq(
+            second.runtime_overrides.fork_snapshot.as_ref().unwrap(),
+            &snapshot
+        ));
+        assert_eq!(
+            std::fs::read_to_string(snapshot.workspace_path.join("file.txt")).unwrap(),
+            "launch contents"
+        );
+        assert!(!snapshot.workspace_path.join("later.txt").exists());
+        complete_spawn(second);
+        assert!(matches!(
+            outcome.await.unwrap(),
+            WorkflowOutcome::Completed { .. }
+        ));
+        super::super::super::worktree::remove_subagent_worktree(&snapshot.workspace_path)
+            .await
+            .unwrap();
+    }
+
+    /// Purpose: Verify n-shot resume reuses persisted inputs and never captures current parent state.
+    /// Input: A paused built-in run and a chat handle without a live parent actor.
+    /// Output: Resume preserves the snapshot, then rejects a missing snapshot workspace.
+    #[tokio::test]
+    async fn n_shot_resume_reuses_snapshot_or_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut events) = test_manager(Some(dir.path().to_path_buf()));
+        let workspace_path = dir.path().join("frozen-workspace");
+        std::fs::create_dir(&workspace_path).unwrap();
+        let snapshot = Arc::new(SubagentForkSnapshot {
+            workspace_path,
+            conversation: serde_json::to_value(vec![
+                xai_grok_sampling_types::conversation::ConversationItem::system("system"),
+                xai_grok_sampling_types::conversation::ConversationItem::user("frozen context"),
+            ])
+            .unwrap(),
+        });
+        let resolved = || super::super::registry::resolve_by_name("n-shot", None).unwrap();
+        let launch_spec = || LaunchSpec {
+            args: serde_json::json!({ "n": 1, "prompt": "work" }),
+            ..spec()
+        };
+        let (run_id, outcome) = manager
+            .launch_with_snapshot(resolved(), launch_spec(), Some(snapshot.clone()))
+            .unwrap();
+        let first = recv_spawn(&mut events).await;
+        assert!(Arc::ptr_eq(
+            first.runtime_overrides.fork_snapshot.as_ref().unwrap(),
+            &snapshot
+        ));
+        assert!(manager.pause(&run_id));
+        assert!(matches!(outcome.await.unwrap(), WorkflowOutcome::Cancelled));
+
+        let resume_spec = || LaunchSpec {
+            resume_run_id: Some(run_id.clone()),
+            ..launch_spec()
+        };
+        let chat = xai_chat_state::ChatStateHandle::noop();
+        let (_, outcome) = manager
+            .launch_with_context(resolved(), resume_spec(), &chat)
+            .await
+            .unwrap();
+        let resumed = recv_spawn(&mut events).await;
+        let restored = resumed.runtime_overrides.fork_snapshot.as_ref().unwrap();
+        assert_eq!(restored.workspace_path, snapshot.workspace_path);
+        assert_eq!(restored.conversation, snapshot.conversation);
+        assert!(manager.pause(&run_id));
+        assert!(matches!(outcome.await.unwrap(), WorkflowOutcome::Cancelled));
+        std::fs::remove_dir(&snapshot.workspace_path).unwrap();
+        let error = manager
+            .launch_with_context(resolved(), resume_spec(), &chat)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original n-shot launch workspace is unavailable")
+        );
     }
 
     #[tokio::test]
@@ -1299,6 +1534,7 @@ mod tests {
                 &run_id,
                 "let meta = #{ name: \"t\", description: \"d\" };",
                 &serde_json::json!({}),
+                false,
             )
             .unwrap();
         manager.tracker.lock().start_run(

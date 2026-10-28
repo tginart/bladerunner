@@ -271,8 +271,9 @@ fn subagent_child_needs_replay(child_view: &crate::app::agent_view::AgentView) -
     }
     true
 }
-/// Replay child `updates.jsonl` when opening fullscreen if spawn-time replay
-/// has not run yet and scrollback only has the injected task prompt (or is empty).
+/// Purpose: Replay a deferred child transcript before a fullscreen view or workflow column uses it.
+/// Input: The parent view and a child session ID.
+/// Output: Replay an empty or prompt-only child once, then restore its completion state.
 pub(crate) fn ensure_subagent_child_replayed(
     parent: &mut crate::app::agent_view::AgentView,
     child_sid: &str,
@@ -680,6 +681,122 @@ mod tests {
             .push_block(RenderBlock::user_prompt("scan src/"));
         seed_tool_call(&mut view);
         assert!(!subagent_child_needs_replay(&view));
+    }
+    /// Purpose: Check deferred transcripts for each column entry path and repeated opens.
+    /// Input: Two restored shots and one unrelated child with on-disk tool transcripts.
+    /// Output: Only the shots replay, and repeated opens do not duplicate their blocks.
+    #[test]
+    fn workflow_columns_replay_restored_shots_once() {
+        use crate::views::workflows::{WorkflowAgentRowView, WorkflowRunSnapshot};
+
+        for entry in ["shots", "detail", "normalized"] {
+            let home = tempfile::tempdir().unwrap();
+            let mut parent = make_min_child_view();
+            for child_sid in ["shot-1", "shot-2", "unrelated"] {
+                let session_dir = home
+                    .path()
+                    .join("sessions")
+                    .join(urlencoding::encode("/tmp").as_ref())
+                    .join(child_sid);
+                std::fs::create_dir_all(&session_dir).unwrap();
+                std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
+                let update = serde_json::json!({
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": child_sid,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "read-1",
+                            "title": "Read solution",
+                            "kind": "read"
+                        }
+                    }
+                });
+                std::fs::write(session_dir.join("updates.jsonl"), format!("{update}\n")).unwrap();
+                let mut child = make_min_child_view();
+                child
+                    .scrollback
+                    .push_block(RenderBlock::user_prompt("Compare solutions"));
+                parent
+                    .subagent_views
+                    .insert(child_sid.to_string(), Box::new(child));
+                let mut info = make_info();
+                info.child_session_id = child_sid.into();
+                info.workflow_run_id = Some("shots-run".into());
+                info.finished = child_sid == "shot-2";
+                info.duration_ms = info.finished.then_some(100);
+                parent.subagent_sessions.insert(child_sid.to_string(), info);
+            }
+            parent.workflow_runs.push(WorkflowRunSnapshot {
+                run_id: "shots-run".into(),
+                name: "n-shot".into(),
+                objective: "Compare solutions".into(),
+                status: "complete".into(),
+                management_available: false,
+                builtin: true,
+                phases: vec![("Shots".into(), "done".into())],
+                current_phase: None,
+                agents: ["shot-1", "shot-2", "unrelated"]
+                    .into_iter()
+                    .map(|id| WorkflowAgentRowView {
+                        agent_id: id.into(),
+                        label: id.into(),
+                        phase: Some(if id == "unrelated" { "Review" } else { "Shots" }.into()),
+                        model: None,
+                        state: "done".into(),
+                        tokens_used: 0,
+                        duration_ms: 100,
+                    })
+                    .collect(),
+                agent_budget: None,
+                agents_used: 2,
+                agents_reserved: 0,
+                agents_remaining: None,
+                agent_usage_incomplete: false,
+                active_agents: 0,
+                elapsed_ms: 100,
+                received_at: Instant::now(),
+                pause_message: None,
+                result_summary: None,
+            });
+            set_replay_grok_home_for_tests(Some(home.path().to_path_buf()));
+            match entry {
+                "shots" => parent.open_latest_n_shot(),
+                "detail" => parent.open_workflow_detail_by_run_id("shots-run"),
+                "normalized" => parent.replay_workflow_column_children(),
+                _ => unreachable!(),
+            }
+            for child_sid in ["shot-1", "shot-2"] {
+                assert!(
+                    parent.subagent_sessions[child_sid].child_updates_replayed,
+                    "{entry}"
+                );
+                let child = &parent.subagent_views[child_sid];
+                assert!(
+                    (0..child.scrollback.len()).any(|i| matches!(
+                        child.scrollback.entry(i).unwrap().block,
+                        RenderBlock::ToolCall(_)
+                    )),
+                    "{entry}: {child_sid} must contain its transcript"
+                );
+            }
+            assert!(!parent.subagent_sessions["unrelated"].child_updates_replayed);
+            assert_eq!(parent.subagent_views["unrelated"].scrollback.len(), 1);
+            let lengths: Vec<_> = ["shot-1", "shot-2"]
+                .iter()
+                .map(|id| parent.subagent_views[*id].scrollback.len())
+                .collect();
+            parent.open_latest_n_shot();
+            parent.replay_workflow_column_children();
+            for (id, len) in ["shot-1", "shot-2"].iter().zip(lengths) {
+                assert_eq!(parent.subagent_views[*id].scrollback.len(), len);
+            }
+            assert!(
+                parent.active_subagent.is_none(),
+                "columns must not open a child fullscreen"
+            );
+            set_replay_grok_home_for_tests(None);
+        }
     }
     #[test]
     fn ensure_subagent_child_replayed_skips_when_spawn_flag_set() {

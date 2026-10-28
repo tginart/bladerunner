@@ -101,6 +101,7 @@ pub enum ToolKind {
     Monitor,
     GoalUpdate,
     Workflow,
+    NShot,
     #[serde(other)]
     Other,
 }

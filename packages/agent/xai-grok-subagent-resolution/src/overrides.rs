@@ -274,6 +274,7 @@ mod tests {
         reasoning_effort: Option<&str>,
     ) -> SubagentRuntimeOverrides {
         SubagentRuntimeOverrides {
+            fork_snapshot: None,
             model: model.map(String::from),
             model_override_provenance: ModelOverrideProvenance::Harness,
             reasoning_effort: reasoning_effort.map(|value| {
@@ -284,6 +285,7 @@ mod tests {
             persona: persona.map(String::from),
             capability_mode,
             isolation,
+            retain_worktree: false,
             harness_agent_type: None,
             completion_output_cap: None,
             spawn_depth: None,

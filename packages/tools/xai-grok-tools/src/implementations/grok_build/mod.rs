@@ -24,6 +24,7 @@ pub mod kill_task;
 pub mod list_dir;
 pub mod lsp;
 pub mod monitor;
+pub mod n_shot;
 pub mod read_audio;
 pub mod read_file;
 pub mod read_video;
@@ -79,4 +80,5 @@ pub use video_gen::{
 };
 pub use web_fetch::{WebFetchClient, WebFetchConfig, WebFetchParams, WebFetchTool};
 pub use web_search::WebSearchTool;
+pub use n_shot::{N_SHOT_TOOL_NAME, NShotTool};
 pub use workflow::{WORKFLOW_TOOL_NAME, WorkflowTool};

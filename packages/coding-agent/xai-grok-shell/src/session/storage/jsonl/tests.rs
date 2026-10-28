@@ -258,6 +258,7 @@ async fn workflow_run_manifest_round_trips_and_clear_tombstone_wins() {
         version: WORKFLOW_RUN_MANIFEST_VERSION,
         state,
         script_revision: 0,
+        builtin: false,
     };
     adapter.write_workflow_run_state(&info, &manifest).await.unwrap();
     let loaded = adapter.load_session_without_updates(&info).await.unwrap();
@@ -315,6 +316,7 @@ async fn workflow_restore_rejects_symlinks_and_caps_run_count() {
             version: WORKFLOW_RUN_MANIFEST_VERSION,
             state,
             script_revision: 0,
+            builtin: false,
         };
         std::fs::write(
                 run_dir.join("state.json"),

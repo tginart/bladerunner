@@ -129,7 +129,7 @@ impl WorkflowRunSnapshot {
             .or_else(|| self.current_phase.clone())
     }
 
-    fn done_agents(&self) -> usize {
+    pub fn done_agents(&self) -> usize {
         self.agents.iter().filter(|a| a.state != "running").count()
     }
 }
@@ -155,6 +155,8 @@ pub struct WorkflowsViewState {
     pub roster_scroll: usize,
     pub roster_top_agent_id: Option<String>,
     pub roster_anchor: Option<(String, String)>,
+    /// Focused shot column in the n-shot detail view.
+    pub n_shot_focus: usize,
 }
 
 pub mod shortcut_ids {
@@ -174,8 +176,13 @@ pub fn footer_shortcuts(
     use crate::views::modal_window::Shortcut;
     let mut s = Vec::new();
     if in_detail {
+        let label = if run.is_some_and(crate::views::n_shot::is_n_shot_run) {
+            rust_i18n::t!("footer.shot_transcript")
+        } else {
+            rust_i18n::t!("footer.phase_agent")
+        };
         s.push(Shortcut {
-            label: rust_i18n::t!("footer.phase_agent"),
+            label,
             clickable: false,
             id: 0,
         });
@@ -534,6 +541,20 @@ pub fn render_workflows(
     tick: usize,
     live: &WorkflowAgentLiveMap,
 ) -> Option<Rect> {
+    let no_scrollbacks = crate::views::n_shot::WorkflowAgentScrollbacks::new();
+    render_workflows_with_scrollbacks(buf, area, runs, state, tick, live, &no_scrollbacks)
+}
+
+/// Same as [`render_workflows`], with agent transcripts for the n-shot columns.
+pub fn render_workflows_with_scrollbacks(
+    buf: &mut Buffer,
+    area: Rect,
+    runs: &[&WorkflowRunSnapshot],
+    state: &mut WorkflowsViewState,
+    tick: usize,
+    live: &WorkflowAgentLiveMap,
+    scrollbacks: &crate::views::n_shot::WorkflowAgentScrollbacks<'_>,
+) -> Option<Rect> {
     use crate::views::modal_window::{ModalWindowConfig, render_modal_window};
 
     let theme = Theme::current();
@@ -559,6 +580,18 @@ pub fn render_workflows(
     let inner = content.content;
 
     match state.detail_run(runs) {
+        Some(run) if crate::views::n_shot::is_n_shot_run(run) => {
+            crate::views::n_shot::render_n_shot_detail(
+                buf,
+                inner,
+                run,
+                state,
+                tick,
+                &theme,
+                live,
+                scrollbacks,
+            );
+        }
         Some(run) => render_detail(buf, inner, run, state, tick, &theme, live),
         None => render_list(buf, inner, runs, state, &theme),
     }

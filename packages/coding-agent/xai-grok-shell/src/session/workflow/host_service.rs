@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
     ModelOverrideProvenance, SubagentCancelRequest, SubagentCancelTarget, SubagentEvent,
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    SubagentForkSnapshot, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 use xai_workflow::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 
@@ -85,6 +85,7 @@ pub(crate) struct WorkflowHostParams {
     >,
     pub parent_session_id: String,
     pub allow_fork_context: bool,
+    pub fork_snapshot: Option<Arc<SubagentForkSnapshot>>,
     pub templates: std::collections::HashMap<String, String>,
     pub telemetry: TelemetryHook,
     pub stats: Arc<WorkflowAgentStats>,
@@ -120,14 +121,15 @@ pub(crate) fn spawn_workflow_host_service(
                     Some(req) => req,
                     None => break,
                 },
-                _ = service.params.cancel.cancelled() => {
-                    while let Ok(req) = rx.try_recv() {
-                        reply_cancelled(req);
-                    }
-                    break;
-                }
+                _ = service.params.cancel.cancelled() => break,
             };
             service.clone().dispatch(req);
+        }
+        // The executor can release reservations after cancellation. Do not accept
+        // requests that this host can no longer answer while its join is pending.
+        rx.close();
+        while let Ok(req) = rx.try_recv() {
+            reply_cancelled(req);
         }
         let drain_outcome = service.cancel_and_drain_children().await;
         let _ = drained_tx.send(drain_outcome);
@@ -536,11 +538,15 @@ impl HostService {
                     resume_from,
                     cwd: None,
                     runtime_overrides: SubagentRuntimeOverrides {
+                        fork_snapshot: fork_context
+                            .then(|| self.params.fork_snapshot.clone())
+                            .flatten(),
                         model: opts.model.clone(),
                         output_token_budget: None,
                         model_override_provenance: ModelOverrideProvenance::Tool,
                         capability_mode,
                         isolation,
+                        retain_worktree: opts.retain_worktree,
                         output_schema: None,
                         ..Default::default()
                     },
@@ -559,6 +565,7 @@ impl HostService {
         let mut resume_child: Option<String> = opts.resume_from.clone();
         let mut next_prompt = prompt;
         let mut fork_context = opts.fork_context;
+        let mut worktree_base_commit = None;
 
         let (result, output) = loop {
             attempts += 1;
@@ -611,6 +618,9 @@ impl HostService {
                     "subagent coordinator channel closed before completion".into(),
                 ));
             };
+            if attempts == 1 {
+                worktree_base_commit = result.worktree_base_commit.clone();
+            }
             total_tokens = total_tokens.saturating_add(result.total_tokens_used);
             total_duration += result.duration_ms;
             if self.params.cancel.is_cancelled() {
@@ -682,6 +692,13 @@ impl HostService {
         );
         self.tick();
 
+        let worktree_changes = match (
+            result.worktree_path.as_deref(),
+            worktree_base_commit.as_deref(),
+        ) {
+            (Some(path), Some(base)) => worktree_change_summary(Path::new(path), base).await,
+            _ => None,
+        };
         Ok(AgentResult {
             agent_id: id,
             success: result.success,
@@ -689,6 +706,9 @@ impl HostService {
             cancelled: result.cancelled,
             tokens_used: total_tokens,
             duration_ms: total_duration,
+            worktree_path: result.worktree_path.clone(),
+            worktree_base_commit,
+            worktree_changes,
         })
     }
 
@@ -955,6 +975,73 @@ impl HostService {
     }
 }
 
+/// Purpose: Describe the final worktree state relative to its original commit.
+/// Input: The worktree root and its base commit.
+/// Output: Tracked file changes, untracked files, and tracked change statistics.
+/// Note: Untracked files are not included in the statistics.
+async fn worktree_change_summary(worktree: &Path, base: &str) -> Option<String> {
+    const STATUS_CAP_BYTES: usize = 8 * 1024;
+    let tracked = run_git_in(
+        worktree,
+        &["diff", "--no-ext-diff", "--name-status", base, "--"],
+    )
+    .await?;
+    let untracked = run_git_in(worktree, &["ls-files", "--others", "--exclude-standard"]).await?;
+    let shortstat = run_git_in(
+        worktree,
+        &["diff", "--no-ext-diff", "--shortstat", base, "--"],
+    )
+    .await?;
+    if tracked.trim().is_empty() && untracked.trim().is_empty() {
+        return Some("no changes".to_string());
+    }
+    let details = format!(
+        "Tracked changes:\n{}\nUntracked files:\n{}",
+        tracked.trim_end(),
+        untracked.trim_end()
+    );
+    let details = xai_grok_tools::util::truncate_str_with_marker(&details, STATUS_CAP_BYTES);
+    let stat = if shortstat.trim().is_empty() {
+        "no tracked changes"
+    } else {
+        shortstat.trim()
+    };
+    Some(format!("{details}\n{stat}"))
+}
+
+async fn run_git_in(dir: &Path, args: &[&str]) -> Option<String> {
+    const GIT_TIMEOUT: Duration = Duration::from_secs(20);
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .envs(xai_tty_utils::pager_env());
+    xai_tty_utils::detach_command(&mut cmd);
+    let output = match tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::warn!(?dir, ?args, %error, "workflow worktree git command failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(?dir, ?args, "workflow worktree git command timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            ?dir,
+            ?args,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "workflow worktree git command exited non-zero"
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1049,50 @@ mod tests {
     use crate::session::workflow::notify::WorkflowNotifySender;
     use crate::session::workflow::store::WorkflowRunStore;
     use crate::session::workflow::tracker::WorkflowTracker;
+
+    /// Purpose: Verify that summaries include committed and uncommitted final changes.
+    /// Input: A git repository with a base commit and several worktree states.
+    /// Output: Summaries that match the final state and reject an invalid base.
+    #[tokio::test]
+    async fn worktree_change_summary_includes_commits_and_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        async fn git(repo: &Path, args: &[&str]) -> String {
+            run_git_in(repo, args).await.unwrap()
+        }
+        git(repo, &["init", "-q"]).await;
+        git(repo, &["config", "user.email", "test@example.com"]).await;
+        git(repo, &["config", "user.name", "Test"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(repo, &["add", "tracked"]).await;
+        git(repo, &["commit", "-qm", "base"]).await;
+        let base = git(repo, &["rev-parse", "HEAD"]).await.trim().to_owned();
+        assert_eq!(
+            worktree_change_summary(repo, &base).await.as_deref(),
+            Some("no changes")
+        );
+
+        std::fs::write(repo.join("tracked"), "committed\n").unwrap();
+        git(repo, &["commit", "-qam", "shot"]).await;
+        let summary = worktree_change_summary(repo, &base).await.unwrap();
+        assert!(summary.contains("tracked"), "{summary}");
+        assert!(summary.contains("1 file changed"), "{summary}");
+        assert!(git(repo, &["status", "--short"]).await.is_empty());
+
+        std::fs::write(repo.join("staged"), "staged\n").unwrap();
+        git(repo, &["add", "staged"]).await;
+        std::fs::write(repo.join("tracked"), "committed and unstaged\n").unwrap();
+        std::fs::write(repo.join("untracked"), "new\n").unwrap();
+        let summary = worktree_change_summary(repo, &base).await.unwrap();
+        for expected in ["tracked", "staged", "untracked", "2 files changed"] {
+            assert!(summary.contains(expected), "{summary}");
+        }
+        assert!(
+            worktree_change_summary(repo, "invalid-base")
+                .await
+                .is_none()
+        );
+    }
 
     /// Everything but the per-test tracker and subagent channel; the returned
     /// receiver keeps the persistence channel open for the test's lifetime.
@@ -995,6 +1126,7 @@ mod tests {
                 subagent_event_tx,
                 parent_session_id: "parent".into(),
                 allow_fork_context: false,
+                fork_snapshot: None,
                 templates: Default::default(),
                 telemetry: Arc::new(|_, _, _| {}),
                 stats: Arc::new(WorkflowAgentStats::default()),
@@ -1117,6 +1249,135 @@ mod tests {
             "in-memory release must stick so resume does not double-charge"
         );
 
+        drop(host_tx);
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Purpose: Reject late executor requests while cancelled children drain.
+    /// Input: A cancelled host with its launch sender and join handle still alive.
+    /// Output: A late reservation release fails instead of waiting for a reply forever.
+    #[tokio::test]
+    async fn cancelled_host_closes_requests_before_child_drain() {
+        let run_id = "wf_late_release";
+        let mut tracker = WorkflowTracker::default();
+        tracker.start_run(
+            run_id.into(),
+            "test".into(),
+            "test".into(),
+            vec![],
+            Some(2),
+            None,
+        );
+        let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel();
+        let (params, _persist_rx) = test_host_params(
+            run_id,
+            1,
+            "wf-scratch-late-release",
+            Arc::new(parking_lot::Mutex::new(tracker)),
+            subagent_tx,
+        );
+        let cancel = params.cancel.clone();
+        let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (handle, drained) = spawn_workflow_host_service(params, host_rx);
+        cancel.cancel();
+        let event = tokio::time::timeout(Duration::from_secs(5), subagent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SubagentEvent::Cancel(request) = event else {
+            panic!("expected child drain request");
+        };
+        let (reply, _reply_rx) = oneshot::channel();
+        assert!(
+            host_tx
+                .send(WorkflowHostRequest::ReleaseAgentCalls { count: 1, reply })
+                .is_err(),
+            "a stopped host must not accept requests during child drain"
+        );
+        request.respond_to.send(
+            xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome::Cancelled,
+        ).unwrap();
+        assert_eq!(drained.await.unwrap(), HostDrainOutcome::Drained);
+        handle.await.unwrap();
+    }
+
+    /// Purpose: Preserve shot model and worktree policies at the coordinator boundary.
+    /// Input: Workflow agent options with a model, context fork, and retained worktree.
+    /// Output: The child request carries each option without a default-policy override.
+    #[tokio::test]
+    async fn shot_options_reach_the_child_request() {
+        let run_id = "wf_shot_options";
+        let mut tracker = WorkflowTracker::default();
+        tracker.start_run(
+            run_id.into(),
+            "n-shot".into(),
+            "compare".into(),
+            vec![],
+            Some(2),
+            None,
+        );
+        let tracker = Arc::new(parking_lot::Mutex::new(tracker));
+        let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel();
+        let (mut params, _persist_rx) =
+            test_host_params(run_id, 1, "wf-scratch-shot-options", tracker, subagent_tx);
+        params.allow_fork_context = true;
+        let snapshot = Arc::new(SubagentForkSnapshot {
+            workspace_path: PathBuf::from("/frozen-launch"),
+            conversation: serde_json::json!([]),
+        });
+        params.fork_snapshot = Some(snapshot.clone());
+        let cancel = params.cancel.clone();
+        let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (handle, _drained) = spawn_workflow_host_service(params, host_rx);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::SpawnAgent {
+                opts: AgentOpts {
+                    prompt: "fix it".into(),
+                    model: Some("shot-model".into()),
+                    fork_context: true,
+                    isolation_worktree: true,
+                    retain_worktree: true,
+                    ..Default::default()
+                },
+                reply: reply_tx,
+            })
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), subagent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SubagentEvent::Spawn(spawn) = event else {
+            panic!("expected spawn");
+        };
+        assert!(spawn.fork_context);
+        assert!(spawn.owner.is_workflow());
+        assert_eq!(spawn.runtime_overrides.model.as_deref(), Some("shot-model"));
+        assert_eq!(
+            spawn.runtime_overrides.model_override_provenance,
+            ModelOverrideProvenance::Tool
+        );
+        assert_eq!(
+            spawn.runtime_overrides.isolation,
+            Some(xai_tool_types::SubagentIsolationMode::Worktree)
+        );
+        assert!(spawn.runtime_overrides.retain_worktree);
+        assert!(Arc::ptr_eq(
+            spawn.runtime_overrides.fork_snapshot.as_ref().unwrap(),
+            &snapshot,
+        ));
+        spawn
+            .respond_with(|request| {
+                xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
+                    success: true,
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    ..Default::default()
+                }
+            })
+            .unwrap();
+        assert!(reply_rx.await.unwrap().unwrap().success);
         drop(host_tx);
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
