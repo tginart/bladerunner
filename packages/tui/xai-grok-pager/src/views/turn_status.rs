@@ -710,9 +710,9 @@ fn compute_activity(
             "Compacting…".to_string(),
             false,
         ),
-        (AgentState::TurnRunning, Some(TurnActivity::Retrying { attempt, .. })) => (
+        (AgentState::TurnRunning, Some(TurnActivity::Retrying { attempt, reason, .. })) => (
             Style::default().fg(theme.warning),
-            format!("Retrying (attempt {attempt})…"),
+            retry_label(*attempt, reason),
             false,
         ),
         (AgentState::TurnRunning, Some(TurnActivity::Waiting(reason))) => (
@@ -1730,5 +1730,36 @@ mod tests {
         // so this assertion guards against an accidental tweak that
         // would silently change the cadence of every "your turn" cue.
         assert_eq!(USER_WAITING_PULSE_SPEED, 0.08);
+    }
+}
+
+/// Longest retry reason shown on the status line, in characters.
+const RETRY_REASON_MAX_CHARS: usize = 80;
+
+/// `Retrying (attempt 4)…`, plus the reason when it is short enough to read.
+fn retry_label(attempt: u32, reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > RETRY_REASON_MAX_CHARS {
+        return format!("Retrying (attempt {attempt})…");
+    }
+    format!("Retrying (attempt {attempt}): {reason}")
+}
+
+#[cfg(test)]
+mod retry_label_tests {
+    use super::retry_label;
+
+    #[test]
+    fn short_reason_is_shown() {
+        assert_eq!(
+            retry_label(4, "Can't reach spark:8888. Is the server running?"),
+            "Retrying (attempt 4): Can't reach spark:8888. Is the server running?"
+        );
+    }
+
+    #[test]
+    fn empty_or_long_reason_keeps_the_plain_label() {
+        assert_eq!(retry_label(2, ""), "Retrying (attempt 2)…");
+        assert_eq!(retry_label(2, &"x".repeat(200)), "Retrying (attempt 2)…");
     }
 }

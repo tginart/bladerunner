@@ -123,6 +123,12 @@ pub(crate) fn execute(
                     TaskResult::LogoutComplete
                 });
         }
+        Effect::Sovereign(task) => {
+            tasks.spawn(async move {
+                let message = crate::sovereign_cmd::run_task(task).await;
+                TaskResult::SovereignComplete { message }
+            });
+        }
         Effect::LogoutKimi => {
             tasks.spawn(async move {
                 let message = match xai_grok_shell::auth::run_cli_logout_kimi() {

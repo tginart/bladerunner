@@ -2009,6 +2009,8 @@ const NON_SERDE_CONFIG_PATHS: &[&str] = &[
     crate::util::config::SLASH_COMMAND_TAGS_CONFIG_PATH,
     // Read from the raw config by `crate::auth::palantir_aip`.
     "palantir_aip",
+    // `[sovereign] show_commands`, read by the pager's `/sovereign` and `/tailnet`.
+    "sovereign",
 ];
 /// Parse `[auth_provider.<name>]` tables leniently: a malformed entry warns
 /// (surfaced by `grok inspect`) and is skipped, so it fails closed for the
@@ -12899,11 +12901,17 @@ agent_type = "cursor"
             workflows = "new"
             [palantir_aip]
             hostname = "acme.palantirfoundry.com"
+            [sovereign]
+            show_commands = false
         "#,
         );
         assert!(
             !unused.iter().any(|k| k.starts_with("palantir_aip")),
             "palantir_aip is a real table: {unused:?}"
+        );
+        assert!(
+            !unused.iter().any(|k| k.starts_with("sovereign")),
+            "sovereign is a real table: {unused:?}"
         );
         assert!(
             !unused.iter().any(|k| k == "features.remote_fetch"),

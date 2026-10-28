@@ -166,6 +166,8 @@ pub enum Command {
     Plugin(crate::plugin_cmd::PluginArgs),
     /// Manage cross-session memory
     Memory(crate::memory_cmd::MemoryArgs),
+    /// Register, start and stop models served from your own hardware
+    Sovereign(crate::sovereign_cmd::SovereignArgs),
     /// List available models and exit
     Models,
     /// List, search, or restore sessions

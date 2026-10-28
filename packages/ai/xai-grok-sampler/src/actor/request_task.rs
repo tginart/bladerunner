@@ -992,7 +992,7 @@ fn emit_retrying(
         "Model-specific reasoning history was incompatible; retrying with portable context."
             .to_string()
     } else {
-        err.to_string()
+        unreachable_reason(err).unwrap_or_else(|| err.to_string())
     };
     let _ = event_tx.send(SamplingEvent::Retrying {
         request_id: request_id.clone(),
@@ -1003,6 +1003,25 @@ fn emit_retrying(
         doom_loop_triggers: info.doom_loop_triggers,
         doom_loop_aborted_at_chunk: info.doom_loop_aborted_at_chunk,
     });
+}
+
+/// A short reason when the server did not accept the connection at all.
+///
+/// Typical case: a model served from your own hardware that is switched off.
+fn unreachable_reason(err: &SamplingError) -> Option<String> {
+    let SamplingError::Http(e) = err else {
+        return None;
+    };
+    if !e.is_connect() {
+        return None;
+    }
+    let url = e.url()?;
+    let host = url.host_str()?;
+    let server = match url.port_or_known_default() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Some(format!("Can't reach {server}. Is the server running?"))
 }
 
 fn handle_cancellation(

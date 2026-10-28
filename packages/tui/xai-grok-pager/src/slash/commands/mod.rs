@@ -47,6 +47,7 @@ pub mod model;
 pub mod multiline;
 pub mod new;
 pub mod nexus;
+pub mod sovereign;
 pub mod personas;
 pub mod plan;
 pub mod plugin;
@@ -173,6 +174,8 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(privacy::PrivacyCommand),
         Arc::new(rewind::RewindCommand),
         Arc::new(jump::JumpCommand),
+        Arc::new(sovereign::SovereignCommand),
+        Arc::new(sovereign::TailnetCommand),
         Arc::new(login::LoginCommand),
         Arc::new(logout::LogoutCommand),
         #[cfg(not(feature = "community-build"))]
@@ -388,7 +391,9 @@ mod tests {
             "enabled-models",
             "show-plan",
             "skills",
+            "sovereign",
             "summarize",
+            "tailnet",
             "tasks",
             "terminal-check",
             "terminal-info",

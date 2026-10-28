@@ -713,6 +713,8 @@ pub enum Action {
     Logout,
     /// Log out of Kimi Code OAuth only (static API keys are unchanged).
     LogoutKimi,
+    /// Start, stop or check a model on your own hardware (`/sovereign`, `/tailnet`).
+    Sovereign(crate::sovereign_cmd::SovereignTask),
     /// Log out of OpenAI Codex OAuth only.
     LogoutOpenAiCodex,
     /// Log out of Anthropic Claude OAuth only.
@@ -2099,6 +2101,8 @@ pub enum Effect {
     Logout,
     /// Clear Kimi Code OAuth locally (does not remove a static API key).
     LogoutKimi,
+    /// Run a `/sovereign` or `/tailnet` task in the background.
+    Sovereign(crate::sovereign_cmd::SovereignTask),
     /// Clear OpenAI Codex OAuth locally.
     LogoutOpenAiCodex,
     /// Clear Anthropic Claude OAuth locally.
@@ -3003,6 +3007,10 @@ pub enum TaskResult {
     },
     /// Shell acknowledged logout (auth cleared).
     LogoutComplete,
+    /// A `/sovereign` or `/tailnet` task finished; `message` is its report.
+    SovereignComplete {
+        message: String,
+    },
     /// Kimi Code scoped OAuth logout completed.
     LogoutKimiComplete {
         message: String,

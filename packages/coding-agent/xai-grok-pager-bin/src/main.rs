@@ -2385,6 +2385,9 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::trace_cmd::run(trace_args, &agent_config).await;
             }
+            Command::Sovereign(sovereign_args) => {
+                return xai_grok_pager::sovereign_cmd::run(sovereign_args).await;
+            }
             Command::Memory(memory_args) => {
                 return xai_grok_pager::memory_cmd::run(memory_args);
             }
