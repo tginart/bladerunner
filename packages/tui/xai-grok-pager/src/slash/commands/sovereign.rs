@@ -7,6 +7,7 @@
 //! - `/tailnet`                   — show which machines are on the tailnet
 //!
 //! Adding a sovereign stays on the command line (`bladerunner sovereign add`).
+//! Set `[sovereign] show_commands = false` in config.toml to unlist both commands.
 
 use crate::app::actions::Action;
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
@@ -31,6 +32,10 @@ impl SlashCommand for SovereignCommand {
 
     fn usage(&self) -> &str {
         "/sovereign [up|down|status] [name]"
+    }
+
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        crate::sovereign_cmd::commands_listed()
     }
 
     fn takes_args(&self) -> bool {
@@ -80,6 +85,10 @@ impl SlashCommand for TailnetCommand {
 
     fn usage(&self) -> &str {
         "/tailnet"
+    }
+
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        crate::sovereign_cmd::commands_listed()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {

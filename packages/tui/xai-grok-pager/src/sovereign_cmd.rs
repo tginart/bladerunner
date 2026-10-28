@@ -15,6 +15,8 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+/// `[sovereign] show_commands = false` in config.toml hides `/sovereign` and `/tailnet`.
+const SHOW_COMMANDS_KEY: &str = "show_commands";
 const REGISTRY_FILE: &str = "sovereigns.toml";
 const CONFIG_FILE: &str = "config.toml";
 const PROBE_TIMEOUT_S: u64 = 4;
@@ -108,6 +110,26 @@ enum Health {
     WrongModel(Vec<String>),
     /// The endpoint does not answer.
     Down,
+}
+
+/// Whether `/sovereign` and `/tailnet` are listed in the slash menu. Read once per run.
+///
+/// The commands stay runnable when hidden. The default is to show them.
+pub fn commands_listed() -> bool {
+    static LISTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LISTED.get_or_init(|| {
+        xai_grok_config::load_effective_config_disk_only()
+            .map(|config| listed_in_config(&config))
+            .unwrap_or(true)
+    })
+}
+
+fn listed_in_config(config: &toml::Value) -> bool {
+    config
+        .get("sovereign")
+        .and_then(|table| table.get(SHOW_COMMANDS_KEY))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
 }
 
 /// Work that the `/sovereign` and `/tailnet` slash commands run in the background.
@@ -536,6 +558,14 @@ mod tests {
 
     fn sample() -> Sovereign {
         sovereign_from_preset(&PRESETS[0], "tginart@spark-500e.tail86acc5.ts.net", None)
+    }
+
+    #[test]
+    fn commands_are_listed_unless_the_config_hides_them() {
+        let parse = |text: &str| toml::from_str::<toml::Value>(text).unwrap();
+        assert!(listed_in_config(&parse("")));
+        assert!(listed_in_config(&parse("[sovereign]\nshow_commands = true")));
+        assert!(!listed_in_config(&parse("[sovereign]\nshow_commands = false")));
     }
 
     #[test]
