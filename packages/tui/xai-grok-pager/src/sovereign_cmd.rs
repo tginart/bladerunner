@@ -135,6 +135,7 @@ fn listed_in_config(config: &toml::Value) -> bool {
 /// Work that the `/sovereign` and `/tailnet` slash commands run in the background.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SovereignTask {
+    List,
     Up(Option<String>),
     Down(Option<String>),
     Status(Option<String>),
@@ -147,7 +148,7 @@ impl SovereignTask {
         match self {
             Self::Up(name) => format!("Starting {} ...", name.as_deref().unwrap_or("sovereign")),
             Self::Down(name) => format!("Stopping {} ...", name.as_deref().unwrap_or("sovereign")),
-            Self::Status(_) | Self::Tailnet => "Checking ...".to_string(),
+            Self::List | Self::Status(_) | Self::Tailnet => "Checking ...".to_string(),
         }
     }
 }
@@ -156,6 +157,7 @@ impl SovereignTask {
 pub async fn run_task(task: SovereignTask) -> String {
     let home = xai_grok_config::grok_home();
     let result = match task {
+        SovereignTask::List => list(&home).await,
         SovereignTask::Up(name) => up(&home, name.as_deref(), Output::Captured).await,
         SovereignTask::Down(name) => down(&home, name.as_deref(), Output::Captured).await,
         SovereignTask::Status(name) => status(&home, name.as_deref()).await,
@@ -222,7 +224,8 @@ fn add(
     registry.sovereign.insert(name.to_string(), sovereign.clone());
     save_registry(home, &registry)?;
     upsert_model_entry(home, name, preset, &sovereign)?;
-    if let Some(allowed) = allowed_models {
+    // An empty allowlist already permits every model.
+    if let Some(allowed) = allowed_models.filter(|allowed| !allowed.is_empty()) {
         set_allowed_models(home, with_pattern(allowed, &allow_pattern(name)))?;
     }
     Ok(format!(
@@ -490,6 +493,8 @@ fn upsert_model_entry(home: &Path, name: &str, preset: &Preset, sovereign: &Sove
     entry["model"] = toml_edit::value(sovereign.model.as_str());
     entry["name"] = toml_edit::value(format!("{} ({name})", preset.display));
     entry["base_url"] = toml_edit::value(sovereign.base_url.as_str());
+    // A non-secret local key prevents fallback to cloud credentials.
+    entry["api_key"] = toml_edit::value("sovereign");
     entry["context_window"] = toml_edit::value(preset.context_window as i64);
     let models = doc
         .entry("model")
@@ -599,6 +604,76 @@ mod tests {
             Health::WrongModel(vec!["Qwen3.8-Flash-Next".into()])
         );
         assert!(parse_model_ids(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn add_preserves_unrestricted_model_allowlists() {
+        for allowed in [None, Some(Vec::new())] {
+            let dir = tempfile::tempdir().unwrap();
+            let original = if allowed.is_some() {
+                "[models]\nallowed_models = []\n"
+            } else {
+                "[ui]\nyolo = false\n"
+            };
+            std::fs::write(dir.path().join(CONFIG_FILE), original).unwrap();
+            add(
+                dir.path(),
+                "spark",
+                "qwen38-flash-dual-spark",
+                "u@spark",
+                None,
+                allowed.clone(),
+            )
+            .unwrap();
+            let config = load_config_doc(dir.path()).unwrap();
+            let actual = config
+                .get("models")
+                .and_then(|models| models.get("allowed_models"))
+                .map(|value| value.as_array().unwrap().len());
+            assert_eq!(actual, allowed.map(|items| items.len()));
+        }
+    }
+
+    #[test]
+    fn add_isolates_the_model_from_global_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        add(
+            dir.path(),
+            "spark",
+            "qwen38-flash-dual-spark",
+            "u@spark",
+            None,
+            None,
+        )
+        .unwrap();
+        let config = load_config_doc(dir.path()).unwrap();
+        let entry = &config["model"]["spark/qwen-3.8-flash"];
+        assert_eq!(entry["api_key"].as_str(), Some("sovereign"));
+        assert_eq!(entry["base_url"].as_str(), Some("http://spark:8888/v1"));
+    }
+
+    #[tokio::test]
+    async fn list_handles_empty_and_multiple_sovereigns() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            list(dir.path())
+                .await
+                .unwrap()
+                .starts_with("No sovereigns.")
+        );
+        let mut registry = Registry::default();
+        for name in ["spark-a", "spark-b"] {
+            let mut sovereign = sample();
+            // An unsupported scheme fails without any network access.
+            sovereign.base_url = "invalid://local/v1".into();
+            registry.sovereign.insert(name.into(), sovereign);
+        }
+        save_registry(dir.path(), &registry).unwrap();
+        let report = list(dir.path()).await.unwrap();
+        assert_eq!(report.lines().count(), 2);
+        assert!(report.contains("spark-a/qwen-3.8-flash  down"));
+        assert!(report.contains("spark-b/qwen-3.8-flash  down"));
     }
 
     #[test]

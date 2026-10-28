@@ -101,7 +101,7 @@ fn parse_task(args: &str) -> Result<SovereignTask, String> {
     let (verb, rest) = split_first_token(args);
     let name = (!rest.is_empty()).then(|| rest.to_string());
     match verb {
-        "" | "list" => Ok(SovereignTask::Status(None)),
+        "" | "list" => Ok(SovereignTask::List),
         "up" | "start" => Ok(SovereignTask::Up(name)),
         "down" | "stop" => Ok(SovereignTask::Down(name)),
         "status" => Ok(SovereignTask::Status(name)),
@@ -127,7 +127,13 @@ mod tests {
     fn parses_verbs_and_optional_name() {
         assert_eq!(parse_task("up dgx-spark"), Ok(SovereignTask::Up(Some("dgx-spark".into()))));
         assert_eq!(parse_task("down"), Ok(SovereignTask::Down(None)));
-        assert_eq!(parse_task(""), Ok(SovereignTask::Status(None)));
+        assert_eq!(parse_task(""), Ok(SovereignTask::List));
+        assert_eq!(parse_task("list"), Ok(SovereignTask::List));
+        assert_eq!(parse_task("status"), Ok(SovereignTask::Status(None)));
+        assert_eq!(
+            parse_task("status spark"),
+            Ok(SovereignTask::Status(Some("spark".into())))
+        );
         assert!(parse_task("explode").is_err());
     }
 }
