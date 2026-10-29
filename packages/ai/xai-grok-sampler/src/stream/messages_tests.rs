@@ -54,6 +54,58 @@ fn block_stop(index: u32) -> MessageStreamEvent {
     MessageStreamEvent::ContentBlockStop { index }
 }
 
+/// The event sequence for one thinking block: start, one text delta, one
+/// signature delta, stop.
+fn thinking_block(
+    index: u32,
+    text: &str,
+    sig: &str,
+) -> Vec<Result<MessageStreamEvent, SamplingError>> {
+    vec![
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: StreamDelta::ThinkingDelta {
+                thinking: text.into(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: StreamDelta::SignatureDelta {
+                signature: sig.into(),
+            },
+        }),
+        Ok(block_stop(index)),
+    ]
+}
+
+fn tool_use_block(index: u32, id: &str) -> Vec<Result<MessageStreamEvent, SamplingError>> {
+    vec![
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlock::ToolUse {
+                id: id.into(),
+                name: "do_thing".into(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index,
+            delta: StreamDelta::InputJsonDelta {
+                partial_json: "{}".into(),
+            },
+        }),
+        Ok(block_stop(index)),
+    ]
+}
+
 fn message_delta_with_stop(stop: messages::StopReason) -> MessageStreamEvent {
     MessageStreamEvent::MessageDelta {
         delta: MessageDeltaBody {
@@ -220,30 +272,6 @@ async fn thinking_block_emits_reasoning_channel_and_preserved_in_response() {
 /// each block keeps its own signature rather than collapsing to one.
 #[tokio::test]
 async fn multiple_thinking_blocks_emit_per_block_signatures_in_order() {
-    let thinking_block = |index: u32, text: &str, sig: &str| {
-        vec![
-            Ok(MessageStreamEvent::ContentBlockStart {
-                index,
-                content_block: ContentBlock::Thinking {
-                    thinking: String::new(),
-                    signature: String::new(),
-                },
-            }),
-            Ok(MessageStreamEvent::ContentBlockDelta {
-                index,
-                delta: StreamDelta::ThinkingDelta {
-                    thinking: text.into(),
-                },
-            }),
-            Ok(MessageStreamEvent::ContentBlockDelta {
-                index,
-                delta: StreamDelta::SignatureDelta {
-                    signature: sig.into(),
-                },
-            }),
-            Ok(block_stop(index)),
-        ]
-    };
     let mut events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![Ok(message_start())];
     events.extend(thinking_block(0, "first", "sig-1"));
     events.push(Ok(text_block_start(1)));
@@ -267,6 +295,97 @@ async fn multiple_thinking_blocks_emit_per_block_signatures_in_order() {
         vec!["sig-1", "sig-2"],
         "each thinking block emits its own signature in order"
     );
+}
+
+/// Interleaved thinking (`thinking, tool_use, thinking, tool_use`) must keep
+/// every thinking block, in order, with its own signature. Keeping only the
+/// last block makes replay send modified thinking, which the API rejects.
+#[tokio::test]
+async fn interleaved_thinking_blocks_all_survive_into_response() {
+    let mut events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![Ok(message_start())];
+    events.extend(thinking_block(0, "first", "sig-1"));
+    events.extend(tool_use_block(1, "call_1"));
+    events.extend(thinking_block(2, "second", "sig-2"));
+    events.extend(tool_use_block(3, "call_2"));
+    events.push(Ok(message_delta_with_stop(messages::StopReason::ToolUse)));
+    events.push(Ok(MessageStreamEvent::MessageStop));
+
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            let reasoning: Vec<(String, Option<&str>)> = response
+                .reasoning_items()
+                .map(|r| {
+                    let text = r
+                        .summary
+                        .iter()
+                        .map(|rs::SummaryPart::SummaryText(t)| t.text.as_str())
+                        .collect();
+                    (text, r.encrypted_content.as_deref())
+                })
+                .collect();
+            assert_eq!(
+                reasoning,
+                vec![
+                    ("first".to_string(), Some("sig-1")),
+                    ("second".to_string(), Some("sig-2")),
+                ]
+            );
+            assert_eq!(response.tool_calls().len(), 2);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// The first `SignatureDelta` replaces a start-seeded signature (a gateway
+/// sending both must not double it); later deltas append so a signature split
+/// across deltas survives whole.
+#[tokio::test]
+async fn start_seeded_signature_is_replaced_then_deltas_append() {
+    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+        Ok(message_start()),
+        Ok(MessageStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: "seeded".into(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: StreamDelta::SignatureDelta {
+                signature: "part-a".into(),
+            },
+        }),
+        Ok(MessageStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: StreamDelta::SignatureDelta {
+                signature: "part-b".into(),
+            },
+        }),
+        Ok(block_stop(0)),
+        Ok(MessageStreamEvent::MessageStop),
+    ];
+    let raw = stream::iter(events).boxed();
+    let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+
+    let sigs: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ReasoningCompleted { signature, .. } => Some(signature.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sigs, vec!["part-apart-b"]);
+    match evs.last().unwrap() {
+        SamplingEvent::Completed { response, .. } => {
+            let r = response.reasoning_items().next().expect("reasoning item");
+            assert_eq!(r.encrypted_content.as_deref(), Some("part-apart-b"));
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
