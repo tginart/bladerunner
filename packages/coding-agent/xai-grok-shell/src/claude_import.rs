@@ -1181,9 +1181,9 @@ fn apply_hooks_to_dir(hooks_dir: &Path, items: &[ImportableItem]) -> anyhow::Res
     if count > 0 || dirty {
         std::fs::create_dir_all(hooks_dir)?;
         let json_str = serde_json::to_string_pretty(&root)?;
-        let tmp = target.with_extension("json.tmp");
-        std::fs::write(&tmp, &json_str)?;
-        std::fs::rename(&tmp, &target)?;
+        // The hooks dir can sit in an untrusted project tree, so never write
+        // through a planted symlink at the temp or target path.
+        crate::util::config::atomic_replace_string(&target, &json_str)?;
         info!(
             path = %target.display(),
             count,
@@ -2052,6 +2052,42 @@ extra_rule_dirs = ["/c/rules"]
             parsed["paths"]["extra_rule_dirs"][0].as_str().unwrap(),
             "/bar/rules"
         );
+    }
+
+    /// Repo-planted symlinks at the old fixed temp name or at the hooks file
+    /// itself must not redirect the hook import write.
+    #[cfg(unix)]
+    #[test]
+    fn apply_hooks_to_dir_ignores_planted_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_victim = tmp.path().join("tmp_victim");
+        let target_victim = tmp.path().join("target_victim");
+        std::fs::write(&tmp_victim, "secret").unwrap();
+        std::fs::write(&target_victim, "{}").unwrap();
+        let hooks_dir = tmp.path().join("repo").join(".grok").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let target = hooks_dir.join("imported-from-claude.json");
+        std::os::unix::fs::symlink(&tmp_victim, hooks_dir.join("imported-from-claude.json.tmp"))
+            .unwrap();
+        std::os::unix::fs::symlink(&target_victim, &target).unwrap();
+
+        let items = vec![ImportableItem::Hook {
+            event: "PreToolUse".to_string(),
+            matcher: None,
+            command: "echo x".to_string(),
+            timeout: None,
+        }];
+        assert_eq!(apply_hooks_to_dir(&hooks_dir, &items).unwrap(), 1);
+
+        assert_eq!(std::fs::read_to_string(&tmp_victim).unwrap(), "secret");
+        assert_eq!(std::fs::read_to_string(&target_victim).unwrap(), "{}");
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert!(std::fs::read_to_string(&target).unwrap().contains("echo x"));
     }
 
     /// A repo-planted `.grok/config.toml.tmp` symlink must not redirect the
