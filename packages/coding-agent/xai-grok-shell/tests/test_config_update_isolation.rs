@@ -170,3 +170,30 @@ async fn update_config_does_not_leak_managed_config_values() {
         "channel from managed_config.toml leaked into user config. Raw:\n{raw}"
     );
 }
+
+/// Regression test: a config.toml that exists but can't be read as UTF-8 must
+/// make `update_config` fail, not be treated as empty and overwritten.
+#[tokio::test]
+#[serial]
+async fn update_config_refuses_to_overwrite_unreadable_config() {
+    let home = test_home();
+    reset_config_files(home);
+
+    let original: &[u8] = b"[ui]\nyolo = true\n# caf\xe9\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    let result = xai_grok_shell::util::config::update_config(|cfg| {
+        cfg.models.default = Some("grok-3".to_string());
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "update_config must refuse an unreadable file"
+    );
+    assert_eq!(
+        fs::read(home.join("config.toml")).unwrap(),
+        original,
+        "config.toml must be left untouched"
+    );
+}

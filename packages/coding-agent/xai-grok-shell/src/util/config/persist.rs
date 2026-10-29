@@ -12,20 +12,7 @@ static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
 async fn save_config_locked(config: &Config) -> Result<()> {
     let path = user_config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => match toml::from_str::<TomlValue>(&s) {
-            Ok(v) => v,
-            Err(parse_err) => {
-                return Err(anyhow::anyhow!(
-                    "refusing to overwrite unparseable {}: {}; save a backup \
-                         and fix the syntax error before retrying",
-                    path.display(),
-                    parse_err,
-                ));
-            }
-        },
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
+    let mut root = read_existing_config_root(&path).await?;
     if !matches!(root, TomlValue::Table(_)) {
         root = TomlValue::Table(TomlMap::new());
     }
@@ -82,6 +69,32 @@ async fn save_config_locked(config: &Config) -> Result<()> {
     let _ = prior_mode;
     tokio::fs::rename(&tmp, &write_path).await?;
     Ok(())
+}
+/// Read the on-disk `config.toml` that a save merges into. Only `NotFound`
+/// counts as empty: any other read error (EACCES, EISDIR, invalid UTF-8) or a
+/// parse error refuses the save, since the merged result would replace the
+/// whole user file.
+async fn read_existing_config_root(path: &std::path::Path) -> Result<TomlValue> {
+    let s = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TomlValue::Table(TomlMap::new()));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "refusing to overwrite unreadable {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    toml::from_str::<TomlValue>(&s).map_err(|parse_err| {
+        anyhow::anyhow!(
+            "refusing to overwrite unparseable {}: {}; save a backup \
+                 and fix the syntax error before retrying",
+            path.display(),
+            parse_err,
+        )
+    })
 }
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
 /// mutate the file directly (marketplace add/remove, Foundry sign-in) can't
@@ -178,22 +191,37 @@ pub(crate) fn read_to_string_or_empty(path: &std::path::Path) -> std::io::Result
     }
 }
 /// Atomic write via temp file + `rename` (mirrors [`save_config`]) so a crash
-/// mid-write can't truncate `config.toml`. Preserves the dest mode on unix.
+/// mid-write can't truncate `config.toml`. Follows a symlink at `path` and
+/// writes its target. Preserves the dest mode on unix.
 pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let write_path = xai_grok_config::fs_atomic::resolve_write_target(path)?;
+    replace_via_temp(&write_path, content)
+}
+/// Like [`atomic_write_string`], but the `rename` replaces a symlink at `path`
+/// with a regular file instead of writing its target. Use it for files in an
+/// untrusted tree (a project `.grok/config.toml`), where a planted symlink
+/// could otherwise redirect the write to any user file.
+pub(crate) fn atomic_replace_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    replace_via_temp(path, content)
+}
+/// Write `content` to a uniquely named `create_new` temp next to `write_path`,
+/// then rename it over `write_path`. Carries over the mode of a regular-file
+/// `write_path`.
+fn replace_via_temp(write_path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(parent) = write_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     #[cfg(unix)]
-    let prior_mode: Option<u32> = match std::fs::metadata(&write_path) {
-        Ok(m) => {
+    let prior_mode: Option<u32> = match std::fs::symlink_metadata(write_path) {
+        Ok(m) if m.is_file() => {
             use std::os::unix::fs::PermissionsExt;
             Some(m.permissions().mode())
         }
-        Err(_) => None,
+        _ => None,
     };
     #[cfg(not(unix))]
     let prior_mode: Option<u32> = None;
@@ -205,14 +233,23 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std:
         format!("toml.tmp.{}.{}", std::process::id(), nanos)
     };
     let tmp = write_path.with_extension(suffix);
-    std::fs::write(&tmp, content)?;
+    // `create_new` so a pre-existing entry (e.g. a planted symlink) at the temp
+    // name fails the write instead of being written through.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?
+        .write_all(content.as_bytes())
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
     #[cfg(unix)]
     if let Some(mode) = prior_mode {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
     }
     let _ = prior_mode;
-    if let Err(e) = std::fs::rename(&tmp, &write_path) {
+    if let Err(e) = std::fs::rename(&tmp, write_path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -287,8 +324,9 @@ where
     F: FnOnce(&mut Config),
 {
     let _guard = lock_config_writes().await?;
-    let root: TomlValue =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
+    // `load_from_disk` already maps a missing file to an empty table; any other
+    // error must abort, or the save below would replace the user's whole file.
+    let root: TomlValue = crate::config::load_from_disk()?;
     let mut cfg = load_config_from_toml(&root);
     f(&mut cfg);
     save_config_locked(&cfg).await
@@ -418,6 +456,31 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    /// Only a missing file reads as empty; any other read error must refuse
+    /// the save, or the merged result would wipe the user's config.toml.
+    #[tokio::test]
+    async fn read_existing_config_root_refuses_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = read_existing_config_root(&dir.path().join("config.toml"))
+            .await
+            .unwrap();
+        assert_eq!(missing, TomlValue::Table(TomlMap::new()));
+
+        let non_utf8 = dir.path().join("non_utf8.toml");
+        std::fs::write(&non_utf8, b"[ui]\nyolo = true\n# \xff\xfe\n").unwrap();
+        let err = read_existing_config_root(&non_utf8).await.unwrap_err();
+        assert!(err.to_string().contains("unreadable"), "{err}");
+
+        let is_dir = dir.path().join("is_dir.toml");
+        std::fs::create_dir(&is_dir).unwrap();
+        assert!(read_existing_config_root(&is_dir).await.is_err());
+
+        let unparseable = dir.path().join("bad.toml");
+        std::fs::write(&unparseable, "[ui\n").unwrap();
+        let err = read_existing_config_root(&unparseable).await.unwrap_err();
+        assert!(err.to_string().contains("unparseable"), "{err}");
     }
 
     #[test]

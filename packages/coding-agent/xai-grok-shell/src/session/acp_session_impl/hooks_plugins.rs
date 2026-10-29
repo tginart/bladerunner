@@ -27,6 +27,21 @@ impl SessionActor {
         }
     }
 
+    /// Whether `name` is a managed-policy (non-disableable) hook in the live
+    /// registry, keyed on the spec's typed `layer`, never on the name. This
+    /// modal check is UX; the dispatcher re-checks provenance at run time.
+    pub(super) fn is_managed_policy_hook(&self, name: &str) -> bool {
+        self.hook_registry
+            .borrow()
+            .as_ref()
+            .is_some_and(|registry| {
+                registry
+                    .all_hooks()
+                    .into_iter()
+                    .any(|spec| spec.name == name && spec.is_managed_policy())
+            })
+    }
+
     // ── Shared hook/plugin operation functions ────────────────────────
 
     /// Trust the current project via the unified folder-trust store. Now an
@@ -232,6 +247,16 @@ impl SessionActor {
                 }
             }
             HooksAction::Disable { hook_name } => {
+                if self.is_managed_policy_hook(&hook_name) {
+                    return ActionOutcome {
+                        status: OutcomeStatus::ValidationError,
+                        message: format!(
+                            "Hook {hook_name} is enforced by managed policy and cannot be disabled."
+                        ),
+                        requires_reload: false,
+                        requires_restart: false,
+                    };
+                }
                 match xai_grok_hooks::trust::disable_hook(&hook_name) {
                     Ok(()) => ActionOutcome {
                         status: OutcomeStatus::Success,
@@ -274,7 +299,13 @@ impl SessionActor {
                 disable,
             } => {
                 let mut toggled = 0usize;
+                let mut managed_skipped = 0usize;
                 for name in &hook_names {
+                    // Same exemption as the per-hook Disable action.
+                    if disable && self.is_managed_policy_hook(name) {
+                        managed_skipped += 1;
+                        continue;
+                    }
                     let ok = if disable {
                         xai_grok_hooks::trust::disable_hook(name).is_ok()
                     } else {
@@ -285,9 +316,15 @@ impl SessionActor {
                     }
                 }
                 let action = if disable { "Disabled" } else { "Enabled" };
+                let mut message = format!("{action} {toggled}/{} hooks", hook_names.len());
+                if managed_skipped > 0 {
+                    message.push_str(&format!(
+                        " ({managed_skipped} enforced by managed policy, not disabled)"
+                    ));
+                }
                 ActionOutcome {
                     status: OutcomeStatus::Success,
-                    message: format!("{action} {toggled}/{} hooks", hook_names.len()),
+                    message,
                     requires_reload: false,
                     requires_restart: false,
                 }

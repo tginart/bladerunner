@@ -66,9 +66,10 @@ pub fn browser_unavailable_line(url: &str, copied: bool) -> String {
 
 /// Open a URL in the system's default browser/handler.
 ///
-/// Spawns the platform-native opener (`open` on macOS, `xdg-open` on
-/// Linux, `cmd /c start` on Windows) with fully detached stdio so it
-/// cannot block the pager.
+/// Uses the platform-native opener: `open` on macOS and `xdg-open` on
+/// Linux (spawned with fully detached stdio so it cannot block the pager),
+/// and `ShellExecuteW` on Windows. Never `cmd /c start`: its `&` splitting
+/// and `%VAR%` expansion would let a crafted URL run arbitrary commands.
 ///
 /// Returns `true` when the opener was launched (or the test seam recorded
 /// the URL). Returns `false` when the environment looks headless or spawn
@@ -77,7 +78,6 @@ pub fn browser_unavailable_line(url: &str, copied: bool) -> String {
 ///
 /// **Callers handling untrusted input** should call [`is_safe_to_open`]
 /// first, or use [`open_url_if_safe`] / [`try_open_url`] which combine both.
-#[allow(clippy::disallowed_methods)] // fire and forget; the child is reaped when this process exits
 pub fn open_url(url: &str) -> bool {
     // Test seam: PTY e2e must observe the open without launching a real
     // browser. When set, append the URL to the file and skip the OS opener.
@@ -105,16 +105,61 @@ pub fn open_url(url: &str) -> bool {
         return false;
     }
 
+    let opened = spawn_url_opener(url);
+    if !opened {
+        // Redact URL to avoid leaking sensitive query params to logs.
+        let redacted = url::Url::parse(url)
+            .map(|mut u| {
+                u.set_query(None);
+                u.set_fragment(None);
+                u.to_string()
+            })
+            .unwrap_or_else(|_| "<unparseable>".to_string());
+        tracing::warn!(url = %redacted, "failed to open URL");
+    }
+    opened
+}
+
+/// Hand the URL to the default browser via `ShellExecuteW`, which takes it
+/// as a single argument. The URL must never pass through `cmd.exe`: `start`
+/// splits on `&` and expands `%VAR%`, so a model-supplied URL such as
+/// `https://example.com/&calc.exe` would execute a command.
+#[cfg(target_os = "windows")]
+fn spawn_url_opener(url: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb = to_wide_nul("open");
+    let target = to_wide_nul(url);
+    // SAFETY: `verb` and `target` are NUL-terminated UTF-16 buffers that
+    // outlive the call; `hwnd`, `lpparameters`, and `lpdirectory` are
+    // documented as optional and passed null. Per the ShellExecuteW
+    // contract the returned pseudo-HINSTANCE is only compared (> 32 means
+    // success), never dereferenced.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result as usize > 32
+}
+
+/// Spawn `open` (macOS) or `xdg-open` (Linux / BSD) with the URL as a
+/// single argument and fully detached stdio.
+#[cfg(not(target_os = "windows"))]
+#[allow(clippy::disallowed_methods)] // fire and forget; the child is reaped when this process exits
+fn spawn_url_opener(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let cmd = "open";
-    #[cfg(target_os = "windows")]
-    let cmd = "cmd";
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(target_os = "macos"))]
     let cmd = "xdg-open";
 
     let mut command = std::process::Command::new(cmd);
-    #[cfg(target_os = "windows")]
-    command.args(["/c", "start", ""]);
     command
         .arg(url)
         .stdin(std::process::Stdio::null())
@@ -124,18 +169,16 @@ pub fn open_url(url: &str) -> bool {
     match command.spawn() {
         Ok(_) => true,
         Err(e) => {
-            // Redact URL to avoid leaking sensitive query params to logs.
-            let redacted = url::Url::parse(url)
-                .map(|mut u| {
-                    u.set_query(None);
-                    u.set_fragment(None);
-                    u.to_string()
-                })
-                .unwrap_or_else(|_| "<unparseable>".to_string());
-            tracing::warn!(url = %redacted, error = %e, "failed to open URL");
+            tracing::debug!(error = %e, "URL opener failed to spawn");
             false
         }
     }
+}
+
+/// Encode `s` as a NUL-terminated UTF-16 buffer for Win32 wide-string APIs.
+#[cfg(any(target_os = "windows", test))]
+fn to_wide_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Build the `open`/`xdg-open` opener command (macOS / Linux / BSD).
@@ -334,6 +377,16 @@ mod tests {
         let command = build_open_path_command(path);
         let args: Vec<_> = command.get_args().map(|a| a.to_os_string()).collect();
         assert!(args.contains(&path.as_os_str().to_os_string()));
+    }
+
+    /// The Windows opener hands `ShellExecuteW` this buffer as one argument.
+    /// `cmd.exe` metacharacters (`&`, `%VAR%`) must reach it verbatim.
+    #[test]
+    fn wide_url_buffer_keeps_shell_metacharacters_verbatim() {
+        let url = "https://example.com/&calc.exe?x=%PATH%|y";
+        let wide = to_wide_nul(url);
+        assert_eq!(wide.last(), Some(&0));
+        assert_eq!(String::from_utf16(&wide[..wide.len() - 1]).unwrap(), url);
     }
 
     #[test]

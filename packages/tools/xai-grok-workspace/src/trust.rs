@@ -12,11 +12,12 @@
 //! decided_at = 1780000000
 //! ```
 //!
-//! Trust **cascades to subdirectories**: if a folder is recorded trusted, any
-//! path at or below it is considered trusted, unless a nearer (more specific)
-//! folder records its own decision — the longest matching path prefix wins, so
-//! an explicit child untrust overrides an ancestor's trust. The persisted file
-//! is written atomically with owner-only (`0600`) permissions.
+//! A recorded grant covers that workspace key and descendants that still
+//! resolve to the same git root ([`workspace_key`]). A nearer recorded
+//! decision wins, so an explicit child untrust overrides an ancestor's trust.
+//! Other workspace keys under the path — including nested git roots — are not
+//! covered. The persisted file is written atomically with owner-only (`0600`)
+//! permissions.
 //!
 //! The store is rooted at [`xai_grok_config::user_grok_home`] — the **Option**
 //! home that resolves to `None` (rather than a cwd-relative `./.grok`) when
@@ -40,7 +41,7 @@ pub const TRUST_FILE_NAME: &str = "trusted_folders.toml";
 /// A single folder's trust record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderTrust {
-    /// Whether the folder (and its subdirectories) is trusted.
+    /// Whether the folder (and same-repo descendants) is trusted.
     pub trusted: bool,
     /// Unix timestamp (seconds) of when the decision was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +53,23 @@ pub struct FolderTrust {
 struct TrustDocument {
     #[serde(default)]
     folders: BTreeMap<String, FolderTrust>,
+}
+
+/// Result of a successful strict read. A failed read is not represented here.
+enum StoreRead {
+    /// File absent. Safe to create.
+    Missing,
+    /// Read and parsed (including an empty/whitespace file as an empty map).
+    Document(TrustDocument),
+}
+
+impl StoreRead {
+    fn into_document(self) -> TrustDocument {
+        match self {
+            Self::Missing => TrustDocument::default(),
+            Self::Document(doc) => doc,
+        }
+    }
 }
 
 /// Persisted set of trusted folders.
@@ -67,14 +85,19 @@ pub struct TrustStore {
     /// Backing file, or `None` when no user home resolves — a trust-nothing,
     /// persist-nothing store. Never a cwd-relative path.
     path: Option<PathBuf>,
+    /// False when the backing file exists but could not be read or parsed.
+    /// Such a store trusts nothing and refuses to write until the file reads
+    /// cleanly again, so a corrupt store is never replaced by an empty one.
+    disk_readable: bool,
 }
 
 impl TrustStore {
     /// Load the trust store from `<user_grok_home>/trusted_folders.toml`.
     ///
     /// When no user home resolves (see the module-level fail-closed note) the
-    /// path is `None` and this returns an [`Self::empty`] store. Otherwise an
-    /// empty store is returned if the file is missing or unparseable (logged).
+    /// path is `None` and this returns an [`Self::empty`] store. A missing file
+    /// loads as an empty store; an unreadable or unparseable one loads as an
+    /// empty, read-only store ([`Self::disk_readable`] is false, logged).
     pub fn load() -> Self {
         match Self::default_path() {
             Some(path) => Self::load_from(path),
@@ -84,21 +107,43 @@ impl TrustStore {
 
     /// Load from a custom path (for tests).
     pub fn load_from(path: PathBuf) -> Self {
-        let doc = Self::read_doc(&path);
-        Self {
-            doc,
-            path: Some(path),
+        match Self::read_doc_strict(&path) {
+            Ok(read) => Self {
+                doc: read.into_document(),
+                path: Some(path),
+                disk_readable: true,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "folder trust: failed to read trust store; leaving file untouched"
+                );
+                Self {
+                    doc: TrustDocument::default(),
+                    path: Some(path),
+                    disk_readable: false,
+                }
+            }
         }
     }
 
     /// An empty store with no backing path: trusts nothing and persists
     /// nothing. Used for the no-home environment where [`Self::default_path`]
-    /// resolves to `None`.
+    /// resolves to `None`. `disk_readable` is true so a missing home is not
+    /// confused with a corrupt file.
     fn empty() -> Self {
         Self {
             doc: TrustDocument::default(),
             path: None,
+            disk_readable: true,
         }
+    }
+
+    /// Whether the backing file (if any) was read and parsed. False means the
+    /// store holds no decisions only because the file is unreadable.
+    pub fn disk_readable(&self) -> bool {
+        self.disk_readable
     }
 
     /// Default on-disk path: `<user_grok_home>/trusted_folders.toml`, or `None`
@@ -121,16 +166,18 @@ impl TrustStore {
     }
 
     /// Whether `workspace_key` is trusted, per the MOST-SPECIFIC recorded
-    /// decision (longest matching path prefix).
+    /// decision that applies to this workspace.
     ///
     /// This is the SHARED folder-trust gate: the most-specific-wins semantics
     /// apply to ALL folder-trust surfaces (repo-local MCP and LSP servers, and
     /// project hooks), not just hooks.
     ///
-    /// Trust cascades to subdirectories: a trusted parent folder trusts all of
-    /// its children. When both an ancestor and a nearer folder are recorded, the
-    /// longest matching prefix wins, so an explicit child untrust overrides an
-    /// ancestor's trust instead of being undone by the cascade. The query key is
+    /// A grant covers the recorded key and descendants that share its
+    /// [`workspace_key`] (one git root). When both an ancestor and a nearer
+    /// folder are recorded, the longest matching prefix wins, so an explicit
+    /// child untrust overrides an ancestor's trust. A descendant with its own
+    /// workspace key (e.g. a nested git repo) is not covered: trusting `~/code`
+    /// must not trust a separate repo cloned at `~/code/evil`. The query key is
     /// canonicalized here, so callers need not pre-canonicalize (symmetric with
     /// [`Self::set_trusted`]).
     ///
@@ -140,9 +187,14 @@ impl TrustStore {
     /// would otherwise trust huge swaths of the filesystem through the cascade.
     /// See [`is_unsafe_trust_root`].
     pub fn is_trusted(&self, workspace_key: &Path) -> bool {
+        // An unreadable store is not an empty allow-list; fail closed.
+        if !self.disk_readable {
+            return false;
+        }
         let workspace_key = canonicalize_or_owned(workspace_key);
-        // Among all recorded ancestor folders (including the key itself), the
-        // longest match decides. Canonical, code-produced keys are normalized, so
+        let query_id = workspace_id(&workspace_key);
+        // Among recorded folders that cover this workspace, the longest match
+        // decides. Canonical, code-produced keys are normalized, so
         // that longest match is unique. A hand-edited store could hold
         // non-canonical aliases (e.g. `/a/b` vs `/a/b/`) that tie on depth; on a
         // tie we require EVERY tied record to be trusted, so a contradictory edit
@@ -152,6 +204,9 @@ impl TrustStore {
         for (folder, record) in &self.doc.folders {
             let folder = Path::new(folder);
             if is_unsafe_trust_root(folder) || !workspace_key.starts_with(folder) {
+                continue;
+            }
+            if workspace_id(folder) != query_id {
                 continue;
             }
             let depth = folder.components().count();
@@ -231,10 +286,12 @@ impl TrustStore {
     ///    for the whole critical section (released on drop), so concurrent
     ///    writers serialize;
     /// 2. re-read the current on-disk document so a peer's decisions are merged
-    ///    rather than clobbered (lost-update fix);
+    ///    rather than clobbered (lost-update fix). A read or parse failure is
+    ///    an `Err` and nothing is written: rewriting would replace every prior
+    ///    decision in a corrupt store with just this one;
     /// 3. insert the record and persist atomically;
     /// 4. only on success commit the new document to memory — on any
-    ///    lock/persist error `self.doc` is left unchanged.
+    ///    lock/read/persist error `self.doc` is left unchanged.
     fn record_decision(&mut self, workspace_key: &Path, trusted: bool) -> io::Result<()> {
         let canonical = canonicalize_or_owned(workspace_key);
         if is_unsafe_trust_root(&canonical) {
@@ -271,7 +328,16 @@ impl TrustStore {
         let _lock = ExclusiveLock::acquire(&path.with_extension("toml.lock"))?;
 
         // Re-read the latest on-disk state (merges a peer's concurrent writes).
-        let mut doc = Self::read_doc(path);
+        // A failed read is not an empty document and must not be written back.
+        let mut doc = Self::read_doc_strict(path)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "folder trust: trust store unreadable; decision not recorded"
+                );
+            })?
+            .into_document();
         doc.folders.insert(
             canonical.to_string_lossy().to_string(),
             FolderTrust {
@@ -284,30 +350,22 @@ impl TrustStore {
         // leaves the in-memory store unchanged.
         Self::persist_doc(path, &doc)?;
         self.doc = doc;
+        self.disk_readable = true;
         Ok(())
     }
 
-    fn read_doc(path: &Path) -> TrustDocument {
+    /// Strict read: only an absent file is [`StoreRead::Missing`]. Any other
+    /// read error, or a parse error, is an `Err` — never an empty document —
+    /// so the caller cannot mistake a corrupt store for "no decisions".
+    fn read_doc_strict(path: &Path) -> io::Result<StoreRead> {
         let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return TrustDocument::default(),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "folder trust: failed to read trust store; treating as empty"
-                );
-                return TrustDocument::default();
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StoreRead::Missing),
+            Err(e) => return Err(e),
         };
-        toml::from_str(&contents).unwrap_or_else(|e| {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "folder trust: failed to parse trust store; treating as empty"
-            );
-            TrustDocument::default()
-        })
+        toml::from_str(&contents)
+            .map(StoreRead::Document)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Write `doc` to `path` atomically (unique temp + fsync + rename) with
@@ -440,6 +498,12 @@ pub fn is_home_dir(path: &Path) -> bool {
 /// for a key the store can never grant would be unliftable.
 pub fn is_unsafe_trust_root(key: &Path) -> bool {
     !key.is_absolute() || key.parent().is_none() || is_home_dir(key)
+}
+
+/// [`workspace_key`] of the nearest existing ancestor (git2 discover fails on
+/// a missing path).
+fn workspace_id(path: &Path) -> PathBuf {
+    workspace_key(path.ancestors().find(|p| p.exists()).unwrap_or(path))
 }
 
 fn canonicalize_or_owned(path: &Path) -> PathBuf {
@@ -861,13 +925,14 @@ mod tests {
         let repo = tmp.path().join("repo");
         let child = repo.join("crates").join("inner");
         std::fs::create_dir_all(&child).unwrap();
+        git2::Repository::init(&repo).unwrap();
         let repo_key = canonicalize_or_owned(&repo);
         let child_key = canonicalize_or_owned(&child);
 
         let mut store = TrustStore::load_from(tmp.path().join(TRUST_FILE_NAME));
         store.set_trusted(&repo_key).unwrap();
 
-        // Child dir is trusted because an ancestor (the repo root) is trusted.
+        // Child dir is trusted because it shares the trusted repo's git root.
         assert!(store.is_trusted(&child_key));
         // A sibling outside the trusted root is NOT trusted.
         let sibling = canonicalize_or_owned(tmp.path()).join("other-repo");
@@ -883,6 +948,90 @@ mod tests {
     }
 
     #[test]
+    fn parent_grant_does_not_cover_nested_git_root() {
+        // Trusting `~/code` must not trust a separate repo cloned beneath it.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("work");
+        let nested = parent.join("evil");
+        std::fs::create_dir_all(&nested).unwrap();
+        git2::Repository::init(&nested).unwrap();
+        let parent_key = canonicalize_or_owned(&parent);
+        let nested_key = canonicalize_or_owned(&nested);
+
+        let mut store = TrustStore::load_from(tmp.path().join(TRUST_FILE_NAME));
+        store.set_trusted(&parent_key).unwrap();
+
+        assert!(
+            store.is_trusted(&parent_key),
+            "the granted folder stays trusted"
+        );
+        assert!(
+            !store.is_trusted(&nested_key),
+            "a nested git root must not inherit a parent grant"
+        );
+    }
+
+    #[test]
+    fn git_parent_grant_does_not_cover_nested_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("work");
+        let nested = parent.join("evil");
+        let sibling = parent.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        git2::Repository::init(&parent).unwrap();
+        git2::Repository::init(&nested).unwrap();
+        let parent_key = canonicalize_or_owned(&parent);
+        let nested_key = canonicalize_or_owned(&nested);
+        let sibling_key = canonicalize_or_owned(&sibling);
+
+        let mut store = TrustStore::load_from(tmp.path().join(TRUST_FILE_NAME));
+        store.set_trusted(&parent_key).unwrap();
+
+        assert!(
+            store.is_trusted(&parent_key),
+            "the granted folder stays trusted"
+        );
+        assert!(
+            store.is_trusted(&sibling_key),
+            "a same-repo subdirectory is still covered"
+        );
+        assert!(
+            !store.is_trusted(&nested_key),
+            "a nested git root must not inherit a parent grant"
+        );
+        assert!(
+            !store.is_trusted(&nested_key.join("src")),
+            "a descendant of the nested git root must not inherit a parent grant"
+        );
+    }
+
+    #[test]
+    fn parent_grant_does_not_cover_nongit_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("work");
+        let child = parent.join("tarball");
+        std::fs::create_dir_all(&child).unwrap();
+        let parent_key = canonicalize_or_owned(&parent);
+        let child_key = canonicalize_or_owned(&child);
+        // Stop git discovery here in case the temp dir sits inside a repo
+        // (libgit2 discover ignores GIT_CEILING_DIRECTORIES).
+        std::fs::write(tmp.path().join(".git"), "gitdir: /nonexistent\n").unwrap();
+
+        let mut store = TrustStore::load_from(tmp.path().join(TRUST_FILE_NAME));
+        store.set_trusted(&parent_key).unwrap();
+
+        assert!(
+            store.is_trusted(&parent_key),
+            "the granted folder stays trusted"
+        );
+        assert!(
+            !store.is_trusted(&child_key),
+            "a non-git descendant is its own workspace and must not inherit a parent grant"
+        );
+    }
+
+    #[test]
     fn most_specific_decision_wins_over_ancestor_cascade() {
         // An explicit child untrust must override a trusted ancestor (the bug
         // where an untrust was undone by the cascade on the next reload). The
@@ -894,6 +1043,7 @@ mod tests {
         let other = parent.join("other");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::create_dir_all(&other).unwrap();
+        git2::Repository::init(&parent).unwrap();
         let parent_key = canonicalize_or_owned(&parent);
         let child_key = canonicalize_or_owned(&child);
         let other_key = canonicalize_or_owned(&other);
@@ -931,6 +1081,7 @@ mod tests {
         let parent = tmp.path().join("parent");
         let child = parent.join("child");
         std::fs::create_dir_all(&child).unwrap();
+        git2::Repository::init(&parent).unwrap();
         let parent_key = canonicalize_or_owned(&parent);
         let child_key = canonicalize_or_owned(&child);
 
@@ -1067,7 +1218,43 @@ mod tests {
 
         let store = TrustStore::load_from(store_path);
         assert!(store.is_empty(), "malformed store must load as empty");
+        assert!(!store.disk_readable());
         assert!(!store.is_trusted(Path::new("/any/path")));
+    }
+
+    #[test]
+    fn corrupt_store_is_not_overwritten_by_a_new_decision() {
+        // A store that fails to parse (e.g. a bad hand-edit) still holds the
+        // user's prior decisions. Recording a new one must refuse to write
+        // rather than replace the whole file with a single-entry document.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join(TRUST_FILE_NAME);
+        let corrupt = "[folders.\"/work/repo\"]\ntrusted = true\n[[[ broken\n";
+        std::fs::write(&store_path, corrupt).unwrap();
+        let project = tmp.path().join("other");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut store = TrustStore::load_from(store_path.clone());
+        assert!(!store.disk_readable());
+        let err = store.set_trusted(&project).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(&store_path).unwrap(),
+            corrupt,
+            "the unreadable store must be left untouched"
+        );
+        assert!(
+            !store.is_trusted(&project),
+            "nothing was recorded in memory"
+        );
+
+        // Once the file reads cleanly again, decisions merge and persist.
+        std::fs::write(&store_path, "[folders.\"/work/repo\"]\ntrusted = true\n").unwrap();
+        store.set_trusted(&project).unwrap();
+        assert!(store.disk_readable());
+        let reloaded = TrustStore::load_from(store_path);
+        assert!(reloaded.has_decision(&project));
+        assert!(reloaded.has_decision(Path::new("/work/repo")));
     }
 
     #[test]

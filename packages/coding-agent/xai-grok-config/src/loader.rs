@@ -192,12 +192,14 @@ pub fn managed_config_layers_at(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookProvenance {
-    /// `/etc/grok/managed_config.toml`.
+    /// `/etc/grok/managed_config.toml` (root-owned).
     SystemManaged,
-    /// `$BLADERUNNER_HOME/managed_config.toml` (server-synced).
+    /// `$BLADERUNNER_HOME/managed_config.toml` (server-synced, user-writable).
     Managed,
-    /// `requirements.toml` (user or system tier).
+    /// System-tier `requirements.toml` (root-owned).
     Requirements,
+    /// `$BLADERUNNER_HOME/requirements.toml` (user-writable).
+    UserRequirements,
     /// `$BLADERUNNER_HOME/config.toml`.
     User,
     /// A JSON hook file (the hooks directory, a vendor settings file, or a
@@ -221,12 +223,21 @@ impl Default for HookProvenance {
 }
 
 impl HookProvenance {
+    /// Root-owned admin policy tiers; the user cannot disable their hooks.
+    /// Every disable path must consult this predicate rather than re-derive the
+    /// rule from names or paths. `$BLADERUNNER_HOME` tiers (`Managed`,
+    /// `UserRequirements`) never qualify: the user owns that directory.
+    pub fn is_managed_policy(self) -> bool {
+        matches!(self, Self::SystemManaged | Self::Requirements)
+    }
+
     /// The snake_case wire string (matches the derived serde representation).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SystemManaged => "system_managed",
             Self::Managed => "managed",
             Self::Requirements => "requirements",
+            Self::UserRequirements => "user_requirements",
             Self::User => "user",
             Self::File => "file",
             Self::Plugin => "plugin",
@@ -245,6 +256,7 @@ impl std::str::FromStr for HookProvenance {
             "system_managed" => Self::SystemManaged,
             "managed" => Self::Managed,
             "requirements" => Self::Requirements,
+            "user_requirements" => Self::UserRequirements,
             "user" => Self::User,
             "file" => Self::File,
             "plugin" => Self::Plugin,
@@ -339,7 +351,7 @@ pub fn hook_config_layers_at(
         LayerSpec {
             dir: user_home,
             filename: REQUIREMENTS_FILENAME,
-            provenance: HookProvenance::Requirements,
+            provenance: HookProvenance::UserRequirements,
             source_name: "requirements/user",
         },
         LayerSpec {
@@ -755,6 +767,39 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(cmd, "${HOME}/u.sh");
+    }
+
+    /// Only root-owned tiers are managed policy; `$BLADERUNNER_HOME` copies of
+    /// the same files are user-writable and stay disableable.
+    #[test]
+    fn hook_config_layers_split_requirements_by_owner() {
+        let sys = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let hooks = "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"/r.sh\"\n";
+        for dir in [sys.path(), home.path()] {
+            write(dir, REQUIREMENTS_FILENAME, hooks);
+            write(dir, MANAGED_CONFIG_FILENAME, hooks);
+        }
+
+        let layers = hook_config_layers_at(Some(sys.path()), Some(home.path()));
+        let got: Vec<_> = layers
+            .iter()
+            .map(|l| (l.source_name(), l.provenance().is_managed_policy()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("requirements/system", true),
+                ("requirements/user", false),
+                ("managed", false),
+                ("system_managed", true),
+            ]
+        );
+        assert_eq!(layers[1].provenance(), HookProvenance::UserRequirements);
+        assert_eq!(
+            "user_requirements".parse::<HookProvenance>().unwrap(),
+            HookProvenance::UserRequirements
+        );
     }
 
     #[test]

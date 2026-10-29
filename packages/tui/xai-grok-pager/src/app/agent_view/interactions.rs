@@ -111,20 +111,45 @@ impl AgentView {
                         } else if is_right {
                             scope.selected = crate::views::permission_view::McpScope::Tool;
                         }
-                    } else if is_right
-                        && let Some(ref h) = perm.bash_highlights
-                        && perm.bash_selection_count < h.highlighted_words.len()
+                        let on_scoped_row = perm
+                            .options
+                            .get(perm.active_idx)
+                            .is_some_and(|o| perm.is_scoped_option(o));
+                        if !on_scoped_row && let Some(idx) = perm.scoped_allow_row_idx() {
+                            perm.active_idx = idx;
+                        }
+                    } else if let Some(len) = perm
+                        .bash_highlights
+                        .as_ref()
+                        .map(|h| h.highlighted_words.len())
                     {
-                        perm.bash_selection_count += 1;
-                    } else if is_left && perm.bash_selection_count > 1 {
-                        perm.bash_selection_count -= 1;
-                    }
-                    let on_scoped_row = perm
-                        .options
-                        .get(perm.active_idx)
-                        .is_some_and(|o| perm.is_scoped_option(o));
-                    if !on_scoped_row && let Some(idx) = perm.scoped_allow_row_idx() {
-                        perm.active_idx = idx;
+                        // Land on a scoped row first, then adjust that row's
+                        // own count: the deny row narrows freely, the allow
+                        // row stops at the agent's minimum persisted scope.
+                        let on_scoped_row = perm
+                            .options
+                            .get(perm.active_idx)
+                            .is_some_and(|o| perm.is_scoped_option(o));
+                        if !on_scoped_row && let Some(idx) = perm.scoped_row_jump_idx() {
+                            perm.active_idx = idx;
+                        }
+                        let active_row = perm
+                            .options
+                            .get(perm.active_idx)
+                            .map(|o| o.option_id.0.as_ref());
+                        if active_row
+                            == Some(crate::views::permission_view::REJECT_ALWAYS_COMMAND_OPTION_ID)
+                        {
+                            if is_right && perm.bash_deny_selection_count < len {
+                                perm.bash_deny_selection_count += 1;
+                            } else if is_left && perm.bash_deny_selection_count > 1 {
+                                perm.bash_deny_selection_count -= 1;
+                            }
+                        } else if active_row
+                            == Some(crate::views::permission_view::ALLOW_ALWAYS_COMMAND_OPTION_ID)
+                        {
+                            perm.bash_selection_count = perm.step_allow_scope(is_right);
+                        }
                     }
                     return InputOutcome::Changed;
                 }
@@ -1663,6 +1688,7 @@ mod permission_scope_key_tests {
             },
         );
         perm.bash_selection_count = 2;
+        perm.bash_deny_selection_count = 2;
         agent.permission_queue.push_back(perm);
     }
     /// ←/→ on the "Never allow" (RejectAlways) row must adjust the scope in
@@ -1679,7 +1705,68 @@ mod permission_scope_key_tests {
         assert!(matches!(outcome, InputOutcome::Changed));
         let perm = agent.permission_queue.front().unwrap();
         assert_eq!(perm.active_idx, 3, "cursor must stay on the deny row");
-        assert_eq!(perm.bash_selection_count, 1, "← must still narrow scope");
+        assert_eq!(
+            perm.bash_deny_selection_count, 1,
+            "← on the deny row narrows the deny scope"
+        );
+        assert_eq!(
+            perm.bash_selection_count, 2,
+            "the allow scope is untouched from the deny row"
+        );
+    }
+    /// Pinned commands (here a dangerous verb) save only the full command, so
+    /// ← on the allow row must not narrow below it — the agent would refuse
+    /// the narrower label and the "always allow" would silently become
+    /// allow-once. The deny row still narrows freely.
+    #[test]
+    fn allow_scope_left_is_clamped_to_minimum_but_deny_is_not() {
+        let mut agent = make_agent();
+        setup_bash_permission(&mut agent);
+        let words: Vec<String> = vec!["git".into(), "push".into(), "origin".into()];
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_highlights = Some(
+                xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights {
+                    prefix: vec![],
+                    highlighted_words: words.clone(),
+                    suffix: vec![],
+                },
+            );
+            perm.bash_selection_count =
+                xai_grok_workspace::permission::default_always_allow_scope(&words);
+            perm.bash_deny_selection_count =
+                xai_grok_workspace::permission::default_always_deny_scope(&words);
+            perm.active_idx = 0;
+        }
+        {
+            let perm = agent.permission_queue.front().unwrap();
+            assert_eq!(
+                perm.bash_selection_count, 3,
+                "allow opens on the full command"
+            );
+            assert_eq!(
+                perm.bash_deny_selection_count, 2,
+                "deny opens on `git push`"
+            );
+        }
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+        agent.handle_permission_key(&left);
+        assert_eq!(
+            agent.permission_queue.front().unwrap().bash_selection_count,
+            3,
+            "← must not narrow a pinned allow below the minimum scope"
+        );
+        agent.permission_queue.front_mut().unwrap().active_idx = 3;
+        agent.handle_permission_key(&left);
+        let perm = agent.permission_queue.front().unwrap();
+        assert_eq!(
+            perm.bash_deny_selection_count, 1,
+            "← on the deny row narrows even for pinned commands"
+        );
+        assert!(
+            perm.has_adjustable_scope(),
+            "arrows stay advertised while the deny row is adjustable"
+        );
     }
     /// From a non-scoped row ←/→ still jump the cursor to the AllowAlways
     /// row (the discoverability affordance).
@@ -1767,10 +1854,9 @@ mod permission_scope_key_tests {
             }
         }
     }
-    /// With only the exact `reject-always-command` row present, ←/→ still
-    /// adjust the scope in place on that row; from a neutral row there is no
-    /// allow row to jump to, so the cursor stays put (but the scope keys keep
-    /// working).
+    /// With only the exact `reject-always-command` row present, ←/→ adjust
+    /// the deny scope in place on that row, and from a neutral row they land
+    /// on the deny row — never on an invisible allow count.
     #[test]
     fn reject_only_scoped_row_adjusts_in_place_without_allow_jump() {
         let mut agent = make_agent();
@@ -1791,14 +1877,24 @@ mod permission_scope_key_tests {
         {
             let perm = agent.permission_queue.front().unwrap();
             assert_eq!(perm.active_idx, 1, "cursor stays on the deny row");
-            assert_eq!(perm.bash_selection_count, 1, "← must still narrow scope");
+            assert_eq!(
+                perm.bash_deny_selection_count, 1,
+                "← must still narrow the deny scope"
+            );
         }
         agent.permission_queue.front_mut().unwrap().active_idx = 0;
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::empty());
         let _ = agent.handle_permission_key(&right);
         let perm = agent.permission_queue.front().unwrap();
-        assert_eq!(perm.active_idx, 0, "no allow row -> no cursor jump");
-        assert_eq!(perm.bash_selection_count, 2, "→ must still expand scope");
+        assert_eq!(perm.active_idx, 1, "arrows land on the deny row");
+        assert_eq!(
+            perm.bash_deny_selection_count, 2,
+            "→ expands the deny scope"
+        );
+        assert_eq!(
+            perm.bash_selection_count, 2,
+            "the invisible allow count is untouched"
+        );
     }
     /// Ctrl-F toggles args expansion in both focus modes when the prompt
     /// shows planned MCP args — even when remember_tool_approvals=false

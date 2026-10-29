@@ -2104,9 +2104,13 @@ pub fn collect_tool_metadata(iter: impl Iterator<Item = io::Result<SessionUpdate
                             if budget == 0 {
                                 continue;
                             }
-                            let truncated = &tc.title[..tc.title.len().min(budget)];
-                            chars_emitted += truncated.len();
-                            meta.push(truncated.to_string());
+                            // Floor to a char boundary: a byte cut inside a
+                            // multibyte char would panic.
+                            let truncated = &tc.title[..tc.title.floor_char_boundary(budget)];
+                            if !truncated.is_empty() {
+                                chars_emitted += truncated.len();
+                                meta.push(truncated.to_string());
+                            }
                         }
 
                         // File paths from locations[].path
@@ -2118,9 +2122,11 @@ pub fn collect_tool_metadata(iter: impl Iterator<Item = io::Result<SessionUpdate
                                 if budget == 0 {
                                     continue;
                                 }
-                                let truncated = &path_str[..path_str.len().min(budget)];
-                                meta.push(truncated.to_string());
-                                chars_emitted += truncated.len();
+                                let truncated = &path_str[..path_str.floor_char_boundary(budget)];
+                                if !truncated.is_empty() {
+                                    meta.push(truncated.to_string());
+                                    chars_emitted += truncated.len();
+                                }
                             }
                         }
                     }
@@ -3542,6 +3548,33 @@ mod tests {
         // Should cap at 200 tool calls (title + paths, but paths empty so just titles)
         let titles: Vec<_> = result.iter().filter(|s| s.starts_with("tool_")).collect();
         assert_eq!(titles.len(), 200);
+    }
+
+    /// A budget that ends inside a multibyte char must truncate at the
+    /// previous char boundary instead of panicking.
+    #[test]
+    fn collect_tool_metadata_truncates_multibyte_at_char_boundary() {
+        let tool_call = |id: &str, title: &str, locations: &str| -> io::Result<SessionUpdate> {
+            let line = acp_envelope(&format!(
+                r#"{{"sessionUpdate":"tool_call","toolCallId":"{id}","title":"{title}","kind":"read","locations":{locations}}}"#,
+            ));
+            Ok(serde_json::from_str(&line).unwrap())
+        };
+
+        // A 1-byte budget ends inside the title's leading "é", so it is dropped.
+        let filler = "a".repeat(99_999);
+        let updates = vec![
+            tool_call("tc0", &filler, "[]"),
+            tool_call("tc1", "éa", "[]"),
+        ];
+        let result = collect_tool_metadata(updates.into_iter());
+        assert_eq!(result, vec![filler]);
+
+        // A 6-byte budget ends inside the path's trailing "é".
+        let filler = "a".repeat(99_994);
+        let updates = vec![tool_call("tc0", &filler, r#"[{"path":"/tmp/é"}]"#)];
+        let result = collect_tool_metadata(updates.into_iter());
+        assert_eq!(result, vec![filler, "/tmp/".to_string()]);
     }
 
     #[test]

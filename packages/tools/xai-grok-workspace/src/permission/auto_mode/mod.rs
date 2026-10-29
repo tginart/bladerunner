@@ -596,7 +596,7 @@ pub(crate) const RG_UNSAFE_FLAGS: &[&str] = &["--pre", "--hostname-bin"];
 /// Why this exists: ordinary search is safe to allow automatically, but these
 /// flags execute programs. Both permission paths must use the same list.
 pub(crate) fn rg_has_unsafe_flag(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("rg") {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("rg") {
         return false;
     }
     words.iter().skip(1).any(|w| {
