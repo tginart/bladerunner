@@ -46,7 +46,7 @@ mod bash_grants;
 pub mod reasons;
 mod request_classification;
 
-use bash_grants::{bash_glob_covers_script, persist_bash_always_allow};
+use bash_grants::{bash_glob_covers_script, glob_names_program, persist_bash_always_allow};
 
 pub use request_classification::{AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT};
 use request_classification::{
@@ -521,6 +521,37 @@ fn matches_bash_glob(segment_str: &str, pattern: &str) -> bool {
     super::policy::bash_pattern_matches_command(pattern, segment_str)
 }
 
+/// Whether a persisted session grant (literal prefix or glob) authorizes one
+/// wrapper-peeled segment `words` (joined as `segment_str`).
+///
+/// Enforcement mirrors the scopes always-allow may save, so a legacy or forged
+/// grant cannot reach further than a fresh prompt would:
+/// - pinned commands run whatever argv follows, so they match only an exact
+///   literal grant (`docker run nginx` must not cover `... --privileged`, nor
+///   `sed -n 1p f` cover `sed -n 1p f -e 'w /tmp/x'`); globs never count;
+/// - for `gh`, a prefix grant shorter than group + action (a legacy `gh pr`)
+///   would cover mutating verbs like `gh pr merge`, so it does not count;
+/// - a glob counts only if its first token literally names the program
+///   (`bash_grants::glob_names_program`), so `*a*` cannot cover everything.
+fn session_grant_covers_segment(
+    words: &[String],
+    segment_str: &str,
+    state: &PermissionState,
+) -> bool {
+    if always_allow_scope_pinned(words) {
+        return state.allowed_bash_commands.contains(segment_str);
+    }
+    let min_words = gh_always_allow_scope(words).unwrap_or(1);
+    let prefix_grant = state.allowed_bash_commands.iter().any(|a| {
+        a.split_whitespace().count() >= min_words && matches_whitelist_prefix(segment_str, a)
+    });
+    prefix_grant
+        || state
+            .allowed_bash_globs
+            .iter()
+            .any(|g| glob_names_program(g, words) && matches_bash_glob(segment_str, g))
+}
+
 /// Ordinary command-segment outcome, before script-level effect floors.
 #[derive(Debug)]
 pub(crate) enum SegmentEvaluation {
@@ -684,23 +715,7 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
             };
         }
 
-        // Pinned commands run whatever argv follows, so a prefix grant would
-        // widen: `docker run nginx` must not match `... --privileged`, nor
-        // `sed -n 1p f` match `sed -n 1p f -e 'w /tmp/x'`. Their saved scope is
-        // the full command, so enforce it on the exact segment only.
-        let matched_command_grant = if always_allow_scope_pinned(words) {
-            state.allowed_bash_commands.contains(s.as_str())
-        } else {
-            state
-                .allowed_bash_commands
-                .iter()
-                .any(|a| matches_whitelist_prefix(&s, a))
-        };
-        let matched_grant = matched_command_grant
-            || state
-                .allowed_bash_globs
-                .iter()
-                .any(|g| matches_bash_glob(&s, g));
+        let matched_grant = session_grant_covers_segment(words, &s, state);
         all_segments_granted &= matched_grant;
 
         // 2. Dangerous commands must be prompted even if a whitelist prefix
@@ -7119,6 +7134,64 @@ mod tests {
         assert!(matches!(
             evaluate_bash_segments("python3 -c 'import os'", &legacy),
             SegmentEvaluation::NeedsPrompts { .. }
+        ));
+    }
+
+    /// Legacy or forged glob grants must not reach further than a fresh
+    /// always-allow could: wildcard-led globs never count, and pinned commands
+    /// ignore globs entirely (exact literal grants only).
+    #[test]
+    fn glob_grants_need_a_literal_program_and_skip_pinned_commands() {
+        let mut state = PermissionState::default();
+        for glob in ["*a*", "*3*", "?argo *", "cargo build *"] {
+            state.allowed_bash_globs.insert(glob.to_owned());
+        }
+        for cmd in ["npm install evil", "python3 x.py", "python3 -c 'import os'"] {
+            assert!(
+                matches!(
+                    evaluate_bash_segments(cmd, &state),
+                    SegmentEvaluation::NeedsPrompts { .. }
+                ),
+                "{cmd:?} must not ride a wildcard-led glob"
+            );
+        }
+        assert!(matches!(
+            evaluate_bash_segments("cargo build --release", &state),
+            SegmentEvaluation::AutoAllow {
+                via_session_grant: true
+            }
+        ));
+        // Even a literal-headed glob never covers a pinned exec vehicle.
+        let mut vehicle = PermissionState::default();
+        vehicle.allowed_bash_globs.insert("python3 *".to_owned());
+        assert!(matches!(
+            evaluate_bash_segments("python3 x.py", &vehicle),
+            SegmentEvaluation::NeedsPrompts { .. }
+        ));
+    }
+
+    /// Legacy `gh` grants saved under the old two-word default (`gh pr`) must
+    /// not auto-allow mutating verbs; group + action grants still work.
+    #[test]
+    fn legacy_short_gh_prefix_grants_do_not_cover_mutating_verbs() {
+        let mut state = PermissionState::default();
+        for grant in ["gh pr", "gh repo", "gh pr view"] {
+            state.allowed_bash_commands.insert(grant.to_owned());
+        }
+        for cmd in ["gh pr merge 5", "gh repo delete x", "gh pr close 5"] {
+            assert!(
+                matches!(
+                    evaluate_bash_segments(cmd, &state),
+                    SegmentEvaluation::NeedsPrompts { .. }
+                ),
+                "{cmd:?} must not ride a legacy short gh grant"
+            );
+        }
+        assert!(matches!(
+            evaluate_bash_segments("gh pr view 5 --json title", &state),
+            SegmentEvaluation::AutoAllow {
+                via_session_grant: true
+            }
         ));
     }
 

@@ -7,7 +7,9 @@ use crate::permission::bash_command_splitting::{
     is_setup_command, primary_command_from_script, try_parse_shell,
     try_parse_word_only_commands_sequence, unwrap_wrappers,
 };
-use crate::permission::policy::{bash_glob_is_catchall, bash_pattern_matches_command};
+use crate::permission::policy::{
+    bash_glob_is_catchall, bash_pattern_matches_command, normalized_command_head,
+};
 use crate::permission::state::PermissionState;
 
 /// Whether `join(" ")` round-trips these words to the same single command.
@@ -60,11 +62,12 @@ pub(super) fn persist_bash_always_allow(state: &mut PermissionState, cmd: &str, 
 
 /// Whether a client-supplied glob grant is scoped to `cmd`: it must match at
 /// least one non-setup segment under the same matcher enforcement uses (the
-/// raw text when the script is unparseable), and it must not be universally
-/// broad. A pattern like `*` / `**` / `* *` "matches the prompted script" only
-/// by matching everything, so a forged reply could mint a blanket grant;
-/// [`bash_glob_is_catchall`] refuses those. Scoped patterns the pattern editor
-/// produces (`gh api repos/owner/*`) still pass.
+/// raw text when the script is unparseable), it must name that segment's
+/// program literally ([`glob_names_program`]), and it must not be universally
+/// broad. A pattern like `*` / `*a*` "matches the prompted script" only by
+/// matching nearly everything, so a forged reply could mint a blanket grant.
+/// Scoped patterns the pattern editor produces (`gh api repos/owner/*`) still
+/// pass.
 pub(super) fn bash_glob_covers_script(cmd: &str, pattern: &str) -> bool {
     if bash_glob_is_catchall(pattern) {
         return false;
@@ -72,14 +75,32 @@ pub(super) fn bash_glob_covers_script(cmd: &str, pattern: &str) -> bool {
     let segments =
         try_parse_shell(cmd).and_then(|tree| try_parse_word_only_commands_sequence(&tree, cmd));
     let Some(segments) = segments else {
-        return bash_pattern_matches_command(pattern, cmd);
+        let raw_words: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
+        return glob_names_program(pattern, &raw_words)
+            && bash_pattern_matches_command(pattern, cmd);
     };
     segments.iter().any(|seg| {
         let words = unwrap_wrappers(seg.words());
         !words.is_empty()
             && !is_setup_command(words)
+            && glob_names_program(pattern, words)
             && bash_pattern_matches_command(pattern, &words.join(" "))
     })
+}
+
+/// Whether the glob's first token is a literal (no wildcard characters) that
+/// names the segment's program ([`normalized_command_head`] on both sides).
+/// A glob that leads with a wildcard (`*a*`, `*3*`) matches across programs,
+/// so it never counts as a grant, whether persisted or enforced.
+pub(super) fn glob_names_program(pattern: &str, words: &[String]) -> bool {
+    let Some(head) = pattern.split_whitespace().next() else {
+        return false;
+    };
+    if head.contains(['*', '?', '[', ']']) {
+        return false;
+    }
+    let head = normalized_command_head(&[head.to_owned()]);
+    head.is_some() && head == normalized_command_head(words)
 }
 
 #[cfg(test)]
@@ -182,6 +203,17 @@ mod tests {
         // A forged scope naming commands the prompt never showed is refused.
         assert!(!bash_glob_covers_script("ls -la", "gh api *"));
         assert!(!bash_glob_covers_script("ls -la", "*push*"));
+        // Near-universal globs that lead with a wildcard match the prompted
+        // script but also nearly everything else, so they are refused too.
+        assert!(!bash_glob_covers_script("cargo build", "*a*"));
+        assert!(!bash_glob_covers_script("python3 x.py", "*3*"));
+        assert!(!bash_glob_covers_script("cargo build", "?argo build"));
+        // The literal head must be the segment's own program.
+        assert!(!bash_glob_covers_script("cargo build", "cargo* build"));
+        assert!(bash_glob_covers_script(
+            "cargo build --release",
+            "cargo build *"
+        ));
         // Catch-all patterns "match the prompted script" only by matching
         // everything, so a forged reply cannot mint a blanket grant.
         for catchall in ["*", "**", "* *", "?*"] {
