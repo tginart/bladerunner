@@ -184,14 +184,24 @@ fn feature_enabled_for_build(remote: Option<&RemoteSettings>, is_local_build: bo
 /// servers are honored on the next resolve. Done client-side because trust is
 /// durable: even when the agent runs in a separate leader process it reads the
 /// same `~/.grok/trusted_folders.toml`. Best-effort; a write failure is logged,
-/// not fatal.
+/// not fatal. Interactive "trust this folder" answers use
+/// [`try_grant_folder_trust`] so they can tell the user when the grant did not
+/// persist.
 pub fn grant_folder_trust(cwd: &Path) {
+    // The error is already logged by `persist_trust`.
+    let _ = try_grant_folder_trust(cwd);
+}
+
+/// [`grant_folder_trust`] that returns the store error (e.g. an unreadable
+/// `trusted_folders.toml`, which [`TrustStore`] refuses to overwrite) instead
+/// of only logging it.
+pub fn try_grant_folder_trust(cwd: &Path) -> std::io::Result<()> {
     // Local/dev builds never gate, so there is nothing to grant: `--trust` is a
     // no-op and the store is left untouched (the whole feature is inert).
     if folder_trust_inert() {
-        return;
+        return Ok(());
     }
-    persist_trust(&mut TrustStore::load(), &workspace_key(cwd));
+    persist_trust(&mut TrustStore::load(), &workspace_key(cwd))
 }
 
 /// Store-only half of revoking trust for `cwd`'s workspace: persist an explicit
@@ -219,14 +229,15 @@ pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     was_trusted
 }
 
-pub fn persist_trust(store: &mut TrustStore, key: &Path) {
-    if let Err(e) = store.set_trusted(key) {
+/// Persist a trust grant for `key`, logging and returning any store error.
+pub fn persist_trust(store: &mut TrustStore, key: &Path) -> std::io::Result<()> {
+    store.set_trusted(key).inspect_err(|e| {
         tracing::warn!(
             path = %key.display(),
             error = %e,
             "folder trust: failed to persist trust decision"
         );
-    }
+    })
 }
 
 /// Whether any repo-local trust-sensitive config is present for `cwd`. When none

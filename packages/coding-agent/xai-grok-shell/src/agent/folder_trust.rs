@@ -45,7 +45,7 @@ pub use xai_grok_workspace::folder_trust::grant_folder_trust;
 use xai_grok_workspace::folder_trust::{
     DecideInputs, TrustOutcome, claude_project_mcp_names, decide, decide_inputs,
     decide_inputs_with_interactive, feature_enabled, folder_trust_inert, persist_trust,
-    prompt_for_trust,
+    prompt_for_trust, try_grant_folder_trust,
 };
 
 use crate::session::managed_mcp::mcp_server_name;
@@ -204,6 +204,36 @@ fn record(workspace_key: &Path, allowed: bool) {
     DECISIONS
         .lock()
         .insert(workspace_key.to_path_buf(), allowed);
+}
+
+/// Grant trust for `cwd`'s workspace in answer to an explicit user "trust
+/// this folder". The grant is persisted when possible. When the store cannot
+/// be written (e.g. an unreadable `trusted_folders.toml`, which the store
+/// refuses to overwrite) the decision is still honored in this process, so
+/// the answer does not silently do nothing, and the error is returned for the
+/// caller to show the user.
+pub fn grant_folder_trust_for_session(cwd: &Path) -> std::io::Result<()> {
+    grant_for_session_with(cwd, try_grant_folder_trust)
+}
+
+/// [`grant_folder_trust_for_session`] with the durable grant injected, so
+/// tests need not touch the process-global trust store path.
+fn grant_for_session_with(
+    cwd: &Path,
+    persist: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    persist(cwd).inspect_err(|_| record(&workspace_key(cwd), true))
+}
+
+/// User-facing text for a trust grant that holds only for this process.
+pub fn session_only_trust_notice(err: &std::io::Error) -> String {
+    let store = TrustStore::default_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the folder-trust store".to_owned());
+    format!(
+        "Folder trusted for this session only: could not save the decision to {store} ({err}). \
+         Fix or remove that file to make trust decisions persist."
+    )
 }
 
 /// Test-only: force the recorded decision for `cwd`'s workspace key.
@@ -378,7 +408,11 @@ fn compute_from_inputs(
             if prompt_for_trust(key) {
                 // Reload the store (the inputs gather dropped its copy) to
                 // persist the accepted prompt grant.
-                persist_trust(&mut TrustStore::load(), key);
+                // The caller records this durable verdict in-process, so the
+                // answer holds for this session even if the store write fails.
+                if let Err(e) = persist_trust(&mut TrustStore::load(), key) {
+                    eprintln!("{}", session_only_trust_notice(&e));
+                }
                 (true, true)
             } else {
                 (false, true)
@@ -567,6 +601,46 @@ mod tests {
             !project_scope_allowed(tmp.path()),
             "cache must be downgraded so untrust is immediate"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trust_answer_holds_for_session_when_store_is_unreadable() {
+        let _sim = simulate_release_build();
+        // An unreadable store refuses writes (see the trust store's
+        // `corrupt_store_is_not_overwritten_by_a_new_decision`), so a "trust
+        // this folder" answer cannot persist. It must still take effect
+        // in-process (not silently do nothing) and report the error. The
+        // failing write is injected: the store path is a process-global, so
+        // writing a corrupt file there would poison other tests.
+        let tmp = repo_tmp();
+        let key = workspace_key(tmp.path());
+        record(&key, false);
+        let unreadable = |_: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected newline",
+            ))
+        };
+
+        let err = grant_for_session_with(tmp.path(), unreadable).unwrap_err();
+        assert!(
+            session_only_trust_notice(&err).contains("this session only"),
+            "the notice must say the grant did not persist"
+        );
+        assert!(
+            project_scope_allowed(tmp.path()),
+            "the user's trust answer must hold in-process for this session"
+        );
+        assert!(
+            resolve_and_record_inner(&key, || false, || panic!("cached grant must not recompute")),
+            "a later resolve must keep the session grant, not re-read the store"
+        );
+
+        // A successful durable write records nothing extra in-process.
+        let other = repo_tmp();
+        assert!(grant_for_session_with(other.path(), |_| Ok(())).is_ok());
+        assert!(DECISIONS.lock().get(&workspace_key(other.path())).is_none());
     }
 
     #[test]
