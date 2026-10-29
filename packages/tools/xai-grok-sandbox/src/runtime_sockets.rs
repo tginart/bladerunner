@@ -1,13 +1,19 @@
 //! Launch-time unix socket deny list for sandbox profiles.
 //!
 //! Restricted profiles keep `/run`, `/var`, and the home directory readable
-//! (DNS/NSS, tool config). That leaves D-Bus, the systemd private socket, and
-//! container-runtime API sockets path-reachable. A message on those sockets
-//! runs work outside the sandboxed process tree: `systemd-run --user` starts a
-//! unit that Landlock does not cover, and `docker run -v /:/host` reaches the
-//! whole host. Profile resolution adds the well-known endpoints that exist at
-//! launch to the profile's `deny` list (bwrap bind-over on Linux, Seatbelt on
-//! macOS).
+//! (DNS/NSS, tool config). That leaves the session D-Bus, the systemd private
+//! sockets, and container-runtime API sockets path-reachable. A message on
+//! those sockets runs work outside the sandboxed process tree: `systemd-run
+//! --user` starts a unit that Landlock does not cover, and
+//! `docker run -v /:/host` reaches the whole host. Profile resolution adds the
+//! well-known endpoints that exist at launch to the profile's `deny` list
+//! (bwrap bind-over on Linux, Seatbelt on macOS).
+//!
+//! The system bus (`/run/dbus/system_bus_socket`) stays reachable on purpose.
+//! The Linux bwrap re-exec wraps the whole agent process, and the agent itself
+//! listens to logind on the system bus (`xai-system-power`, which feeds the
+//! auth sleep gate). Unit spawn over the system bus also needs polkit
+//! authorization, so the session bus and user systemd are the real escape.
 //!
 //! This is a static, launch-time list: it does not cover sockets created after
 //! startup. For container runtimes the session-long guarantee is the per-spawn
@@ -41,7 +47,7 @@ const PER_HOME_RUNTIME_SOCKET_SUFFIXES: &[&str] =
 /// Which socket families a profile denies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SocketDenyPolicy {
-    /// System/session D-Bus and systemd private sockets.
+    /// Session D-Bus and systemd private sockets (not the system bus).
     pub dbus: bool,
     /// Docker, podman, and containerd API sockets.
     pub container_runtime: bool,
@@ -80,11 +86,8 @@ pub(crate) fn existing_socket_paths(candidates: impl IntoIterator<Item = PathBuf
 }
 
 fn dbus_socket_candidates() -> Vec<PathBuf> {
-    let mut paths = vec![
-        PathBuf::from("/run/dbus/system_bus_socket"),
-        PathBuf::from("/var/run/dbus/system_bus_socket"),
-        PathBuf::from("/run/systemd/private"),
-    ];
+    // No system bus: see the module docs.
+    let mut paths = vec![PathBuf::from("/run/systemd/private")];
     #[cfg(unix)]
     {
         let uid = current_uid();
@@ -133,11 +136,10 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn dbus_policy_covers_system_and_session_buses() {
+    fn dbus_policy_covers_session_bus_and_systemd_but_not_system_bus() {
         let candidates = socket_deny_candidates(SocketDenyPolicy { dbus: true, ..NONE });
         let uid = current_uid();
         for expected in [
-            "/run/dbus/system_bus_socket".to_string(),
             "/run/systemd/private".to_string(),
             format!("/run/user/{uid}/bus"),
             format!("/run/user/{uid}/systemd/private"),
@@ -148,6 +150,11 @@ mod tests {
             );
         }
         assert!(!candidates.iter().any(|p| p.ends_with("docker.sock")));
+        // The agent's own logind listener needs the system bus.
+        assert!(
+            !candidates.iter().any(|p| p.ends_with("system_bus_socket")),
+            "{candidates:?}"
+        );
     }
 
     #[test]
