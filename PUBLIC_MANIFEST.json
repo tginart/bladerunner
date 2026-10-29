@@ -9801,6 +9801,12 @@
       "mode": "0644"
     },
     {
+      "path": "packages/tools/xai-grok-tools/src/implementations/grok_build/n_shot/decision.rs",
+      "bytes": 9120,
+      "sha256": "9a9f735b3027caa912862b4f0a4178ee90ec4e125435fa2f0a540a67babeba83",
+      "mode": "0644"
+    },
+    {
       "path": "packages/tools/xai-grok-tools/src/implementations/grok_build/n_shot/mod.rs",
       "bytes": 12373,
       "sha256": "5fbcc365cda27c9a7b25e28a06f0cb4928fba2b0d6f74f5563ac135071e24003",
