@@ -32,7 +32,6 @@ const SYSTEM_RUNTIME_SOCKETS: &[&str] = &[
 ];
 
 /// Rootless engines bind under the calling uid's runtime dir, not `/run`.
-#[cfg(unix)]
 const PER_UID_RUNTIME_SOCKET_SUFFIXES: &[&str] = &[
     "docker.sock",
     "podman/podman.sock",
@@ -88,22 +87,18 @@ pub(crate) fn existing_socket_paths(candidates: impl IntoIterator<Item = PathBuf
 fn dbus_socket_candidates() -> Vec<PathBuf> {
     // No system bus: see the module docs.
     let mut paths = vec![PathBuf::from("/run/systemd/private")];
-    #[cfg(unix)]
-    {
-        let uid = current_uid();
-        paths.push(PathBuf::from(format!("/run/user/{uid}/bus")));
-        paths.push(PathBuf::from(format!("/run/user/{uid}/systemd/private")));
+    if let Some(runtime_dir) = user_runtime_dir() {
+        paths.push(runtime_dir.join("bus"));
+        paths.push(runtime_dir.join("systemd/private"));
     }
     paths
 }
 
 fn container_runtime_socket_candidates() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = SYSTEM_RUNTIME_SOCKETS.iter().map(PathBuf::from).collect();
-    #[cfg(unix)]
-    {
-        let uid = current_uid();
+    if let Some(runtime_dir) = user_runtime_dir() {
         for suffix in PER_UID_RUNTIME_SOCKET_SUFFIXES {
-            paths.push(PathBuf::from(format!("/run/user/{uid}/{suffix}")));
+            paths.push(runtime_dir.join(suffix));
         }
     }
     if let Some(home) = dirs::home_dir() {
@@ -114,10 +109,18 @@ fn container_runtime_socket_candidates() -> Vec<PathBuf> {
     paths
 }
 
-#[cfg(unix)]
-fn current_uid() -> libc::uid_t {
-    // SAFETY: getuid has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
+/// `/run/user/<uid>`, the per-user runtime dir; `None` where there are no uids.
+fn user_runtime_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        Some(PathBuf::from(format!("/run/user/{uid}")))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -138,7 +141,8 @@ mod tests {
     #[cfg(unix)]
     fn dbus_policy_covers_session_bus_and_systemd_but_not_system_bus() {
         let candidates = socket_deny_candidates(SocketDenyPolicy { dbus: true, ..NONE });
-        let uid = current_uid();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
         for expected in [
             "/run/systemd/private".to_string(),
             format!("/run/user/{uid}/bus"),
@@ -164,7 +168,8 @@ mod tests {
             container_runtime: true,
             ..NONE
         });
-        let uid = current_uid();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
         for expected in [
             "/var/run/docker.sock".to_string(),
             "/run/podman/podman.sock".to_string(),
