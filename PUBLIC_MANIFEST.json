@@ -16042,8 +16042,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/scrollback/scrollback_pane.rs",
-      "bytes": 64559,
-      "sha256": "870876ad405523163ffb8027fab168524720585283e39bdaa0e71bc894225dd7",
+      "bytes": 64901,
+      "sha256": "852d584ed40150aeb4e82a5a41d41291d77635d98298460d74c92ff0da8e3aff",
       "mode": "0644"
     },
     {
