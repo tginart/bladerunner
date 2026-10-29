@@ -420,6 +420,22 @@ pub fn default_always_allow_scope(words: &[String]) -> usize {
     if let Some(n) = gh_always_allow_scope(words) {
         return n;
     }
+    base_scope(words)
+}
+
+/// Default "Never allow" scope (word count) for a parsed command. Denies
+/// honor prefixes for every command — "Never allow: git push" blocking all
+/// pushes is the point — so the always-allow pins do not apply.
+pub fn default_always_deny_scope(words: &[String]) -> usize {
+    if words.is_empty() {
+        return 0;
+    }
+    base_scope(words)
+}
+
+/// Verb-plus-flags scope shared by the allow default (unpinned arm) and the
+/// deny default.
+fn base_scope(words: &[String]) -> usize {
     if is_safe_command_words(words) {
         if is_safe_command_words_str(&words[0]) {
             return 1;
@@ -7063,6 +7079,10 @@ mod tests {
         );
         // Ordinary commands still narrow freely.
         assert_eq!(minimum_always_allow_scope(&words("cargo test --lib")), 1);
+        // Deny scopes are not pinned: "Never allow: git push" covers all pushes.
+        assert_eq!(default_always_deny_scope(&words("git push origin main")), 2);
+        assert_eq!(default_always_deny_scope(&words("sudo git status")), 2);
+        assert_eq!(default_always_deny_scope(&words("ls -la src/")), 1);
     }
 
     /// A pinned grant persists the full command and matches only that exact
