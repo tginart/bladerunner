@@ -55,6 +55,23 @@ struct TrustDocument {
     folders: BTreeMap<String, FolderTrust>,
 }
 
+/// Result of a successful strict read. A failed read is not represented here.
+enum StoreRead {
+    /// File absent. Safe to create.
+    Missing,
+    /// Read and parsed (including an empty/whitespace file as an empty map).
+    Document(TrustDocument),
+}
+
+impl StoreRead {
+    fn into_document(self) -> TrustDocument {
+        match self {
+            Self::Missing => TrustDocument::default(),
+            Self::Document(doc) => doc,
+        }
+    }
+}
+
 /// Persisted set of trusted folders.
 ///
 /// Construct with [`TrustStore::load`] (production) or [`TrustStore::load_from`]
@@ -68,14 +85,19 @@ pub struct TrustStore {
     /// Backing file, or `None` when no user home resolves — a trust-nothing,
     /// persist-nothing store. Never a cwd-relative path.
     path: Option<PathBuf>,
+    /// False when the backing file exists but could not be read or parsed.
+    /// Such a store trusts nothing and refuses to write until the file reads
+    /// cleanly again, so a corrupt store is never replaced by an empty one.
+    disk_readable: bool,
 }
 
 impl TrustStore {
     /// Load the trust store from `<user_grok_home>/trusted_folders.toml`.
     ///
     /// When no user home resolves (see the module-level fail-closed note) the
-    /// path is `None` and this returns an [`Self::empty`] store. Otherwise an
-    /// empty store is returned if the file is missing or unparseable (logged).
+    /// path is `None` and this returns an [`Self::empty`] store. A missing file
+    /// loads as an empty store; an unreadable or unparseable one loads as an
+    /// empty, read-only store ([`Self::disk_readable`] is false, logged).
     pub fn load() -> Self {
         match Self::default_path() {
             Some(path) => Self::load_from(path),
@@ -85,21 +107,43 @@ impl TrustStore {
 
     /// Load from a custom path (for tests).
     pub fn load_from(path: PathBuf) -> Self {
-        let doc = Self::read_doc(&path);
-        Self {
-            doc,
-            path: Some(path),
+        match Self::read_doc_strict(&path) {
+            Ok(read) => Self {
+                doc: read.into_document(),
+                path: Some(path),
+                disk_readable: true,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "folder trust: failed to read trust store; leaving file untouched"
+                );
+                Self {
+                    doc: TrustDocument::default(),
+                    path: Some(path),
+                    disk_readable: false,
+                }
+            }
         }
     }
 
     /// An empty store with no backing path: trusts nothing and persists
     /// nothing. Used for the no-home environment where [`Self::default_path`]
-    /// resolves to `None`.
+    /// resolves to `None`. `disk_readable` is true so a missing home is not
+    /// confused with a corrupt file.
     fn empty() -> Self {
         Self {
             doc: TrustDocument::default(),
             path: None,
+            disk_readable: true,
         }
+    }
+
+    /// Whether the backing file (if any) was read and parsed. False means the
+    /// store holds no decisions only because the file is unreadable.
+    pub fn disk_readable(&self) -> bool {
+        self.disk_readable
     }
 
     /// Default on-disk path: `<user_grok_home>/trusted_folders.toml`, or `None`
@@ -143,6 +187,10 @@ impl TrustStore {
     /// would otherwise trust huge swaths of the filesystem through the cascade.
     /// See [`is_unsafe_trust_root`].
     pub fn is_trusted(&self, workspace_key: &Path) -> bool {
+        // An unreadable store is not an empty allow-list; fail closed.
+        if !self.disk_readable {
+            return false;
+        }
         let workspace_key = canonicalize_or_owned(workspace_key);
         let query_id = workspace_id(&workspace_key);
         // Among recorded folders that cover this workspace, the longest match
@@ -238,10 +286,12 @@ impl TrustStore {
     ///    for the whole critical section (released on drop), so concurrent
     ///    writers serialize;
     /// 2. re-read the current on-disk document so a peer's decisions are merged
-    ///    rather than clobbered (lost-update fix);
+    ///    rather than clobbered (lost-update fix). A read or parse failure is
+    ///    an `Err` and nothing is written: rewriting would replace every prior
+    ///    decision in a corrupt store with just this one;
     /// 3. insert the record and persist atomically;
     /// 4. only on success commit the new document to memory — on any
-    ///    lock/persist error `self.doc` is left unchanged.
+    ///    lock/read/persist error `self.doc` is left unchanged.
     fn record_decision(&mut self, workspace_key: &Path, trusted: bool) -> io::Result<()> {
         let canonical = canonicalize_or_owned(workspace_key);
         if is_unsafe_trust_root(&canonical) {
@@ -278,7 +328,16 @@ impl TrustStore {
         let _lock = ExclusiveLock::acquire(&path.with_extension("toml.lock"))?;
 
         // Re-read the latest on-disk state (merges a peer's concurrent writes).
-        let mut doc = Self::read_doc(path);
+        // A failed read is not an empty document and must not be written back.
+        let mut doc = Self::read_doc_strict(path)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "folder trust: trust store unreadable; decision not recorded"
+                );
+            })?
+            .into_document();
         doc.folders.insert(
             canonical.to_string_lossy().to_string(),
             FolderTrust {
@@ -291,30 +350,22 @@ impl TrustStore {
         // leaves the in-memory store unchanged.
         Self::persist_doc(path, &doc)?;
         self.doc = doc;
+        self.disk_readable = true;
         Ok(())
     }
 
-    fn read_doc(path: &Path) -> TrustDocument {
+    /// Strict read: only an absent file is [`StoreRead::Missing`]. Any other
+    /// read error, or a parse error, is an `Err` — never an empty document —
+    /// so the caller cannot mistake a corrupt store for "no decisions".
+    fn read_doc_strict(path: &Path) -> io::Result<StoreRead> {
         let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return TrustDocument::default(),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "folder trust: failed to read trust store; treating as empty"
-                );
-                return TrustDocument::default();
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StoreRead::Missing),
+            Err(e) => return Err(e),
         };
-        toml::from_str(&contents).unwrap_or_else(|e| {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "folder trust: failed to parse trust store; treating as empty"
-            );
-            TrustDocument::default()
-        })
+        toml::from_str(&contents)
+            .map(StoreRead::Document)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Write `doc` to `path` atomically (unique temp + fsync + rename) with
@@ -1167,7 +1218,43 @@ mod tests {
 
         let store = TrustStore::load_from(store_path);
         assert!(store.is_empty(), "malformed store must load as empty");
+        assert!(!store.disk_readable());
         assert!(!store.is_trusted(Path::new("/any/path")));
+    }
+
+    #[test]
+    fn corrupt_store_is_not_overwritten_by_a_new_decision() {
+        // A store that fails to parse (e.g. a bad hand-edit) still holds the
+        // user's prior decisions. Recording a new one must refuse to write
+        // rather than replace the whole file with a single-entry document.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join(TRUST_FILE_NAME);
+        let corrupt = "[folders.\"/work/repo\"]\ntrusted = true\n[[[ broken\n";
+        std::fs::write(&store_path, corrupt).unwrap();
+        let project = tmp.path().join("other");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut store = TrustStore::load_from(store_path.clone());
+        assert!(!store.disk_readable());
+        let err = store.set_trusted(&project).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(&store_path).unwrap(),
+            corrupt,
+            "the unreadable store must be left untouched"
+        );
+        assert!(
+            !store.is_trusted(&project),
+            "nothing was recorded in memory"
+        );
+
+        // Once the file reads cleanly again, decisions merge and persist.
+        std::fs::write(&store_path, "[folders.\"/work/repo\"]\ntrusted = true\n").unwrap();
+        store.set_trusted(&project).unwrap();
+        assert!(store.disk_readable());
+        let reloaded = TrustStore::load_from(store_path);
+        assert!(reloaded.has_decision(&project));
+        assert!(reloaded.has_decision(Path::new("/work/repo")));
     }
 
     #[test]
