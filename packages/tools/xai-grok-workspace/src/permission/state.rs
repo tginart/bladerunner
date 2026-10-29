@@ -81,7 +81,9 @@ impl PermissionState {
     /// Merging is deliberately additive in both directions: denies persist
     /// like grants, so an accepted "never allow" holds until an explicit reset
     /// ([`replace_state_on_disk`], the non-merging path) — nothing removed only
-    /// in one session's memory can win a merge.
+    /// in one session's memory can win a merge. The flip side: a reset in one
+    /// session does not reach other live sessions until they restart (see
+    /// [`replace_state_on_disk`]).
     ///
     /// Exhaustive destructure: adding a `PermissionState` field breaks this
     /// fn until the merge decision for it is made explicitly.
@@ -253,6 +255,12 @@ pub(crate) async fn persist_state(
 
 /// Replace the on-disk state without merging — reset semantics, where the
 /// whole point is discarding grants.
+///
+/// Limitation: a reset clears only the file and the resetting session.
+/// Another live session in the same project keeps its in-memory snapshot,
+/// still honors the pre-reset grants, and writes them back to disk on its
+/// next save (merge-on-write cannot tell a reset-removed grant from one this
+/// file never saw). The reset takes full effect once those sessions restart.
 pub(crate) async fn replace_state_on_disk(
     cwd: &AbsPathBuf,
     state: &PermissionState,

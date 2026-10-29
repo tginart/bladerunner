@@ -1529,7 +1529,9 @@ fn spawn_permission_manager_with_pin(
                     state = PermissionState::default();
                     // Replace, not merge: persist_state unions on-disk grants
                     // back in, which would resurrect everything a reset is
-                    // meant to discard.
+                    // meant to discard. Other live sessions in this project
+                    // keep (and may re-save) their pre-reset grants until they
+                    // restart; see `replace_state_on_disk`.
                     replace_state_on_disk(&cwd, &state, client_id_ref).await;
                     allow_edits_for_session = false;
                     tracing::info!(
