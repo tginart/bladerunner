@@ -66,11 +66,14 @@ pub(super) fn dispatch_interject(
     let blocks = if images.is_empty() {
         None
     } else {
-        Some(crate::prompt_images::build_content_blocks_with_workspace(
+        let build = crate::prompt_images::build_content_blocks_with_workspace_report(
             text.clone(),
             images,
             Some(std::path::Path::new(&agent.session.cwd)),
-        ))
+        );
+        // After the "Interjection sent" toast so the skipped notice wins.
+        agent.notify_skipped_image_send(&build.skipped_display_numbers);
+        Some(build.blocks)
     };
 
     vec![Effect::SendInterject {
@@ -138,11 +141,13 @@ pub(super) fn dispatch_send_prompt_now(
     // marker.
     super::queue::arm_send_now_and_paint_dispatched(agent, &prompt_id, &text);
 
-    let blocks = crate::prompt_images::build_content_blocks_with_workspace(
+    let build = crate::prompt_images::build_content_blocks_with_workspace_report(
         text.clone(),
         images,
         Some(std::path::Path::new(&agent.session.cwd)),
     );
+    agent.notify_skipped_image_send(&build.skipped_display_numbers);
+    let blocks = build.blocks;
 
     // Optimistic queue-pane echo, reconciled by the shell's queue broadcast.
     let sid_str = session_id.0.to_string();
@@ -360,5 +365,74 @@ mod tests {
             effects.as_slice(),
             [Effect::SendInterject { blocks: None, .. }]
         ));
+    }
+
+    /// An attached image whose staged file is gone: no bytes reach the wire.
+    fn unreadable_image(dir: &std::path::Path) -> crate::prompt_images::PastedImage {
+        let mut img = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+            data: vec![1, 2, 3],
+            mime_type: "image/png".into(),
+        });
+        img.display_number = 1;
+        img.encoded_bytes = None;
+        img.session_image_path = Some(dir.join("gone.png"));
+        img
+    }
+
+    /// An image that cannot be loaded must not vanish silently: the prompt
+    /// still carries `[Image #1]`, so the user is told it was not sent.
+    #[test]
+    fn interject_with_unreadable_image_shows_notice() {
+        let mut app = test_app_with_agent();
+        let dir = tempfile::tempdir().unwrap();
+
+        let effects = dispatch(
+            Action::Interject {
+                text: "look at [Image #1]".into(),
+                images: vec![unreadable_image(dir.path())],
+            },
+            &mut app,
+        );
+
+        match effects.as_slice() {
+            [
+                Effect::SendInterject {
+                    blocks: Some(blocks),
+                    ..
+                },
+            ] => assert_eq!(blocks.len(), 1, "only the text block is sent"),
+            other => panic!("expected SendInterject with blocks, got {other:?}"),
+        }
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.toast.as_ref().map(|(m, _)| m.as_str()),
+            Some("Image #1 couldn't be read — not sent")
+        );
+    }
+
+    #[test]
+    fn send_now_with_unreadable_image_shows_notice() {
+        let mut app = test_app_with_agent();
+        let dir = tempfile::tempdir().unwrap();
+
+        let effects = dispatch(
+            Action::SendPromptNow {
+                text: "look at [Image #1]".into(),
+                images: vec![unreadable_image(dir.path())],
+            },
+            &mut app,
+        );
+
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendPromptNow { blocks, .. } if blocks.len() == 1)),
+            "send-now goes out with the text block only: {effects:?}"
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.toast.as_ref().map(|(m, _)| m.as_str()),
+            Some("Image #1 couldn't be read — not sent")
+        );
     }
 }
