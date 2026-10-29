@@ -12,20 +12,7 @@ static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
 async fn save_config_locked(config: &Config) -> Result<()> {
     let path = user_config_path();
-    let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => match toml::from_str::<TomlValue>(&s) {
-            Ok(v) => v,
-            Err(parse_err) => {
-                return Err(anyhow::anyhow!(
-                    "refusing to overwrite unparseable {}: {}; save a backup \
-                         and fix the syntax error before retrying",
-                    path.display(),
-                    parse_err,
-                ));
-            }
-        },
-        Err(_) => TomlValue::Table(TomlMap::new()),
-    };
+    let mut root = read_existing_config_root(&path).await?;
     if !matches!(root, TomlValue::Table(_)) {
         root = TomlValue::Table(TomlMap::new());
     }
@@ -82,6 +69,32 @@ async fn save_config_locked(config: &Config) -> Result<()> {
     let _ = prior_mode;
     tokio::fs::rename(&tmp, &write_path).await?;
     Ok(())
+}
+/// Read the on-disk `config.toml` that a save merges into. Only `NotFound`
+/// counts as empty: any other read error (EACCES, EISDIR, invalid UTF-8) or a
+/// parse error refuses the save, since the merged result would replace the
+/// whole user file.
+async fn read_existing_config_root(path: &std::path::Path) -> Result<TomlValue> {
+    let s = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TomlValue::Table(TomlMap::new()));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "refusing to overwrite unreadable {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    toml::from_str::<TomlValue>(&s).map_err(|parse_err| {
+        anyhow::anyhow!(
+            "refusing to overwrite unparseable {}: {}; save a backup \
+                 and fix the syntax error before retrying",
+            path.display(),
+            parse_err,
+        )
+    })
 }
 /// Acquire the `config.toml` write lock used by [`save_config`], so callers that
 /// mutate the file directly (marketplace add/remove, Foundry sign-in) can't
@@ -287,8 +300,9 @@ where
     F: FnOnce(&mut Config),
 {
     let _guard = lock_config_writes().await?;
-    let root: TomlValue =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
+    // `load_from_disk` already maps a missing file to an empty table; any other
+    // error must abort, or the save below would replace the user's whole file.
+    let root: TomlValue = crate::config::load_from_disk()?;
     let mut cfg = load_config_from_toml(&root);
     f(&mut cfg);
     save_config_locked(&cfg).await
@@ -418,6 +432,31 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    /// Only a missing file reads as empty; any other read error must refuse
+    /// the save, or the merged result would wipe the user's config.toml.
+    #[tokio::test]
+    async fn read_existing_config_root_refuses_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = read_existing_config_root(&dir.path().join("config.toml"))
+            .await
+            .unwrap();
+        assert_eq!(missing, TomlValue::Table(TomlMap::new()));
+
+        let non_utf8 = dir.path().join("non_utf8.toml");
+        std::fs::write(&non_utf8, b"[ui]\nyolo = true\n# \xff\xfe\n").unwrap();
+        let err = read_existing_config_root(&non_utf8).await.unwrap_err();
+        assert!(err.to_string().contains("unreadable"), "{err}");
+
+        let is_dir = dir.path().join("is_dir.toml");
+        std::fs::create_dir(&is_dir).unwrap();
+        assert!(read_existing_config_root(&is_dir).await.is_err());
+
+        let unparseable = dir.path().join("bad.toml");
+        std::fs::write(&unparseable, "[ui\n").unwrap();
+        let err = read_existing_config_root(&unparseable).await.unwrap_err();
+        assert!(err.to_string().contains("unparseable"), "{err}");
     }
 
     #[test]
