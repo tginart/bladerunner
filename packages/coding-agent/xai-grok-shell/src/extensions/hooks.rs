@@ -72,7 +72,8 @@ pub(crate) fn hook_spec_to_info(spec: &xai_grok_hooks::config::HookSpec) -> Hook
         url: url_display,
         timeout_ms: spec.timeout_ms,
         source_dir: spec.source_dir.display().to_string(),
-        disabled: xai_grok_hooks::trust::is_hook_disabled(&spec.name),
+        // Managed-policy hooks never show as disabled: dispatch ignores the list.
+        disabled: xai_grok_hooks::trust::is_spec_disabled(spec),
     }
 }
 
