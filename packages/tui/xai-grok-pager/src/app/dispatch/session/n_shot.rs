@@ -7,11 +7,13 @@
 use super::fork::{ForkFocus, spawn_fork};
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
+use crate::app::agent_view::AgentView;
+use crate::app::app_view::ActiveView;
 use crate::app::app_view::AppView;
 use crate::app::n_shot::{
     NShotColumnsState, NShotGroup, NShotMember, PendingShotStart, ShotSpec, ShotStatus,
-    ShotSummary, build_record, build_report, classify_shot, join_prompt, next_group_label,
-    shot_label,
+    ShotSummary, StoredGroup, build_record, build_report, classify_shot, join_prompt,
+    next_group_label, parse_record, shot_label,
 };
 use crate::scrollback::block::RenderBlock;
 
@@ -111,6 +113,7 @@ fn start_group(
         last_statuses: Vec::new(),
         started_at: std::time::Instant::now(),
         settled_after: None,
+        stored: Vec::new(),
     });
     effects
 }
@@ -233,6 +236,9 @@ pub(crate) fn tick(app: &mut AppView) -> Vec<Effect> {
         let parent_session_id = parent_session_id(app, &group).unwrap_or_default();
         let mut joined = group.clone();
         joined.joined = all_settled;
+        if all_settled {
+            joined.settled_after = Some(group.started_at.elapsed());
+        }
         let mut files = vec![(
             dir.join("shots.json"),
             pretty(&build_record(
@@ -368,17 +374,17 @@ fn parent_session_id(app: &AppView, group: &NShotGroup) -> Option<String> {
 
 /// The group's directory: `<parent session dir>/n-shot/<label>/`.
 fn group_dir(app: &AppView, group: &NShotGroup) -> Option<std::path::PathBuf> {
-    let parent = app.agents.get(&group.parent)?;
+    Some(n_shot_root(app.agents.get(&group.parent)?)?.join(&group.label))
+}
+
+/// The parent's `n-shot/` directory, which holds one directory per group.
+fn n_shot_root(parent: &AgentView) -> Option<std::path::PathBuf> {
     let session_id = parent.session.session_id.clone()?;
     let info = xai_grok_shell::session::info::Info {
         id: session_id,
         cwd: parent.session.cwd.to_string_lossy().to_string(),
     };
-    Some(
-        xai_grok_shell::session::persistence::session_dir(&info)
-            .join("n-shot")
-            .join(&group.label),
-    )
+    Some(xai_grok_shell::session::persistence::session_dir(&info).join("n-shot"))
 }
 
 /// `n_shot.json` in each shot's session dir, pointing back at the group.
@@ -435,50 +441,51 @@ fn pretty(value: &serde_json::Value) -> String {
 }
 
 /// Open the columns of the active parent's group `label`, if it has one.
-pub(in crate::app::dispatch) fn open_columns(app: &mut AppView, label: &str) {
-    let crate::app::app_view::ActiveView::Agent(parent_id) = app.active_view else {
-        return;
+/// Output: Load effects for shots that were stored but not loaded yet.
+pub(in crate::app::dispatch) fn open_columns(app: &mut AppView, label: &str) -> Vec<Effect> {
+    let ActiveView::Agent(parent_id) = app.active_view else {
+        return vec![];
     };
-    if app
+    if !app
         .n_shot_groups
         .iter()
         .any(|g| g.parent == parent_id && g.label == label)
     {
-        app.n_shot_columns = Some(NShotColumnsState {
-            parent: Some(parent_id),
-            label: label.to_string(),
-            focus: 0,
-        });
+        return vec![];
     }
+    app.n_shot_columns = Some(NShotColumnsState {
+        parent: Some(parent_id),
+        label: label.to_string(),
+        focus: 0,
+    });
+    load_stored_shots(app, parent_id, label)
 }
 
-/// Open the columns of the active parent's latest group. Returns false when the
-/// active agent has no session-shot group, so `/shots` can fall back to the
-/// subagent n-shot view.
-pub(in crate::app::dispatch) fn open_latest_columns(app: &mut AppView) -> bool {
-    let crate::app::app_view::ActiveView::Agent(parent_id) = app.active_view else {
-        return false;
+/// Open the columns of the active parent's latest group. Returns `None` when
+/// the active agent has no session-shot group, so `/shots` can fall back to
+/// the subagent n-shot view.
+pub(in crate::app::dispatch) fn open_latest_columns(app: &mut AppView) -> Option<Vec<Effect>> {
+    let ActiveView::Agent(parent_id) = app.active_view else {
+        return None;
     };
-    let Some(group) = app
+    let label = app
         .n_shot_groups
         .iter()
         .rev()
-        .find(|g| g.parent == parent_id)
-    else {
-        return false;
-    };
-    app.n_shot_columns = Some(NShotColumnsState {
-        parent: Some(parent_id),
-        label: group.label.clone(),
-        focus: 0,
-    });
-    true
+        .find(|g| g.parent == parent_id)?
+        .label
+        .clone();
+    Some(open_columns(app, &label))
 }
 
 /// Close the columns view and switch to its focused shot.
 pub(in crate::app::dispatch) fn attach_focused_shot(app: &mut AppView) -> Vec<Effect> {
     let Some(columns) = app.n_shot_columns.take() else {
         return vec![];
+    };
+    let effects = match columns.parent {
+        Some(parent_id) => load_stored_shots(app, parent_id, &columns.label),
+        None => vec![],
     };
     let shot = app
         .n_shot_groups
@@ -495,5 +502,187 @@ pub(in crate::app::dispatch) fn attach_focused_shot(app: &mut AppView) -> Vec<Ef
         }
         _ => app.show_toast("That shot session is closed"),
     }
-    vec![]
+    effects
+}
+
+/// Purpose: Rebuild the n-shot groups of a resumed parent from its `shots.json` files.
+/// Input: The app and the agent whose session loaded.
+/// Output: Load effects for the shots of groups that had not joined yet.
+/// Method:
+///     1. Skip shot sessions, and groups that are already in memory.
+///     2. Read each `n-shot/<label>/shots.json` in the parent's session dir.
+///     3. Record each group with its stored shots and show its block again.
+///     4. Load the shots of a group that had not joined, so the tick can join it.
+/// Note: The shots of a joined group load when the user opens its columns.
+pub(in crate::app::dispatch) fn restore_groups(
+    app: &mut AppView,
+    parent_id: AgentId,
+) -> Vec<Effect> {
+    let Some(parent) = app.agents.get(&parent_id) else {
+        return vec![];
+    };
+    if parent.n_shot.is_some() {
+        return vec![];
+    }
+    let Some(root) = n_shot_root(parent) else {
+        return vec![];
+    };
+    let mut effects = Vec::new();
+    for stored in read_stored_groups(&root) {
+        let is_known = app
+            .n_shot_groups
+            .iter()
+            .any(|g| g.parent == parent_id && g.label == stored.label);
+        if is_known {
+            continue;
+        }
+        let label = stored.label.clone();
+        let group = restored_group(app, parent_id, stored);
+        upsert_group_block(app, &group, &stored_summaries(&group), group.joined);
+        let is_joined = group.joined;
+        app.n_shot_groups.push(group);
+        if !is_joined {
+            effects.extend(load_stored_shots(app, parent_id, &label));
+        }
+    }
+    effects
+}
+
+/// Read every group record under `root`, in label order.
+fn read_stored_groups(root: &std::path::Path) -> Vec<StoredGroup> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
+        Err(e) => {
+            tracing::warn!(dir = %root.display(), error = %e, "cannot read n-shot groups");
+            return vec![];
+        }
+    };
+    let mut groups = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join("shots.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let record = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+        match record.as_ref().and_then(parse_record) {
+            Some(group) => groups.push(group),
+            None => tracing::warn!(path = %path.display(), "invalid n-shot record"),
+        }
+    }
+    groups.sort_by_key(|g| {
+        let number = g.label.trim_start_matches("n-shot-").parse::<usize>();
+        (number.unwrap_or(usize::MAX), g.label.clone())
+    });
+    groups
+}
+
+/// Make the in-memory group of a stored record. Each shot gets a fresh agent
+/// id that has no agent yet, so it shows as closed until it loads.
+fn restored_group(app: &mut AppView, parent_id: AgentId, stored: StoredGroup) -> NShotGroup {
+    let shots = stored
+        .shots
+        .iter()
+        .map(|_| {
+            let id = AgentId(app.next_agent_id);
+            app.next_agent_id += 1;
+            id
+        })
+        .collect();
+    let elapsed = stored.elapsed.unwrap_or_default();
+    NShotGroup {
+        label: stored.label,
+        parent: parent_id,
+        prompt: stored.prompt,
+        shots,
+        joined: stored.joined,
+        last_statuses: stored.shots.iter().map(|s| s.status).collect(),
+        started_at: std::time::Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(std::time::Instant::now),
+        settled_after: stored.joined.then_some(elapsed),
+        stored: stored.shots,
+    }
+}
+
+fn stored_summaries(group: &NShotGroup) -> Vec<ShotSummary> {
+    group
+        .stored
+        .iter()
+        .enumerate()
+        .map(|(i, shot)| ShotSummary {
+            index: i + 1,
+            session_id: Some(shot.session_id.clone()),
+            worktree: shot
+                .worktree
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            status: shot.status,
+            final_message: None,
+        })
+        .collect()
+}
+
+/// Purpose: Load the stored shot sessions of a group that are not open yet.
+/// Input: The app, the parent agent, and the group label.
+/// Output: The load effects.
+/// Note: A load switches the view to the shot, so the old view comes back after.
+fn load_stored_shots(app: &mut AppView, parent_id: AgentId, label: &str) -> Vec<Effect> {
+    let Some(group_idx) = app
+        .n_shot_groups
+        .iter()
+        .position(|g| g.parent == parent_id && g.label == label)
+    else {
+        return vec![];
+    };
+    let previous_view = app.active_view;
+    let total = app.n_shot_groups[group_idx].shots.len();
+    let mut effects = Vec::new();
+    for i in 0..total {
+        let group = &app.n_shot_groups[group_idx];
+        if app.agents.contains_key(&group.shots[i]) {
+            continue;
+        }
+        let Some(stored) = group.stored.get(i).cloned() else {
+            continue;
+        };
+        if find_agent_by_session(app, &stored.session_id).is_none() {
+            effects.extend(super::load::dispatch_load_session(
+                app,
+                stored.session_id.clone(),
+                stored.worktree.clone(),
+                false,
+            ));
+        }
+        let Some(shot_id) = find_agent_by_session(app, &stored.session_id) else {
+            continue;
+        };
+        if let Some(shot) = app.agents.get_mut(&shot_id) {
+            shot.n_shot = Some(NShotMember {
+                label: label.to_string(),
+                index: i + 1,
+                total,
+                parent: parent_id,
+            });
+        }
+        app.n_shot_groups[group_idx].shots[i] = shot_id;
+    }
+    if app.active_view != previous_view {
+        match previous_view {
+            ActiveView::Agent(id) => crate::app::dispatch::ctx::switch_to_agent(
+                app,
+                id,
+                crate::app::dispatch::ctx::SwitchCause::Picker,
+            ),
+            other => app.active_view = other,
+        }
+    }
+    effects
+}
+
+fn find_agent_by_session(app: &AppView, session_id: &str) -> Option<AgentId> {
+    app.agents.iter().find_map(|(id, agent)| {
+        let sid = agent.session.session_id.as_ref()?;
+        (*sid.0 == *session_id).then_some(*id)
+    })
 }

@@ -29,6 +29,9 @@ pub(crate) struct NShotGroup {
     pub started_at: std::time::Instant,
     /// Time from launch until every shot settled. Set at the join.
     pub settled_after: Option<std::time::Duration>,
+    /// Shots read back from `shots.json` after a resume, in shot order. Empty
+    /// for a group started in this run. A stored shot loads on demand.
+    pub stored: Vec<StoredShot>,
 }
 
 impl NShotGroup {
@@ -37,6 +40,24 @@ impl NShotGroup {
         self.settled_after
             .unwrap_or_else(|| self.started_at.elapsed())
     }
+}
+
+/// A shot as `shots.json` records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredShot {
+    pub session_id: String,
+    pub worktree: Option<std::path::PathBuf>,
+    pub status: ShotStatus,
+}
+
+/// A group as `shots.json` records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredGroup {
+    pub label: String,
+    pub prompt: String,
+    pub joined: bool,
+    pub elapsed: Option<std::time::Duration>,
+    pub shots: Vec<StoredShot>,
 }
 
 /// Marks an agent as shot `index` of `total` in the group `label`.
@@ -263,8 +284,37 @@ pub(crate) fn build_record(
         "objective": group.prompt,
         "parent_session_id": parent_session_id,
         "joined": group.joined,
+        "elapsed_ms": group.settled_after.map(|d| d.as_millis() as u64),
         "report": report_path,
         "shots": shots,
+    })
+}
+
+/// Purpose: Read a group back from its `shots.json` record.
+/// Input: The record that `build_record` wrote.
+/// Output: The group, or `None` when the record has no label or a shot has
+///     no session id.
+pub(crate) fn parse_record(record: &serde_json::Value) -> Option<StoredGroup> {
+    let mut shots = Vec::new();
+    for shot in record["shots"].as_array()? {
+        shots.push(StoredShot {
+            session_id: shot["session_id"].as_str()?.to_string(),
+            worktree: shot["worktree"].as_str().map(std::path::PathBuf::from),
+            status: match shot["status"].as_str() {
+                Some("settled") => ShotStatus::Settled,
+                Some("closed") => ShotStatus::Closed,
+                _ => ShotStatus::Working,
+            },
+        });
+    }
+    Some(StoredGroup {
+        label: record["label"].as_str()?.to_string(),
+        prompt: record["objective"].as_str().unwrap_or_default().to_string(),
+        joined: record["joined"].as_bool().unwrap_or(false),
+        elapsed: record["elapsed_ms"]
+            .as_u64()
+            .map(std::time::Duration::from_millis),
+        shots,
     })
 }
 
@@ -325,6 +375,7 @@ mod tests {
             last_statuses: vec![],
             started_at: std::time::Instant::now(),
             settled_after: None,
+            stored: vec![],
         }
     }
 
@@ -364,6 +415,31 @@ mod tests {
         assert!(report.contains("## shot-2"));
         assert!(report.contains("/wt/1"));
         assert!(join_prompt(&group(), Path::new("/r/report.md")).contains("/r/report.md"));
+    }
+
+    #[test]
+    fn record_reads_back_after_a_resume() {
+        let mut joined = group();
+        joined.joined = true;
+        joined.settled_after = Some(std::time::Duration::from_secs(90));
+        let shots = [shot(1, ShotStatus::Settled), shot(2, ShotStatus::Closed)];
+        let record = build_record(&joined, "parent", Path::new("/r/report.md"), &shots);
+        let stored = parse_record(&record).unwrap();
+        assert_eq!(stored.label, "n-shot-1");
+        assert_eq!(stored.prompt, "/goal fix it");
+        assert!(stored.joined);
+        assert_eq!(stored.elapsed, Some(std::time::Duration::from_secs(90)));
+        assert_eq!(
+            stored.shots[1],
+            StoredShot {
+                session_id: "s2".into(),
+                worktree: Some("/wt/2".into()),
+                status: ShotStatus::Closed,
+            }
+        );
+        let mut no_session = record.clone();
+        no_session["shots"][0]["session_id"] = serde_json::Value::Null;
+        assert_eq!(parse_record(&no_session), None);
     }
 
     #[test]

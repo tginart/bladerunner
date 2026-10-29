@@ -14638,8 +14638,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/router.rs",
-      "bytes": 77092,
-      "sha256": "a7216936e92ff429b28b3ba8f17df78c93024da9b1cb55ebc878b4e3473e8017",
+      "bytes": 77149,
+      "sha256": "4d2d66605016ec04b9aeae7491aca55882487334903bee65d252741f8783774c",
       "mode": "0644"
     },
     {
@@ -14662,8 +14662,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/session/load.rs",
-      "bytes": 57807,
-      "sha256": "62295fc6241fd61c263cdb8c02e4d801017c621d727adaf82f0e968d9109fe1c",
+      "bytes": 57877,
+      "sha256": "3b0def9ceff1a8f44eebf002dcfafd5876f6545f05ac6caad4a765953a361149",
       "mode": "0644"
     },
     {
@@ -14680,8 +14680,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/session/n_shot.rs",
-      "bytes": 17562,
-      "sha256": "71deeab2d259444d0ffce731f18e16a490d52e735370bf04219a7761b243b646",
+      "bytes": 24426,
+      "sha256": "a98867b8dfa069cae40447d24e9a43de020998dfe6d948b1ed7b8ac3bc5f0292",
       "mode": "0644"
     },
     {
@@ -15004,8 +15004,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/n_shot.rs",
-      "bytes": 14512,
-      "sha256": "9c1e0c9ede5c1c6fc22b12a5be2c7b8fe3ee2bcea7d7525eb1cf104d8fdbd82b",
+      "bytes": 17438,
+      "sha256": "6f59b0818c8f9284e58c511c0bde3d1a63058edd51449f6b709442f03516aa6b",
       "mode": "0644"
     },
     {

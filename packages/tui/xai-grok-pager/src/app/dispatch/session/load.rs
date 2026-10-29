@@ -1198,6 +1198,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         notify_session_ready(&app.notification_service, agent);
         crate::memory_release::release_retained_memory_with("session-load-replay");
         note_peek_page_flip(app, agent_id, page_flip_entry);
+        effects.extend(super::n_shot::restore_groups(app, agent_id));
         return effects;
     }
     vec![]
