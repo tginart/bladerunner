@@ -60,6 +60,13 @@ The agent can also start an n-shot run itself with its `n_shot` tool, with a
 different prompt or model for each shot. Needs background workflows, which are on
 by default (`[workflows] enabled`).
 
+Each run is logged under its parent session, in
+`workflows/<run id>/scratch/`: `shots.json` lists every shot (label, session id,
+prompt, model, status, worktree, changes), `report.md` has the full comparison, and
+`decisions.jsonl` gets one line when the agent records which shot was used, or that
+shots were combined (`single`, `hybrid` or `none`, with the shots and a rationale).
+A shot's `subagents/<id>/meta.json` carries `workflow_run_id` to link it back.
+
 ### `/new`
 
 Start a fresh session and clear the current conversation. Alias: `/clear`.

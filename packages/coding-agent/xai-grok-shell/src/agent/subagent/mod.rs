@@ -3761,6 +3761,10 @@ pub(crate) struct SubagentMeta {
     /// durable `resume_from` identity validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_model_id: Option<String>,
+    /// Workflow run that spawned this subagent, so a shot can be traced back
+    /// to its run (and its `shots.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
 }
 /// Canonical subagent metadata for GCS persistence (`subagent.json`).
 ///
