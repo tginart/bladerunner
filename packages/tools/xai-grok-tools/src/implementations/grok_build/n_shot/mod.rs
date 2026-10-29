@@ -17,9 +17,11 @@ use super::workflow::{
 pub use decision::{NShotOutcome, NShotResolve};
 
 pub const N_SHOT_TOOL_NAME: &str = "n_shot";
+/// `task_id` of a launch ack whose shots are client sessions, not subagents.
+pub const N_SHOT_SESSION_TASK_ID: &str = "n-shot-sessions";
 /// Upper bound on shots per run. Keep in sync with `workflows/n_shot.rhai`.
 pub const N_SHOT_MAX_SHOTS: usize = 10;
-const N_SHOT_WORKFLOW_NAME: &str = "n-shot";
+pub const N_SHOT_WORKFLOW_NAME: &str = "n-shot";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct NShotToolInput {
@@ -235,6 +237,20 @@ impl xai_tool_runtime::Tool for NShotTool {
             )
         })?;
         match ack_rx.await {
+            Ok(WorkflowLaunchAck::Started { name, task_id, .. })
+                if task_id == N_SHOT_SESSION_TASK_ID =>
+            {
+                Ok(NShotToolOutput {
+                    message: format!(
+                        "n-shot run '{name}' accepted. Each shot will be a full session \
+                         forked from this conversation, in its own worktree, and they \
+                         start as soon as this turn ends, so end your turn now. The user \
+                         can watch them side by side. A request to compare the shots \
+                         arrives when all of them finish."
+                    ),
+                    name,
+                })
+            }
             Ok(WorkflowLaunchAck::Started { name, .. }) => Ok(NShotToolOutput {
                 message: format!(
                     "n-shot run '{name}' started in the background. The user can watch the \

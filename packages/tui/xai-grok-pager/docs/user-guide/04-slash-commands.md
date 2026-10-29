@@ -70,11 +70,13 @@ records which shot was used, or that shots were combined (`single`, `hybrid` or
 links back to the run.
 
 The agent can also start an n-shot run itself with its `n_shot` tool, with a
-different prompt or model for each shot. Those shots run as background subagents
-instead of sessions, and are logged in `workflows/<run id>/scratch/` with the same
-files; each shot's `subagents/<id>/meta.json` carries `workflow_run_id`. Headless
-mode and other ACP clients also use subagent shots. Subagent shots need background
-workflows, which are on by default (`[workflows] enabled`).
+different prompt or model for each shot. In the TUI those shots are sessions too:
+they fork as soon as the agent's turn ends, and a shot with its own model switches
+to it before its first prompt. Headless mode and other ACP clients cannot host
+session shots, so there the tool runs the shots as background subagents, logged in
+`workflows/<run id>/scratch/` with the same files; each shot's
+`subagents/<id>/meta.json` carries `workflow_run_id`. Subagent shots need
+background workflows, which are on by default (`[workflows] enabled`).
 
 ### `/new`
 

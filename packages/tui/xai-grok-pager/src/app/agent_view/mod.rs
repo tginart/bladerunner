@@ -1504,6 +1504,8 @@ pub struct AgentView {
     pub(crate) pending_first_prompt: Option<String>,
     /// Set when this agent is a shot of an `/n-shot` group.
     pub(crate) n_shot: Option<crate::app::n_shot::NShotMember>,
+    /// First prompt of a shot that waits for its own model to be set.
+    pub(crate) n_shot_start: Option<crate::app::n_shot::PendingShotStart>,
     /// Deferred fork banner to push at the bottom of the scrollback once
     /// the fork session finishes loading (in `TaskResult::SessionLoaded`).
     /// Set by `dispatch_fork_resolved`; stores the parent session id and

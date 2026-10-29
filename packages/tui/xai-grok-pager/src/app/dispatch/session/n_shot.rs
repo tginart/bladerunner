@@ -9,18 +9,15 @@ use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::app_view::AppView;
 use crate::app::n_shot::{
-    NShotColumnsState, NShotGroup, NShotMember, ShotStatus, ShotSummary, build_record,
-    build_report, classify_shot, join_prompt, next_group_label, shot_label,
+    NShotColumnsState, NShotGroup, NShotMember, PendingShotStart, ShotSpec, ShotStatus,
+    ShotSummary, build_record, build_report, classify_shot, join_prompt, next_group_label,
+    shot_label,
 };
 use crate::scrollback::block::RenderBlock;
 
-/// Purpose: Start an n-shot group from the parent agent.
+/// Purpose: Start an n-shot group from a typed `/n-shot`.
 /// Input: The app, the parent agent, and the `/n-shot` args (`<N> <prompt>`).
 /// Output: One start effect per shot, or no effects after a usage message.
-/// Method:
-///     1. Parse N and the prompt. Require a live session in a git repository.
-///     2. Fork N worktree sessions with the prompt as their first prompt.
-///     3. Mark each shot, record the group, and note the run on the parent.
 pub(in crate::app::dispatch) fn dispatch_n_shot(
     app: &mut AppView,
     parent_id: AgentId,
@@ -46,32 +43,58 @@ pub(in crate::app::dispatch) fn dispatch_n_shot(
         app.show_toast("/n-shot needs a git repository: each shot gets its own worktree");
         return vec![];
     }
-    let label = next_group_label(&app.n_shot_groups, parent_id);
-    let total = n as usize;
-    let mut shots = Vec::with_capacity(total);
+    let label = next_group_label(&app.n_shot_groups, &app.n_shot_requests, parent_id);
+    let shots = vec![
+        ShotSpec {
+            prompt,
+            model: None
+        };
+        n as usize
+    ];
+    start_group(app, parent_id, label, shots)
+}
+
+/// Purpose: Fork the parent into one worktree session per shot and record the group.
+/// Input: The app, the parent agent, the group label, and the shots.
+/// Output: One start effect per shot.
+/// Method:
+///     1. Fork each shot. A shot without a model gets its prompt as the first prompt.
+///     2. A shot with a model holds its prompt until the tick sets the model.
+///     3. Mark each shot, record the group, and open the columns view.
+fn start_group(
+    app: &mut AppView,
+    parent_id: AgentId,
+    label: String,
+    shots: Vec<ShotSpec>,
+) -> Vec<Effect> {
+    let total = shots.len();
+    let objective = shots.first().map(|s| s.prompt.clone()).unwrap_or_default();
+    let mut shot_ids = Vec::with_capacity(total);
     let mut effects = Vec::with_capacity(total);
-    for index in 1..=total {
-        let Some((shot_id, effect)) = spawn_fork(
-            app,
-            parent_id,
-            true,
-            Some(prompt.clone()),
-            ForkFocus::StayOnParent,
-        ) else {
+    for (i, spec) in shots.into_iter().enumerate() {
+        let first_prompt = spec.model.is_none().then(|| spec.prompt.clone());
+        let Some((shot_id, effect)) =
+            spawn_fork(app, parent_id, true, first_prompt, ForkFocus::StayOnParent)
+        else {
             break;
         };
         if let Some(shot) = app.agents.get_mut(&shot_id) {
             shot.n_shot = Some(NShotMember {
                 label: label.clone(),
-                index,
+                index: i + 1,
                 total,
                 parent: parent_id,
             });
+            shot.n_shot_start = spec.model.map(|model| PendingShotStart {
+                prompt: spec.prompt,
+                model: agent_client_protocol::ModelId::new(model),
+                requested_at: None,
+            });
         }
-        shots.push(shot_id);
+        shot_ids.push(shot_id);
         effects.push(effect);
     }
-    if shots.is_empty() {
+    if shot_ids.is_empty() {
         return vec![];
     }
     app.n_shot_columns = Some(NShotColumnsState {
@@ -82,13 +105,94 @@ pub(in crate::app::dispatch) fn dispatch_n_shot(
     app.n_shot_groups.push(NShotGroup {
         label,
         parent: parent_id,
-        prompt,
-        shots,
+        prompt: objective,
+        shots: shot_ids,
         joined: false,
         last_statuses: Vec::new(),
         started_at: std::time::Instant::now(),
         settled_after: None,
     });
+    effects
+}
+
+/// Start each accepted `n_shot` tool call once its parent's turn has ended.
+fn start_ready_requests(app: &mut AppView) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let mut waiting = Vec::new();
+    for request in std::mem::take(&mut app.n_shot_requests) {
+        let Some(parent) = app.agents.get(&request.parent) else {
+            continue;
+        };
+        let parent_idle = parent.session.state.is_idle()
+            && parent.session.turn_activity().is_none()
+            && parent.session.pending_prompts.is_empty();
+        if parent_idle {
+            effects.extend(start_group(
+                app,
+                request.parent,
+                request.label,
+                request.shots,
+            ));
+        } else {
+            waiting.push(request);
+        }
+    }
+    app.n_shot_requests.extend(waiting);
+    effects
+}
+
+/// Purpose: Send the first prompt of shots that wait for their own model.
+/// Input: The app.
+/// Output: Model switch effects, then prompt effects once each model is set.
+/// Note: If the model switch does not land in time, the prompt goes anyway,
+///     so a wrong model id cannot hold a shot forever.
+fn start_pending_shots(app: &mut AppView) -> Vec<Effect> {
+    const MODEL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+    let shot_ids: Vec<AgentId> = app
+        .agents
+        .iter()
+        .filter(|(_, a)| a.n_shot_start.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+    let mut effects = Vec::new();
+    for shot_id in shot_ids {
+        let Some(shot) = app.agents.get_mut(&shot_id) else {
+            continue;
+        };
+        let Some(session_id) = shot.session.session_id.clone() else {
+            continue;
+        };
+        if shot.session.loading_replay {
+            continue;
+        }
+        let Some(start) = shot.n_shot_start.as_mut() else {
+            continue;
+        };
+        match start.requested_at {
+            None => {
+                start.requested_at = Some(std::time::Instant::now());
+                effects.push(Effect::SwitchModel {
+                    agent_id: shot_id,
+                    session_id,
+                    model_id: start.model.clone(),
+                    effort: None,
+                    prev_model_id: None,
+                });
+            }
+            Some(at) => {
+                let model_set = shot.session.models.current.as_ref() == Some(&start.model);
+                if !model_set && at.elapsed() < MODEL_SWITCH_WAIT {
+                    continue;
+                }
+                let prompt = start.prompt.clone();
+                shot.n_shot_start = None;
+                shot.session.enqueue_prompt(prompt);
+                effects.extend(
+                    crate::app::dispatch::queue::maybe_drain_queue_and_note_peek(app, shot_id),
+                );
+            }
+        }
+    }
     effects
 }
 
@@ -100,13 +204,16 @@ fn push_parent_note(app: &mut AppView, parent_id: AgentId, text: String) {
 
 /// Purpose: Track every open n-shot group, once per poll.
 /// Input: The app.
-/// Output: Effects that write the group files, and the parent's compare turn.
+/// Output: Effects that start shots, write the group files, and start the
+///     parent's compare turn.
 /// Method:
-///     1. Classify each shot of each group that has not joined yet.
-///     2. When a status changed, write `shots.json` and each shot's back-link.
-///     3. When every shot settled, write `report.md` and ask the parent to compare.
+///     1. Start accepted tool calls whose parent is idle, and model-held shots.
+///     2. Classify each shot of each group that has not joined yet.
+///     3. When a status changed, write `shots.json` and each shot's back-link.
+///     4. When every shot settled, write `report.md` and ask the parent to compare.
 pub(crate) fn tick(app: &mut AppView) -> Vec<Effect> {
-    let mut effects = Vec::new();
+    let mut effects = start_ready_requests(app);
+    effects.extend(start_pending_shots(app));
     for group_idx in 0..app.n_shot_groups.len() {
         let group = app.n_shot_groups[group_idx].clone();
         if group.joined {
@@ -156,7 +263,7 @@ pub(crate) fn tick(app: &mut AppView) -> Vec<Effect> {
 
 /// True while some group still waits for its shots.
 pub(crate) fn has_open_groups(app: &AppView) -> bool {
-    app.n_shot_groups.iter().any(|g| !g.joined)
+    !app.n_shot_requests.is_empty() || app.n_shot_groups.iter().any(|g| !g.joined)
 }
 
 /// Purpose: Show the group as one live block in the parent's transcript.

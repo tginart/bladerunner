@@ -48,6 +48,74 @@ pub(crate) struct NShotMember {
     pub parent: AgentId,
 }
 
+/// One shot to start: its first prompt and an optional model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShotSpec {
+    pub prompt: String,
+    pub model: Option<String>,
+}
+
+/// An `n_shot` tool call accepted from the shell. It starts when the parent's
+/// turn ends, so no shot forks a half-finished turn.
+#[derive(Debug, Clone)]
+pub(crate) struct NShotRequest {
+    pub parent: AgentId,
+    pub label: String,
+    pub shots: Vec<ShotSpec>,
+}
+
+/// A shot with its own model: the first prompt waits until the model is set.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingShotStart {
+    pub prompt: String,
+    pub model: agent_client_protocol::ModelId,
+    /// When the model switch was sent; `None` until the session loaded.
+    pub requested_at: Option<std::time::Instant>,
+}
+
+/// Purpose: Read the shots from the `n-shot` workflow args of an `n_shot` call.
+/// Input: The args: `prompt` and `n`, or `shots` with a `prompt` and `model` each.
+/// Output: One spec per shot, or an error message.
+pub(crate) fn parse_request_shots(args: &serde_json::Value) -> Result<Vec<ShotSpec>, String> {
+    let max = xai_grok_tools::implementations::grok_build::n_shot::N_SHOT_MAX_SHOTS;
+    let text = |v: &serde_json::Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let default_prompt = text(&args["prompt"]);
+    let shots: Vec<ShotSpec> = match args["shots"].as_array() {
+        Some(items) => items
+            .iter()
+            .map(|item| {
+                let prompt = text(&item["prompt"])
+                    .or_else(|| default_prompt.clone())
+                    .ok_or_else(|| "every shot needs a prompt".to_string())?;
+                Ok(ShotSpec {
+                    prompt,
+                    model: text(&item["model"]),
+                })
+            })
+            .collect::<Result<_, String>>()?,
+        None => {
+            let prompt = default_prompt.ok_or_else(|| "no prompt".to_string())?;
+            let n = args["n"].as_u64().unwrap_or(2) as usize;
+            vec![
+                ShotSpec {
+                    prompt,
+                    model: None
+                };
+                n
+            ]
+        }
+    };
+    if shots.is_empty() || shots.len() > max {
+        return Err(format!("an n-shot run needs 1 to {max} shots"));
+    }
+    Ok(shots)
+}
+
 /// The open side-by-side columns view of one group.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NShotColumnsState {
@@ -121,7 +189,8 @@ pub(crate) fn classify_shot(agent: Option<&AgentView>) -> ShotStatus {
         || agent.session.turn_activity().is_some()
         || !agent.session.pending_prompts.is_empty()
         || agent.session.loading_replay
-        || agent.pending_first_prompt.is_some();
+        || agent.pending_first_prompt.is_some()
+        || agent.n_shot_start.is_some();
     if turn_running {
         return ShotStatus::Working;
     }
@@ -143,8 +212,14 @@ pub(crate) fn classify_shot(agent: Option<&AgentView>) -> ShotStatus {
 }
 
 /// Return the next free group label for `parent`: `n-shot-1`, `n-shot-2`, ...
-pub(crate) fn next_group_label(groups: &[NShotGroup], parent: AgentId) -> String {
-    let taken = groups.iter().filter(|g| g.parent == parent).count();
+/// Requests that have not started yet already hold their label.
+pub(crate) fn next_group_label(
+    groups: &[NShotGroup],
+    requests: &[NShotRequest],
+    parent: AgentId,
+) -> String {
+    let taken = groups.iter().filter(|g| g.parent == parent).count()
+        + requests.iter().filter(|r| r.parent == parent).count();
     format!("n-shot-{}", taken + 1)
 }
 
@@ -294,9 +369,48 @@ mod tests {
     #[test]
     fn group_labels_count_per_parent() {
         let mut groups = vec![group()];
-        assert_eq!(next_group_label(&groups, AgentId(0)), "n-shot-2");
-        assert_eq!(next_group_label(&groups, AgentId(5)), "n-shot-1");
+        assert_eq!(next_group_label(&groups, &[], AgentId(0)), "n-shot-2");
+        assert_eq!(next_group_label(&groups, &[], AgentId(5)), "n-shot-1");
+        let pending = [NShotRequest {
+            parent: AgentId(0),
+            label: "n-shot-2".into(),
+            shots: vec![],
+        }];
+        assert_eq!(next_group_label(&groups, &pending, AgentId(0)), "n-shot-3");
         groups.clear();
-        assert_eq!(next_group_label(&groups, AgentId(0)), "n-shot-1");
+        assert_eq!(next_group_label(&groups, &[], AgentId(0)), "n-shot-1");
+    }
+
+    #[test]
+    fn parses_identical_and_per_shot_requests() {
+        let same = parse_request_shots(&serde_json::json!({ "prompt": "fix it", "n": 3 }));
+        assert_eq!(same.unwrap().len(), 3);
+        let varied = parse_request_shots(&serde_json::json!({
+            "prompt": "fix it",
+            "shots": [{ "model": "m1" }, { "prompt": "rewrite it" }],
+        }))
+        .unwrap();
+        assert_eq!(
+            varied[0],
+            ShotSpec {
+                prompt: "fix it".into(),
+                model: Some("m1".into())
+            }
+        );
+        assert_eq!(
+            varied[1],
+            ShotSpec {
+                prompt: "rewrite it".into(),
+                model: None
+            }
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "shots": [{ "model": "m1" }] }),
+            serde_json::json!({ "prompt": "x", "n": 11 }),
+            serde_json::json!({ "prompt": "x", "shots": [] }),
+        ] {
+            assert!(parse_request_shots(&bad).is_err(), "{bad}");
+        }
     }
 }

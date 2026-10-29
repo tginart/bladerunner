@@ -1301,10 +1301,37 @@ pub(crate) async fn spawn_session_actor(
         let launch_chat_state = chat_state_handle.clone();
         let launch_cwd = std::path::PathBuf::from(session_info.cwd.as_str());
         let launch_session_dir = crate::session::persistence::session_dir(&session_info);
-        tokio::spawn(async move {
+        let launch_gateway = gateway.clone();
+        let launch_session_id = session_info.id.clone();
+        // Local: the client request for session shots is not `Send`.
+        tokio::task::spawn_local(async move {
             use crate::session::workflow::registry;
+            use xai_grok_tools::implementations::grok_build::n_shot::{
+                N_SHOT_SESSION_TASK_ID, N_SHOT_WORKFLOW_NAME,
+            };
             use xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchAck;
             while let Some((req, ack)) = workflow_launch_rx.recv().await {
+                // An `n_shot` tool call runs as client sessions when the client
+                // supports them; otherwise it falls through to subagent shots.
+                if req.input.name.as_deref() == Some(N_SHOT_WORKFLOW_NAME)
+                    && !req.input.validate_only
+                    && let Some(args) = req.input.args.as_ref()
+                    && let Some(label) =
+                        crate::session::workflow::n_shot_sessions::request_session_shots(
+                            &launch_gateway,
+                            &launch_session_id,
+                            args,
+                        )
+                        .await
+                {
+                    let _ = ack.send(WorkflowLaunchAck::Started {
+                        run_id: label.clone(),
+                        task_id: N_SHOT_SESSION_TASK_ID.to_string(),
+                        name: label,
+                        script_path: None,
+                    });
+                    continue;
+                }
                 if !background_workflows_enabled {
                     let _ = ack.send(WorkflowLaunchAck::Rejected {
                         code: "workflows_disabled",

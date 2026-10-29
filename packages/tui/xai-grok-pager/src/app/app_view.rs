@@ -630,6 +630,8 @@ pub struct AppView {
     pub next_agent_id: usize,
     /// `/n-shot` groups: parents forked into N shot sessions.
     pub(crate) n_shot_groups: Vec<crate::app::n_shot::NShotGroup>,
+    /// `n_shot` tool calls waiting for their parent's turn to end.
+    pub(crate) n_shot_requests: Vec<crate::app::n_shot::NShotRequest>,
     /// Side-by-side columns of one n-shot group, drawn over its parent.
     pub(crate) n_shot_columns: Option<crate::app::n_shot::NShotColumnsState>,
     /// Available/selected models (shared across agents).
@@ -1534,6 +1536,7 @@ impl AppView {
             agents: IndexMap::new(),
             next_agent_id: 0,
             n_shot_groups: Vec::new(),
+            n_shot_requests: Vec::new(),
             n_shot_columns: None,
             models,
             registry: ActionRegistry::defaults(),
@@ -6358,6 +6361,7 @@ pub(crate) mod tests {
             agents: indexmap::IndexMap::new(),
             next_agent_id: 0,
             n_shot_groups: Vec::new(),
+            n_shot_requests: Vec::new(),
             n_shot_columns: None,
             models: ModelState::default(),
             registry: ActionRegistry::defaults(),

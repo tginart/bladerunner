@@ -1,5 +1,6 @@
 pub(crate) mod host_service;
 pub(crate) mod manager;
+pub(crate) mod n_shot_sessions;
 pub(crate) mod notify;
 pub(crate) mod registry;
 pub(crate) mod schema_contract;

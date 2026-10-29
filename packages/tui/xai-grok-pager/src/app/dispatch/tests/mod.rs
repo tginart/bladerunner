@@ -83,6 +83,7 @@ fn test_app() -> AppView {
         agents: IndexMap::new(),
         next_agent_id: 0,
         n_shot_groups: Vec::new(),
+        n_shot_requests: Vec::new(),
         n_shot_columns: None,
         models: ModelState::default(),
         registry: crate::actions::ActionRegistry::defaults(),
