@@ -74,8 +74,9 @@ fn collapse_status_spaces(s: &str) -> String {
 /// This runs unattended in a checkout the user may not trust, so repo-local
 /// config must not be able to run commands: `core.fsmonitor` is pinned (see
 /// [`probe_fsmonitor_override`]) and every repo-local content filter driver
-/// is emptied. If the future is dropped (timeout), the git process group is
-/// killed.
+/// is emptied. Submodule work trees are not inspected, since that would run
+/// git under each submodule's own config. If the future is dropped (timeout),
+/// the git process group is killed.
 pub async fn git_status_short(working_directory: impl Into<PathBuf>) -> Result<String, FsError> {
     let working_directory = working_directory.into();
     let fsmonitor = probe_fsmonitor_override(working_directory.clone()).await;
@@ -103,10 +104,20 @@ async fn git_status_short_pinned(
         cmd.args(["-c", pin.as_str()]);
     }
     cmd.args(["-c", fsmonitor.git_config_arg()]);
-    cmd.args(["status", "--short", "--branch", "--untracked-files=normal"])
-        .current_dir(&working_directory)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+    // The pins above cover only the superproject's config. A dirty check of a
+    // populated submodule spawns a child `git status` that reads the
+    // submodule's own (equally untrusted) config, so skip it: only commit
+    // changes recorded in the superproject are reported for submodules.
+    cmd.args([
+        "status",
+        "--short",
+        "--branch",
+        "--untracked-files=normal",
+        "--ignore-submodules=dirty",
+    ])
+    .current_dir(&working_directory)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
 
     let output = super::process::output_killing_group_on_drop(cmd)
         .await
@@ -361,8 +372,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn append_git_config(tmp: &Path, extra: &str) {
-        let cfg_path = tmp.join(".git/config");
+    fn append_git_config(git_dir: &Path, extra: &str) {
+        let cfg_path = git_dir.join("config");
         let mut cfg = std::fs::read_to_string(&cfg_path).unwrap();
         cfg.push_str(extra);
         std::fs::write(&cfg_path, cfg).unwrap();
@@ -371,17 +382,33 @@ mod tests {
     /// Same length as the committed body plus the index mtime, so status must
     /// re-hash the file through the clean filter.
     #[cfg(unix)]
-    fn dirty_for_clean_filter(tmp: &Path) {
-        std::fs::write(tmp.join("data.txt"), "HELLO\n").unwrap();
+    fn dirty_for_clean_filter(work_tree: &Path, git_dir: &Path) {
+        std::fs::write(work_tree.join("data.txt"), "HELLO\n").unwrap();
         let data = std::fs::File::options()
             .write(true)
-            .open(tmp.join("data.txt"))
+            .open(work_tree.join("data.txt"))
             .unwrap();
-        let mtime = std::fs::metadata(tmp.join(".git/index"))
+        let mtime = std::fs::metadata(git_dir.join("index"))
             .unwrap()
             .modified()
             .unwrap();
         data.set_modified(mtime).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_git_cli(cwd: &Path, args: &[&str]) {
+        let output = xai_tty_utils::git_command_locking()
+            .args(["-c", "protocol.file.allow=always"])
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]
@@ -400,11 +427,12 @@ mod tests {
         init_attributed_repo(tmp.path());
         let marker = tmp.path().join("pwned");
         let script = write_marker_script(tmp.path(), &marker);
+        let git_dir = tmp.path().join(".git");
         append_git_config(
-            tmp.path(),
+            &git_dir,
             &format!("\n[filter \"Pwn\"]\n\tclean = {}\n", script.display()),
         );
-        dirty_for_clean_filter(tmp.path());
+        dirty_for_clean_filter(tmp.path(), &git_dir);
 
         run_unpinned_status(tmp.path());
         assert!(marker.exists(), "unpinned status must run the filter");
@@ -424,7 +452,7 @@ mod tests {
         let marker = tmp.path().join("pwned");
         let script = write_marker_script(tmp.path(), &marker);
         append_git_config(
-            tmp.path(),
+            &tmp.path().join(".git"),
             &format!("\n[core]\n\tfsmonitor = {}\n", script.display()),
         );
 
@@ -439,5 +467,47 @@ mod tests {
         assert!(!marker.exists(), "git_status_short must not run the hook");
         git_status(tmp.path()).await.expect("summary status");
         assert!(!marker.exists(), "git_status must not run the hook");
+    }
+
+    /// A submodule's config lives in `.git/modules/<name>/config`, which the
+    /// superproject pins do not cover; status must not run git inside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_short_does_not_run_submodule_content_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        let superproject = tmp.path().join("super");
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::create_dir_all(&superproject).unwrap();
+        init_attributed_repo(&upstream);
+        run_git_cli(&superproject, &["init", "-q"]);
+        run_git_cli(
+            &superproject,
+            &["submodule", "add", "-q", upstream.to_str().unwrap(), "sub"],
+        );
+        run_git_cli(&superproject, &["commit", "-qm", "add sub"]);
+
+        let marker = tmp.path().join("pwned");
+        let script = write_marker_script(tmp.path(), &marker);
+        let sub_git_dir = superproject.join(".git/modules/sub");
+        append_git_config(
+            &sub_git_dir,
+            &format!("\n[filter \"Pwn\"]\n\tclean = {}\n", script.display()),
+        );
+        dirty_for_clean_filter(&superproject.join("sub"), &sub_git_dir);
+
+        run_unpinned_status(&superproject);
+        assert!(
+            marker.exists(),
+            "unpinned status must run the submodule filter"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        git_status_short(&superproject)
+            .await
+            .expect("pinned status");
+        assert!(!marker.exists(), "git_status_short must not run the filter");
+        git_status(&superproject).await.expect("summary status");
+        assert!(!marker.exists(), "git_status must not run the filter");
     }
 }
