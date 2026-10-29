@@ -603,9 +603,9 @@ pub(crate) fn is_claude_import_marked_at(config_path: &Path) -> bool {
 
 /// Write `[claude_compat] imported = true` to `~/.grok/config.toml`.
 ///
-/// Uses the same atomic write pattern as `save_mcp_server_config` (write to
-/// `.tmp`, then rename). Creates the file and parent directory if missing.
-/// Existing content in the file is preserved.
+/// Writes atomically through a symlinked `config.toml` (see
+/// [`crate::util::config::atomic_write_string`]). Creates the file and parent
+/// directory if missing. Existing content in the file is preserved.
 fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
     // Surface parse errors instead of silently discarding the file: an atomic
     // rewrite would otherwise drop unrelated sections ([model], [ui], etc.)
@@ -636,22 +636,7 @@ fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
     compat_table.insert("imported".to_string(), TomlValue::Boolean(true));
 
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = config_path.with_extension("toml.tmp");
-    // Best-effort cleanup of the .tmp file if either write or rename fails so
-    // a failed marker write doesn't leave a stale artefact next to the real
-    // config (otherwise the next attempt would inherit a half-written file
-    // before the rename clobbers it).
-    if let Err(e) = std::fs::write(&tmp, &toml_str) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    if let Err(e) = std::fs::rename(&tmp, config_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    crate::util::config::atomic_write_string(config_path, &toml_str)?;
     Ok(())
 }
 
@@ -692,7 +677,7 @@ pub fn apply_import(plan: &ImportPlan, cwd: &Path) -> anyhow::Result<ImportResul
         let count = {
             // Serialized with other processes' config.toml writes.
             let _lock = crate::util::config::lock_config_file_blocking()?;
-            apply_items_to_config(&global_path, &plan.global_items)?
+            apply_items_to_config(&global_path, &plan.global_items, ImportScope::Global)?
         };
         result.global_count = count;
         if count > 0 {
@@ -717,8 +702,12 @@ pub fn apply_import(plan: &ImportPlan, cwd: &Path) -> anyhow::Result<ImportResul
 
     if !plan.project_items.is_empty() {
         let project_root = find_project_root(cwd);
+        // Check every project path before the first write, so a refused
+        // import leaves nothing half-written.
+        refuse_project_import_symlinks(&project_root)?;
         let project_path = project_root.join(".grok").join("config.toml");
-        let count = apply_items_to_config(&project_path, &plan.project_items)?;
+        let count =
+            apply_items_to_config(&project_path, &plan.project_items, ImportScope::Project)?;
         result.project_count = count;
         if count > 0 {
             result
@@ -732,7 +721,7 @@ pub fn apply_import(plan: &ImportPlan, cwd: &Path) -> anyhow::Result<ImportResul
         if hook_count > 0 {
             result.modified_files.push(
                 hooks_dir
-                    .join("imported-from-claude.json")
+                    .join(IMPORTED_HOOKS_FILE)
                     .to_string_lossy()
                     .to_string(),
             );
@@ -764,8 +753,54 @@ impl ImportResult {
     }
 }
 
+/// File that imported hooks are written to, under a `.grok/hooks` dir.
+const IMPORTED_HOOKS_FILE: &str = "imported-from-claude.json";
+
+/// Refuse a project import when `.grok`, `.grok/hooks`, or either target
+/// file is a symlink. A repo controls these paths: a planted link could
+/// send repo-supplied hooks into the user's global hooks dir, or copy a
+/// user file into the repo through the config read.
+fn refuse_project_import_symlinks(project_root: &Path) -> anyhow::Result<()> {
+    let grok_dir = project_root.join(".grok");
+    let hooks_dir = grok_dir.join("hooks");
+    for path in [
+        grok_dir.join("config.toml"),
+        hooks_dir.join(IMPORTED_HOOKS_FILE),
+        hooks_dir,
+        grok_dir,
+    ] {
+        refuse_symlink(&path)?;
+    }
+    Ok(())
+}
+
+/// Error if `path` is a symlink. A missing path is fine.
+fn refuse_symlink(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(anyhow::anyhow!(
+            "refusing to import: {} is a symlink, so the write could leave the \
+             project. Remove the link and retry.",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Apply items to a single config.toml file using atomic write.
-fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow::Result<usize> {
+///
+/// A user config symlink is written through. A project `.grok/config.toml`
+/// symlink is refused before the read, so a repo can't redirect the write
+/// to another user file or copy one into the repo.
+fn apply_items_to_config(
+    config_path: &Path,
+    items: &[ImportableItem],
+    scope: ImportScope,
+) -> anyhow::Result<usize> {
+    if scope == ImportScope::Project {
+        refuse_symlink(config_path)?;
+    }
     // Read existing TOML. Surface parse errors instead of silently
     // discarding the file: an atomic rewrite would otherwise drop
     // unrelated sections ([model], [ui], etc.) and overwrite a hand-edited
@@ -831,14 +866,15 @@ fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow
     }
 
     if count > 0 {
-        // Atomic write: write to .tmp, then rename.
         let toml_str = toml::to_string_pretty(&root)?;
-        let tmp = config_path.with_extension("toml.tmp");
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        match scope {
+            ImportScope::Global => {
+                crate::util::config::atomic_write_string(config_path, &toml_str)?
+            }
+            ImportScope::Project => {
+                crate::util::config::atomic_replace_string(config_path, &toml_str)?
+            }
         }
-        std::fs::write(&tmp, &toml_str)?;
-        std::fs::rename(&tmp, config_path)?;
         info!(
             path = %config_path.display(),
             count,
@@ -1052,7 +1088,7 @@ fn apply_hooks_to_dir(hooks_dir: &Path, items: &[ImportableItem]) -> anyhow::Res
         return Ok(0);
     }
 
-    let target = hooks_dir.join("imported-from-claude.json");
+    let target = hooks_dir.join(IMPORTED_HOOKS_FILE);
 
     // Read existing JSON if present.
     let mut root: serde_json::Value = match std::fs::read_to_string(&target) {
@@ -1186,9 +1222,9 @@ fn apply_hooks_to_dir(hooks_dir: &Path, items: &[ImportableItem]) -> anyhow::Res
     if count > 0 || dirty {
         std::fs::create_dir_all(hooks_dir)?;
         let json_str = serde_json::to_string_pretty(&root)?;
-        let tmp = target.with_extension("json.tmp");
-        std::fs::write(&tmp, &json_str)?;
-        std::fs::rename(&tmp, &target)?;
+        // The hooks dir can sit in an untrusted project tree, so never write
+        // through a planted symlink at the temp or target path.
+        crate::util::config::atomic_replace_string(&target, &json_str)?;
         info!(
             path = %target.display(),
             count,
@@ -2044,7 +2080,7 @@ extra_rule_dirs = ["/c/rules"]
                 path: "/bar/rules".into(),
             },
         ];
-        let count = apply_items_to_config(&path, &items).unwrap();
+        let count = apply_items_to_config(&path, &items, ImportScope::Global).unwrap();
         assert_eq!(count, 2);
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2057,6 +2093,174 @@ extra_rule_dirs = ["/c/rules"]
             parsed["paths"]["extra_rule_dirs"][0].as_str().unwrap(),
             "/bar/rules"
         );
+    }
+
+    /// Repo-planted symlinks at the old fixed temp name or at the hooks file
+    /// itself must not redirect the hook import write.
+    #[cfg(unix)]
+    #[test]
+    fn apply_hooks_to_dir_ignores_planted_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_victim = tmp.path().join("tmp_victim");
+        let target_victim = tmp.path().join("target_victim");
+        std::fs::write(&tmp_victim, "secret").unwrap();
+        std::fs::write(&target_victim, "{}").unwrap();
+        let hooks_dir = tmp.path().join("repo").join(".grok").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let target = hooks_dir.join(IMPORTED_HOOKS_FILE);
+        std::os::unix::fs::symlink(&tmp_victim, hooks_dir.join("imported-from-claude.json.tmp"))
+            .unwrap();
+        std::os::unix::fs::symlink(&target_victim, &target).unwrap();
+
+        let items = vec![ImportableItem::Hook {
+            event: "PreToolUse".to_string(),
+            matcher: None,
+            command: "echo x".to_string(),
+            timeout: None,
+        }];
+        assert_eq!(apply_hooks_to_dir(&hooks_dir, &items).unwrap(), 1);
+
+        assert_eq!(std::fs::read_to_string(&tmp_victim).unwrap(), "secret");
+        assert_eq!(std::fs::read_to_string(&target_victim).unwrap(), "{}");
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert!(std::fs::read_to_string(&target).unwrap().contains("echo x"));
+    }
+
+    /// Repo-planted `.tmp` symlinks next to the project config and hooks file
+    /// must not redirect the import writes.
+    #[cfg(unix)]
+    #[test]
+    fn project_import_ignores_planted_tmp_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "secret").unwrap();
+        let repo = tmp.path().join("repo");
+        let hooks_dir = repo.join(".grok").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        git2::Repository::init(&repo).unwrap();
+        std::os::unix::fs::symlink(&victim, repo.join(".grok").join("config.toml.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, hooks_dir.join("imported-from-claude.json.tmp"))
+            .unwrap();
+
+        let result = apply_import(&project_import_plan(), &repo).unwrap();
+        assert_eq!(result.project_count, 2);
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "secret");
+        let body = std::fs::read_to_string(repo.join(".grok").join("config.toml")).unwrap();
+        assert!(body.contains("/foo/skills"), "{body}");
+        let hooks = std::fs::read_to_string(hooks_dir.join(IMPORTED_HOOKS_FILE)).unwrap();
+        assert!(hooks.contains("echo repo-hook"), "{hooks}");
+    }
+
+    /// A project import refuses a symlinked `.grok`, `.grok/hooks`, or target
+    /// file: it must not drop repo hooks into the user's global hooks dir,
+    /// write a user file, or copy a user file into the repo.
+    #[cfg(unix)]
+    #[test]
+    fn project_import_refuses_symlinked_paths() {
+        for link in [
+            ".grok",
+            ".grok/hooks",
+            ".grok/config.toml",
+            ".grok/hooks/imported-from-claude.json",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tmp.path().join("user_home");
+            std::fs::create_dir_all(outside.join("hooks")).unwrap();
+            let user_config = "[paths]\nextra_rule_dirs = [\"/user-secret\"]\n";
+            std::fs::write(outside.join("config.toml"), user_config).unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(repo.join(".grok").join("hooks")).unwrap();
+            git2::Repository::init(&repo).unwrap();
+            let link_path = repo.join(link);
+            if link_path.is_dir() {
+                std::fs::remove_dir_all(&link_path).unwrap();
+            }
+            let link_target = match link {
+                ".grok" => outside.clone(),
+                ".grok/hooks" => outside.join("hooks"),
+                ".grok/config.toml" => outside.join("config.toml"),
+                _ => outside.join("hooks").join(IMPORTED_HOOKS_FILE),
+            };
+            std::os::unix::fs::symlink(&link_target, &link_path).unwrap();
+
+            let err = apply_import(&project_import_plan(), &repo).unwrap_err();
+            assert!(err.to_string().contains("symlink"), "{link}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(outside.join("config.toml")).unwrap(),
+                user_config,
+                "{link}: user config must stay untouched"
+            );
+            assert!(
+                !outside.join("hooks").join(IMPORTED_HOOKS_FILE).exists(),
+                "{link}: no hooks file may land outside the project"
+            );
+            assert!(
+                std::fs::read_dir(&outside)
+                    .unwrap()
+                    .chain(std::fs::read_dir(outside.join("hooks")).unwrap())
+                    .all(|e| {
+                        let name = e.unwrap().file_name();
+                        name == "config.toml" || name == "hooks"
+                    }),
+                "{link}: nothing new may be written outside the project"
+            );
+        }
+    }
+
+    fn project_import_plan() -> ImportPlan {
+        ImportPlan {
+            project_items: vec![
+                ImportableItem::PathEntry {
+                    kind: PathKind::Skill,
+                    path: "/foo/skills".into(),
+                },
+                ImportableItem::Hook {
+                    event: "PreToolUse".into(),
+                    matcher: None,
+                    command: "echo repo-hook".into(),
+                    timeout: None,
+                },
+            ],
+            ..ImportPlan::default()
+        }
+    }
+
+    /// A user import writes through a symlinked `config.toml` and keeps the
+    /// link, so a dotfiles-managed config isn't replaced by a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn global_import_writes_through_user_config_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = home.path().join("dotfiles").join("config.toml");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "").unwrap();
+        let slot = home.path().join("config.toml");
+        std::os::unix::fs::symlink(&outside, &slot).unwrap();
+
+        let items = vec![ImportableItem::PathEntry {
+            kind: PathKind::Skill,
+            path: "/foo/skills".into(),
+        }];
+        let count = apply_items_to_config(&slot, &items, ImportScope::Global).unwrap();
+        assert_eq!(count, 1);
+        write_import_marker(&slot).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&slot)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "user config slot must stay a symlink"
+        );
+        let body = std::fs::read_to_string(&outside).unwrap();
+        assert!(body.contains("/foo/skills"), "{body}");
+        assert!(is_claude_import_marked_at(&outside));
     }
 
     #[test]

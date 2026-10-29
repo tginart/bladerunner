@@ -75,8 +75,8 @@ pub(crate) fn init_metrics() {
 }
 pub use manager::{
     AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT, PermissionHandle,
-    default_always_allow_scope, reasons, spawn_permission_manager,
-    spawn_permission_manager_with_hub,
+    default_always_allow_scope, default_always_deny_scope, minimum_always_allow_scope, reasons,
+    spawn_permission_manager, spawn_permission_manager_with_hub,
 };
 pub use policy::{CompiledPolicy, bash_pattern_is_broad, bash_pattern_matches_command};
 pub use prompter::{

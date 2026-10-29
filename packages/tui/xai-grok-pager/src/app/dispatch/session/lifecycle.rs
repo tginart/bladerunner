@@ -621,12 +621,22 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
 }
 /// Handle the user accepting the folder-trust question: persist the grant for
 /// the workspace (writes `~/.grok/trusted_folders.toml`), mark trust resolved,
-/// then replay any deferred session startup (only if auth is also done).
+/// then replay any deferred session startup (only if auth is also done). If
+/// the store can't be written the grant still holds in this process, and a
+/// toast tells the user it was not saved.
 pub(in crate::app::dispatch) fn dispatch_trust_folder(app: &mut AppView) -> Vec<Effect> {
-    if let TrustState::Pending { workspace } = &app.trust_state {
-        xai_grok_workspace::folder_trust::grant_folder_trust(workspace);
+    use xai_grok_shell::agent::folder_trust::{
+        grant_folder_trust_for_session, session_only_trust_notice,
+    };
+    let persist_error = match &app.trust_state {
+        TrustState::Pending { workspace } => grant_folder_trust_for_session(workspace).err(),
+        _ => None,
+    };
+    let effects = finish_trust(app);
+    if let Some(e) = persist_error {
+        app.show_toast(&session_only_trust_notice(&e));
     }
-    finish_trust(app)
+    effects
 }
 /// Tail of accepting the folder-trust question (via [`dispatch_trust_folder`];
 /// declining quits instead): resolve `trust_state` to `Done`, focus the welcome

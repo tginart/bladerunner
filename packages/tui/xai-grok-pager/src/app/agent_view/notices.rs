@@ -382,6 +382,31 @@ impl AgentView {
             }
         }
     }
+
+    /// Tell the user which attached images could not be loaded for the wire.
+    /// The prompt still goes out with their `[Image #N]` text, so a silent
+    /// drop would leave the model answering about an image it never saw.
+    pub(crate) fn notify_skipped_image_send(&mut self, display_numbers: &[usize]) {
+        if display_numbers.is_empty() {
+            return;
+        }
+        crate::unified_log::warn(
+            "prompt.image_send_skipped",
+            self.session.session_id.as_ref().map(|s| s.0.as_ref()),
+            Some(serde_json::json!({ "display_numbers": display_numbers })),
+        );
+        let numbers = display_numbers
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if display_numbers.len() == 1 {
+            "Image"
+        } else {
+            "Images"
+        };
+        self.show_toast(&format!("{noun} {numbers} couldn't be read — not sent"));
+    }
 }
 
 #[cfg(test)]

@@ -3779,6 +3779,18 @@ fn is_pasteable_key_event(ev: &Event) -> bool {
     }
 }
 
+/// A pasted line feed (`\n`, 0x0A). In raw mode crossterm parses a bare LF as
+/// `Ctrl+J` (0x0A is the control code for `j`), while a real Enter keypress is
+/// a carriage return (`\r`) parsed as [`KeyCode::Enter`]. So an `Enter`
+/// immediately followed by this is a pasted CRLF line break, not a submit —
+/// see [`coalesce_rapid_keys`].
+fn is_paste_lf(ev: &Event) -> bool {
+    matches!(ev, Event::Key(ke)
+        if ke.kind == KeyEventKind::Press
+            && ke.code == KeyCode::Char('j')
+            && ke.modifiers == KeyModifiers::CONTROL)
+}
+
 /// Map a voice-chord key event to its action (pure, so it's unit-testable).
 ///
 /// Hold mode is press-to-record / release-to-stop, but only a hold-*owned*
@@ -3845,9 +3857,13 @@ fn is_voice_chord(ke: &KeyEvent) -> bool {
 /// A contiguous run of character/Enter/Tab events is replaced with a
 /// single `Event::Paste` when EITHER:
 ///
-/// 1. `>= PASTE_COALESCE_THRESHOLD` events AND at least one Enter is
-///    followed by more characters (distinguishes `type + submit` from
-///    `pasted multiline`).
+/// 1. `>= PASTE_COALESCE_THRESHOLD` events AND an Enter is followed by more
+///    characters (unambiguous multi-line paste), OR the run contains a
+///    carriage-return/line-feed pair (an `Enter` immediately followed by
+///    [`is_paste_lf`]). A pasted Windows line break arrives as CRLF —
+///    `Enter` (`\r`) then `Ctrl+J` (`\n`) — whereas a real Enter keypress is
+///    a lone `\r`, so this coalesces the paste (e.g. `"foo\r\n"`) without
+///    swallowing a genuine submit.
 /// 2. **Windows only:** `>= PATH_COALESCE_THRESHOLD` events AND the
 ///    assembled text starts with a drag-drop-style path anchor. Some
 ///    Windows Terminal versions deliver dropped paths as keystrokes
@@ -3896,34 +3912,53 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
             let mut text = String::new();
             let mut seen_enter = false;
             let mut has_char_after_enter = false;
+            // An Enter (`\r`) immediately followed by a pasted LF (`\n`): the
+            // CRLF signature of a pasted Windows line break, never a submit.
+            let mut has_crlf = false;
+            let mut prev_was_enter = false;
 
-            while i < events.len() && is_pasteable_key_event(&events[i].event) {
-                if let Event::Key(ke) = &events[i].event {
-                    match ke.code {
-                        KeyCode::Char(c) => {
-                            text.push(c);
-                            if seen_enter {
-                                has_char_after_enter = true;
+            while i < events.len() {
+                if is_pasteable_key_event(&events[i].event) {
+                    if let Event::Key(ke) = &events[i].event {
+                        match ke.code {
+                            KeyCode::Char(c) => {
+                                text.push(c);
+                                if seen_enter {
+                                    has_char_after_enter = true;
+                                }
+                                prev_was_enter = false;
                             }
-                        }
-                        KeyCode::Enter => {
-                            text.push('\n');
-                            seen_enter = true;
-                        }
-                        KeyCode::Tab => {
-                            text.push('\t');
-                            if seen_enter {
-                                has_char_after_enter = true;
+                            KeyCode::Enter => {
+                                text.push('\n');
+                                seen_enter = true;
+                                prev_was_enter = true;
                             }
+                            KeyCode::Tab => {
+                                text.push('\t');
+                                if seen_enter {
+                                    has_char_after_enter = true;
+                                }
+                                prev_was_enter = false;
+                            }
+                            _ => unreachable!("is_pasteable_key_event guards this"),
                         }
-                        _ => unreachable!("is_pasteable_key_event guards this"),
                     }
+                    i += 1;
+                } else if prev_was_enter && is_paste_lf(&events[i].event) {
+                    // LF half of a pasted CRLF: the preceding Enter already
+                    // pushed '\n', so absorb this without a second newline and
+                    // without letting it reach its Ctrl+J binding.
+                    has_crlf = true;
+                    prev_was_enter = false;
+                    i += 1;
+                } else {
+                    break;
                 }
-                i += 1;
             }
 
             let run_len = i - run_start;
-            let multiline_paste = run_len >= PASTE_COALESCE_THRESHOLD && has_char_after_enter;
+            let multiline_paste =
+                (run_len >= PASTE_COALESCE_THRESHOLD && has_char_after_enter) || has_crlf;
             // Windows fallback for drag-drops that arrive as a key
             // burst instead of a bracketed paste — reuse the drop
             // classifier's anchor detector so the two layers can't
@@ -5301,7 +5336,8 @@ mod tests {
 
     #[test]
     fn coalesce_type_then_submit_not_coalesced() {
-        // Enter is the LAST event — "type + submit", not paste.
+        // Enter is the LAST event with no trailing LF — a real submit
+        // (lone `\r`), not a paste. Must pass through so Enter sends.
         let events = vec![
             press(KeyCode::Char('a')),
             press(KeyCode::Char('b')),
@@ -5311,6 +5347,55 @@ mod tests {
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 4);
         assert!(matches!(&result[3].event, Event::Key(ke) if ke.code == KeyCode::Enter));
+    }
+
+    #[test]
+    fn coalesce_crlf_paste_ending_in_newline_is_paste() {
+        // Windows paste of "foo\r\n": Enter (`\r`) then Ctrl+J (`\n`). The
+        // CRLF pair marks a paste, so the trailing Enter inserts as text
+        // instead of submitting.
+        let events = vec![
+            press(KeyCode::Char('f')),
+            press(KeyCode::Char('o')),
+            press(KeyCode::Char('o')),
+            press(KeyCode::Enter),
+            press_ctrl(KeyCode::Char('j')),
+        ];
+        let result = coalesce_rapid_keys(events);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].event, Event::Paste("foo\n".to_string()));
+    }
+
+    #[test]
+    fn coalesce_crlf_multiline_collapses_pairs() {
+        // "a\r\nb\r\n" → each Enter+Ctrl+J is one newline; no doubled blanks.
+        let events = vec![
+            press(KeyCode::Char('a')),
+            press(KeyCode::Enter),
+            press_ctrl(KeyCode::Char('j')),
+            press(KeyCode::Char('b')),
+            press(KeyCode::Enter),
+            press_ctrl(KeyCode::Char('j')),
+        ];
+        let result = coalesce_rapid_keys(events);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].event, Event::Paste("a\nb\n".to_string()));
+    }
+
+    #[test]
+    fn coalesce_lone_ctrl_j_not_after_enter_preserved() {
+        // A deliberate Ctrl+J is not part of a CRLF and must reach its
+        // binding: not absorbed, run does not coalesce.
+        let events = vec![
+            press(KeyCode::Char('a')),
+            press(KeyCode::Char('b')),
+            press_ctrl(KeyCode::Char('j')),
+        ];
+        let result = coalesce_rapid_keys(events);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(&result[2].event,
+            Event::Key(ke) if ke.code == KeyCode::Char('j')
+                && ke.modifiers == KeyModifiers::CONTROL));
     }
 
     #[test]
@@ -5595,8 +5680,8 @@ mod tests {
 
     #[test]
     fn coalesce_mouse_breaks_key_run_preserves_events() {
-        // A genuine paste batch that also collected mouse events.
-        // The paste chars should still coalesce; mouse events are preserved.
+        // A mouse event splits a key run. [a, b, Enter] has a trailing Enter
+        // with no LF → a submit, not coalesced; then [mouse], then [c].
         use crossterm::event::{MouseEvent, MouseEventKind};
         let events = vec![
             press(KeyCode::Char('a')),
@@ -5611,9 +5696,6 @@ mod tests {
             press(KeyCode::Char('c')),
         ];
         let result = coalesce_rapid_keys(events);
-        // The mouse event breaks the key run: [a, b, Enter] (3 keys, but
-        // Enter is last in that sub-run → no char after Enter → not coalesced),
-        // then [mouse], then [c] (1 key).
         assert_eq!(result.len(), 5);
     }
 

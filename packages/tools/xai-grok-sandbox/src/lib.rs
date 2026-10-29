@@ -34,6 +34,7 @@ mod logging;
 mod network_policy;
 mod paths;
 mod profiles;
+mod runtime_sockets;
 mod types;
 pub use hook_write_deny::{profile_enforces_hook_write_deny, verify_hook_write_deny_enforced};
 pub use logging::SandboxLogger;
@@ -413,13 +414,7 @@ fn bwrap_blocked_placeholder(name: &str, want_dir: bool) -> Option<PathBuf> {
 /// so it applies even WITHOUT the `enforce` feature.
 #[cfg(target_os = "linux")]
 fn is_devbox_based(profile: &ProfileName, config: &SandboxConfig) -> bool {
-    match profile {
-        ProfileName::Devbox => true,
-        ProfileName::Custom(name) => {
-            config.profiles.get(name).and_then(|p| p.extends.as_deref()) == Some("devbox")
-        }
-        _ => false,
-    }
+    profile.is_devbox_based(config)
 }
 /// Whether kernel read-deny enforcement is required. The single source of truth
 /// for this classification so callers (e.g. the shell's fail-closed startup path)

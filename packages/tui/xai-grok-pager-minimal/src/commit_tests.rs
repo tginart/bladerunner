@@ -107,6 +107,41 @@ fn running_agent_message_commits_once_a_later_block_exists() {
 }
 
 #[test]
+fn interleaved_thinking_does_not_commit_a_still_streaming_agent_message() {
+    // The model can emit a first reply token, then more thinking, then the
+    // rest of the sentence. Thinking is pushed *after* the live agent entry
+    // without resetting `current_agent_msg`, so later chunks still append.
+    // "Any later block" used to trip print-once and freeze the partial reply
+    // on the terminal while the rest of the stream landed only in memory.
+    let mut s = ScrollbackState::new();
+    let msg = s.push(ScrollbackEntry::running(RenderBlock::agent_message(
+        "The user",
+    )));
+    s.push(ScrollbackEntry::running(RenderBlock::thinking_streaming()));
+
+    assert_eq!(
+        commit_collect(&mut s),
+        Vec::<usize>::new(),
+        "interleaved thinking must not freeze the still-open agent stream"
+    );
+    assert!(!minimal_api::is_committed(&s, s.get(0).unwrap()));
+    assert_eq!(minimal_api::commit_scan_cursor(&s), 0);
+
+    // Later tokens still append to the same entry. Committing at the thinking
+    // boundary would have left this suffix invisible on the terminal.
+    assert!(s.push_chunk_to_agent(msg, " asked me to wait."));
+    assert_eq!(commit_collect(&mut s), Vec::<usize>::new());
+
+    // A later tool is the real "tracker moved on" signal: the message is
+    // complete and must leave the live tail.
+    s.push(ScrollbackEntry::running(RenderBlock::execute("true")));
+    assert_eq!(commit_collect(&mut s), vec![0]);
+    assert!(minimal_api::is_committed(&s, s.get(0).unwrap()));
+    assert!(!minimal_api::is_committed(&s, s.get(1).unwrap()));
+    assert!(!minimal_api::is_committed(&s, s.get(2).unwrap()));
+}
+
+#[test]
 fn running_tool_still_holds_the_frontier_even_with_a_later_block() {
     // The agent-message relaxation must NOT extend to tools: a running tool
     // can still update its result, so committing it (print-once) would lose
