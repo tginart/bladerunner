@@ -5,6 +5,7 @@
 //! Output is prioritized by change type and limited to ~1k characters.
 
 use crate::file_system::FsError;
+use crate::file_system::fsmonitor::{FsmonitorOverride, probe_fsmonitor_override};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -68,48 +69,74 @@ fn collapse_status_spaces(s: &str) -> String {
     out
 }
 
+/// `git status --short --branch` for the prompt-time `<git_status>` block.
+///
+/// This runs unattended in a checkout the user may not trust, so repo-local
+/// config must not be able to run commands: `core.fsmonitor` is pinned (see
+/// [`probe_fsmonitor_override`]) and every repo-local content filter driver
+/// is emptied. If the future is dropped (timeout), the git process group is
+/// killed.
 pub async fn git_status_short(working_directory: impl Into<PathBuf>) -> Result<String, FsError> {
     let working_directory = working_directory.into();
-    let permit = crate::git_odb::try_acquire_odb();
+    let fsmonitor = probe_fsmonitor_override(working_directory.clone()).await;
+    git_status_short_pinned(working_directory, fsmonitor).await
+}
 
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let output = xai_tty_utils::git_command()
-            .args(["status", "--short", "--branch", "--untracked-files=normal"])
-            .current_dir(&working_directory)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| {
-                FsError::Other(format!(
-                    "git status --short --branch --untracked-files=normal failed: {}",
-                    e
-                ))
-            })?;
+async fn git_status_short_pinned(
+    working_directory: PathBuf,
+    fsmonitor: FsmonitorOverride,
+) -> Result<String, FsError> {
+    // Held for the whole run to bound ODB contention.
+    let _permit = crate::git_odb::try_acquire_odb();
 
-        if !output.status.success() {
-            return Err(FsError::Other(format!(
-                "git status --short --branch exited with code {:?}",
-                output.status.code()
-            )));
-        }
-
-        // Output >= 1 MiB is dropped entirely, not truncated. Render-time
-        // truncation handles the < 1 MiB case.
-        if git_status_exceeds_buffer(output.stdout.len()) {
-            return Err(FsError::Other(
-                "git status --short --branch output exceeded 1 MiB buffer".to_string(),
-            ));
-        }
-
-        // Consecutive spaces in the status body are collapsed so staged
-        // entries (`A  file` -> `A file`) match the wire format.
-        Ok(collapse_status_spaces(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
+    // libgit2 config walk is blocking; keep it off the async scheduler.
+    let pin_cwd = working_directory.clone();
+    let filter_pins = tokio::task::spawn_blocking(move || {
+        crate::git_content_filters::content_filter_config_pins(&pin_cwd)
     })
     .await
-    .map_err(|e| FsError::Other(format!("git status --short --branch task failed: {}", e)))?
+    .map_err(|e| FsError::Other(format!("git config pin task failed: {e}")))?
+    .ok_or_else(|| FsError::Other("unreadable git config".to_string()))?;
+
+    let mut cmd = xai_tty_utils::git_command();
+    for pin in &filter_pins {
+        cmd.args(["-c", pin.as_str()]);
+    }
+    cmd.args(["-c", fsmonitor.git_config_arg()]);
+    cmd.args(["status", "--short", "--branch", "--untracked-files=normal"])
+        .current_dir(&working_directory)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let output = super::process::output_killing_group_on_drop(cmd)
+        .await
+        .map_err(|e| {
+            FsError::Other(format!(
+                "git status --short --branch --untracked-files=normal failed: {}",
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Err(FsError::Other(format!(
+            "git status --short --branch exited with code {:?}",
+            output.status.code()
+        )));
+    }
+
+    // Output >= 1 MiB is dropped entirely, not truncated. Render-time
+    // truncation handles the < 1 MiB case.
+    if git_status_exceeds_buffer(output.stdout.len()) {
+        return Err(FsError::Other(
+            "git status --short --branch output exceeded 1 MiB buffer".to_string(),
+        ));
+    }
+
+    // Consecutive spaces in the status body are collapsed so staged
+    // entries (`A  file` -> `A file`) match the wire format.
+    Ok(collapse_status_spaces(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
@@ -242,8 +269,18 @@ fn git_status_impl(working_directory: &Path) -> Result<String, FsError> {
 /// Uses `--no-optional-locks` to avoid creating `index.lock` for stat-cache
 /// refreshes.  This function is called from background tasks (system prompt
 /// generation) and must never contend with foreground git operations.
+///
+/// Like [`git_status_short`], it pins `core.fsmonitor=false` and empties every
+/// repo-local content filter so repo config can't run commands.
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = xai_tty_utils::git_command()
+    // Caller is already on a blocking pool (`git_status_impl`).
+    let filter_pins = crate::git_content_filters::content_filter_config_pins(cwd)?;
+    let mut cmd = xai_tty_utils::git_command();
+    for pin in &filter_pins {
+        cmd.args(["-c", pin.as_str()]);
+    }
+    let output = cmd
+        .args(["-c", FsmonitorOverride::Disabled.git_config_arg()])
         .args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
@@ -290,5 +327,117 @@ mod tests {
     fn collapse_status_spaces_preserves_newlines() {
         assert_eq!(collapse_status_spaces("a\n\n\nb"), "a\n\n\nb");
         assert_eq!(collapse_status_spaces(""), "");
+    }
+
+    #[cfg(unix)]
+    fn init_attributed_repo(tmp: &Path) {
+        let repo = git2::Repository::init(tmp).unwrap();
+        std::fs::write(tmp.join(".gitattributes"), "data.txt filter=Pwn\n").unwrap();
+        std::fs::write(tmp.join("data.txt"), "hello\n").unwrap();
+        // Commit before installing any hook so the commit itself runs nothing.
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".gitattributes")).unwrap();
+        index.add_path(Path::new("data.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+    }
+
+    /// Write an executable that touches `marker` and passes stdin through.
+    #[cfg(unix)]
+    fn write_marker_script(tmp: &Path, marker: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = tmp.join("pwn.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexec cat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn append_git_config(tmp: &Path, extra: &str) {
+        let cfg_path = tmp.join(".git/config");
+        let mut cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        cfg.push_str(extra);
+        std::fs::write(&cfg_path, cfg).unwrap();
+    }
+
+    /// Same length as the committed body plus the index mtime, so status must
+    /// re-hash the file through the clean filter.
+    #[cfg(unix)]
+    fn dirty_for_clean_filter(tmp: &Path) {
+        std::fs::write(tmp.join("data.txt"), "HELLO\n").unwrap();
+        let data = std::fs::File::options()
+            .write(true)
+            .open(tmp.join("data.txt"))
+            .unwrap();
+        let mtime = std::fs::metadata(tmp.join(".git/index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        data.set_modified(mtime).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_unpinned_status(tmp: &Path) {
+        xai_tty_utils::git_command()
+            .args(["status", "--short"])
+            .current_dir(tmp)
+            .output()
+            .expect("unpinned status");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_short_does_not_run_content_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_attributed_repo(tmp.path());
+        let marker = tmp.path().join("pwned");
+        let script = write_marker_script(tmp.path(), &marker);
+        append_git_config(
+            tmp.path(),
+            &format!("\n[filter \"Pwn\"]\n\tclean = {}\n", script.display()),
+        );
+        dirty_for_clean_filter(tmp.path());
+
+        run_unpinned_status(tmp.path());
+        assert!(marker.exists(), "unpinned status must run the filter");
+        std::fs::remove_file(&marker).unwrap();
+
+        git_status_short(tmp.path()).await.expect("pinned status");
+        assert!(!marker.exists(), "git_status_short must not run the filter");
+        git_status(tmp.path()).await.expect("summary status");
+        assert!(!marker.exists(), "git_status must not run the filter");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_short_does_not_run_fsmonitor_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_attributed_repo(tmp.path());
+        let marker = tmp.path().join("pwned");
+        let script = write_marker_script(tmp.path(), &marker);
+        append_git_config(
+            tmp.path(),
+            &format!("\n[core]\n\tfsmonitor = {}\n", script.display()),
+        );
+
+        run_unpinned_status(tmp.path());
+        assert!(
+            marker.exists(),
+            "unpinned status must run the fsmonitor hook"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        git_status_short(tmp.path()).await.expect("pinned status");
+        assert!(!marker.exists(), "git_status_short must not run the hook");
+        git_status(tmp.path()).await.expect("summary status");
+        assert!(!marker.exists(), "git_status must not run the hook");
     }
 }
