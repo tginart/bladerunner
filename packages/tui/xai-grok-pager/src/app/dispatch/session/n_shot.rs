@@ -478,6 +478,31 @@ pub(in crate::app::dispatch) fn open_latest_columns(app: &mut AppView) -> Option
     Some(open_columns(app, &label))
 }
 
+/// Switch from the active shot to its parent, with the group's columns open
+/// on that shot.
+pub(in crate::app::dispatch) fn open_parent_columns(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(shot_id) = app.active_view else {
+        return vec![];
+    };
+    let Some(member) = app.agents.get(&shot_id).and_then(|a| a.n_shot.clone()) else {
+        return vec![];
+    };
+    if !app.agents.contains_key(&member.parent) {
+        app.show_toast("The parent session of this shot is closed");
+        return vec![];
+    }
+    crate::app::dispatch::ctx::switch_to_agent(
+        app,
+        member.parent,
+        crate::app::dispatch::ctx::SwitchCause::Picker,
+    );
+    let effects = open_columns(app, &member.label);
+    if let Some(columns) = app.n_shot_columns.as_mut() {
+        columns.focus = member.index - 1;
+    }
+    effects
+}
+
 /// Close the columns view and switch to its focused shot.
 pub(in crate::app::dispatch) fn attach_focused_shot(app: &mut AppView) -> Vec<Effect> {
     let Some(columns) = app.n_shot_columns.take() else {

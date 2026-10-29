@@ -1087,6 +1087,8 @@ pub enum Action {
     NShotColumnsAttach,
     /// Open the columns view of the active agent's n-shot group with this label.
     OpenNShotColumns(String),
+    /// From a shot, switch to its parent and open the group's columns on it.
+    OpenNShotParent,
     Rewind,
     RewindShowPicker,
     RewindPickerSelect(usize),

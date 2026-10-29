@@ -52,8 +52,10 @@ as one live line (`n-shot-1 … [shot-1 settled · shot-2 goal active]`) and ope
 side-by-side view with one column per shot: its status and the tail of its
 transcript. Use `←`/`→` to move between columns, `Enter` to switch into a shot's
 session (to answer its questions or steer it), and `Esc` to close the view. `/shots`
-reopens it. On the dashboard, the shots are nested under this session, and each
-shot's status bar shows `n-shot-1 · shot 2 of 4`.
+or a click on the run's line reopens it. On the dashboard, the shots are nested under
+this session. Each shot's status bar shows `↑ n-shot-1 · shot 2 of 4`; click it to go
+back to this session with the view open on that shot. A resumed session reads its
+runs back from disk, and loads their shot sessions when you open the view.
 
 A shot is settled when its turn has ended, it has no active `/goal`, and it has no
 scheduled `/loop`. A paused, blocked, or finished goal counts as settled. When every

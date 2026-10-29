@@ -1642,13 +1642,18 @@ impl AgentView {
                 format!("{icon} {b}")
             }
         });
+        let mut shot_width: u16 = 0;
         if let Some(member) = &self.n_shot {
             let shot_text = format!(
-                "{} \u{00b7} shot {} of {} ",
+                "\u{2191} {} \u{00b7} shot {} of {} ",
                 member.label, member.index, member.total
             );
-            let shot_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
-            path_offset += shot_text.width() as u16;
+            let mut shot_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
+            if self.hit_n_shot_label.hovered {
+                shot_style = shot_style.add_modifier(ratatui::style::Modifier::UNDERLINED);
+            }
+            shot_width = shot_text.width() as u16;
+            path_offset += shot_width;
             parts.push(Span::styled(shot_text, shot_style));
         }
         if let Some(git_text) = git_text {
@@ -1715,6 +1720,13 @@ impl AgentView {
             &cwd_line,
             cwd_width,
         );
+        let visible_shot_width = shot_width.min(cwd_width);
+        self.hit_n_shot_label.rect = (visible_shot_width > 0).then_some(Rect {
+            x: layout.status_bar.x,
+            y: layout.status_bar.y,
+            width: visible_shot_width,
+            height: 1,
+        });
         let path_x = layout.status_bar.x + path_offset;
         let visible_path_width = path_width.min(cwd_width.saturating_sub(path_offset));
         self.hit_cwd.rect = (visible_path_width > 0).then_some(Rect {
