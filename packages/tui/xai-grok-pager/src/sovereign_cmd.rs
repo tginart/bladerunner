@@ -53,7 +53,7 @@ const PRESETS: &[Preset] = &[
         dir: "~/ai/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold",
         context_window: 1_048_576,
     },
-    // github.com/tginart/mac-serve
+    // Apple-silicon Mac serving through oMLX.
     Preset {
         id: "qwen38-flash-mac-studio",
         slug: "qwen-3.8-flash",
@@ -84,7 +84,7 @@ pub enum SovereignCommand {
         /// Where the recipe is installed, as `[user@]host` (tailnet name or IP)
         #[arg(long)]
         ssh: String,
-        /// Override the endpoint, for example `http://100.94.10.105:8888/v1`
+        /// Override the endpoint, for example `http://host.example:8888/v1`
         #[arg(long)]
         base_url: Option<String>,
         /// API key of the server. Only for a recipe that does not publish its key file
@@ -651,7 +651,7 @@ mod tests {
     use super::*;
 
     fn sample() -> Sovereign {
-        sovereign_from_preset(&PRESETS[0], "tginart@spark-500e.tail86acc5.ts.net", None, None)
+        sovereign_from_preset(&PRESETS[0], "user@dgx.example.ts.net", None, None)
     }
 
     #[test]
@@ -665,8 +665,8 @@ mod tests {
     #[test]
     fn default_base_url_drops_the_user() {
         assert_eq!(
-            default_base_url("tginart@spark-500e.ts.net", 8888),
-            "http://spark-500e.ts.net:8888/v1"
+            default_base_url("user@dgx.example.ts.net", 8888),
+            "http://dgx.example.ts.net:8888/v1"
         );
         assert_eq!(default_base_url("10.0.0.5", 8888), "http://10.0.0.5:8888/v1");
     }
