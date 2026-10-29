@@ -434,6 +434,24 @@ fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_default()
 }
 
+/// Open the columns of the active parent's group `label`, if it has one.
+pub(in crate::app::dispatch) fn open_columns(app: &mut AppView, label: &str) {
+    let crate::app::app_view::ActiveView::Agent(parent_id) = app.active_view else {
+        return;
+    };
+    if app
+        .n_shot_groups
+        .iter()
+        .any(|g| g.parent == parent_id && g.label == label)
+    {
+        app.n_shot_columns = Some(NShotColumnsState {
+            parent: Some(parent_id),
+            label: label.to_string(),
+            focus: 0,
+        });
+    }
+}
+
 /// Open the columns of the active parent's latest group. Returns false when the
 /// active agent has no session-shot group, so `/shots` can fall back to the
 /// subagent n-shot view.

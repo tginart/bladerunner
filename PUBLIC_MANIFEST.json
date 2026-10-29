@@ -14350,8 +14350,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/actions.rs",
-      "bytes": 137208,
-      "sha256": "eb4ae5d885426d2e09b888c11a17ba37f6aae967eb40e55cfe02540eb966bd0d",
+      "bytes": 137320,
+      "sha256": "cfa6886efd37838da4b4c29d10ac8c47900c7502fa9c9ae6d08e2d9fb7650124",
       "mode": "0644"
     },
     {
@@ -14470,8 +14470,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/agent_view/selection.rs",
-      "bytes": 127741,
-      "sha256": "9394ef6b92d1f2a18959e80a5d175ae5059d36d61a631a391fd9f93691046eb1",
+      "bytes": 128143,
+      "sha256": "4f56639ba30dbe1cb7d9b82a26f5bb49ed68fa45d1889195b371c602a702e242",
       "mode": "0644"
     },
     {
@@ -14638,8 +14638,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/router.rs",
-      "bytes": 76955,
-      "sha256": "96494f25b820846ca0515e4a45c4951b2ad2ed597855c959e05f036b3f819251",
+      "bytes": 77092,
+      "sha256": "a7216936e92ff429b28b3ba8f17df78c93024da9b1cb55ebc878b4e3473e8017",
       "mode": "0644"
     },
     {
@@ -14680,8 +14680,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/session/n_shot.rs",
-      "bytes": 17014,
-      "sha256": "767ccb97ab6f25de708deb49e631e2069d787d8767e0962c5f1b84e94848bc06",
+      "bytes": 17562,
+      "sha256": "71deeab2d259444d0ffce731f18e16a490d52e735370bf04219a7761b243b646",
       "mode": "0644"
     },
     {
@@ -14998,8 +14998,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/mouse.rs",
-      "bytes": 87759,
-      "sha256": "14410df791dda6f2b78287a8bcf03cb4a5b9d2996407b4572fe69322c77b13cc",
+      "bytes": 87972,
+      "sha256": "b34acbb0c4337341c45fc435bd4f40ab9d6ba293da4214b12ebdb066962ac9d0",
       "mode": "0644"
     },
     {

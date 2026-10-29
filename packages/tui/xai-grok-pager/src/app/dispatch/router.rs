@@ -1637,6 +1637,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![]
         }
         Action::NShotColumnsAttach => super::session::n_shot::attach_focused_shot(app),
+        Action::OpenNShotColumns(label) => {
+            super::session::n_shot::open_columns(app, &label);
+            vec![]
+        }
         Action::Rewind => dispatch_rewind(app),
         Action::RewindShowPicker => dispatch_rewind_show_picker(app),
         Action::RewindPickerSelect(prompt_index) => {

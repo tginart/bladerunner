@@ -942,6 +942,9 @@ impl AgentView {
                                 if show_word_select_tip {
                                     return InputOutcome::Action(Action::ShowWordSelectTip);
                                 }
+                                if let Some(label) = self.n_shot_group_at(idx) {
+                                    return InputOutcome::Action(Action::OpenNShotColumns(label));
+                                }
                                 return InputOutcome::Changed;
                             }
                         } else if let Some((last_time, last_idx, last_count)) = self.last_click
