@@ -1597,6 +1597,11 @@ pub(crate) async fn run(
     const ROSTER_POLL_INTERVAL: Duration = Duration::from_secs(1);
     let mut roster_poll_at: Option<Instant> = Some(Instant::now());
 
+    // n-shot groups: track the shots of every open group and start the
+    // parent's compare turn when all settle. Armed only while a group is open.
+    const N_SHOT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+    let mut n_shot_poll_at: Option<Instant> = None;
+
     // Pre-generate the automatic "return-from-away" recap while the terminal is
     // unfocused, so it's already in the scrollback (instant) when the user
     // returns. The arm is a cheap no-op while focused / not-yet-eligible; the
@@ -2073,6 +2078,10 @@ pub(crate) async fn run(
             app.gboom_release_all_games();
         }
 
+        if n_shot_poll_at.is_none() && dispatch::n_shot_has_open_groups(&app) {
+            n_shot_poll_at = Some(Instant::now() + N_SHOT_POLL_INTERVAL);
+        }
+
         // Re-arm the dashboard roster poll when the dashboard is open but the
         // poll has gone dormant — i.e. the dashboard was just opened. The poll
         // arm leaves `roster_poll_at = None` only when it fired with the
@@ -2176,6 +2185,13 @@ pub(crate) async fn run(
 
         let roster_poll = async {
             match roster_poll_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+
+        let n_shot_poll = async {
+            match n_shot_poll_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -2579,6 +2595,14 @@ pub(crate) async fn run(
             _ = subscription_watch => {
                 subscription_watch_at = None;
                 let effs = app.fire_subscription_check("watch");
+                if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                    break;
+                }
+            }
+
+            _ = n_shot_poll => {
+                n_shot_poll_at = None;
+                let effs = dispatch::n_shot_tick(&mut app);
                 if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                     break;
                 }

@@ -102,9 +102,10 @@ fn record_blocking(resolve: &NShotResolve, applied_to: &Path) -> Result<String, 
     ))
 }
 
-/// Return the `scratch` directory of an n-shot run, from the path of its report.
-/// Only `…/workflows/<run>/scratch/report.md` is accepted, so a wrong or made-up
-/// path cannot make this tool write somewhere else.
+/// Return the directory of an n-shot run, from the path of its report.
+/// Only `…/workflows/<run>/scratch/report.md` (subagent shots) and
+/// `…/n-shot/<label>/report.md` (session shots) are accepted, so a wrong or
+/// made-up path cannot make this tool write somewhere else.
 fn run_scratch_dir(report_path: &Path) -> Result<PathBuf, String> {
     if !report_path.is_absolute() {
         return Err("report_path must be the absolute path of report.md".into());
@@ -115,9 +116,12 @@ fn run_scratch_dir(report_path: &Path) -> Result<PathBuf, String> {
     let name_of = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(String::from);
     let scratch = report.parent();
     let runs = scratch.and_then(Path::parent).and_then(Path::parent);
-    let is_run_report = name_of(&report).as_deref() == Some(REPORT_FILE)
-        && scratch.and_then(name_of).as_deref() == Some("scratch")
+    let is_workflow_dir = scratch.and_then(name_of).as_deref() == Some("scratch")
         && runs.and_then(name_of).as_deref() == Some("workflows");
+    let is_session_group_dir =
+        scratch.and_then(Path::parent).and_then(name_of).as_deref() == Some("n-shot");
+    let is_run_report = name_of(&report).as_deref() == Some(REPORT_FILE)
+        && (is_workflow_dir || is_session_group_dir);
     match scratch {
         Some(dir) if is_run_report => Ok(dir.to_path_buf()),
         _ => {
@@ -222,6 +226,18 @@ mod tests {
         assert_eq!(log.lines().count(), 2);
         assert_eq!(first["outcome"], "single");
         assert_eq!(first["shots"][0], "shot-2");
+
+        let group = tmp.path().canonicalize().unwrap().join("n-shot/n-shot-1");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(group.join(REPORT_FILE), "report").unwrap();
+        std::fs::write(
+            group.join(MANIFEST_FILE),
+            r#"{"shots":[{"label":"shot-2"}]}"#,
+        )
+        .unwrap();
+        r.report_path = group.join(REPORT_FILE).to_string_lossy().into_owned();
+        record_blocking(&r, Path::new("/work")).unwrap();
+        assert!(group.join(DECISIONS_FILE).exists());
 
         let elsewhere = tmp.path().join("report.md");
         std::fs::write(&elsewhere, "x").unwrap();

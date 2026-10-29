@@ -82,6 +82,8 @@ fn test_app() -> AppView {
         auth_return_view: None,
         agents: IndexMap::new(),
         next_agent_id: 0,
+        n_shot_groups: Vec::new(),
+        n_shot_columns: None,
         models: ModelState::default(),
         registry: crate::actions::ActionRegistry::defaults(),
         settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),

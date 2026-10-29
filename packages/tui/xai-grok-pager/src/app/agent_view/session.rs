@@ -366,6 +366,7 @@ impl AgentView {
             esc_pressed_at: None,
             rewind_suppress_deadline: None,
             pending_first_prompt: None,
+            n_shot: None,
             pending_fork_banner: None,
             loading_placeholder_id: None,
             pending_recap_entry: None,

@@ -1642,6 +1642,15 @@ impl AgentView {
                 format!("{icon} {b}")
             }
         });
+        if let Some(member) = &self.n_shot {
+            let shot_text = format!(
+                "{} \u{00b7} shot {} of {} ",
+                member.label, member.index, member.total
+            );
+            let shot_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
+            path_offset += shot_text.width() as u16;
+            parts.push(Span::styled(shot_text, shot_style));
+        }
         if let Some(git_text) = git_text {
             let git_style = Style::default()
                 .fg(theme.text_primary)

@@ -178,12 +178,33 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     let ActiveView::Agent(parent_id) = app.active_view else {
         return vec![];
     };
-    let Some(parent) = app.agents.get(&parent_id) else {
-        return vec![];
-    };
+    spawn_fork(app, parent_id, worktree, directive, ForkFocus::SwitchToFork)
+        .map_or_else(Vec::new, |(_, effect)| vec![effect])
+}
+/// Where the view goes after [`spawn_fork`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app::dispatch) enum ForkFocus {
+    /// `/fork`: mark the parent and switch to the new agent.
+    SwitchToFork,
+    /// `/n-shot`: stay on the parent; the caller marks the parent itself.
+    StayOnParent,
+}
+/// Purpose: Create one fork agent of `parent_id` and the effect that starts it.
+/// Input: The parent agent, the worktree choice, an optional first prompt, and
+///     the focus after the fork.
+/// Output: The new agent id and its start effect, or `None` when the parent has
+///     no session yet.
+pub(in crate::app::dispatch) fn spawn_fork(
+    app: &mut AppView,
+    parent_id: AgentId,
+    worktree: bool,
+    directive: Option<String>,
+    focus: ForkFocus,
+) -> Option<(AgentId, Effect)> {
+    let parent = app.agents.get(&parent_id)?;
     let Some(parent_session_id) = parent.session.session_id.clone() else {
         app.show_toast("Cannot fork: session not yet created");
-        return vec![];
+        return None;
     };
     let parent_cwd = parent.session.cwd.clone();
     let parent_is_worktree = parent.session.is_worktree;
@@ -238,14 +259,16 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
         }
         agent.pending_first_prompt = directive;
     }
-    if let Some(parent_mut) = app.agents.get_mut(&parent_id) {
-        parent_mut
-            .scrollback
-            .push_block(RenderBlock::system(parent_marker));
+    if focus == ForkFocus::SwitchToFork {
+        if let Some(parent_mut) = app.agents.get_mut(&parent_id) {
+            parent_mut
+                .scrollback
+                .push_block(RenderBlock::system(parent_marker));
+        }
+        switch_to_agent(app, new_id, SwitchCause::Fork);
     }
-    switch_to_agent(app, new_id, SwitchCause::Fork);
-    if worktree {
-        vec![Effect::CreateWorktreeSession {
+    let effect = if worktree {
+        Effect::CreateWorktreeSession {
             agent_id: new_id,
             load_session_id: Some(parent_session_id.0.to_string()),
             label: None,
@@ -254,16 +277,17 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
             model_id: None,
             preferred_session_id: None,
             chat_kind: parent_chat_kind,
-        }]
+        }
     } else {
-        vec![Effect::ForkSession {
+        Effect::ForkSession {
             agent_id: new_id,
             parent_session_id,
             parent_cwd,
             parent_is_worktree,
             new_session_id: None,
-        }]
-    }
+        }
+    };
+    Some((new_id, effect))
 }
 /// Build the placeholder [`AgentView`] for a fork. Centralises the
 /// `AgentSession`/spinner construction shared by both worktree and

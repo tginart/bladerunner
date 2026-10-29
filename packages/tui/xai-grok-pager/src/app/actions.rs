@@ -1083,6 +1083,8 @@ pub enum Action {
     ToggleWorkflows,
     /// Open the side-by-side columns of the latest n-shot run.
     OpenShots,
+    /// Switch to the focused shot of the open n-shot columns view.
+    NShotColumnsAttach,
     Rewind,
     RewindShowPicker,
     RewindPickerSelect(usize),
@@ -1726,6 +1728,11 @@ pub enum Effect {
     /// pagers may produce last-writer-wins behaviour but never corrupt
     /// the file.
     PersistDashboard(crate::views::dashboard::PersistedDashboard),
+    /// Write n-shot group files (`shots.json`, `report.md`, shot back-links).
+    /// Each pair is a path and its full contents; parent dirs are created.
+    WriteNShotFiles {
+        files: Vec<(std::path::PathBuf, String)>,
+    },
     /// Persist a per-command worktree mode preference to `[hints]` in
     /// config.toml. `config_key` is the TOML key under `[hints]`
     /// (`"new_session_worktree_mode"` or `"fork_worktree_mode"`).

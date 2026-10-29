@@ -35,37 +35,46 @@ the permission decision.
 
 ### `/n-shot <N> <prompt>`
 
-Fork the conversation into N parallel attempts (1-10) at the same prompt. Each
-shot starts from the same launch snapshot of this conversation and working tree,
-and works in its own git worktree. Later parent edits do not enter queued shots.
+Fork this session into N shots (1-10) that each work on the same prompt in their
+own git worktree. `/n-shot N` can go anywhere in the message: Bladerunner removes it
+and every shot runs the rest as if you had typed it there. So slash commands work
+inside the shots:
 
 ```
 /n-shot 3 fix the flaky login test
+/goal make the parser handle nested quotes /n-shot 2 keep the diff small
+/n-shot 4 /loop 10m check CI and fix what fails
 ```
 
-The shots run in the background as a workflow. Outside minimal mode, Bladerunner
-opens a side-by-side view with one column per shot: live status, model, elapsed
-time, tokens, and the tail of that shot's transcript. Use `←`/`→` to move between
-columns, `Enter` (or a click) to open a shot's full transcript, and `Esc` to return
-to the chat. You can keep talking to the session while the shots run. Switch to
-fullscreen and run `/shots` to reopen the columns for the latest run.
+Each shot is a full session forked from this one (like `/fork --worktree`), with
+this conversation's history. The view stays on this session, which shows the run
+as one live line (`n-shot-1 … [shot-1 settled · shot-2 goal active]`) and opens a
+side-by-side view with one column per shot: its status and the tail of its
+transcript. Use `←`/`→` to move between columns, `Enter` to switch into a shot's
+session (to answer its questions or steer it), and `Esc` to close the view. `/shots`
+reopens it. On the dashboard, the shots are nested under this session, and each
+shot's status bar shows `n-shot-1 · shot 2 of 4`.
 
-When every shot finishes, the session wakes up with a report: each shot's final
-message, worktree path, and changed files. It compares the shots and recommends
-one. Then tell it what to keep, for example "take shot 2" or "use shot 1 but port
-the retry logic from shot 3". It applies the result to your working tree. The
-worktrees stay on disk until you remove them.
+A shot is settled when its turn has ended, it has no active `/goal`, and it has no
+scheduled `/loop`. A paused, blocked, or finished goal counts as settled. When every
+shot has settled, this session gets a prompt to compare them: the strengths, risks,
+and a recommendation. Then tell it what to keep, for example "take shot 2" or "use
+shot 1 but port the retry logic from shot 3". It applies the result to your working
+tree. The shot sessions and worktrees stay until you remove them.
+
+Each run is logged under this session's directory in `n-shot/<label>/`:
+`shots.json` lists every shot (label, session id, worktree, status), `report.md` has
+each shot's final message, and `decisions.jsonl` gets one line when the agent
+records which shot was used, or that shots were combined (`single`, `hybrid` or
+`none`, with the shots and a rationale). Each shot session has an `n_shot.json` that
+links back to the run.
 
 The agent can also start an n-shot run itself with its `n_shot` tool, with a
-different prompt or model for each shot. Needs background workflows, which are on
-by default (`[workflows] enabled`).
-
-Each run is logged under its parent session, in
-`workflows/<run id>/scratch/`: `shots.json` lists every shot (label, session id,
-prompt, model, status, worktree, changes), `report.md` has the full comparison, and
-`decisions.jsonl` gets one line when the agent records which shot was used, or that
-shots were combined (`single`, `hybrid` or `none`, with the shots and a rationale).
-A shot's `subagents/<id>/meta.json` carries `workflow_run_id` to link it back.
+different prompt or model for each shot. Those shots run as background subagents
+instead of sessions, and are logged in `workflows/<run id>/scratch/` with the same
+files; each shot's `subagents/<id>/meta.json` carries `workflow_run_id`. Headless
+mode and other ACP clients also use subagent shots. Subagent shots need background
+workflows, which are on by default (`[workflows] enabled`).
 
 ### `/new`
 

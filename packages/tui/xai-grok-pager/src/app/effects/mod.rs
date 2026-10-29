@@ -2183,6 +2183,26 @@ pub(crate) fn execute(
                     TaskResult::CancelComplete
                 });
         }
+        Effect::WriteNShotFiles { files } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    for (path, contents) in files {
+                        if let Some(dir) = path.parent() {
+                            std::fs::create_dir_all(dir)?;
+                        }
+                        std::fs::write(&path, contents)?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+                .await;
+                match result {
+                    Ok(Err(e)) => tracing::warn!(error = %e, "failed to write n-shot files"),
+                    Err(e) => tracing::warn!(error = %e, "n-shot file writer failed"),
+                    Ok(Ok(())) => {}
+                }
+                TaskResult::CancelComplete
+            });
+        }
         Effect::PersistWorktreeMode { mode, config_key } => {
             debug_assert!(
                 config_key == "fork_worktree_mode" || config_key == "new_session_worktree_mode",

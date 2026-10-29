@@ -176,6 +176,14 @@ fn build_local_rows(
     let mut rows = Vec::new();
     for (id, agent) in agents.iter() {
         let top_id = DashboardRowId::TopLevel(*id);
+        // n-shot shots are listed under their parent, below.
+        if agent
+            .n_shot
+            .as_ref()
+            .is_some_and(|member| agents.contains_key(&member.parent))
+        {
+            continue;
+        }
         if is_empty_top_level(agent)
             && !pinned.contains(&top_id)
             && !matches!(
@@ -193,6 +201,7 @@ fn build_local_rows(
             home,
         );
         rows.push(row);
+        push_n_shot_rows(&mut rows, agents, *id, agent, pinned, active, home);
         if !include_subagents {
             continue;
         }
@@ -251,6 +260,43 @@ fn build_local_rows(
         }
     }
     rows
+}
+/// Push the n-shot shots of `parent_id` as nested rows, in group and shot order.
+/// The rows keep their top-level id, so attach and pin work as for any session.
+fn push_n_shot_rows(
+    rows: &mut Vec<DashboardRow>,
+    agents: &IndexMap<AgentId, AgentView>,
+    parent_id: AgentId,
+    parent: &AgentView,
+    pinned: &std::collections::BTreeSet<DashboardRowId>,
+    active: Option<AgentId>,
+    home: Option<&str>,
+) {
+    let mut shots: Vec<(&crate::app::n_shot::NShotMember, AgentId, &AgentView)> = agents
+        .iter()
+        .filter_map(|(id, agent)| {
+            let member = agent.n_shot.as_ref()?;
+            (member.parent == parent_id).then_some((member, *id, agent))
+        })
+        .collect();
+    shots.sort_by(|a, b| (a.0.label.as_str(), a.0.index).cmp(&(b.0.label.as_str(), b.0.index)));
+    for (member, id, agent) in shots {
+        let mut row = top_level_row(
+            id,
+            agent,
+            pinned.contains(&DashboardRowId::TopLevel(id)),
+            active == Some(id),
+            home,
+        );
+        row.label = format!(
+            "{} \u{00b7} {}",
+            member.label,
+            crate::app::n_shot::shot_label(member.index)
+        );
+        row.indent = 1;
+        row.parent_label = Some(top_level_label(parent));
+        rows.push(row);
+    }
 }
 /// Map a leader [`RosterActivity`] to the dashboard's coarse [`RowState`].
 /// Public so the dispatcher can gate roster-row deletion through the very

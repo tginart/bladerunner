@@ -101,6 +101,122 @@ pub fn render_n_shot_detail(
     }
 }
 
+/// Purpose: Draw the columns of an n-shot group whose shots are full sessions.
+/// Input: The buffer, the area to cover, the columns state, the group, and the
+///     agents that hold each shot's session.
+/// Output: None. The function draws a bordered window over `area`.
+/// Method:
+///     1. Describe the group as a run snapshot, so the subagent column code applies.
+///     2. Take each shot's live status and transcript from its agent.
+///     3. Draw the window, the columns, and a key hint.
+pub(crate) fn render_session_columns(
+    buf: &mut Buffer,
+    area: Rect,
+    columns: &mut crate::app::n_shot::NShotColumnsState,
+    group: &crate::app::n_shot::NShotGroup,
+    agents: &indexmap::IndexMap<crate::app::agent::AgentId, crate::app::agent_view::AgentView>,
+) {
+    use crate::app::n_shot::{classify_shot, shot_label};
+    use crate::views::workflows::WorkflowAgentLiveStatus;
+
+    let theme = Theme::current();
+    let window = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if window.width < 10 || window.height < 6 {
+        return;
+    }
+    ratatui::widgets::Clear.render(window, buf);
+    let frame = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent_plan))
+        .style(Style::default().bg(theme.bg_base))
+        .title(format!(" {} ", group.label));
+    let inner = frame.inner(window);
+    frame.render(window, buf);
+
+    let mut live = WorkflowAgentLiveMap::new();
+    let mut scrollbacks = WorkflowAgentScrollbacks::new();
+    let mut rows = Vec::with_capacity(group.shots.len());
+    for (i, shot_id) in group.shots.iter().enumerate() {
+        let agent = agents.get(shot_id);
+        let status = classify_shot(agent);
+        let key = shot_id.0.to_string();
+        rows.push(WorkflowAgentRowView {
+            agent_id: key.clone(),
+            label: shot_label(i + 1),
+            phase: Some("Shots".to_string()),
+            model: None,
+            state: if status.is_settled() {
+                "done"
+            } else {
+                "running"
+            }
+            .to_string(),
+            tokens_used: 0,
+            duration_ms: 0,
+        });
+        live.insert(
+            key.clone(),
+            WorkflowAgentLiveStatus {
+                activity: Some(status.label()),
+                ..Default::default()
+            },
+        );
+        if let Some(agent) = agent {
+            scrollbacks.insert(key, &agent.scrollback);
+        }
+    }
+    let run = WorkflowRunSnapshot {
+        run_id: group.label.clone(),
+        name: group.label.clone(),
+        objective: group.prompt.clone(),
+        status: if group.joined { "complete" } else { "active" }.to_string(),
+        management_available: false,
+        builtin: true,
+        phases: Vec::new(),
+        current_phase: None,
+        agents: rows,
+        agent_budget: None,
+        agents_used: 0,
+        agents_reserved: 0,
+        agents_remaining: None,
+        agent_usage_incomplete: false,
+        active_agents: 0,
+        elapsed_ms: if group.joined {
+            group.elapsed().as_millis() as u64
+        } else {
+            0
+        },
+        received_at: group.started_at,
+        pause_message: None,
+        result_summary: None,
+    };
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let mut state = WorkflowsViewState {
+        n_shot_focus: columns.focus,
+        ..Default::default()
+    };
+    render_n_shot_detail(buf, body, &run, &mut state, 0, &theme, &live, &scrollbacks);
+    columns.focus = state.n_shot_focus;
+    let hint = "\u{2190}\u{2192} shot \u{00b7} Enter attach \u{00b7} Esc close";
+    write_line(
+        buf,
+        inner.x + 1,
+        inner.bottom().saturating_sub(1),
+        hint,
+        Style::default().fg(theme.gray_dim),
+        inner.width.saturating_sub(2),
+    );
+}
+
 struct ShotColumn<'a> {
     shot: &'a WorkflowAgentRowView,
     index: usize,

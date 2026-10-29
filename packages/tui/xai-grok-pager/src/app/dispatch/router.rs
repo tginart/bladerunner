@@ -1631,9 +1631,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenShots => {
             app.scroll_state.cancel_stream();
             app.last_scroll_pos = None;
-            with_active_agent(app, |agent| agent.open_latest_n_shot());
+            if !super::session::n_shot::open_latest_columns(app) {
+                with_active_agent(app, |agent| agent.open_latest_n_shot());
+            }
             vec![]
         }
+        Action::NShotColumnsAttach => super::session::n_shot::attach_focused_shot(app),
         Action::Rewind => dispatch_rewind(app),
         Action::RewindShowPicker => dispatch_rewind_show_picker(app),
         Action::RewindPickerSelect(prompt_index) => {
