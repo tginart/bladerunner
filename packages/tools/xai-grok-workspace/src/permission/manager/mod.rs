@@ -147,7 +147,7 @@ fn mcp_pre_decision(
 /// (nor a broader whitelist *prefix* grant — see `evaluate_bash`). Flag list is
 /// [`KUBECTL_UNSAFE_FLAGS`] so the two classifiers cannot drift.
 fn kubectl_has_unsafe_flag(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("kubectl") {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("kubectl") {
         return false;
     }
     words.iter().skip(1).any(|w| {
@@ -168,7 +168,7 @@ fn kubectl_has_unsafe_flag(words: &[String]) -> bool {
 /// Value operands of format/select flags (`-o etime`, `o command`,
 /// `-eo pid,cmd`) are skipped so they are not mistaken for option clusters.
 fn ps_dumps_environment(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("ps") {
+    if crate::permission::policy::normalized_command_head(words).as_deref() != Some("ps") {
         return false;
     }
     let mut skip_next = false;
@@ -466,10 +466,16 @@ pub fn minimum_always_allow_scope(words: &[String]) -> usize {
 /// `is_dangerous_command` script-level check, but applied to every
 /// segment in a chain instead of only the start of the script.
 fn is_dangerous_command_words(words: &[String]) -> bool {
-    if words.is_empty() {
+    // Match on the normalized basename so `/bin/rm`, `RM`, and `rm.exe` are all
+    // caught (consistent with `head_is_exec_vehicle` / the sed pin).
+    let Some(head) = crate::permission::policy::normalized_command_head(words) else {
         return false;
-    }
-    let joined = words.join(" ");
+    };
+    let joined = if words.len() == 1 {
+        head
+    } else {
+        format!("{head} {}", words[1..].join(" "))
+    };
     matches_command_prefix(&joined, "rm")
         || matches_command_prefix(&joined, "chmod")
         || matches_command_prefix(&joined, "chown")
@@ -7073,6 +7079,61 @@ mod tests {
         assert!(!is_dangerous_command("cargo run --example rm_test"));
         assert!(is_dangerous_command("killall zombies"));
         assert!(!is_dangerous_command("git pushing"));
+
+        // Path-qualified, case-variant, and `.exe` spellings are the same verb.
+        assert!(is_dangerous_command("/bin/rm -rf /"));
+        assert!(is_dangerous_command("/usr/bin/git push origin main"));
+        assert!(is_dangerous_command("RM.EXE file.txt"));
+        assert!(!is_dangerous_command("/usr/bin/rmdir empty"));
+    }
+
+    /// A path-qualified prefix grant must not let an unsafe-flag variant ride
+    /// over the force-prompt guards, nor a full-path dangerous verb ride a
+    /// prefix grant: the guards normalize the command basename.
+    #[test]
+    fn path_qualified_grant_does_not_bypass_unsafe_flag_guard() {
+        let mut state = PermissionState::default();
+        for grant in [
+            "/usr/bin/kubectl get",
+            "/usr/bin/ps",
+            "/opt/homebrew/bin/rg",
+            "/usr/bin/git log",
+            "/bin/rm",
+        ] {
+            state.allowed_bash_commands.insert(grant.to_owned());
+        }
+        // Safe reads still auto-allow via the prefix grant.
+        for cmd in [
+            "/usr/bin/kubectl get pods",
+            "/usr/bin/ps aux",
+            "/opt/homebrew/bin/rg needle",
+            "/usr/bin/git log -1",
+        ] {
+            assert!(
+                matches!(
+                    evaluate_bash_segments(cmd, &state),
+                    SegmentEvaluation::AutoAllow {
+                        via_session_grant: true
+                    }
+                ),
+                "{cmd:?} must ride the prefix grant"
+            );
+        }
+        for cmd in [
+            "/usr/bin/kubectl get pods --kubeconfig /tmp/evil.yaml",
+            "/usr/bin/ps auxe",
+            "/opt/homebrew/bin/rg --pre ./payload needle",
+            "/usr/bin/git log --output=/tmp/x",
+            "/bin/rm -rf /",
+        ] {
+            assert!(
+                matches!(
+                    evaluate_bash_segments(cmd, &state),
+                    SegmentEvaluation::NeedsPrompts { .. }
+                ),
+                "{cmd:?} must prompt despite the prefix grant"
+            );
+        }
     }
 
     #[test]
