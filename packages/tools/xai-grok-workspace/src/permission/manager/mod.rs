@@ -28,7 +28,9 @@ use crate::permission::shell_access::{
     command_write_paths_in_tree, edit_target_protection, is_safe_write_sink, tree_has_opaque_shell,
     words_are_opaque_shell,
 };
-use crate::permission::state::{PermissionState, load_state_from_disk, persist_state};
+use crate::permission::state::{
+    PermissionState, load_state_from_disk, persist_state, replace_state_on_disk,
+};
 use crate::permission::types::{
     AccessKind, ClientType, Decision, EditPolicy, PermissionCommand, PermissionEvent,
     PermissionResolution, PromptPolicy, RequestPathContext,
@@ -1494,7 +1496,10 @@ fn spawn_permission_manager_with_pin(
                 }
                 PermissionCommand::ResetState => {
                     state = PermissionState::default();
-                    persist_state(&cwd, &state, client_id_ref).await;
+                    // Replace, not merge: persist_state unions on-disk grants
+                    // back in, which would resurrect everything a reset is
+                    // meant to discard.
+                    replace_state_on_disk(&cwd, &state, client_id_ref).await;
                     allow_edits_for_session = false;
                     tracing::info!(
                         "Permission state reset to defaults (including session edit allow)"
@@ -3097,6 +3102,68 @@ mod tests {
                     1,
                     "always_approve must persist so the second call needs no hook"
                 );
+            })
+            .await;
+    }
+
+    /// A grant persisted by this session must not erase grants or denies a
+    /// concurrent session in the same project saved after this actor's
+    /// snapshot; an explicit reset still clears everything.
+    #[tokio::test]
+    async fn persist_keeps_concurrent_session_grants_and_reset_replaces() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let transport = fake_hub(serde_json::json!({
+                    "outcome": "always_approve",
+                    "scope": { "kind": "bash_command", "value": "cargo build" },
+                }));
+                let (mgr, _e) = test_manager_with_hub(&cwd, transport);
+
+                // A safe-listed warmup completes only after the actor's
+                // spawn-time load, so the write below is provably newer than
+                // its snapshot.
+                let d = mgr
+                    .request(AccessKind::Bash("ls".into()), tool_call(), None, None, None)
+                    .await;
+                assert_eq!(d, Decision::Allow);
+                let mut other = PermissionState::default();
+                other.allowed_bash_commands.insert("npm test".to_owned());
+                other.disallowed_bash_commands.insert("git push".to_owned());
+                persist_state(&cwd, &other, None).await;
+
+                let d = mgr
+                    .request(
+                        AccessKind::Bash("cargo build".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(d, Decision::Allow);
+                let persisted = load_state_from_disk(&cwd, None).await;
+                assert!(persisted.allowed_bash_commands.contains("cargo build"));
+                assert!(
+                    persisted.allowed_bash_commands.contains("npm test"),
+                    "the other session's grant must survive this session's save"
+                );
+                assert!(
+                    persisted.disallowed_bash_commands.contains("git push"),
+                    "the other session's deny must survive this session's save"
+                );
+
+                mgr.reset_state();
+                // Requests are handled in order, so this one runs after the reset.
+                let d = mgr
+                    .request(AccessKind::Bash("ls".into()), tool_call(), None, None, None)
+                    .await;
+                assert_eq!(d, Decision::Allow);
+                let persisted = load_state_from_disk(&cwd, None).await;
+                assert!(persisted.allowed_bash_commands.is_empty());
+                assert!(persisted.disallowed_bash_commands.is_empty());
             })
             .await;
     }
