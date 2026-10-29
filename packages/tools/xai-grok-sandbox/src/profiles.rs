@@ -332,12 +332,48 @@ impl ProfileName {
     }
 
     /// Resolve this profile into a fully-specified `SandboxProfile` for logging.
+    ///
+    /// Also appends the runtime sockets that exist at launch to `deny`: D-Bus
+    /// and systemd for every non-devbox profile, plus container-runtime
+    /// sockets when the profile restricts network. See [`crate::runtime_sockets`].
     pub fn resolve_profile(
         &self,
         workspace: &Path,
         config: &SandboxConfig,
     ) -> anyhow::Result<SandboxProfile> {
-        self.resolve(workspace, config)
+        let mut profile = self.resolve(workspace, config)?;
+        let policy = self.socket_deny_policy(config, &profile);
+        let candidates = crate::runtime_sockets::socket_deny_candidates(policy);
+        for path in crate::runtime_sockets::existing_socket_paths(candidates) {
+            if !profile.deny.contains(&path) {
+                profile.deny.push(path);
+            }
+        }
+        Ok(profile)
+    }
+
+    /// Devbox keeps host D-Bus/systemd; container-runtime sockets still follow
+    /// `restrict_network`.
+    fn socket_deny_policy(
+        &self,
+        config: &SandboxConfig,
+        profile: &SandboxProfile,
+    ) -> crate::runtime_sockets::SocketDenyPolicy {
+        crate::runtime_sockets::SocketDenyPolicy {
+            dbus: !self.is_devbox_based(config),
+            container_runtime: profile.restrict_network,
+        }
+    }
+
+    /// Whether this is `devbox` or a custom profile that `extends = "devbox"`.
+    pub(crate) fn is_devbox_based(&self, config: &SandboxConfig) -> bool {
+        match self {
+            Self::Devbox => true,
+            Self::Custom(name) => {
+                config.profiles.get(name).and_then(|p| p.extends.as_deref()) == Some("devbox")
+            }
+            _ => false,
+        }
     }
 
     fn resolve(&self, workspace: &Path, config: &SandboxConfig) -> anyhow::Result<SandboxProfile> {
@@ -860,10 +896,65 @@ read_write = ["/tmp/ci-artifacts"]
             ]
         );
         assert_eq!(resolved.read_only, [PathBuf::from("/opt/tooling")]);
+        let mut expected = vec![PathBuf::from("**/.env"), PathBuf::from("/secrets/**")];
+        expected.extend(crate::runtime_sockets::existing_socket_paths(
+            crate::runtime_sockets::socket_deny_candidates(
+                crate::runtime_sockets::SocketDenyPolicy {
+                    dbus: true,
+                    container_runtime: false,
+                },
+            ),
+        ));
         assert_eq!(
-            resolved.deny,
-            [PathBuf::from("**/.env"), PathBuf::from("/secrets/**")]
+            resolved.deny, expected,
+            "deny must be globs then live dbus sockets"
         );
+    }
+
+    /// Every non-devbox profile denies D-Bus/systemd; container-runtime
+    /// sockets follow `restrict_network`, including for devbox-based profiles.
+    #[test]
+    fn socket_deny_policy_follows_devbox_and_network() {
+        use crate::runtime_sockets::SocketDenyPolicy;
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::current_dir().unwrap();
+        let config = SandboxConfig {
+            profiles: HashMap::from([(
+                "sealed-dev".to_string(),
+                ProfileConfig {
+                    extends: Some("devbox".to_string()),
+                    restrict_network: Some(true),
+                    read_only: vec![],
+                    read_write: vec![],
+                    deny: vec![],
+                },
+            )]),
+        };
+        let policy = |dbus, container_runtime| SocketDenyPolicy {
+            dbus,
+            container_runtime,
+        };
+        for (name, expected) in [
+            (ProfileName::Workspace, policy(true, false)),
+            (ProfileName::Devbox, policy(false, false)),
+            (ProfileName::ReadOnly, policy(true, true)),
+            (ProfileName::Strict, policy(true, true)),
+            (
+                ProfileName::Custom("sealed-dev".into()),
+                policy(false, true),
+            ),
+        ] {
+            let base = name.resolve(&workspace, &config).unwrap();
+            assert_eq!(name.socket_deny_policy(&config, &base), expected, "{name}");
+            let resolved = name.resolve_profile(&workspace, &config).unwrap();
+            for socket in crate::runtime_sockets::existing_socket_paths(
+                crate::runtime_sockets::socket_deny_candidates(expected),
+            ) {
+                assert!(resolved.deny.contains(&socket), "{name}: {socket:?}");
+            }
+        }
     }
 
     /// Building the capability set pre-creates missing `read_write` dirs; a
