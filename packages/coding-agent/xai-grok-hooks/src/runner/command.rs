@@ -20,6 +20,34 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// or block (Stop/SubagentStop, with stderr as the feedback).
 const GATE_EXIT_CODE: i32 = 2;
 
+/// Kills the hook's process group when dropped, so a cancelled hook future
+/// (turn cancel, session teardown) takes its grandchildren with it. A
+/// leader-only `kill_on_drop` would leave them running. Disarmed once the hook
+/// exits on its own.
+struct HookProcessGuard {
+    group: Option<Arc<ProcessGroup>>,
+}
+
+impl HookProcessGuard {
+    fn arm(group: Option<Arc<ProcessGroup>>) -> Self {
+        Self { group }
+    }
+
+    fn disarm(&mut self) {
+        self.group = None;
+    }
+}
+
+impl Drop for HookProcessGuard {
+    fn drop(&mut self) {
+        // The leader is reaped by tokio's `kill_on_drop` handling; orphaned
+        // grandchildren are reaped by init once killed.
+        if let Some(group) = self.group.take() {
+            let _ = group.kill();
+        }
+    }
+}
+
 /// `None` when the group cannot be built, which only costs session reaping, so
 /// the hook still runs.
 fn hook_process_group(child: &tokio::process::Child) -> Option<Arc<ProcessGroup>> {
@@ -186,20 +214,20 @@ pub async fn run_command_hook(
         }
     };
 
-    let mut hook_group = None;
-    if let Some(scope) = ctx.process_scope.as_ref()
-        && let Some(group) = hook_process_group(&child)
+    // Always build the group, even without a session scope: the drop guard
+    // below needs it to reap grandchildren of a cancelled hook.
+    let hook_group = hook_process_group(&child);
+    // A closed scope means the session is gone and `register` already killed
+    // the child, so stop rather than write stdin to a corpse.
+    if let (Some(scope), Some(group)) = (ctx.process_scope.as_ref(), hook_group.as_ref())
+        && !scope.register(group)
     {
-        // A closed scope means the session is gone and `register` already killed
-        // the child, so stop rather than write stdin to a corpse.
-        if !scope.register(&group) {
-            return (
-                HookRunnerResult::Failed("session closed before the hook ran".to_string()),
-                start.elapsed(),
-            );
-        }
-        hook_group = Some(group);
+        return (
+            HookRunnerResult::Failed("session closed before the hook ran".to_string()),
+            start.elapsed(),
+        );
     }
+    let mut reap = HookProcessGuard::arm(hook_group);
 
     // Write stdin concurrently with draining output, under the timeout: a hook
     // that never reads stdin would otherwise block `write_all` on a full pipe
@@ -219,12 +247,12 @@ pub async fn run_command_hook(
 
     let elapsed = start.elapsed();
 
-    // killpg takes grandchildren that kill_on_drop would miss.
-    if !matches!(result, Ok(Ok(_)))
-        && let Some(group) = &hook_group
-    {
-        let _ = group.kill();
+    // killpg takes grandchildren that kill_on_drop would miss. A clean exit
+    // disarms the guard; a timeout or error drops it armed, which kills.
+    if matches!(result, Ok(Ok(_))) {
+        reap.disarm();
     }
+    drop(reap);
 
     match result {
         Err(_) => (
@@ -1472,6 +1500,42 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild outlived session close, so the group was not killpg'd"
+        );
+    }
+
+    /// Without a session scope, a cancelled hook (dropped future) must still
+    /// take its grandchildren down, not just the `sh` leader.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_command_hook_kills_grandchild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("grandchild_alive");
+        let started = tmp.path().join("started");
+        let mut spec = make_shell_spec(&format!(
+            "sh -c 'touch {}; sleep 2 && echo alive > {}' & wait",
+            started.display(),
+            marker.display()
+        ));
+        spec.timeout_ms = 60_000;
+        let envelope = make_envelope();
+        let hook = tokio::spawn(async move {
+            run_command_hook(&spec, &envelope, &make_ctx(), GateKind::Observe).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("grandchild never started");
+        hook.abort();
+        let _ = hook.await;
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "grandchild outlived the cancelled hook, so the group was not killpg'd"
         );
     }
 
