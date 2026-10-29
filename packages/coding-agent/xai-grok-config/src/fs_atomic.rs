@@ -36,9 +36,10 @@ pub fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Atomic temp + rename so a torn write can't leave a half-written file. The temp
-/// name is unique per writer (pid + counter) and `create_new`, so concurrent
-/// writers don't collide. `mode` (unix only) is applied at temp-file creation, so
-/// the final file never exists with looser permissions.
+/// is fsynced before the rename, so a crash can't publish an empty or truncated
+/// file. The temp name is unique per writer (pid + counter) and `create_new`, so
+/// concurrent writers don't collide. `mode` (unix only) is applied at temp-file
+/// creation, so the final file never exists with looser permissions.
 pub fn write_atomically(
     final_path: &Path,
     contents: &str,
@@ -66,7 +67,10 @@ pub fn write_atomically(
     let _ = mode;
     let result = options
         .open(&tmp)
-        .and_then(|mut f| f.write_all(contents.as_bytes()))
+        .and_then(|mut f| {
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()
+        })
         .and_then(|()| std::fs::rename(&tmp, final_path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
