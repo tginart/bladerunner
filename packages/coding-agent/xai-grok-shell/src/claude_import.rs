@@ -603,9 +603,9 @@ pub(crate) fn is_claude_import_marked_at(config_path: &Path) -> bool {
 
 /// Write `[claude_compat] imported = true` to `~/.grok/config.toml`.
 ///
-/// Uses the same atomic write pattern as `save_mcp_server_config` (write to
-/// `.tmp`, then rename). Creates the file and parent directory if missing.
-/// Existing content in the file is preserved.
+/// Writes atomically through a symlinked `config.toml` (see
+/// [`crate::util::config::atomic_write_string`]). Creates the file and parent
+/// directory if missing. Existing content in the file is preserved.
 fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
     // Surface parse errors instead of silently discarding the file: an atomic
     // rewrite would otherwise drop unrelated sections ([model], [ui], etc.)
@@ -636,22 +636,7 @@ fn write_import_marker(config_path: &Path) -> anyhow::Result<()> {
     compat_table.insert("imported".to_string(), TomlValue::Boolean(true));
 
     let toml_str = toml::to_string_pretty(&root)?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = config_path.with_extension("toml.tmp");
-    // Best-effort cleanup of the .tmp file if either write or rename fails so
-    // a failed marker write doesn't leave a stale artefact next to the real
-    // config (otherwise the next attempt would inherit a half-written file
-    // before the rename clobbers it).
-    if let Err(e) = std::fs::write(&tmp, &toml_str) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    if let Err(e) = std::fs::rename(&tmp, config_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    crate::util::config::atomic_write_string(config_path, &toml_str)?;
     Ok(())
 }
 
@@ -692,7 +677,7 @@ pub fn apply_import(plan: &ImportPlan, cwd: &Path) -> anyhow::Result<ImportResul
         let count = {
             // Serialized with other processes' config.toml writes.
             let _lock = crate::util::config::lock_config_file_blocking()?;
-            apply_items_to_config(&global_path, &plan.global_items)?
+            apply_items_to_config(&global_path, &plan.global_items, ImportScope::Global)?
         };
         result.global_count = count;
         if count > 0 {
@@ -718,7 +703,8 @@ pub fn apply_import(plan: &ImportPlan, cwd: &Path) -> anyhow::Result<ImportResul
     if !plan.project_items.is_empty() {
         let project_root = find_project_root(cwd);
         let project_path = project_root.join(".grok").join("config.toml");
-        let count = apply_items_to_config(&project_path, &plan.project_items)?;
+        let count =
+            apply_items_to_config(&project_path, &plan.project_items, ImportScope::Project)?;
         result.project_count = count;
         if count > 0 {
             result
@@ -765,7 +751,15 @@ impl ImportResult {
 }
 
 /// Apply items to a single config.toml file using atomic write.
-fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow::Result<usize> {
+///
+/// A user config symlink is written through. A project `.grok/config.toml`
+/// symlink is replaced with a regular file, so a repo can't redirect the
+/// write to another user file.
+fn apply_items_to_config(
+    config_path: &Path,
+    items: &[ImportableItem],
+    scope: ImportScope,
+) -> anyhow::Result<usize> {
     // Read existing TOML. Surface parse errors instead of silently
     // discarding the file: an atomic rewrite would otherwise drop
     // unrelated sections ([model], [ui], etc.) and overwrite a hand-edited
@@ -831,14 +825,15 @@ fn apply_items_to_config(config_path: &Path, items: &[ImportableItem]) -> anyhow
     }
 
     if count > 0 {
-        // Atomic write: write to .tmp, then rename.
         let toml_str = toml::to_string_pretty(&root)?;
-        let tmp = config_path.with_extension("toml.tmp");
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        match scope {
+            ImportScope::Global => {
+                crate::util::config::atomic_write_string(config_path, &toml_str)?
+            }
+            ImportScope::Project => {
+                crate::util::config::atomic_replace_string(config_path, &toml_str)?
+            }
         }
-        std::fs::write(&tmp, &toml_str)?;
-        std::fs::rename(&tmp, config_path)?;
         info!(
             path = %config_path.display(),
             count,
@@ -2044,7 +2039,7 @@ extra_rule_dirs = ["/c/rules"]
                 path: "/bar/rules".into(),
             },
         ];
-        let count = apply_items_to_config(&path, &items).unwrap();
+        let count = apply_items_to_config(&path, &items, ImportScope::Global).unwrap();
         assert_eq!(count, 2);
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2057,6 +2052,79 @@ extra_rule_dirs = ["/c/rules"]
             parsed["paths"]["extra_rule_dirs"][0].as_str().unwrap(),
             "/bar/rules"
         );
+    }
+
+    /// A repo-planted `.grok/config.toml.tmp` symlink must not redirect the
+    /// import write, and a `.grok/config.toml` symlink is replaced, not
+    /// written through to its external target.
+    #[cfg(unix)]
+    #[test]
+    fn project_import_ignores_planted_tmp_and_replaces_config_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "secret").unwrap();
+        let outside = tmp.path().join("outside.toml");
+        std::fs::write(&outside, "[paths]\nextra_rule_dirs = [\"/keep\"]\n").unwrap();
+        let grok_dir = tmp.path().join("repo").join(".grok");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+        let project_cfg = grok_dir.join("config.toml");
+        std::os::unix::fs::symlink(&outside, &project_cfg).unwrap();
+        std::os::unix::fs::symlink(&victim, grok_dir.join("config.toml.tmp")).unwrap();
+
+        let items = vec![ImportableItem::PathEntry {
+            kind: PathKind::Skill,
+            path: "/foo/skills".into(),
+        }];
+        let count = apply_items_to_config(&project_cfg, &items, ImportScope::Project).unwrap();
+        assert_eq!(count, 1);
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "secret");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "[paths]\nextra_rule_dirs = [\"/keep\"]\n",
+            "external symlink target must stay untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&project_cfg)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "project config slot must become a regular file"
+        );
+        let body = std::fs::read_to_string(&project_cfg).unwrap();
+        assert!(body.contains("/foo/skills"), "{body}");
+    }
+
+    /// A user import writes through a symlinked `config.toml` and keeps the
+    /// link, so a dotfiles-managed config isn't replaced by a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn global_import_writes_through_user_config_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = home.path().join("dotfiles").join("config.toml");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "").unwrap();
+        let slot = home.path().join("config.toml");
+        std::os::unix::fs::symlink(&outside, &slot).unwrap();
+
+        let items = vec![ImportableItem::PathEntry {
+            kind: PathKind::Skill,
+            path: "/foo/skills".into(),
+        }];
+        let count = apply_items_to_config(&slot, &items, ImportScope::Global).unwrap();
+        assert_eq!(count, 1);
+        write_import_marker(&slot).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&slot)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "user config slot must stay a symlink"
+        );
+        let body = std::fs::read_to_string(&outside).unwrap();
+        assert!(body.contains("/foo/skills"), "{body}");
+        assert!(is_claude_import_marked_at(&outside));
     }
 
     #[test]

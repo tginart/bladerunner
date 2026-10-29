@@ -191,22 +191,37 @@ pub(crate) fn read_to_string_or_empty(path: &std::path::Path) -> std::io::Result
     }
 }
 /// Atomic write via temp file + `rename` (mirrors [`save_config`]) so a crash
-/// mid-write can't truncate `config.toml`. Preserves the dest mode on unix.
+/// mid-write can't truncate `config.toml`. Follows a symlink at `path` and
+/// writes its target. Preserves the dest mode on unix.
 pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let write_path = xai_grok_config::fs_atomic::resolve_write_target(path)?;
+    replace_via_temp(&write_path, content)
+}
+/// Like [`atomic_write_string`], but the `rename` replaces a symlink at `path`
+/// with a regular file instead of writing its target. Use it for files in an
+/// untrusted tree (a project `.grok/config.toml`), where a planted symlink
+/// could otherwise redirect the write to any user file.
+pub(crate) fn atomic_replace_string(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    replace_via_temp(path, content)
+}
+/// Write `content` to a uniquely named `create_new` temp next to `write_path`,
+/// then rename it over `write_path`. Carries over the mode of a regular-file
+/// `write_path`.
+fn replace_via_temp(write_path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(parent) = write_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     #[cfg(unix)]
-    let prior_mode: Option<u32> = match std::fs::metadata(&write_path) {
-        Ok(m) => {
+    let prior_mode: Option<u32> = match std::fs::symlink_metadata(write_path) {
+        Ok(m) if m.is_file() => {
             use std::os::unix::fs::PermissionsExt;
             Some(m.permissions().mode())
         }
-        Err(_) => None,
+        _ => None,
     };
     #[cfg(not(unix))]
     let prior_mode: Option<u32> = None;
@@ -218,14 +233,23 @@ pub(crate) fn atomic_write_string(path: &std::path::Path, content: &str) -> std:
         format!("toml.tmp.{}.{}", std::process::id(), nanos)
     };
     let tmp = write_path.with_extension(suffix);
-    std::fs::write(&tmp, content)?;
+    // `create_new` so a pre-existing entry (e.g. a planted symlink) at the temp
+    // name fails the write instead of being written through.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?
+        .write_all(content.as_bytes())
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
     #[cfg(unix)]
     if let Some(mode) = prior_mode {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
     }
     let _ = prior_mode;
-    if let Err(e) = std::fs::rename(&tmp, &write_path) {
+    if let Err(e) = std::fs::rename(&tmp, write_path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
