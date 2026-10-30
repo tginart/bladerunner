@@ -9,6 +9,10 @@ pub(super) const RESUME_REFUSES_CHAT: &str =
     "session/resume is not supported for chat sessions; use session/load";
 pub(super) const RESUME_REFUSES_EXTRA_DIRS: &str =
     "session/resume does not support additionalDirectories";
+/// How long `session/new` and `session/load` wait on the actor for the
+/// toolOverrides echo. A busy or wedged actor must not hang the reply; the
+/// echo is optional, so a timeout just omits it.
+const TOOL_OVERRIDES_ECHO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 async fn read_applied_tool_overrides(
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
 ) -> Option<xai_grok_sampling_types::ToolOverrides> {
@@ -20,10 +24,17 @@ async fn read_applied_tool_overrides(
         tracing::warn!("tool-overrides echo: session actor command channel closed");
         return None;
     }
-    match rx.await {
-        Ok(overrides) => overrides,
-        Err(_) => {
+    match tokio::time::timeout(TOOL_OVERRIDES_ECHO_BUDGET, rx).await {
+        Ok(Ok(overrides)) => overrides,
+        Ok(Err(_)) => {
             tracing::warn!("tool-overrides echo: session actor dropped the response channel");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                budget_s = TOOL_OVERRIDES_ECHO_BUDGET.as_secs(),
+                "tool-overrides echo exceeded its budget; continuing without echo"
+            );
             None
         }
     }
@@ -1489,4 +1500,21 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
     acp::LoadSessionRequest::new(session_id, cwd)
         .mcp_servers(mcp_servers)
         .meta(meta.unwrap_or_default())
+}
+#[cfg(test)]
+mod tool_overrides_echo_tests {
+    use super::*;
+    /// An actor that holds `GetToolOverrides` without answering must not hang
+    /// `session/new` or `session/load`: the echo gives up after its budget.
+    #[tokio::test(start_paused = true)]
+    async fn read_applied_tool_overrides_times_out_on_silent_actor() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        // `join!` keeps the received command (and its responder) alive until
+        // both finish, so only the budget can end the wait.
+        let (echo, held) = tokio::join!(read_applied_tool_overrides(&cmd_tx), cmd_rx.recv());
+        assert!(matches!(held, Some(SessionCommand::GetToolOverrides { .. })));
+        assert!(echo.is_none());
+        assert!(started.elapsed() >= TOOL_OVERRIDES_ECHO_BUDGET);
+    }
 }

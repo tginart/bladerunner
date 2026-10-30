@@ -18,13 +18,13 @@ fn dispatch_span(event: HookEventName, hook_count: usize) -> tracing::Span {
 }
 
 /// Disabled/trust-disabled specs record a `Skipped` result; a matcher miss
-/// records nothing.
+/// records nothing. Managed-policy specs are never skipped as disabled.
 fn eligible_or_record_skip(
     spec: &HookSpec,
     match_value: Option<&str>,
     results: &mut Vec<HookRunResult>,
 ) -> bool {
-    if !spec.enabled || crate::trust::is_hook_disabled(&spec.name) {
+    if crate::trust::is_spec_disabled(spec) {
         tracing::info!(hook_name = %spec.name, "hook skipped (disabled)");
         results.push(HookRunResult::Skipped {
             hook_name: spec.name.clone(),
@@ -700,6 +700,27 @@ mod tests {
         let envelope = pre_tool_use_envelope("run_terminal_cmd");
         let result = dispatch_pre_tool_use(&registry, &envelope, &run_ctx()).await;
         assert_eq!(result.decision, HookDecision::Allow);
+    }
+
+    /// Root-owned policy hooks run even when marked disabled.
+    #[tokio::test]
+    async fn disabled_managed_policy_hook_still_runs() {
+        let mut spec = make_command_spec(
+            "policy-deny",
+            None,
+            false,
+            "echo '{\"decision\":\"deny\",\"reason\":\"policy\"}'; exit 2",
+        );
+        spec.layer = crate::config::HookProvenance::SystemManaged;
+        let registry = registry_from_specs(vec![spec]);
+        assert!(registry.has_enabled_hooks_for_canonical(HookEventName::PreToolUse));
+        let envelope = pre_tool_use_envelope("run_terminal_cmd");
+        let result = dispatch_pre_tool_use(&registry, &envelope, &run_ctx()).await;
+        assert!(
+            matches!(result.decision, HookDecision::Deny { .. }),
+            "got {:?}",
+            result.decision
+        );
     }
 
     #[tokio::test]

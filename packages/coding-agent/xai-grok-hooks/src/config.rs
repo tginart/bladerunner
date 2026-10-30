@@ -202,6 +202,14 @@ pub struct HookSpec {
     pub layer: HookProvenance,
 }
 
+impl HookSpec {
+    /// Pinned by root-owned admin policy and therefore not user-disableable;
+    /// see [`HookProvenance::is_managed_policy`].
+    pub fn is_managed_policy(&self) -> bool {
+        self.layer.is_managed_policy()
+    }
+}
+
 /// Namespace prefixes stamped on hook names, matched by [`hook_origin`]. Shared
 /// so a rename can't silently reclassify a tier.
 pub const GLOBAL_HOOK_PREFIX: &str = "global/";
@@ -229,7 +237,9 @@ pub fn hook_origin(spec: &HookSpec) -> HookOrigin {
     match spec.layer {
         HookProvenance::SystemManaged => HookOrigin::SystemManaged,
         HookProvenance::Managed => HookOrigin::Managed,
-        HookProvenance::Requirements => HookOrigin::Requirements,
+        // Both requirements tiers display as the requirements origin; only the
+        // managed-policy exemption tells root-owned from `$BLADERUNNER_HOME`.
+        HookProvenance::Requirements | HookProvenance::UserRequirements => HookOrigin::Requirements,
         HookProvenance::User => HookOrigin::UserConfig,
         HookProvenance::Plugin => HookOrigin::Plugin,
         HookProvenance::Unknown => HookOrigin::Unknown,

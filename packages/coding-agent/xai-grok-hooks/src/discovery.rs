@@ -27,11 +27,7 @@ impl HookRegistry {
     /// Returns true when any enabled hook is registered for `event` or its
     /// alias spelling. Allocation-free guard for hot paths.
     pub fn has_enabled_hooks_for_canonical(&self, event: HookEventName) -> bool {
-        let enabled = |specs: &[HookSpec]| {
-            specs
-                .iter()
-                .any(|s| s.enabled && !crate::trust::is_hook_disabled(&s.name))
-        };
+        let enabled = |specs: &[HookSpec]| specs.iter().any(|s| !crate::trust::is_spec_disabled(s));
         let canonical = event.canonical();
         enabled(self.hooks_for(canonical))
             || (canonical == HookEventName::SubagentStop

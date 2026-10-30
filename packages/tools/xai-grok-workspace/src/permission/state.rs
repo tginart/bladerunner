@@ -70,6 +70,47 @@ impl Default for PermissionState {
     }
 }
 
+impl PermissionState {
+    /// Union `other`'s grants/denies into `self`. Set-valued fields merge, and
+    /// so does `allow_bash_execute` (`|=`): it is a persisted blanket *grant*,
+    /// so it follows grant semantics — additive until an explicit reset.
+    /// Scalar policy fields keep `self`'s values (the in-memory session is
+    /// authoritative for them, and `edit_policy` is migrated to `Ask` at
+    /// manager startup regardless).
+    ///
+    /// Merging is deliberately additive in both directions: denies persist
+    /// like grants, so an accepted "never allow" holds until an explicit reset
+    /// ([`replace_state_on_disk`], the non-merging path) — nothing removed only
+    /// in one session's memory can win a merge. The flip side: a reset in one
+    /// session does not reach other live sessions until they restart (see
+    /// [`replace_state_on_disk`]).
+    ///
+    /// Exhaustive destructure: adding a `PermissionState` field breaks this
+    /// fn until the merge decision for it is made explicitly.
+    pub(crate) fn merge_grants_from(&mut self, other: PermissionState) {
+        let PermissionState {
+            edit_policy: _,
+            allow_bash_execute,
+            allowed_bash_commands,
+            disallowed_bash_commands,
+            allowed_bash_globs,
+            allowed_web_fetch_domains,
+            allowed_mcp_tools,
+            allowed_mcp_servers,
+            validated_mcp_server_grants_version: _,
+        } = other;
+        self.allow_bash_execute |= allow_bash_execute;
+        self.allowed_bash_commands.extend(allowed_bash_commands);
+        self.disallowed_bash_commands
+            .extend(disallowed_bash_commands);
+        self.allowed_bash_globs.extend(allowed_bash_globs);
+        self.allowed_web_fetch_domains
+            .extend(allowed_web_fetch_domains);
+        self.allowed_mcp_tools.extend(allowed_mcp_tools);
+        self.allowed_mcp_servers.extend(allowed_mcp_servers);
+    }
+}
+
 fn state_dir_for_cwd(cwd: &AbsPathBuf) -> std::path::PathBuf {
     xai_grok_config::sessions_cwd_dir(cwd.as_str())
 }
@@ -182,11 +223,54 @@ async fn persist_state_to_dir(
     }
 }
 
+/// Merge-on-write: a concurrent session in the same project may have
+/// persisted new grants or denies since this actor loaded its snapshot at
+/// spawn. A whole-file replace would silently erase them (last-writer-wins);
+/// union the on-disk state back in before writing. Not a lock — the
+/// read-modify-write race window remains — but it turns "other session's
+/// grants always lost" into "lost only on a same-instant write".
+async fn persist_state_merging_to_dir(
+    dir: &std::path::Path,
+    state: &PermissionState,
+    client_identifier: Option<&str>,
+) {
+    let mut merged = state.clone();
+    if let Some(on_disk) = try_load_state(&state_file_path(dir, client_identifier)).await {
+        merged.merge_grants_from(on_disk);
+    }
+    persist_state_to_dir(dir, &merged, client_identifier).await
+}
+
+/// Persist `state`, merging grants/denies already on disk (see
+/// [`persist_state_merging_to_dir`]). Use [`replace_state_on_disk`] for an
+/// explicit reset.
 pub(crate) async fn persist_state(
     cwd: &AbsPathBuf,
     state: &PermissionState,
     client_identifier: Option<&str>,
 ) {
+    let dir = ensure_state_dir(cwd).await;
+    persist_state_merging_to_dir(&dir, state, client_identifier).await
+}
+
+/// Replace the on-disk state without merging — reset semantics, where the
+/// whole point is discarding grants.
+///
+/// Limitation: a reset clears only the file and the resetting session.
+/// Another live session in the same project keeps its in-memory snapshot,
+/// still honors the pre-reset grants, and writes them back to disk on its
+/// next save (merge-on-write cannot tell a reset-removed grant from one this
+/// file never saw). The reset takes full effect once those sessions restart.
+pub(crate) async fn replace_state_on_disk(
+    cwd: &AbsPathBuf,
+    state: &PermissionState,
+    client_identifier: Option<&str>,
+) {
+    let dir = ensure_state_dir(cwd).await;
+    persist_state_to_dir(&dir, state, client_identifier).await
+}
+
+async fn ensure_state_dir(cwd: &AbsPathBuf) -> std::path::PathBuf {
     // Canonical creator: also tightens the sessions root this write may create,
     // on the blocking pool (mkdir + chmod can stall on slow filesystems). Falls
     // back to the computed path (persist_state_to_dir re-creates it) so a
@@ -197,14 +281,13 @@ pub(crate) async fn persist_state(
             .await
             .map_err(std::io::Error::other)
             .and_then(|r| r);
-    let dir = match ensured {
+    match ensured {
         Ok(dir) => dir,
         Err(e) => {
             tracing::warn!(?e, "failed ensuring sessions cwd dir for permission state");
             state_dir_for_cwd(cwd)
         }
-    };
-    persist_state_to_dir(&dir, state, client_identifier).await
+    }
 }
 
 pub async fn cleanup_stale_permission_state(max_age: std::time::Duration) {
@@ -831,5 +914,70 @@ allowed_mcp_servers = ["a"]
         let loaded_b = load_state_from_dir(dir, Some("client_b")).await;
         assert!(loaded_b.allowed_bash_commands.contains("npm test"));
         assert!(!loaded_b.allowed_bash_commands.contains("cargo test"));
+    }
+
+    // ── merge-on-write / concurrent sessions ─────────────────────
+
+    /// Two sessions in the same project persist independently; the second
+    /// write must not erase grants or "never allow" denies the first one saved
+    /// (last-writer-wins).
+    #[tokio::test]
+    async fn persist_merges_grants_and_denies_already_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let mut session_a = PermissionState::default();
+        session_a
+            .allowed_bash_commands
+            .insert("cargo test".to_string());
+        session_a
+            .disallowed_bash_commands
+            .insert("git push".to_string());
+        session_a
+            .allowed_web_fetch_domains
+            .insert("docs.rs".to_string());
+        persist_state_merging_to_dir(dir, &session_a, None).await;
+
+        // Session B loaded before A persisted, so its snapshot lacks A's state.
+        let mut session_b = PermissionState::default();
+        session_b
+            .allowed_bash_commands
+            .insert("npm test".to_string());
+        persist_state_merging_to_dir(dir, &session_b, None).await;
+
+        let loaded = load_state_from_dir(dir, None).await;
+        assert!(loaded.allowed_bash_commands.contains("cargo test"));
+        assert!(loaded.allowed_bash_commands.contains("npm test"));
+        assert!(loaded.disallowed_bash_commands.contains("git push"));
+        assert!(loaded.allowed_web_fetch_domains.contains("docs.rs"));
+
+        // An explicit reset replaces instead of merging.
+        persist_state_to_dir(dir, &PermissionState::default(), None).await;
+        let reset = load_state_from_dir(dir, None).await;
+        assert!(reset.allowed_bash_commands.is_empty());
+        assert!(reset.disallowed_bash_commands.is_empty());
+    }
+
+    #[test]
+    fn merge_grants_unions_sets_and_keeps_scalars() {
+        let mut a = PermissionState::default();
+        a.allowed_bash_commands.insert("cargo test".to_string());
+        a.edit_policy = EditPolicy::Ask;
+
+        let mut b = PermissionState::default();
+        b.allowed_bash_commands.insert("npm test".to_string());
+        b.disallowed_bash_commands.insert("rm -rf".to_string());
+        b.allowed_mcp_tools.insert("linear__get_issue".to_string());
+        b.allow_bash_execute = true;
+        b.edit_policy = EditPolicy::Allow;
+
+        a.merge_grants_from(b);
+        assert!(a.allowed_bash_commands.contains("cargo test"));
+        assert!(a.allowed_bash_commands.contains("npm test"));
+        assert!(a.disallowed_bash_commands.contains("rm -rf"));
+        assert!(a.allowed_mcp_tools.contains("linear__get_issue"));
+        assert!(a.allow_bash_execute);
+        // Scalar policy keeps the in-memory session's value.
+        assert_eq!(a.edit_policy, EditPolicy::Ask);
     }
 }

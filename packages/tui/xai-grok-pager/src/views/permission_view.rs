@@ -223,11 +223,18 @@ pub struct PermissionViewState {
     /// permissions). Imported from `xai-grok-shell`, NOT duplicated locally.
     pub bash_highlights: Option<BashCommandHighlights>,
 
-    /// How many highlighted words are currently selected (1-indexed).
-    /// Starts at `default_always_allow_scope(highlighted_words)`: the safe
-    /// prefix for safe-listed commands, else first two words plus flags.
-    /// Right-arrow (or `>`) expands, Left-arrow (or `<`) contracts, minimum 1.
+    /// How many highlighted words the "Always allow" row selects (1-indexed).
+    /// Starts at `default_always_allow_scope(highlighted_words)`. Right-arrow
+    /// (or `>`) expands; Left-arrow (or `<`) contracts down to
+    /// `minimum_always_allow_scope` (the full command for pinned commands),
+    /// since the agent refuses to save a narrower label.
     pub bash_selection_count: usize,
+
+    /// How many highlighted words the "Never allow" row selects (1-indexed).
+    /// Starts at `default_always_deny_scope(highlighted_words)` and narrows
+    /// freely to one word: deny prefixes bind for every command, so "Never
+    /// allow: git push" blocking all pushes is legitimate.
+    pub bash_deny_selection_count: usize,
 
     /// Raw bash command string for display when `bash_highlights` is `None`
     /// (complex commands that tree-sitter cannot decompose).
@@ -294,23 +301,22 @@ impl PermissionViewState {
     /// Whether the scope selector (← → arrows) is meaningful for this prompt.
     ///
     /// True when:
-    /// - bash: there are 2+ highlighted words to expand/contract between AND
-    ///   the request actually carries a scoped `allow-always-command` /
-    ///   `reject-always-command` row to adjust (stale selection meta without
-    ///   those rows must not advertise arrows), OR
+    /// - bash: the request carries a scoped row whose own range has 2+ stops
+    ///   (stale selection meta without those rows must not advertise arrows):
+    ///   the `reject-always-command` row narrows to one word, while the
+    ///   `allow-always-command` row stops at `minimum_always_allow_scope`
+    ///   (the full command for pinned commands), OR
     /// - MCP: the tool name has a `__` separator, so server-scope is reachable.
     pub fn has_adjustable_scope(&self) -> bool {
-        let bash_words = self
-            .bash_highlights
-            .as_ref()
-            .is_some_and(|h| h.highlighted_words.len() > 1);
-        let scoped_rows = self.options.iter().any(|o| {
-            matches!(
-                o.option_id.0.as_ref(),
-                ALLOW_ALWAYS_COMMAND_OPTION_ID | REJECT_ALWAYS_COMMAND_OPTION_ID
-            )
+        let has_row = |id: &str| self.options.iter().any(|o| o.option_id.0.as_ref() == id);
+        let bash_adjustable = self.bash_highlights.as_ref().is_some_and(|h| {
+            let len = h.highlighted_words.len();
+            let allow_adjustable =
+                has_row(ALLOW_ALWAYS_COMMAND_OPTION_ID) && len > self.minimum_allow_scope();
+            let deny_adjustable = has_row(REJECT_ALWAYS_COMMAND_OPTION_ID) && len > 1;
+            allow_adjustable || deny_adjustable
         });
-        (bash_words && scoped_rows)
+        bash_adjustable
             || self
                 .mcp_scope
                 .as_ref()
@@ -345,10 +351,49 @@ impl PermissionViewState {
         }
     }
 
-    /// Index of the row the ←/→ keys jump to from a neutral row: the exact
-    /// bash `allow-always-command` row, or `allow-always-mcp` on MCP prompts.
-    /// `None` when no such row exists (e.g. a reject-only option set) — the
-    /// cursor then stays where it is.
+    /// Row the ←/→ keys land on from a neutral row: the scoped allow row when
+    /// present, else the bash `reject-always-command` row. `None` when neither
+    /// exists — the cursor then stays where it is.
+    pub fn scoped_row_jump_idx(&self) -> Option<usize> {
+        if let Some(idx) = self.scoped_allow_row_idx() {
+            return Some(idx);
+        }
+        if self.mcp_scope.is_some() {
+            return None;
+        }
+        self.options
+            .iter()
+            .position(|o| o.option_id.0.as_ref() == REJECT_ALWAYS_COMMAND_OPTION_ID)
+    }
+
+    /// Narrowest "Always allow" word count the agent will persist for these
+    /// highlights (`minimum_always_allow_scope`, at least 1). A narrower
+    /// label is refused by the agent, so ← must never reach it.
+    pub fn minimum_allow_scope(&self) -> usize {
+        self.bash_highlights.as_ref().map_or(1, |h| {
+            xai_grok_workspace::permission::minimum_always_allow_scope(&h.highlighted_words).max(1)
+        })
+    }
+
+    /// The allow row's word count after one ←/→ step: → expands up to the full
+    /// command, ← contracts but stops at [`Self::minimum_allow_scope`].
+    pub fn step_allow_scope(&self, right: bool) -> usize {
+        let current = self.bash_selection_count;
+        let Some(h) = self.bash_highlights.as_ref() else {
+            return current;
+        };
+        if right && current < h.highlighted_words.len() {
+            current + 1
+        } else if !right && current > self.minimum_allow_scope() {
+            current - 1
+        } else {
+            current
+        }
+    }
+
+    /// Index of the scoped *allow* row: the exact bash `allow-always-command`
+    /// row, or `allow-always-mcp` on MCP prompts. `None` when no such row
+    /// exists (e.g. a reject-only option set).
     pub fn scoped_allow_row_idx(&self) -> Option<usize> {
         let target = if self.mcp_scope.is_some() {
             ALLOW_ALWAYS_MCP_OPTION_ID
@@ -828,11 +873,16 @@ pub fn render_permission_view(
     let visible_bottom = area.y + area.height;
     let hover_bg = hovered_bg(theme);
 
-    // Precompute the selected words string for dynamic labels.
+    // Precompute the per-row selected words for dynamic labels: the allow and
+    // deny rows each own a selection count.
     let selected_words: Option<String> = state
         .bash_highlights
         .as_ref()
         .map(|h| h.highlighted_words[..state.bash_selection_count].join(" "));
+    let deny_selected_words: Option<String> = state
+        .bash_highlights
+        .as_ref()
+        .map(|h| h.highlighted_words[..state.bash_deny_selection_count].join(" "));
 
     let mut inline_prompt_result: Option<InlinePromptArea> = None;
 
@@ -913,12 +963,17 @@ pub fn render_permission_view(
             theme.bg_light
         };
 
+        let row_words = if option.option_id.0.as_ref() == REJECT_ALWAYS_COMMAND_OPTION_ID {
+            deny_selected_words.as_deref()
+        } else {
+            selected_words.as_deref()
+        };
         let line = build_permission_option_line(
             option,
             i,
             is_cursor,
             row_bg,
-            selected_words.as_deref(),
+            row_words,
             state.mcp_scope.as_ref(),
             followup_text,
             content_width,
@@ -2062,6 +2117,7 @@ mod tests {
             active_idx: 0,
             bash_highlights: None,
             bash_selection_count: 0,
+            bash_deny_selection_count: 0,
             bash_command_raw: Some("cargo test --all".to_string()),
             mcp_scope: None,
             title: title.to_string(),
@@ -2217,6 +2273,7 @@ mod tests {
             active_idx: 0,
             bash_highlights: None,
             bash_selection_count: 0,
+            bash_deny_selection_count: 0,
             bash_command_raw: None,
             mcp_scope,
             title: String::new(),

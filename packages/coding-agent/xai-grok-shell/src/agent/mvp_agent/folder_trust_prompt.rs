@@ -161,6 +161,7 @@ impl MvpAgent {
         );
 
         tokio::task::spawn_local(async move {
+            let request_session_id = session_id.clone();
             let request = FolderTrustRequest {
                 session_id,
                 cwd: cwd.to_string_lossy().into_owned(),
@@ -244,8 +245,22 @@ impl MvpAgent {
 
             // Persist the grant, then flip the cached untrusted verdict to trusted
             // (the `Some(false)` arm of `resolve_and_record` re-reads the store).
-            folder_trust::grant_folder_trust(&cwd);
+            // If the store can't be written, the grant is honored in-process
+            // for this session and the user is told it did not persist.
+            let persist_error = folder_trust::grant_folder_trust_for_session(&cwd).err();
             folder_trust::resolve_and_record(&cwd, remote.as_ref(), false);
+            if let Some(e) = persist_error {
+                let notice = folder_trust::session_only_trust_notice(&e);
+                let update = acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new(notice)),
+                ));
+                let _ = gateway
+                    .session_notification(acp::SessionNotification::new(
+                        acp::SessionId::new(request_session_id.as_str()),
+                        update,
+                    ))
+                    .await;
+            }
 
             reload_project_servers_after_grant(ReloadAfterGrant {
                 gateway: &gateway,

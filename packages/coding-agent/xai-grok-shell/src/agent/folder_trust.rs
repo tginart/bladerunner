@@ -45,7 +45,7 @@ pub use xai_grok_workspace::folder_trust::grant_folder_trust;
 use xai_grok_workspace::folder_trust::{
     DecideInputs, TrustOutcome, claude_project_mcp_names, decide, decide_inputs,
     decide_inputs_with_interactive, feature_enabled, folder_trust_inert, persist_trust,
-    prompt_for_trust,
+    prompt_for_trust, try_grant_folder_trust,
 };
 
 use crate::session::managed_mcp::mcp_server_name;
@@ -204,6 +204,36 @@ fn record(workspace_key: &Path, allowed: bool) {
     DECISIONS
         .lock()
         .insert(workspace_key.to_path_buf(), allowed);
+}
+
+/// Grant trust for `cwd`'s workspace in answer to an explicit user "trust
+/// this folder". The grant is persisted when possible. When the store cannot
+/// be written (e.g. an unreadable `trusted_folders.toml`, which the store
+/// refuses to overwrite) the decision is still honored in this process, so
+/// the answer does not silently do nothing, and the error is returned for the
+/// caller to show the user.
+pub fn grant_folder_trust_for_session(cwd: &Path) -> std::io::Result<()> {
+    grant_for_session_with(cwd, try_grant_folder_trust)
+}
+
+/// [`grant_folder_trust_for_session`] with the durable grant injected, so
+/// tests need not touch the process-global trust store path.
+fn grant_for_session_with(
+    cwd: &Path,
+    persist: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    persist(cwd).inspect_err(|_| record(&workspace_key(cwd), true))
+}
+
+/// User-facing text for a trust grant that holds only for this process.
+pub fn session_only_trust_notice(err: &std::io::Error) -> String {
+    let store = TrustStore::default_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the folder-trust store".to_owned());
+    format!(
+        "Folder trusted for this session only: could not save the decision to {store} ({err}). \
+         Fix or remove that file to make trust decisions persist."
+    )
 }
 
 /// Test-only: force the recorded decision for `cwd`'s workspace key.
@@ -378,7 +408,11 @@ fn compute_from_inputs(
             if prompt_for_trust(key) {
                 // Reload the store (the inputs gather dropped its copy) to
                 // persist the accepted prompt grant.
-                persist_trust(&mut TrustStore::load(), key);
+                // The caller records this durable verdict in-process, so the
+                // answer holds for this session even if the store write fails.
+                if let Err(e) = persist_trust(&mut TrustStore::load(), key) {
+                    eprintln!("{}", session_only_trust_notice(&e));
+                }
                 (true, true)
             } else {
                 (false, true)
@@ -571,91 +605,74 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn revoke_never_trusted_folder_writes_no_deny_and_preserves_cascade() {
+    fn trust_answer_holds_for_session_when_store_is_unreadable() {
         let _sim = simulate_release_build();
-        // The actual bug fix: revoking a NEVER-trusted child must write no explicit
-        // child STORE deny (returning false) so a later ancestor grant still
-        // cascades to the child — a spurious child `set_untrusted` would win
-        // most-specific and break the cascade. It must STILL downgrade the
-        // in-process cache, though, so a cached storeless grant cannot survive a
-        // mid-session untrust. BLADERUNNER_HOME-isolated so the grant writes to a temp
-        // store; `#[serial]` because BLADERUNNER_HOME is global.
-        let home = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::set("BLADERUNNER_HOME", home.path());
-        // Distinct git roots for parent/child so `workspace_key` does not collapse
-        // them onto one key (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
+        // An unreadable store refuses writes (see the trust store's
+        // `corrupt_store_is_not_overwritten_by_a_new_decision`), so a "trust
+        // this folder" answer cannot persist. It must still take effect
+        // in-process (not silently do nothing) and report the error. The
+        // failing write is injected: the store path is a process-global, so
+        // writing a corrupt file there would poison other tests.
+        let tmp = repo_tmp();
+        let key = workspace_key(tmp.path());
+        record(&key, false);
+        let unreadable = |_: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected newline",
+            ))
+        };
 
-        // Seed a cached grant with NO backing store record (e.g. a kill-switch /
-        // feature-off `compute` allow), so the cache downgrade is observable below.
-        record(&workspace_key(&child), true);
-
-        // Revoking the never-trusted child reports false and writes no store deny.
+        let err = grant_for_session_with(tmp.path(), unreadable).unwrap_err();
         assert!(
-            !revoke_folder_trust(&child),
-            "revoking a never-trusted folder must return false"
+            session_only_trust_notice(&err).contains("this session only"),
+            "the notice must say the grant did not persist"
+        );
+        assert!(
+            project_scope_allowed(tmp.path()),
+            "the user's trust answer must hold in-process for this session"
+        );
+        assert!(
+            resolve_and_record_inner(&key, || false, || panic!("cached grant must not recompute")),
+            "a later resolve must keep the session grant, not re-read the store"
         );
 
-        // The in-process cache is still downgraded so the untrust is immediate even
-        // for the storeless cached grant.
-        assert!(
-            !project_scope_allowed(&child),
-            "revoke must downgrade the in-process cache even for a never-trusted folder"
-        );
-
-        // A subsequent ancestor grant must still cascade to the child — proving
-        // the revoke did not poison the store with a most-specific child deny.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
-        assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "ancestor grant must cascade to a child that was only revoked-when-untrusted"
-        );
+        // A successful durable write records nothing extra in-process.
+        let other = repo_tmp();
+        assert!(grant_for_session_with(other.path(), |_| Ok(())).is_ok());
+        assert!(DECISIONS.lock().get(&workspace_key(other.path())).is_none());
     }
 
     #[test]
     #[serial_test::serial]
-    fn revoke_ancestor_cascade_trusted_child_writes_explicit_untrust() {
+    fn revoke_never_trusted_folder_writes_no_deny() {
         let _sim = simulate_release_build();
-        // Revoke on a child trusted ONLY via an ancestor cascade (no direct child
-        // grant) must report was_trusted=true and actually untrust the child: it
-        // writes an explicit child deny (overriding the cascade) and downgrades
-        // the cache. BLADERUNNER_HOME-isolated so the grant writes to a temp store;
-        // `#[serial]` because BLADERUNNER_HOME is process-global.
+        // Revoking a NEVER-trusted folder must write no store deny (returning
+        // false) — do not persist a decision the user did not make. It must
+        // STILL downgrade the in-process cache, though, so a cached storeless
+        // grant cannot survive a mid-session untrust. BLADERUNNER_HOME-isolated
+        // so any write lands in a temp store; `#[serial]` because
+        // BLADERUNNER_HOME is global.
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set("BLADERUNNER_HOME", home.path());
-        // Distinct git roots so `workspace_key` keeps parent/child as separate
-        // keys (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
+        let tmp = repo_tmp();
 
-        // Trust the parent only; the child inherits trust via the cascade.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
-        assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "child must be trusted via the ancestor cascade before revoke"
-        );
+        // Seed a cached grant with NO backing store record (e.g. a kill-switch /
+        // feature-off `compute` allow), so the cache downgrade is observable below.
+        record(&workspace_key(tmp.path()), true);
 
-        // Revoking the cascade-trusted child reports was_trusted=true, then the
-        // child is untrusted: an explicit child deny overrides the cascade and
-        // the in-process cache is downgraded.
         assert!(
-            revoke_folder_trust(&child),
-            "a cascade-trusted child must report was_trusted=true"
+            !revoke_folder_trust(tmp.path()),
+            "revoking a never-trusted folder must return false"
         );
         assert!(
-            !TrustStore::load().is_trusted(&workspace_key(&child)),
-            "revoke must write an explicit child untrust that overrides the cascade"
+            !project_scope_allowed(tmp.path()),
+            "revoke must downgrade the in-process cache even for a never-trusted folder"
         );
+        let store = TrustStore::load();
         assert!(
-            !project_scope_allowed(&child),
-            "revoke must downgrade the in-process cache for the child"
+            !store.has_decision(&workspace_key(tmp.path())),
+            "revoking a never-trusted folder must not record a deny"
         );
     }
 

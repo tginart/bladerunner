@@ -318,7 +318,9 @@ fn git_safe_query_verb_index(words: &[String]) -> Option<usize> {
 /// whitelist-prefix grant from riding over a driver/write flag, and by
 /// [`git_words_are_read_only_query`].
 pub(crate) fn git_words_have_unsafe_query_option(words: &[String]) -> bool {
-    if words.first().map(String::as_str) != Some("git") {
+    // A guard, so match the normalized name: `/usr/bin/git log --output=…`
+    // must not slip past it on a path-qualified prefix grant.
+    if !is_git_program(words) {
         return false;
     }
     if words.iter().skip(1).any(|w| git_query_option_is_unsafe(w)) {

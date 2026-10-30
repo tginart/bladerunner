@@ -639,6 +639,79 @@ fn tool_filter_matches(access: &AccessKind, filter: &ToolFilter) -> bool {
     }
 }
 
+/// Program heads that execute code handed to them — interpreters, script
+/// runners, remote shells, and privilege escalators. Exact basename matches
+/// (compared lowercased, `.exe` stripped); interpreter families with
+/// versioned spellings (`python3.13`) live in [`EXEC_VEHICLE_HEAD_FAMILIES`].
+/// Over-matching is fail-safe: a head wrongly treated as a vehicle only floors
+/// its always-allow scope to the full command — never the reverse.
+const EXEC_VEHICLE_HEADS: &[&str] = &[
+    // Shells (their `-c` forms are also floored by `shell_dash_c_script`;
+    // listing them here additionally covers `bash script.sh`-style runs).
+    "sh", "bash", "zsh", "dash", "ksh", "fish",
+    // Interpreters and distro / variant spellings the versioned family rule
+    // below does not catch, then package runners that fetch-and-execute.
+    "deno", "bun", "julia", "rscript", "awk", "gawk", "mawk", "nawk", "nodejs", "luajit", "phpdbg",
+    "php-cgi", "pythonw", "npx", "bunx", "pipx", "uvx", "uv",
+    // Arg-forwarding executors (`find -exec` hands off like `xargs`), remote
+    // shells, privilege escalators.
+    "xargs", "find", "sudo", "doas", "su", "ssh", "watch", "setsid", "flock", "chroot", "nsenter",
+    // Container runtimes: `run --privileged -v /:/host <image>` is full host
+    // root, so a bare `docker`/`podman` grant is as broad as `sudo`.
+    "docker", "podman",
+];
+
+/// Interpreter families with versioned spellings: `python` also covers
+/// `python3`, `python3.13`, and `python3.13t` (free-threaded). Only a
+/// version-like suffix counts — a bare prefix match would rope in unrelated
+/// tools (`nodemon`, `phpunit`).
+const EXEC_VEHICLE_HEAD_FAMILIES: &[&str] = &["python", "node", "ruby", "perl", "php", "lua"];
+
+/// Normalized command basename for name matching: leading path stripped,
+/// lowercased, trailing `.exe` removed — so `/usr/bin/GH.EXE` reads as `gh`.
+pub(crate) fn normalized_command_head(words: &[String]) -> Option<String> {
+    let head = words
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    Some(head.strip_suffix(".exe").unwrap_or(&head).to_owned())
+}
+
+/// Whether the command's program head executes code handed to it: the
+/// [`normalized_command_head`] is in [`EXEC_VEHICLE_HEADS`] or is a versioned
+/// [`EXEC_VEHICLE_HEAD_FAMILIES`] spelling. Always-allow floors these to the
+/// full command, since a `python3` / `sudo git` prefix grant would authorize
+/// arbitrary arguments.
+pub(crate) fn head_is_exec_vehicle(words: &[String]) -> bool {
+    let Some(head) = normalized_command_head(words) else {
+        return false;
+    };
+    let head = head.as_str();
+    if EXEC_VEHICLE_HEADS.contains(&head) {
+        return true;
+    }
+    EXEC_VEHICLE_HEAD_FAMILIES.iter().any(|family| {
+        head.strip_prefix(family).is_some_and(|rest| {
+            // digits/dots, plus an optional trailing `t` (free-threaded build).
+            let core = rest.strip_suffix('t').unwrap_or(rest);
+            core.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+    })
+}
+
+/// Whether a bash glob pattern is universally broad — matches every bash probe
+/// ([`bash_probes`], the same set [`rule_is_catchall`] uses). Callers
+/// persisting a client-supplied glob use this to refuse `*`, `**`, `?*`,
+/// `* *`, and the like, which "match the prompted script" only because they
+/// match anything.
+pub fn bash_glob_is_catchall(pattern: &str) -> bool {
+    bash_probes().iter().all(|access| match access {
+        AccessKind::Bash(cmd) => bash_pattern_matches_command(pattern, cmd),
+        _ => false,
+    })
+}
+
 /// Prefix match requiring a word boundary: `git` matches `git`/`git ...` but
 /// not `gitleaks`.
 fn matches_command_prefix(cmd: &str, pattern: &str) -> bool {
@@ -1108,6 +1181,49 @@ mod tests {
         assert!(!bash_pattern_is_broad("gh api"));
         assert!(!bash_pattern_is_broad("gh api repos/owner/*"));
         assert!(!bash_pattern_is_broad(""));
+    }
+
+    #[test]
+    fn bash_glob_is_catchall_refuses_universal_patterns() {
+        // Universal patterns match every bash probe, so persisting them from a
+        // (possibly forged) client reply would mint a blanket grant.
+        for pattern in ["*", "**", "* *", "?*"] {
+            assert!(bash_glob_is_catchall(pattern), "{pattern:?}");
+        }
+        for pattern in ["gh api repos/owner/*", "git push*", "cargo *", "deploy *"] {
+            assert!(!bash_glob_is_catchall(pattern), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn head_is_exec_vehicle_normalizes_spellings() {
+        let words = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_owned).collect() };
+        for cmd in [
+            "python foo.py",
+            "python3.13 foo.py",
+            "python3.13t foo.py",
+            "nodejs server.js",
+            "/usr/local/bin/python3 x.py",
+            "PYTHON3.EXE x.py",
+            "sudo make install",
+            "ssh host uname",
+            "docker run --privileged -v /:/host img",
+        ] {
+            assert!(head_is_exec_vehicle(&words(cmd)), "{cmd:?}");
+        }
+        for cmd in [
+            "nodemon server.js",
+            "phpunit --filter Foo",
+            "git push",
+            "ls -la",
+        ] {
+            assert!(!head_is_exec_vehicle(&words(cmd)), "{cmd:?}");
+        }
+        assert!(!head_is_exec_vehicle(&[]));
+        assert_eq!(
+            normalized_command_head(&words("/usr/bin/GH.EXE pr view")).as_deref(),
+            Some("gh")
+        );
     }
 
     #[test]

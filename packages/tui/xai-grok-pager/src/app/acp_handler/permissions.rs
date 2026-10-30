@@ -106,6 +106,12 @@ fn enqueue_permission(
         .as_ref()
         .map(|h| xai_grok_workspace::permission::default_always_allow_scope(&h.highlighted_words))
         .unwrap_or(0);
+    // The "Never allow" row owns its own count: deny prefixes bind for every
+    // command, so it keeps the unpinned verb-plus-flags default.
+    let bash_deny_selection_count = bash_highlights
+        .as_ref()
+        .map(|h| xai_grok_workspace::permission::default_always_deny_scope(&h.highlighted_words))
+        .unwrap_or(0);
 
     // 1b. Parse MCP scope state from the `allow-always-mcp` option's meta.
     //     Mutually exclusive with the bash flow at the per-request level —
@@ -183,6 +189,7 @@ fn enqueue_permission(
         active_idx,
         bash_highlights,
         bash_selection_count,
+        bash_deny_selection_count,
         bash_command_raw,
         mcp_scope,
         title,

@@ -46,6 +46,17 @@ pub fn is_hook_disabled(hook_name: &str) -> bool {
     }
 }
 
+/// The one per-spec disable rule, shared by dispatch, the dispatch guard, and
+/// display: a disabled spec is skipped unless it is managed policy, which the
+/// user cannot disable.
+pub fn is_spec_disabled(spec: &crate::config::HookSpec) -> bool {
+    is_spec_disabled_by(spec, is_hook_disabled)
+}
+
+fn is_spec_disabled_by(spec: &crate::config::HookSpec, is_listed: impl Fn(&str) -> bool) -> bool {
+    !spec.is_managed_policy() && (!spec.enabled || is_listed(&spec.name))
+}
+
 fn is_hook_disabled_with_file(hook_name: &str, file: &Path) -> bool {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
@@ -167,5 +178,41 @@ mod tests {
             list_trusted_projects_with_file(Path::new("/nonexistent/trusted-hook-projects"))
                 .expect("missing file resolves to Ok(empty)");
         assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn disabled_list_never_skips_managed_policy_hooks() {
+        use crate::config::HookProvenance;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("disabled-hooks");
+        disable_hook_with_file("gate", &file).unwrap();
+        let is_listed = |name: &str| is_hook_disabled_with_file(name, &file);
+        let json = r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"g.sh"}]}]}}"#;
+        let (specs, errors) = crate::config::parse_hook_file(json, &dir.path().join("hooks.json"));
+        assert!(errors.is_empty(), "{errors:?}");
+
+        for layer in [
+            HookProvenance::SystemManaged,
+            HookProvenance::Managed,
+            HookProvenance::Requirements,
+            HookProvenance::UserRequirements,
+            HookProvenance::User,
+            HookProvenance::File,
+            HookProvenance::Plugin,
+            HookProvenance::Unknown,
+        ] {
+            let mut spec = specs[0].clone();
+            spec.name = "gate".into();
+            spec.layer = layer;
+            let root_owned = matches!(
+                layer,
+                HookProvenance::SystemManaged | HookProvenance::Requirements
+            );
+            assert_eq!(
+                is_spec_disabled_by(&spec, is_listed),
+                !root_owned,
+                "disabled-hooks entry wrong for {layer:?}"
+            );
+        }
     }
 }

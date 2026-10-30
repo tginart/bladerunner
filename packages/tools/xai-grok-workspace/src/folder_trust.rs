@@ -9,7 +9,7 @@
 //!
 //! ## Precedence (canonical — see [`decide`])
 //! 1. Feature flag OFF  → trusted (no gating; preserves prior behavior).
-//! 2. Store (self/ancestor recorded trusted) → trusted. An explicit `--trust`
+//! 2. Store (this workspace recorded trusted) → trusted. An explicit `--trust`
 //!    grant is persisted to the store up front (see [`grant_folder_trust`]), so
 //!    it is honored here.
 //! 3. Key unrecordable (an over-broad root — the user's own `$HOME` / filesystem
@@ -184,14 +184,24 @@ fn feature_enabled_for_build(remote: Option<&RemoteSettings>, is_local_build: bo
 /// servers are honored on the next resolve. Done client-side because trust is
 /// durable: even when the agent runs in a separate leader process it reads the
 /// same `~/.grok/trusted_folders.toml`. Best-effort; a write failure is logged,
-/// not fatal.
+/// not fatal. Interactive "trust this folder" answers use
+/// [`try_grant_folder_trust`] so they can tell the user when the grant did not
+/// persist.
 pub fn grant_folder_trust(cwd: &Path) {
+    // The error is already logged by `persist_trust`.
+    let _ = try_grant_folder_trust(cwd);
+}
+
+/// [`grant_folder_trust`] that returns the store error (e.g. an unreadable
+/// `trusted_folders.toml`, which [`TrustStore`] refuses to overwrite) instead
+/// of only logging it.
+pub fn try_grant_folder_trust(cwd: &Path) -> std::io::Result<()> {
     // Local/dev builds never gate, so there is nothing to grant: `--trust` is a
     // no-op and the store is left untouched (the whole feature is inert).
     if folder_trust_inert() {
-        return;
+        return Ok(());
     }
-    persist_trust(&mut TrustStore::load(), &workspace_key(cwd));
+    persist_trust(&mut TrustStore::load(), &workspace_key(cwd))
 }
 
 /// Store-only half of revoking trust for `cwd`'s workspace: persist an explicit
@@ -199,9 +209,8 @@ pub fn grant_folder_trust(cwd: &Path) {
 /// it had been trusted. The in-process `DECISIONS` cache downgrade is the shell
 /// wrapper's job (the cache lives there).
 ///
-/// Writing a store deny for a never-trusted folder would record a most-specific
-/// child DENY that poisons a future ancestor `set_trusted` cascade — so that
-/// write stays gated. Symmetric with [`grant_folder_trust`].
+/// A never-trusted folder stays undecided: do not persist a decision the user
+/// did not make. Symmetric with [`grant_folder_trust`].
 pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     // Local/dev builds never wrote the store, so there is nothing to revoke.
     if folder_trust_inert() {
@@ -210,9 +219,6 @@ pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     let key = workspace_key(cwd);
     let mut store = TrustStore::load();
     let was_trusted = store.is_trusted(&key);
-    // Persist an explicit deny ONLY for an actually-trusted folder: writing one
-    // for a never-trusted folder would record a most-specific child DENY that
-    // overrides a future ancestor `set_trusted` grant (cascade poisoning).
     if was_trusted && let Err(e) = store.set_untrusted(&key) {
         tracing::warn!(
             path = %key.display(),
@@ -223,14 +229,15 @@ pub fn revoke_folder_trust_store(cwd: &Path) -> bool {
     was_trusted
 }
 
-pub fn persist_trust(store: &mut TrustStore, key: &Path) {
-    if let Err(e) = store.set_trusted(key) {
+/// Persist a trust grant for `key`, logging and returning any store error.
+pub fn persist_trust(store: &mut TrustStore, key: &Path) -> std::io::Result<()> {
+    store.set_trusted(key).inspect_err(|e| {
         tracing::warn!(
             path = %key.display(),
             error = %e,
             "folder trust: failed to persist trust decision"
         );
-    }
+    })
 }
 
 /// Whether any repo-local trust-sensitive config is present for `cwd`. When none
@@ -1102,34 +1109,25 @@ mod tests {
 
     #[test]
     fn revoke_folder_trust_store_writes_no_deny_for_never_trusted_folder() {
-        // The cascade-poisoning guard: revoking a NEVER-trusted child returns
-        // false and writes NO explicit child deny, so a later ancestor grant still
-        // cascades to the child (a spurious child `set_untrusted` would win
-        // most-specific and break the cascade). This store half does NOT touch the
+        // Revoking a NEVER-trusted folder returns false and records no decision
+        // the user did not make. This store half does NOT touch the
         // `DECISIONS` cache — that downgrade is the shell wrapper's job.
-        // BLADERUNNER_HOME-isolated so the grant writes to a temp store.
+        // BLADERUNNER_HOME-isolated so any write lands in a temp store.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set("BLADERUNNER_HOME", home.path());
         let _sim = simulate_release_build();
-        // Distinct git roots so `workspace_key` keeps parent/child as separate
-        // keys (the child's own `.git` stops discovery at the child).
-        let parent = repo_tmp();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        git2::Repository::init(&child).unwrap();
+        let tmp = repo_tmp();
 
         assert!(
-            !revoke_folder_trust_store(&child),
+            !revoke_folder_trust_store(tmp.path()),
             "revoking a never-trusted folder must return false"
         );
 
-        // No child deny was written, so an ancestor grant still cascades down.
-        let mut store = TrustStore::load();
-        store.set_trusted(&workspace_key(parent.path())).unwrap();
+        let store = TrustStore::load();
         assert!(
-            TrustStore::load().is_trusted(&workspace_key(&child)),
-            "ancestor grant must cascade to a child revoked-while-untrusted (no poisoning deny)"
+            !store.has_decision(&workspace_key(tmp.path())),
+            "revoking a never-trusted folder must not record a deny"
         );
     }
 

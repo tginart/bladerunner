@@ -25,6 +25,19 @@ impl PlainCommand {
     pub fn words(&self) -> &[String] {
         &self.words
     }
+
+    /// Whether this command spans the whole script (only whitespace before
+    /// and after it). The spans were taken from the script this command was
+    /// parsed from; `get` keeps a mismatched `script` panic-safe, and `false`
+    /// is the conservative answer for one.
+    pub(crate) fn spans_whole_script(&self, script: &str) -> bool {
+        let (Some(before), Some(after)) =
+            (script.get(..self.span_start), script.get(self.span_end..))
+        else {
+            return false;
+        };
+        before.trim().is_empty() && after.trim().is_empty()
+    }
 }
 
 /// Parse the provided bash source using tree-sitter-bash, returning a Tree on
