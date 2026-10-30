@@ -10,7 +10,8 @@
 //! - `./start.sh` returns only when the model serves. `./stop.sh` stops it.
 //! - The API is OpenAI-compatible on port 8888, and `GET /v1/models` lists the model.
 //! - `./api-key.sh` is optional. It prints the API key, or the recipe has no key.
-//! A preset holds only data: the directory, model id and context window.
+//! A preset holds only data: the model id and context window.
+//! Where the recipe is installed on the host is configuration, given to `add` as `--dir`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,6 @@ struct Preset {
     slug: &'static str,
     model: &'static str,
     display: &'static str,
-    dir: &'static str,
     context_window: u64,
 }
 
@@ -50,7 +50,6 @@ const PRESETS: &[Preset] = &[
         slug: "qwen-3.8-flash",
         model: "Qwen3.8-Flash-Next",
         display: "Qwen 3.8 Flash",
-        dir: "~/ai/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold",
         context_window: 1_048_576,
     },
     // Apple-silicon Mac serving through oMLX.
@@ -59,7 +58,6 @@ const PRESETS: &[Preset] = &[
         slug: "qwen-3.8-flash",
         model: "Qwen3.8-Flash-Next-4e8d8g",
         display: "Qwen 3.8 Flash",
-        dir: "~/ai/mac-serve",
         context_window: 32_768,
     },
 ];
@@ -84,6 +82,9 @@ pub enum SovereignCommand {
         /// Where the recipe is installed, as `[user@]host` (tailnet name or IP)
         #[arg(long)]
         ssh: String,
+        /// Directory of the recipe on that host, for example `~/recipe`
+        #[arg(long)]
+        dir: String,
         /// Override the endpoint, for example `http://host.example:8888/v1`
         #[arg(long)]
         base_url: Option<String>,
@@ -196,11 +197,20 @@ pub async fn run(args: SovereignArgs) -> Result<()> {
             name,
             preset,
             ssh,
+            dir,
             base_url,
             api_key,
         } => {
             let allowed = effective_allowed_models()?;
-            add(&home, &name, &preset, &ssh, base_url, api_key, allowed)
+            let new = NewSovereign {
+                name: &name,
+                preset: &preset,
+                ssh: &ssh,
+                dir: &dir,
+                base_url,
+                api_key,
+            };
+            add(&home, new, allowed)
         }
         SovereignCommand::Status { name } => status(&home, name.as_deref()).await,
         SovereignCommand::Up { name } => up(&home, name.as_deref(), Output::Terminal).await,
@@ -223,7 +233,7 @@ enum Output {
 async fn list(home: &Path) -> Result<String> {
     let registry = load_registry(home)?;
     if registry.sovereign.is_empty() {
-        return Ok("No sovereigns. Add one with `sovereign add <name> --ssh <host>`.".into());
+        return Ok("No sovereigns. Add one with `sovereign add <name> --ssh <host> --dir <path>`.".into());
     }
     let mut lines = Vec::new();
     for (name, sovereign) in &registry.sovereign {
@@ -233,17 +243,20 @@ async fn list(home: &Path) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-fn add(
-    home: &Path,
-    name: &str,
-    preset_id: &str,
-    ssh: &str,
+/// What `sovereign add` needs to register a machine.
+struct NewSovereign<'a> {
+    name: &'a str,
+    preset: &'a str,
+    ssh: &'a str,
+    dir: &'a str,
     base_url: Option<String>,
     api_key: Option<String>,
-    allowed_models: Option<Vec<String>>,
-) -> Result<String> {
-    let preset = find_preset(preset_id)?;
-    let sovereign = sovereign_from_preset(preset, ssh, base_url, api_key);
+}
+
+fn add(home: &Path, new: NewSovereign, allowed_models: Option<Vec<String>>) -> Result<String> {
+    let name = new.name;
+    let preset = find_preset(new.preset)?;
+    let sovereign = sovereign_from_preset(preset, &new);
     let mut registry = load_registry(home)?;
     registry.sovereign.insert(name.to_string(), sovereign.clone());
     save_registry(home, &registry)?;
@@ -316,22 +329,20 @@ fn find_preset(id: &str) -> Result<&'static Preset> {
     })
 }
 
-fn sovereign_from_preset(
-    preset: &Preset,
-    ssh: &str,
-    base_url: Option<String>,
-    api_key: Option<String>,
-) -> Sovereign {
+fn sovereign_from_preset(preset: &Preset, new: &NewSovereign) -> Sovereign {
     Sovereign {
-        ssh: ssh.to_string(),
-        dir: preset.dir.to_string(),
+        ssh: new.ssh.to_string(),
+        dir: new.dir.to_string(),
         start: START_SCRIPT.to_string(),
         stop: STOP_SCRIPT.to_string(),
-        base_url: base_url.unwrap_or_else(|| default_base_url(ssh, PORT)),
+        base_url: new
+            .base_url
+            .clone()
+            .unwrap_or_else(|| default_base_url(new.ssh, PORT)),
         model: preset.model.to_string(),
         slug: preset.slug.to_string(),
         ready_timeout_s: READY_TIMEOUT_S,
-        api_key,
+        api_key: new.api_key.clone(),
     }
 }
 
@@ -364,9 +375,25 @@ fn ssh_args(sovereign: &Sovereign, remote_command: &str) -> Vec<String> {
         "-o".into(),
         format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_S}"),
         sovereign.ssh.clone(),
-        // The dir may start with `~`, so it is left unquoted for the remote shell.
-        format!("cd {} && {remote_command}", sovereign.dir),
+        format!(
+            "cd -- {} && {remote_command}",
+            quote_remote_dir(&sovereign.dir)
+        ),
     ]
+}
+
+/// Purpose: Quote a recipe directory for the remote shell, with remote home expansion.
+/// Input: A literal directory, optionally with a leading `~` or `~/`.
+/// Output: One shell word with only the remote home variable left to expand.
+fn quote_remote_dir(dir: &str) -> String {
+    if dir == "~" {
+        return "\"$HOME\"".to_string();
+    }
+    let (prefix, path) = match dir.strip_prefix("~/") {
+        Some(path) => ("\"$HOME\"/", path),
+        None => ("", dir),
+    };
+    format!("{prefix}'{}'", path.replace('\'', "'\\''"))
 }
 
 fn parse_model_ids(body: &serde_json::Value) -> Vec<String> {
@@ -667,8 +694,20 @@ fn remove_model_entry(home: &Path, key: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn new_sovereign<'a>(name: &'a str, preset: &'a str, ssh: &'a str) -> NewSovereign<'a> {
+        NewSovereign {
+            name,
+            preset,
+            ssh,
+            dir: "~/recipe",
+            base_url: None,
+            api_key: None,
+        }
+    }
+
     fn sample() -> Sovereign {
-        sovereign_from_preset(&PRESETS[0], "user@dgx.example.ts.net", None, None)
+        let new = new_sovereign("dgx", "qwen38-flash-dual-spark", "user@dgx.example.ts.net");
+        sovereign_from_preset(&PRESETS[0], &new)
     }
 
     #[test]
@@ -689,13 +728,65 @@ mod tests {
     }
 
     #[test]
-    fn ssh_args_leave_tilde_unquoted_and_never_prompt() {
+    fn ssh_args_expand_remote_home_and_never_prompt() {
         let args = ssh_args(&sample(), "./start.sh");
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert_eq!(
             args.last().unwrap(),
-            "cd ~/ai/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold && ./start.sh"
+            "cd -- \"$HOME\"/'recipe' && ./start.sh"
         );
+    }
+
+    /// Purpose: Verify that a shell treats each recipe directory as literal data.
+    /// Input: Absolute, relative, and home-relative paths with shell metacharacters.
+    /// Output: Each command enters exactly the requested directory.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_args_keep_recipe_directories_literal() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("remote home's $dir");
+        std::fs::create_dir(&home).unwrap();
+        let mut sovereign = sample();
+        let mut directories = vec![("~".to_string(), home.clone())];
+        for name in [
+            "model recipes/qwen",
+            "model's recipe",
+            "models; exit 7",
+            "models$(exit 7)",
+            "models`exit 7`",
+            "models\"$HOME",
+            "models\nrecipe",
+            "models*?[qwen]",
+            "-recipe",
+            "~literal",
+        ] {
+            let path = home.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            for dir in [
+                path.to_str().unwrap().to_string(),
+                name.to_string(),
+                format!("~/{name}"),
+            ] {
+                directories.push((dir, path.clone()));
+            }
+        }
+        for (dir, path) in directories {
+            sovereign.dir = dir;
+            let args = ssh_args(&sovereign, "pwd -P");
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", args.last().unwrap()])
+                .env("HOME", &home)
+                .current_dir(&home)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}: {:?}", sovereign.dir, output);
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{}\n", path.canonicalize().unwrap().display()),
+                "{}",
+                sovereign.dir
+            );
+        }
     }
 
     #[test]
@@ -722,16 +813,8 @@ mod tests {
                 "[ui]\nyolo = false\n"
             };
             std::fs::write(dir.path().join(CONFIG_FILE), original).unwrap();
-            add(
-                dir.path(),
-                "spark",
-                "qwen38-flash-dual-spark",
-                "u@spark",
-                None,
-                None,
-                allowed.clone(),
-            )
-            .unwrap();
+            let new = new_sovereign("spark", "qwen38-flash-dual-spark", "u@spark");
+            add(dir.path(), new, allowed.clone()).unwrap();
             let config = load_config_doc(dir.path()).unwrap();
             let actual = config
                 .get("models")
@@ -744,16 +827,8 @@ mod tests {
     #[test]
     fn add_isolates_the_model_from_global_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        add(
-            dir.path(),
-            "spark",
-            "qwen38-flash-dual-spark",
-            "u@spark",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let new = new_sovereign("spark", "qwen38-flash-dual-spark", "u@spark");
+        add(dir.path(), new, None).unwrap();
         let config = load_config_doc(dir.path()).unwrap();
         let entry = &config["model"]["spark/qwen-3.8-flash"];
         assert_eq!(entry["api_key"].as_str(), Some("sovereign"));
@@ -763,7 +838,8 @@ mod tests {
     #[test]
     fn mac_preset_follows_the_protocol_and_stores_a_fetched_key() {
         let dir = tempfile::tempdir().unwrap();
-        add(dir.path(), "studio", "qwen38-flash-mac-studio", "u@studio", None, None, None).unwrap();
+        let new = new_sovereign("studio", "qwen38-flash-mac-studio", "u@studio");
+        add(dir.path(), new, None).unwrap();
         let mut registry = load_registry(dir.path()).unwrap();
         let mut sovereign = registry.sovereign.remove("studio").unwrap();
         assert_eq!(sovereign.base_url, "http://studio:8888/v1");
@@ -789,7 +865,11 @@ mod tests {
         let config = dir.path().join(CONFIG_FILE);
         std::fs::write(&config, "[ui]\nyolo = false\n").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
-        add(dir.path(), "box", "qwen38-flash-mac-studio", "u@box", None, Some("k".into()), None).unwrap();
+        let new = NewSovereign {
+            api_key: Some("k".into()),
+            ..new_sovereign("box", "qwen38-flash-mac-studio", "u@box")
+        };
+        add(dir.path(), new, None).unwrap();
         assert_eq!(mode(&config), 0o600);
         assert_eq!(mode(&registry_path(dir.path())), 0o600);
 
@@ -803,7 +883,8 @@ mod tests {
     #[test]
     fn a_failed_config_write_leaves_the_registry_key_unset() {
         let dir = tempfile::tempdir().unwrap();
-        add(dir.path(), "box", "qwen38-flash-mac-studio", "u@box", None, None, None).unwrap();
+        let new = new_sovereign("box", "qwen38-flash-mac-studio", "u@box");
+        add(dir.path(), new, None).unwrap();
         let mut sovereign = load_registry(dir.path()).unwrap().sovereign.remove("box").unwrap();
         // The model entry is missing, as when config.toml was edited or restored.
         std::fs::write(dir.path().join(CONFIG_FILE), "").unwrap();
@@ -815,16 +896,11 @@ mod tests {
     #[test]
     fn an_explicit_api_key_replaces_the_placeholder() {
         let dir = tempfile::tempdir().unwrap();
-        add(
-            dir.path(),
-            "box",
-            "qwen38-flash-dual-spark",
-            "u@box",
-            None,
-            Some("k1".into()),
-            None,
-        )
-        .unwrap();
+        let new = NewSovereign {
+            api_key: Some("k1".into()),
+            ..new_sovereign("box", "qwen38-flash-dual-spark", "u@box")
+        };
+        add(dir.path(), new, None).unwrap();
         let config = load_config_doc(dir.path()).unwrap();
         assert_eq!(config["model"]["box/qwen-3.8-flash"]["api_key"].as_str(), Some("k1"));
     }
@@ -860,7 +936,8 @@ mod tests {
         std::fs::write(dir.join(CONFIG_FILE), "[ui]\nyolo = false\n").unwrap();
 
         let bundled = Some(vec!["openai-codex/*".to_string()]);
-        add(&dir, "dgx-spark", "qwen38-flash-dual-spark", "u@spark", None, None, bundled).unwrap();
+        let new = new_sovereign("dgx-spark", "qwen38-flash-dual-spark", "u@spark");
+        add(&dir, new, bundled).unwrap();
         let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
         assert!(config.contains("[ui]"), "existing config is kept");
         assert!(config.contains("[model.\"dgx-spark/qwen-3.8-flash\"]"));
