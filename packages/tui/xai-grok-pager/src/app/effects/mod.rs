@@ -1904,6 +1904,7 @@ pub(crate) fn execute(
             model_id,
             effort,
             prev_model_id,
+            scope,
         } => {
             let tx = acp_tx.clone();
             tasks
@@ -1949,6 +1950,7 @@ pub(crate) fn execute(
                         effort,
                         result,
                         prev_model_id,
+                        scope,
                     }
                 });
         }
@@ -2182,6 +2184,23 @@ pub(crate) fn execute(
                     }
                     TaskResult::CancelComplete
                 });
+        }
+        Effect::WriteNShotFiles { parent, label, files } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    for (path, contents) in files {
+                        if let Some(dir) = path.parent() {
+                            std::fs::create_dir_all(dir)?;
+                        }
+                        std::fs::write(&path, contents)?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+                .await;
+                let result = result.map_err(|e| e.to_string())
+                    .and_then(|result| result.map_err(|e| e.to_string()));
+                TaskResult::NShotFilesWritten { parent, label, result }
+            });
         }
         Effect::PersistWorktreeMode { mode, config_key } => {
             debug_assert!(

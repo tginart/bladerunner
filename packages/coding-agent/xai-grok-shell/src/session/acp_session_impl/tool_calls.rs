@@ -2202,12 +2202,12 @@ impl SessionActor {
                     .shots
                     .as_ref()
                     .map_or(input.n.unwrap_or(2) as usize, Vec::len);
-                (
-                    format!("n-shot: {count} shots"),
-                    acp::ToolKind::Other,
-                    vec![],
-                    vec![],
-                )
+                let title = if input.resolve.is_some() {
+                    "n-shot: record outcome".to_string()
+                } else {
+                    format!("n-shot: {count} shots")
+                };
+                (title, acp::ToolKind::Other, vec![], vec![])
             }
             ToolInput::UpdateGoal(ref ug) => {
                 let title = if ug.completed == Some(true) {

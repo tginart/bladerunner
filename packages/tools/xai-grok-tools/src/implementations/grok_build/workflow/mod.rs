@@ -101,9 +101,17 @@ fn blank_to_none(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
+/// The tool whose controls and output contract apply to a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowLaunchSource {
+    WorkflowTool,
+    NShotTool,
+}
+
 #[derive(Debug)]
 pub struct WorkflowLaunchRequest {
     pub input: WorkflowToolInput,
+    pub source: WorkflowLaunchSource,
 }
 
 #[derive(Debug)]
@@ -262,7 +270,13 @@ impl xai_tool_runtime::Tool for WorkflowTool {
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<WorkflowLaunchAck>();
         sender
-            .send((WorkflowLaunchRequest { input }, ack_tx))
+            .send((
+                WorkflowLaunchRequest {
+                    input,
+                    source: WorkflowLaunchSource::WorkflowTool,
+                },
+                ack_tx,
+            ))
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom(
                     "workflow_channel_closed",

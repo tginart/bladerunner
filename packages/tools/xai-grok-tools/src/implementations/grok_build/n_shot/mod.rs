@@ -7,15 +7,22 @@
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::tool::{ToolKind, ToolNamespace};
 
+mod decision;
+
 use super::task::types::SubagentDepthCounter;
 use super::workflow::{
-    WorkflowLaunchAck, WorkflowLaunchHandle, WorkflowLaunchRequest, WorkflowToolInput,
+    WorkflowLaunchAck, WorkflowLaunchHandle, WorkflowLaunchRequest, WorkflowLaunchSource,
+    WorkflowToolInput,
 };
 
+pub use decision::{NShotOutcome, NShotResolve};
+
 pub const N_SHOT_TOOL_NAME: &str = "n_shot";
+/// `task_id` of a launch ack whose shots are client sessions, not subagents.
+pub const N_SHOT_SESSION_TASK_ID: &str = "n-shot-sessions";
 /// Upper bound on shots per run. Keep in sync with `workflows/n_shot.rhai`.
 pub const N_SHOT_MAX_SHOTS: usize = 10;
-const N_SHOT_WORKFLOW_NAME: &str = "n-shot";
+pub const N_SHOT_WORKFLOW_NAME: &str = "n-shot";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct NShotToolInput {
@@ -34,6 +41,11 @@ pub struct NShotToolInput {
     )]
     #[serde(default)]
     pub shots: Option<Vec<NShotSpec>>,
+    #[schemars(
+        description = "Set this instead of the fields above, after the user picked a shot or a combination, to record which shots were used. Do not set it together with `prompt`, `n`, or `shots`."
+    )]
+    #[serde(default)]
+    pub resolve: Option<NShotResolve>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -54,6 +66,9 @@ impl NShotToolInput {
     /// Input: The tool input.
     /// Output: The workflow args, or an error message for the model.
     pub fn to_workflow_args(&self) -> Result<serde_json::Value, String> {
+        if self.resolve.is_some() {
+            return Err("`resolve` cannot be combined with `prompt`, `n`, or `shots`".into());
+        }
         let prompt = self
             .prompt
             .as_deref()
@@ -113,7 +128,9 @@ impl crate::types::tool_metadata::ToolMetadata for NShotTool {
 
 Use it when the user asks for several independent attempts, or to compare approaches or models. Pass `prompt` and `n` for identical shots, or `shots` to vary the prompt or model per shot (at most 10). Do not poll or wait for the result.
 
-When the report arrives, compare the shots for the user and recommend one. Do not change the user's working tree until the user picks a shot or a combination."##
+When the report arrives, compare the shots for the user and recommend one. Do not change the user's working tree until the user picks a shot or a combination.
+
+After you apply the user's choice, call this tool again with only `resolve` to record it: the `report_path` from the completion message, the `outcome` (`single`, `hybrid`, or `none`), the labels of the `shots` used, and a short `rationale`."##
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {
@@ -158,6 +175,28 @@ impl xai_tool_runtime::Tool for NShotTool {
         input: NShotToolInput,
     ) -> Result<NShotToolOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
+        if let Some(resolve) = input.resolve.clone() {
+            if input.prompt.is_some() || input.n.is_some() || input.shots.is_some() {
+                return Err(xai_tool_runtime::ToolError::custom(
+                    "n_shot_invalid_input",
+                    "`resolve` cannot be combined with `prompt`, `n`, or `shots`",
+                ));
+            }
+            let cwd = {
+                let resources = shared_resources(&ctx)?;
+                let res = resources.lock().await;
+                res.get::<crate::types::resources::Cwd>()
+                    .map(|c| c.0.clone())
+                    .unwrap_or_default()
+            };
+            let message = decision::record(resolve, cwd).await.map_err(|detail| {
+                xai_tool_runtime::ToolError::custom("n_shot_invalid_input", detail)
+            })?;
+            return Ok(NShotToolOutput {
+                name: "n-shot decision".to_string(),
+                message,
+            });
+        }
         let args = input.to_workflow_args().map_err(|detail| {
             xai_tool_runtime::ToolError::custom("n_shot_invalid_input", detail)
         })?;
@@ -181,6 +220,7 @@ impl xai_tool_runtime::Tool for NShotTool {
             )
         })?;
         let request = WorkflowLaunchRequest {
+            source: WorkflowLaunchSource::NShotTool,
             input: WorkflowToolInput {
                 agent_budget: None,
                 name: Some(N_SHOT_WORKFLOW_NAME.to_string()),
@@ -199,6 +239,20 @@ impl xai_tool_runtime::Tool for NShotTool {
             )
         })?;
         match ack_rx.await {
+            Ok(WorkflowLaunchAck::Started { name, task_id, .. })
+                if task_id == N_SHOT_SESSION_TASK_ID =>
+            {
+                Ok(NShotToolOutput {
+                    message: format!(
+                        "n-shot run '{name}' accepted. Each shot will be a full session \
+                         forked from this conversation, in its own worktree, and they \
+                         start as soon as this turn ends, so end your turn now. The user \
+                         can watch them side by side. A request to compare the shots \
+                         arrives when all of them finish."
+                    ),
+                    name,
+                })
+            }
             Ok(WorkflowLaunchAck::Started { name, .. }) => Ok(NShotToolOutput {
                 message: format!(
                     "n-shot run '{name}' started in the background. The user can watch the \

@@ -41,6 +41,7 @@ mod background;
 mod follow_ups;
 mod interactions;
 mod mcp;
+mod n_shot_fork;
 mod permissions;
 mod prompt_origin;
 mod queue;
@@ -866,6 +867,7 @@ fn handle_ext_method(ext: xai_acp_lib::AcpArgs<acp::ExtRequest>, app: &mut AppVi
     match ext.request.method.as_ref() {
         "x.ai/ask_user_question" => handle_ask_user_question(ext, app),
         "x.ai/exit_plan_mode" => handle_exit_plan_mode(ext, app),
+        "x.ai/n_shot/fork" => n_shot_fork::handle_n_shot_fork(ext, app),
         unknown => {
             tracing::warn!("Unknown ext_method: {unknown}");
             ext.response_tx

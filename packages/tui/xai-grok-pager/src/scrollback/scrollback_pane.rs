@@ -257,13 +257,20 @@ impl ScrollbackPane {
         let Some(entry) = state.entry(hover_idx) else {
             return;
         };
-        if !matches!(
-            entry.block,
-            crate::scrollback::block::RenderBlock::ToolCall(_)
-                | crate::scrollback::block::RenderBlock::Thinking(_)
-                | crate::scrollback::block::RenderBlock::BgTask(_)
-                | crate::scrollback::block::RenderBlock::Subagent(_)
-        ) {
+        // An n-shot line opens its shot columns on click, so it hovers like a row.
+        let is_n_shot_line = matches!(
+            &entry.block,
+            crate::scrollback::block::RenderBlock::Workflow(wf) if wf.run_id.starts_with("n-shot:")
+        );
+        if !is_n_shot_line
+            && !matches!(
+                entry.block,
+                crate::scrollback::block::RenderBlock::ToolCall(_)
+                    | crate::scrollback::block::RenderBlock::Thinking(_)
+                    | crate::scrollback::block::RenderBlock::BgTask(_)
+                    | crate::scrollback::block::RenderBlock::Subagent(_)
+            )
+        {
             return;
         }
         // Skip hover bg whenever the entry isn't collapsed. Once the user
@@ -274,7 +281,7 @@ impl ScrollbackPane {
         // The hover border (`render_entry_hover`) still fires to indicate
         // hover; the chevron paint below is a no-op for non-collapsed
         // entries anyway.
-        if entry.display_mode != DisplayMode::Collapsed {
+        if entry.display_mode != DisplayMode::Collapsed && !is_n_shot_line {
             return;
         }
         let Some((entry_area, top_clipped, _bottom_clipped)) =

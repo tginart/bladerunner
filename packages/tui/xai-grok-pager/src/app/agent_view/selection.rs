@@ -948,6 +948,16 @@ impl AgentView {
         false
     }
 
+    /// The n-shot group label of the live n-shot line at `idx`, if it is one.
+    pub(in crate::app) fn n_shot_group_at(&self, idx: usize) -> Option<String> {
+        match &self.scrollback.entry(idx)?.block {
+            crate::scrollback::block::RenderBlock::Workflow(wf) => {
+                wf.run_id.strip_prefix("n-shot:").map(String::from)
+            }
+            _ => None,
+        }
+    }
+
     /// Handle a click on a scrollback entry with multi-click detection.
     ///
     /// - Single click: select entry

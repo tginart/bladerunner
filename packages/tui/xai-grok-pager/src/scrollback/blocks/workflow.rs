@@ -27,6 +27,8 @@ pub struct WorkflowBlockPhase {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowBlock {
+    /// Leading word, such as `Workflow `. Empty for an n-shot group.
+    pub heading: &'static str,
     pub run_id: String,
     pub name: String,
     pub objective: String,
@@ -44,6 +46,7 @@ impl WorkflowBlock {
         objective: impl Into<String>,
     ) -> Self {
         Self {
+            heading: "Workflow ",
             run_id: run_id.into(),
             name: name.into(),
             objective: objective.into(),
@@ -86,7 +89,7 @@ impl BlockContent for WorkflowBlock {
         };
         let muted = theme.muted();
 
-        let mut spans = vec![Span::styled("Workflow ", bold)];
+        let mut spans = vec![Span::styled(self.heading, bold)];
         let verb = match &self.status {
             WorkflowBlockStatus::Running => format!("{}: ", self.name),
             WorkflowBlockStatus::Done { elapsed } => {

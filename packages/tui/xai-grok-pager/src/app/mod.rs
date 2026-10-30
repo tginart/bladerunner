@@ -75,6 +75,7 @@ mod leader_cluster;
 mod modals;
 pub(crate) mod model_config_reload;
 mod mouse;
+pub(crate) mod n_shot;
 pub(crate) mod palantir_setup;
 mod queue_edit;
 pub(crate) mod screen_mode_relaunch;

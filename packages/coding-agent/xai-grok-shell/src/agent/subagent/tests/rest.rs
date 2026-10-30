@@ -347,6 +347,7 @@ fn resumed_from_field_in_meta_roundtrips() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("resumed_from"));
@@ -394,6 +395,7 @@ fn resumed_from_none_not_serialized_in_meta() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(
@@ -441,6 +443,7 @@ fn snapshot_ref_field_in_meta_roundtrips() {
         worktree_path: Some("/tmp/grok-wt/sa-snap".into()),
         snapshot_ref: Some("refs/grok/subagent-snapshots/sa-snap".into()),
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("snapshot_ref"));
@@ -491,6 +494,7 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
         worktree_path: Some("/tmp/grok-wt/subagent-x".into()),
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     }
 }
 /// The follow-up writer persists `snapshot_ref` into an already-finalized
@@ -710,6 +714,7 @@ fn subagent_session_metadata_roundtrip() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -770,6 +775,7 @@ fn subagent_session_metadata_non_forked() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let session_meta = SubagentSessionMetadata::from_meta(
         &meta,
@@ -834,6 +840,7 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let spawn_gcs = SubagentSessionMetadata::from_meta(
         &spawn_meta,
@@ -917,6 +924,7 @@ fn upload_lifecycle_failure_preserves_error() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -965,6 +973,7 @@ fn session_metadata_session_kind_for_resumed() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     let gcs = SubagentSessionMetadata::from_meta(
         &meta,
@@ -1363,6 +1372,7 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
         worktree_path: Some("/tmp/grok-wt/sa-dur".into()),
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        workflow_run_id: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();
@@ -1402,6 +1412,7 @@ fn durable_fallback_rejects_running_status() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     };
     write_subagent_meta(&parent_dir, &meta);
     let data = std::fs::read_to_string(parent_dir.join("meta.json")).unwrap();
@@ -1484,6 +1495,7 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: None,
+        workflow_run_id: None,
     }
 }
 fn inspection(id: &str, status: SubagentSnapshotStatus) -> SubagentInspection {
@@ -1760,6 +1772,7 @@ fn durable_meta_roundtrips_effective_model_id() {
         worktree_path: None,
         snapshot_ref: None,
         effective_model_id: Some("grok-3".into()),
+        workflow_run_id: None,
     };
     write_subagent_meta(&dir, &meta);
     let data = std::fs::read_to_string(dir.join("meta.json")).unwrap();

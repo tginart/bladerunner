@@ -11,6 +11,7 @@ use crate::scrollback::block::RenderBlock;
 /// Remove an agent and clean up all references to it:
 /// `forked_from` pointers on surviving agents.
 pub(in crate::app::dispatch) fn remove_agent_and_cleanup(app: &mut AppView, agent_id: AgentId) {
+    super::n_shot::remember_closed_shot(app, agent_id);
     let mut removed = app.agents.shift_remove(&agent_id);
     if let Some(agent) = removed.as_mut() {
         app.pending_effects.extend(agent.teardown_review_chat());

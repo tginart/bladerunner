@@ -1147,6 +1147,8 @@ pub struct AgentView {
     pub hit_response_top_indicator: HitArea,
     /// CWD / worktree path in the status bar (click to copy).
     pub hit_cwd: HitArea,
+    /// `n-shot-1 · shot 2 of 3` in a shot's status bar (click opens the parent).
+    pub hit_n_shot_label: HitArea,
     /// Cancel button in turn status line (`[stop]`).
     pub hit_cancel_button: HitArea,
     /// Still-running watcher cue on the turn-status row (click opens the
@@ -1502,6 +1504,10 @@ pub struct AgentView {
     /// directive runs ahead of any prompts the user typed during the
     /// placeholder window.
     pub(crate) pending_first_prompt: Option<String>,
+    /// Set when this agent is a shot of an `/n-shot` group.
+    pub(crate) n_shot: Option<crate::app::n_shot::NShotMember>,
+    /// First prompt of a shot that waits for its own model to be set.
+    pub(crate) n_shot_start: Option<crate::app::n_shot::PendingShotStart>,
     /// Deferred fork banner to push at the bottom of the scrollback once
     /// the fork session finishes loading (in `TaskResult::SessionLoaded`).
     /// Set by `dispatch_fork_resolved`; stores the parent session id and

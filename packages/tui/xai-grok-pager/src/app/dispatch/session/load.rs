@@ -1180,6 +1180,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
                 model_id: switch.model_id,
                 effort: switch.effort,
                 prev_model_id: switch.prev_model_id,
+                scope: crate::app::actions::ModelSwitchScope::Preferred,
             });
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)
@@ -1198,6 +1199,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         notify_session_ready(&app.notification_service, agent);
         crate::memory_release::release_retained_memory_with("session-load-replay");
         note_peek_page_flip(app, agent_id, page_flip_entry);
+        effects.extend(super::n_shot::restore_groups(app, agent_id));
         return effects;
     }
     vec![]
