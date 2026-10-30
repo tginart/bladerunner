@@ -375,9 +375,25 @@ fn ssh_args(sovereign: &Sovereign, remote_command: &str) -> Vec<String> {
         "-o".into(),
         format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_S}"),
         sovereign.ssh.clone(),
-        // The dir may start with `~`, so it is left unquoted for the remote shell.
-        format!("cd {} && {remote_command}", sovereign.dir),
+        format!(
+            "cd -- {} && {remote_command}",
+            quote_remote_dir(&sovereign.dir)
+        ),
     ]
+}
+
+/// Purpose: Quote a recipe directory for the remote shell, with remote home expansion.
+/// Input: A literal directory, optionally with a leading `~` or `~/`.
+/// Output: One shell word with only the remote home variable left to expand.
+fn quote_remote_dir(dir: &str) -> String {
+    if dir == "~" {
+        return "\"$HOME\"".to_string();
+    }
+    let (prefix, path) = match dir.strip_prefix("~/") {
+        Some(path) => ("\"$HOME\"/", path),
+        None => ("", dir),
+    };
+    format!("{prefix}'{}'", path.replace('\'', "'\\''"))
 }
 
 fn parse_model_ids(body: &serde_json::Value) -> Vec<String> {
@@ -712,13 +728,65 @@ mod tests {
     }
 
     #[test]
-    fn ssh_args_leave_tilde_unquoted_and_never_prompt() {
+    fn ssh_args_expand_remote_home_and_never_prompt() {
         let args = ssh_args(&sample(), "./start.sh");
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert_eq!(
             args.last().unwrap(),
-            "cd ~/recipe && ./start.sh"
+            "cd -- \"$HOME\"/'recipe' && ./start.sh"
         );
+    }
+
+    /// Purpose: Verify that a shell treats each recipe directory as literal data.
+    /// Input: Absolute, relative, and home-relative paths with shell metacharacters.
+    /// Output: Each command enters exactly the requested directory.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_args_keep_recipe_directories_literal() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("remote home's $dir");
+        std::fs::create_dir(&home).unwrap();
+        let mut sovereign = sample();
+        let mut directories = vec![("~".to_string(), home.clone())];
+        for name in [
+            "model recipes/qwen",
+            "model's recipe",
+            "models; exit 7",
+            "models$(exit 7)",
+            "models`exit 7`",
+            "models\"$HOME",
+            "models\nrecipe",
+            "models*?[qwen]",
+            "-recipe",
+            "~literal",
+        ] {
+            let path = home.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            for dir in [
+                path.to_str().unwrap().to_string(),
+                name.to_string(),
+                format!("~/{name}"),
+            ] {
+                directories.push((dir, path.clone()));
+            }
+        }
+        for (dir, path) in directories {
+            sovereign.dir = dir;
+            let args = ssh_args(&sovereign, "pwd -P");
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", args.last().unwrap()])
+                .env("HOME", &home)
+                .current_dir(&home)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}: {:?}", sovereign.dir, output);
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{}\n", path.canonicalize().unwrap().display()),
+                "{}",
+                sovereign.dir
+            );
+        }
     }
 
     #[test]
