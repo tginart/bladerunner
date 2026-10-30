@@ -1380,6 +1380,15 @@ pub(crate) async fn spawn_session_actor(
             use xai_grok_tools::implementations::grok_build::n_shot::N_SHOT_SESSION_TASK_ID;
             use xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchAck;
             while let Some((req, ack)) = workflow_launch_rx.recv().await {
+                if !background_workflows_enabled {
+                    let _ = ack.send(WorkflowLaunchAck::Rejected {
+                        code: "workflows_disabled",
+                        detail: "Background workflows are disabled for this session \
+                                 ([workflows] enabled = false / GROK_WORKFLOWS=0 / remote flag)."
+                            .into(),
+                    });
+                    continue;
+                }
                 // Explicit budgets stay on the workflow path, which validates
                 // the cap and reserves the entire panel before any child starts.
                 if let Some(args) = n_shot_session_args(&req.input)
@@ -1396,15 +1405,6 @@ pub(crate) async fn spawn_session_actor(
                         task_id: N_SHOT_SESSION_TASK_ID.to_string(),
                         name: label,
                         script_path: None,
-                    });
-                    continue;
-                }
-                if !background_workflows_enabled {
-                    let _ = ack.send(WorkflowLaunchAck::Rejected {
-                        code: "workflows_disabled",
-                        detail: "Background workflows are disabled for this session \
-                                 ([workflows] enabled = false / GROK_WORKFLOWS=0 / remote flag)."
-                            .into(),
                     });
                     continue;
                 }

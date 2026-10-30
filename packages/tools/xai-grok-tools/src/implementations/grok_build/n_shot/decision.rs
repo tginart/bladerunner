@@ -56,6 +56,13 @@ pub fn validate(resolve: &NShotResolve, labels: &[String]) -> Result<(), String>
             labels.join(", ")
         ));
     }
+    for (i, shot) in resolve.shots.iter().enumerate() {
+        if resolve.shots[..i].contains(shot) {
+            return Err(format!(
+                "duplicate shot `{shot}`; each shot must appear only once"
+            ));
+        }
+    }
     let count = resolve.shots.len();
     match resolve.outcome {
         NShotOutcome::Single if count != 1 => Err("`single` needs exactly one shot".into()),
@@ -191,6 +198,49 @@ mod tests {
         for r in &bad {
             assert!(validate(r, &labels()).is_err(), "{r:?}");
         }
+    }
+
+    #[test]
+    fn hybrid_requires_distinct_shots() {
+        for shots in [vec!["shot-1", "shot-1"], vec!["shot-1", "shot-2", "shot-1"]] {
+            let r = resolve(NShotOutcome::Hybrid, &shots);
+            assert!(
+                validate(&r, &labels())
+                    .unwrap_err()
+                    .contains("duplicate shot")
+            );
+        }
+        assert_eq!(
+            validate(
+                &resolve(NShotOutcome::Hybrid, &["shot-1", "shot-2"]),
+                &labels()
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn duplicate_hybrid_does_not_append_a_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let group = tmp.path().canonicalize().unwrap().join("n-shot/n-shot-1");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(group.join(REPORT_FILE), "report").unwrap();
+        std::fs::write(
+            group.join(MANIFEST_FILE),
+            r#"{"shots":[{"label":"shot-1"},{"label":"shot-2"}]}"#,
+        )
+        .unwrap();
+        let mut r = resolve(NShotOutcome::Hybrid, &["shot-1", "shot-2"]);
+        r.report_path = group.join(REPORT_FILE).to_string_lossy().into_owned();
+        record_blocking(&r, Path::new("/work")).unwrap();
+        let before = std::fs::read(group.join(DECISIONS_FILE)).unwrap();
+        r.shots = vec!["shot-1".into(), "shot-1".into()];
+        assert!(
+            record_blocking(&r, Path::new("/work"))
+                .unwrap_err()
+                .contains("duplicate shot")
+        );
+        assert_eq!(std::fs::read(group.join(DECISIONS_FILE)).unwrap(), before);
     }
 
     #[test]

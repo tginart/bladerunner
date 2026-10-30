@@ -214,7 +214,8 @@ impl ShotStatus {
 ///     1. A creation error is failed. A missing session without an error is still starting.
 ///     2. Questions and permission prompts come first, then a running turn.
 ///     3. Between turns, an active goal or a live loop keeps the shot open.
-///     4. Other background work counts as working. Else the shot is settled.
+///     4. Background commands, subagents, and active workflows count as working.
+///        Else the shot is settled.
 /// Note: A paused, blocked, or finished goal counts as settled, because it
 ///     waits on the user or is done.
 pub(crate) fn classify_shot(agent: Option<&AgentView>) -> ShotStatus {
@@ -255,7 +256,13 @@ pub(crate) fn classify_shot(agent: Option<&AgentView>) -> ShotStatus {
     if loops > 0 {
         return ShotStatus::Looping { count: loops };
     }
-    if row_state == RowState::Working {
+    if row_state == RowState::Working
+        || agent
+            .subagent_sessions
+            .values()
+            .any(|child| child.is_running())
+        || agent.workflow_runs.iter().any(|run| run.is_active())
+    {
         return ShotStatus::Working;
     }
     ShotStatus::Settled

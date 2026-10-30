@@ -39,6 +39,18 @@ pub(in crate::app::dispatch) fn dispatch_n_shot(
         app.show_toast("Cannot start /n-shot: session is still being created");
         return vec![];
     }
+    // Only the shell's built-in advertises the background-workflow gate.
+    if !parent
+        .session
+        .available_commands
+        .iter()
+        .any(|command| command.name == "n-shot" && command.meta.is_none())
+    {
+        app.show_toast(
+            "Cannot start /n-shot: background workflows are unavailable for this session",
+        );
+        return vec![];
+    }
     let in_git_repo = parent.current_branch.is_some()
         || crate::git_info::cwd_git_info_lazy(&parent.session.cwd).is_some();
     if !in_git_repo {
@@ -877,6 +889,153 @@ mod tests {
             .session
             .loading_replay = true;
         app
+    }
+
+    #[test]
+    fn n_shot_unavailable_cannot_fork_from_typed_prompt() {
+        use agent_client_protocol::AvailableCommand;
+        let skill_meta = serde_json::json!({ "path": "/skills/n-shot.md" })
+            .as_object()
+            .cloned();
+        let cases = [
+            vec![],
+            vec![AvailableCommand::new("workflow", "Manage old runs")],
+            vec![AvailableCommand::new("n-shot", "User skill").meta(skill_meta)],
+        ];
+        for commands in cases {
+            let mut app = test_app_with_agent();
+            let parent = app.agents.get_mut(&AgentId(0)).unwrap();
+            parent.current_branch = Some("main".into());
+            parent.session.available_commands = commands;
+            let text = "/goal fix it /n-shot 2";
+            parent.prompt.set_text(text);
+            let effects = crate::app::dispatch::dispatch(
+                crate::app::actions::Action::SendPrompt(text.into()),
+                &mut app,
+            );
+            assert!(effects.is_empty());
+            assert_eq!(app.agents.len(), 1);
+            assert!(app.n_shot_groups.is_empty());
+            assert!(app.n_shot_requests.is_empty());
+            assert_eq!(app.agents[&AgentId(0)].prompt.text(), text);
+        }
+    }
+
+    #[test]
+    fn n_shot_advertised_builtin_can_fork_from_typed_prompt() {
+        let mut app = test_app_with_agent();
+        let parent = app.agents.get_mut(&AgentId(0)).unwrap();
+        parent.current_branch = Some("main".into());
+        parent.session.available_commands = vec![agent_client_protocol::AvailableCommand::new(
+            "n-shot",
+            "Parallel attempts",
+        )];
+        let effects = crate::app::dispatch::dispatch(
+            crate::app::actions::Action::SendPrompt("/n-shot 2 fix it".into()),
+            &mut app,
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::CreateWorktreeSession { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(app.n_shot_groups.len(), 1);
+        assert_eq!(app.agents.len(), 3);
+    }
+
+    /// Purpose: Keep the group open until subagents and workflows finish.
+    /// Input: Two idle shots, each with a different type of background work.
+    /// Output: No report or comparison until both types of background work finish.
+    #[test]
+    fn n_shot_waits_for_subagents_and_workflows() {
+        let mut app = settled_group_app();
+        let shot_ids = app.n_shot_groups[0].shots.clone();
+        let mut child = crate::app::agent_view::test_fixtures::running_subagent_info("child");
+        child.is_background = true;
+        app.agents
+            .get_mut(&shot_ids[0])
+            .unwrap()
+            .subagent_sessions
+            .insert("child".into(), child);
+        app.agents
+            .get_mut(&shot_ids[1])
+            .unwrap()
+            .workflow_runs
+            .push(crate::views::workflows::WorkflowRunSnapshot {
+                run_id: "wf-1".into(),
+                name: "workflow".into(),
+                objective: "fix it".into(),
+                status: "active".into(),
+                management_available: true,
+                builtin: false,
+                phases: vec![],
+                current_phase: None,
+                agents: vec![],
+                agent_budget: None,
+                agents_used: 0,
+                agents_reserved: 0,
+                agents_remaining: None,
+                agent_usage_incomplete: false,
+                active_agents: 0,
+                elapsed_ms: 0,
+                received_at: std::time::Instant::now(),
+                pause_message: None,
+                result_summary: None,
+            });
+        for id in &shot_ids {
+            assert_eq!(classify_shot(app.agents.get(id)), ShotStatus::Working);
+        }
+        let effects = tick(&mut app);
+        let Effect::WriteNShotFiles { files, .. } = &effects[0] else {
+            panic!("missing writer")
+        };
+        assert!(!files.iter().any(|(path, _)| path.ends_with("report.md")));
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(!app.n_shot_groups[0].joined);
+        assert!(app.agents[&AgentId(0)].session.pending_prompts.is_empty());
+        app.agents
+            .get_mut(&shot_ids[0])
+            .unwrap()
+            .subagent_sessions
+            .get_mut("child")
+            .unwrap()
+            .finished = true;
+        assert_eq!(
+            classify_shot(app.agents.get(&shot_ids[0])),
+            ShotStatus::Settled
+        );
+        tick(&mut app);
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(!app.n_shot_groups[0].joined);
+        assert!(app.agents[&AgentId(0)].session.pending_prompts.is_empty());
+        app.agents.get_mut(&shot_ids[1]).unwrap().workflow_runs[0].status = "complete".into();
+        assert_eq!(
+            classify_shot(app.agents.get(&shot_ids[1])),
+            ShotStatus::Settled
+        );
+        let effects = tick(&mut app);
+        let Effect::WriteNShotFiles { files, .. } = &effects[0] else {
+            panic!("missing writer")
+        };
+        assert!(files.iter().any(|(path, _)| path.ends_with("report.md")));
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(app.n_shot_groups[0].joined);
+        assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+    }
+
+    #[test]
+    fn n_shot_workflow_owned_child_keeps_shot_open() {
+        let mut app = settled_group_app();
+        let shot_id = app.n_shot_groups[0].shots[0];
+        let shot = app.agents.get_mut(&shot_id).unwrap();
+        let mut child = crate::app::agent_view::test_fixtures::running_subagent_info("child");
+        child.workflow_run_id = Some("paused-workflow".into());
+        shot.subagent_sessions.insert("child".into(), child);
+        assert_eq!(classify_shot(Some(shot)), ShotStatus::Working);
+        shot.subagent_sessions.get_mut("child").unwrap().finished = true;
+        assert_eq!(classify_shot(Some(shot)), ShotStatus::Settled);
     }
 
     #[test]
