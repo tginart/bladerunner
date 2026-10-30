@@ -1094,6 +1094,7 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1143,6 +1144,7 @@ fn switch_model_complete_warns_when_context_nears_target_window() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1180,6 +1182,7 @@ fn switch_model_complete_never_persists_codex_as_grok_default() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1216,6 +1219,7 @@ fn switch_model_complete_skips_message_and_persist_when_unchanged() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1270,6 +1274,7 @@ fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
             effort: None, // user typed `/model Blackbox 4.7` with no effort
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1336,6 +1341,7 @@ fn switch_to_non_reasoning_model_clears_persisted_effort() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1380,6 +1386,7 @@ fn switch_model_complete_failure_pushes_error_and_clears_pending() {
             effort: None,
             result: Err(SwitchModelError::Other("model not found".into())),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1423,6 +1430,7 @@ fn switch_model_incompatible_agent_shows_question_modal() {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1486,6 +1494,7 @@ fn incompatible_agent_rollback_restores_previous_model() {
                 prev_model_id: Some(prev_model.clone()),
             }),
             prev_model_id: Some(prev_model.clone()),
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1532,6 +1541,7 @@ fn incompatible_agent_closes_active_modal() {
                 prev_model_id: None,
             }),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1578,6 +1588,7 @@ fn same_agent_type_switch_no_modal() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );
@@ -1621,6 +1632,7 @@ fn switch_model_pending_lifecycle() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );

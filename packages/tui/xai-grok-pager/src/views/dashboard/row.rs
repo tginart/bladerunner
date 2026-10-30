@@ -184,7 +184,13 @@ fn build_local_rows(
         {
             continue;
         }
+        let has_shots = agents.values().any(|shot| {
+            shot.n_shot
+                .as_ref()
+                .is_some_and(|member| member.parent == *id)
+        });
         if is_empty_top_level(agent)
+            && !has_shots
             && !pinned.contains(&top_id)
             && !matches!(
                 classify_top_level(agent),
@@ -1242,6 +1248,27 @@ mod tests {
         agents.insert(AgentId(0), parent);
         agents.insert(AgentId(1), shot);
         agents
+    }
+
+    #[test]
+    fn n_shot_keeps_an_empty_parent_and_its_shots_visible() {
+        let mut agents = n_shot_agents_with_children(0);
+        agents.insert(
+            AgentId(0),
+            crate::app::agent_view::test_fixtures::make_agent(),
+        );
+        assert!(is_empty_top_level(&agents[&AgentId(0)]));
+        assert_eq!(classify_top_level(&agents[&AgentId(0)]), RowState::Idle);
+        for include_subagents in [false, true] {
+            let rows =
+                build_local_rows(&agents, &Default::default(), None, None, include_subagents);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].id, DashboardRowId::TopLevel(AgentId(0)));
+            assert_eq!(rows[1].id, DashboardRowId::TopLevel(AgentId(1)));
+            assert_eq!(rows[1].indent, 1);
+        }
+        agents.swap_remove(&AgentId(1));
+        assert!(build_local_rows(&agents, &Default::default(), None, None, false).is_empty());
     }
 
     #[test]

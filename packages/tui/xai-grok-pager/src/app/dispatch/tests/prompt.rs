@@ -2681,6 +2681,7 @@ fn switch_model_holds_prompt_until_complete() {
             effort: None,
             result: Ok(()),
             prev_model_id: None,
+            scope: crate::app::actions::ModelSwitchScope::Preferred,
         }),
         &mut app,
     );

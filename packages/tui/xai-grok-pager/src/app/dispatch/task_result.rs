@@ -649,7 +649,16 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             effort,
             result,
             prev_model_id,
-        } => handle_switch_model_complete(app, agent_id, model_id, effort, result, prev_model_id),
+            scope,
+        } => handle_switch_model_complete(
+            app,
+            agent_id,
+            model_id,
+            effort,
+            result,
+            prev_model_id,
+            scope,
+        ),
         TaskResult::BgTaskKilled {
             session_id,
             task_id,

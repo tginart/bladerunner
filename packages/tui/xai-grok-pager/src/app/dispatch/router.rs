@@ -194,6 +194,7 @@ fn dispatch_cycle_scoped_model(app: &mut AppView, reverse: bool) -> Vec<Effect> 
         model_id,
         effort: None,
         prev_model_id: None,
+        scope: crate::app::actions::ModelSwitchScope::Preferred,
     }]
 }
 /// Dispatch an action: mutate state, return effects to execute.
@@ -1091,6 +1092,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 model_id,
                 effort,
                 prev_model_id: None,
+                scope: crate::app::actions::ModelSwitchScope::Preferred,
             }]
         }
         Action::AnnouncementsHide => {

@@ -1187,6 +1187,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 model_id: switch.model_id,
                 effort: switch.effort,
                 prev_model_id: switch.prev_model_id,
+                scope: crate::app::actions::ModelSwitchScope::Preferred,
             });
         }
         if let Some(mode) = deferred_mode {
@@ -1298,6 +1299,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 model_id: switch.model_id,
                 effort: switch.effort,
                 prev_model_id: switch.prev_model_id,
+                scope: crate::app::actions::ModelSwitchScope::Preferred,
             });
         }
         if let Some(mode) = deferred_mode {
@@ -1502,6 +1504,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     effort: Option<ReasoningEffort>,
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
+    scope: crate::app::actions::ModelSwitchScope,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.model_switch_pending = false;
@@ -1544,7 +1547,10 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 if let Some(hint) = context_hint {
                     agent.scrollback.push_block(RenderBlock::system(hint));
                 }
-                if unchanged || crate::acp::router::is_codex_model(&model_id) {
+                if unchanged
+                    || scope == crate::app::actions::ModelSwitchScope::SessionOnly
+                    || crate::acp::router::is_codex_model(&model_id)
+                {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {

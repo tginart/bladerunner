@@ -1391,22 +1391,32 @@ pub(crate) async fn spawn_session_actor(
                 }
                 // Explicit budgets stay on the workflow path, which validates
                 // the cap and reserves the entire panel before any child starts.
-                if let Some(args) = n_shot_session_args(&req.input)
-                    && let Some(label) =
-                        crate::session::workflow::n_shot_sessions::request_session_shots(
-                            &launch_gateway,
-                            &launch_session_id,
-                            args,
-                        )
-                        .await
-                {
-                    let _ = ack.send(WorkflowLaunchAck::Started {
-                        run_id: label.clone(),
-                        task_id: N_SHOT_SESSION_TASK_ID.to_string(),
-                        name: label,
-                        script_path: None,
-                    });
-                    continue;
+                if let Some(args) = n_shot_session_args(&req.input) {
+                    match crate::session::workflow::n_shot_sessions::request_session_shots(
+                        &launch_gateway,
+                        &launch_session_id,
+                        args,
+                    )
+                    .await
+                    {
+                        Ok(Some(label)) => {
+                            let _ = ack.send(WorkflowLaunchAck::Started {
+                                run_id: label.clone(),
+                                task_id: N_SHOT_SESSION_TASK_ID.to_string(),
+                                name: label,
+                                script_path: None,
+                            });
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(detail) => {
+                            let _ = ack.send(WorkflowLaunchAck::Rejected {
+                                code: "n_shot_session_acceptance_unknown",
+                                detail,
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let input = req.input;
                 if let Err(detail) = input.validate() {

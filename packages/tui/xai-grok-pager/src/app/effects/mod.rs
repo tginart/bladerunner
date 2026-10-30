@@ -1904,6 +1904,7 @@ pub(crate) fn execute(
             model_id,
             effort,
             prev_model_id,
+            scope,
         } => {
             let tx = acp_tx.clone();
             tasks
@@ -1949,6 +1950,7 @@ pub(crate) fn execute(
                         effort,
                         result,
                         prev_model_id,
+                        scope,
                     }
                 });
         }

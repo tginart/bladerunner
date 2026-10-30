@@ -201,6 +201,7 @@ fn start_pending_shots(app: &mut AppView) -> Vec<Effect> {
                     model_id: start.model.clone(),
                     effort: None,
                     prev_model_id: None,
+                    scope: crate::app::actions::ModelSwitchScope::SessionOnly,
                 });
             }
             Some(at) => {
@@ -437,6 +438,26 @@ fn upsert_group_block(app: &mut AppView, group: &NShotGroup, shots: &[ShotSummar
     }
 }
 
+/// Purpose: Keep an idle shot open until its own session-shot work completes.
+/// Input: The app and the shot identity.
+/// Output: The shot status, including accepted requests and open child groups.
+fn classify_session_shot(app: &AppView, shot_id: AgentId) -> ShotStatus {
+    let status = classify_shot(app.agents.get(&shot_id));
+    let has_nested_work = app
+        .n_shot_requests
+        .iter()
+        .any(|request| request.parent == shot_id)
+        || app
+            .n_shot_groups
+            .iter()
+            .any(|group| group.parent == shot_id && !group.joined);
+    if status == ShotStatus::Settled && has_nested_work {
+        ShotStatus::Working
+    } else {
+        status
+    }
+}
+
 fn summarize_shots(app: &AppView, group: &NShotGroup) -> Vec<ShotSummary> {
     group
         .shots
@@ -461,7 +482,7 @@ fn summarize_shots(app: &AppView, group: &NShotGroup) -> Vec<ShotSummary> {
                             .map(|p| p.to_string_lossy().into_owned())
                     }),
                 status: match agent {
-                    Some(agent) => classify_shot(Some(agent)),
+                    Some(_) => classify_session_shot(app, *shot_id),
                     None if stored.is_some_and(|s| s.status == ShotStatus::Failed) => {
                         ShotStatus::Failed
                     }
@@ -1023,6 +1044,106 @@ mod tests {
         files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
         assert!(app.n_shot_groups[0].joined);
         assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+    }
+
+    /// Purpose: Keep the outer report open through nested shots and their comparison.
+    /// Input: A settled outer group and an accepted nested request.
+    /// Output: The outer group joins only after the nested comparison ends.
+    #[test]
+    fn n_shot_waits_for_nested_requests_groups_and_comparison() {
+        let mut app = settled_group_app();
+        let shot_id = app.n_shot_groups[0].shots[0];
+        let shots = crate::app::n_shot::parse_request_shots(
+            &serde_json::json!({"prompt": "nested fix", "n": 1}),
+        )
+        .unwrap();
+        app.n_shot_requests.push(crate::app::n_shot::NShotRequest {
+            parent: shot_id,
+            label: "n-shot-1".into(),
+            shots,
+        });
+        // Inspect accepted work before the tick moves it into a live group.
+        assert_eq!(classify_shot(app.agents.get(&shot_id)), ShotStatus::Settled);
+        assert_eq!(
+            summarize_shots(&app, &app.n_shot_groups[0])[0].status,
+            ShotStatus::Working
+        );
+        tick(&mut app);
+        assert!(app.n_shot_requests.is_empty());
+        assert_eq!(app.n_shot_groups.len(), 2);
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        files_written(&mut app, shot_id, "n-shot-1", Ok(()));
+        assert!(!app.n_shot_groups[0].joined);
+        assert!(!app.n_shot_groups[1].joined);
+        let nested_id = app.n_shot_groups[1].shots[0];
+        let nested = app.agents.get_mut(&nested_id).unwrap();
+        nested.session.session_id = Some(agent_client_protocol::SessionId::new("nested"));
+        nested.session.state = AgentState::Idle;
+        nested.pending_first_prompt = None;
+        app.agents.get_mut(&shot_id).unwrap().session.loading_replay = true;
+        tick(&mut app);
+        files_written(&mut app, shot_id, "n-shot-1", Ok(()));
+        assert!(app.n_shot_groups[1].joined);
+        assert_eq!(app.agents[&shot_id].session.pending_prompts.len(), 1);
+        tick(&mut app);
+        assert!(!app.n_shot_groups[0].joined);
+        let shot = app.agents.get_mut(&shot_id).unwrap();
+        shot.session.pending_prompts.clear();
+        shot.session.loading_replay = false;
+        tick(&mut app);
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(app.n_shot_groups[0].joined);
+        assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+    }
+
+    /// Purpose: Keep automatic shot overrides out of the persisted model default.
+    /// Input: A pending per-shot model switch, including a completion after its wait expires.
+    /// Output: The shot model changes without a preferred-model write.
+    #[test]
+    fn n_shot_model_override_is_session_only_even_after_start_timeout() {
+        use crate::app::actions::{Action, ModelSwitchScope, TaskResult};
+        let mut app = settled_group_app();
+        let shot_id = app.n_shot_groups[0].shots[0];
+        let model_id = agent_client_protocol::ModelId::new("shot-test-model");
+        app.agents.get_mut(&shot_id).unwrap().n_shot_start = Some(PendingShotStart {
+            prompt: "fix with this model".into(),
+            model: model_id.clone(),
+            requested_at: None,
+        });
+        let effects = start_pending_shots(&mut app);
+        assert!(matches!(
+            &effects[..],
+            [Effect::SwitchModel {
+                scope: ModelSwitchScope::SessionOnly,
+                ..
+            }]
+        ));
+        let shot = app.agents.get_mut(&shot_id).unwrap();
+        shot.n_shot_start.as_mut().unwrap().requested_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(16));
+        // A late completion retains its scope even after the first prompt is released.
+        start_pending_shots(&mut app);
+        assert!(app.agents[&shot_id].n_shot_start.is_none());
+        let effects = crate::app::dispatch::dispatch(
+            Action::TaskComplete(TaskResult::SwitchModelComplete {
+                agent_id: shot_id,
+                model_id: model_id.clone(),
+                effort: None,
+                result: Ok(()),
+                prev_model_id: None,
+                scope: ModelSwitchScope::SessionOnly,
+            }),
+            &mut app,
+        );
+        assert_eq!(
+            app.agents[&shot_id].session.models.current.as_ref(),
+            Some(&model_id)
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. }))
+        );
     }
 
     #[test]
