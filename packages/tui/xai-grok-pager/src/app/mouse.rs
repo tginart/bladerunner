@@ -262,6 +262,10 @@ impl AgentView {
                         xai_grok_telemetry::events::AnnouncementCtaSurface::Header,
                     ));
                 }
+                if self.n_shot.is_some() && self.hit_n_shot_label.contains(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(Action::OpenNShotParent);
+                }
                 if self.hit_cwd.contains(mouse.column, mouse.row) {
                     let path = self.session.cwd.display().to_string();
                     self.copy_to_clipboard(&path);
@@ -942,6 +946,9 @@ impl AgentView {
                                 if show_word_select_tip {
                                     return InputOutcome::Action(Action::ShowWordSelectTip);
                                 }
+                                if let Some(label) = self.n_shot_group_at(idx) {
+                                    return InputOutcome::Action(Action::OpenNShotColumns(label));
+                                }
                                 return InputOutcome::Changed;
                             }
                         } else if let Some((last_time, last_idx, last_count)) = self.last_click
@@ -1134,6 +1141,7 @@ impl AgentView {
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_n_shot_label.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_upgrade_cta.update_hover(mouse.column, mouse.row);
                 {
                     let new_kill = self

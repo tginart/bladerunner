@@ -11,6 +11,13 @@ use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 use xai_grok_shell::session::unified_list::SessionKind;
+/// Whether a model switch also changes the preferred model for future sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSwitchScope {
+    Preferred,
+    SessionOnly,
+}
+
 /// Typed error for model switch failures. Replaces the raw `String` in
 /// `TaskResult::SwitchModelComplete` so dispatch can match on the variant
 /// instead of parsing strings.
@@ -1083,6 +1090,12 @@ pub enum Action {
     ToggleWorkflows,
     /// Open the side-by-side columns of the latest n-shot run.
     OpenShots,
+    /// Switch to the focused shot of the open n-shot columns view.
+    NShotColumnsAttach,
+    /// Open the columns view of the active agent's n-shot group with this label.
+    OpenNShotColumns(String),
+    /// From a shot, switch to its parent and open the group's columns on it.
+    OpenNShotParent,
     Rewind,
     RewindShowPicker,
     RewindPickerSelect(usize),
@@ -1702,6 +1715,7 @@ pub enum Effect {
         session_id: acp::SessionId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        scope: ModelSwitchScope,
         /// The model that was active before the optimistic UI update
         /// in `set_default_model`. `None` for `Action::SwitchModel`
         /// (no optimistic update). Threaded through to
@@ -1726,6 +1740,13 @@ pub enum Effect {
     /// pagers may produce last-writer-wins behaviour but never corrupt
     /// the file.
     PersistDashboard(crate::views::dashboard::PersistedDashboard),
+    /// Write n-shot group files (`shots.json`, `report.md`, shot back-links).
+    /// Each pair is a path and its full contents; parent dirs are created.
+    WriteNShotFiles {
+        parent: AgentId,
+        label: String,
+        files: Vec<(std::path::PathBuf, String)>,
+    },
     /// Persist a per-command worktree mode preference to `[hints]` in
     /// config.toml. `config_key` is the TOML key under `[hints]`
     /// (`"new_session_worktree_mode"` or `"fork_worktree_mode"`).
@@ -2628,6 +2649,12 @@ pub enum TaskResult {
     /// Cancel notification was sent (fire-and-forget).
     /// The real turn end comes via PromptResponse.
     CancelComplete,
+    /// The n-shot files are durable, or the group must retry before comparison.
+    NShotFilesWritten {
+        parent: AgentId,
+        label: String,
+        result: Result<(), String>,
+    },
     /// Response to `x.ai/subagent/cancel`; see [`SubagentKillOutcome`].
     KillSubagentComplete {
         session_id: acp::SessionId,
@@ -2675,6 +2702,7 @@ pub enum TaskResult {
         agent_id: AgentId,
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+        scope: ModelSwitchScope,
         result: Result<(), SwitchModelError>,
         /// Forwarded from `Effect::SwitchModel.prev_model_id` for
         /// rollback on `IncompatibleAgent`.

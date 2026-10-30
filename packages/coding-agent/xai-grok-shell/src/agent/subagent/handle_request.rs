@@ -793,6 +793,7 @@ pub(crate) async fn run_shell_child(
             .map(|p| p.to_string_lossy().to_string()),
         snapshot_ref: None,
         effective_model_id: Some(effective_model_id.0.to_string()),
+        workflow_run_id: request.owner.workflow_run_id().map(String::from),
     };
     write_subagent_meta(&subagent_meta_dir, &subagent_meta);
     if let (Some(bucket_url), Some(upload_method)) = (&ctx.gcs_bucket_url, &ctx.gcs_upload_method) {

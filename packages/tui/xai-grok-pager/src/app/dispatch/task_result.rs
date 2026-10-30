@@ -13,13 +13,13 @@ use super::cta::{
     handle_plugin_cta_catalog_loaded, handle_plugin_cta_debounce_expired,
     handle_plugin_cta_mcps_loaded,
 };
+use super::ctx::with_active_agent;
 use super::ctx::{find_agent_by_session_id, get_active_agent_mut};
 use super::notes::{handle_btw_response, handle_memory_note_saved};
 use super::prompt::{
     defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
     handle_suggestion_debounce_expired,
 };
-use super::ctx::with_active_agent;
 use super::queue::push_and_page_flip;
 use super::rewind::{
     dispatch_rewind_success, handle_rewind_execute_failed, handle_rewind_points_loaded,
@@ -615,6 +615,11 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             }
             vec![]
         }
+        TaskResult::NShotFilesWritten {
+            parent,
+            label,
+            result,
+        } => super::session::n_shot::files_written(app, parent, &label, result),
         TaskResult::CancelComplete => {
             tracing::trace!("Cancel notification sent successfully");
             vec![]
@@ -644,7 +649,16 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             effort,
             result,
             prev_model_id,
-        } => handle_switch_model_complete(app, agent_id, model_id, effort, result, prev_model_id),
+            scope,
+        } => handle_switch_model_complete(
+            app,
+            agent_id,
+            model_id,
+            effort,
+            result,
+            prev_model_id,
+            scope,
+        ),
         TaskResult::BgTaskKilled {
             session_id,
             task_id,

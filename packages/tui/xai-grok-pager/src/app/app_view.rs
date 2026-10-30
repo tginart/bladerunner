@@ -628,6 +628,12 @@ pub struct AppView {
     /// Monotonically increasing counter for agent ID allocation.
     /// Never reuse IDs after `shift_remove` to avoid collisions.
     pub next_agent_id: usize,
+    /// `/n-shot` groups: parents forked into N shot sessions.
+    pub(crate) n_shot_groups: Vec<crate::app::n_shot::NShotGroup>,
+    /// `n_shot` tool calls waiting for their parent's turn to end.
+    pub(crate) n_shot_requests: Vec<crate::app::n_shot::NShotRequest>,
+    /// Side-by-side columns of one n-shot group, drawn over its parent.
+    pub(crate) n_shot_columns: Option<crate::app::n_shot::NShotColumnsState>,
     /// Available/selected models (shared across agents).
     pub models: ModelState,
     /// Keybinding definitions.
@@ -1529,6 +1535,9 @@ impl AppView {
             auth_return_view: None,
             agents: IndexMap::new(),
             next_agent_id: 0,
+            n_shot_groups: Vec::new(),
+            n_shot_requests: Vec::new(),
+            n_shot_columns: None,
             models,
             registry: ActionRegistry::defaults(),
             settings_registry: Arc::new(crate::settings::SettingsRegistry::defaults()),
@@ -2968,6 +2977,31 @@ impl AppView {
                             }
                             _ => {}
                         }
+                    }
+                }
+                if let Some(columns) = self.n_shot_columns.as_mut()
+                    && matches!(self.active_view, ActiveView::Agent(id) if Some(id) == columns.parent)
+                {
+                    if let Event::Key(key) = ev {
+                        if key.kind == KeyEventKind::Release {
+                            return InputOutcome::Unchanged;
+                        }
+                        return match key.code {
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                columns.focus = columns.focus.saturating_sub(1);
+                                InputOutcome::Changed
+                            }
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                                columns.focus += 1;
+                                InputOutcome::Changed
+                            }
+                            KeyCode::Enter => InputOutcome::Action(Action::NShotColumnsAttach),
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                self.n_shot_columns = None;
+                                InputOutcome::Changed
+                            }
+                            _ => InputOutcome::Unchanged,
+                        };
                     }
                 }
                 if let Some(modal) = self.import_claude_modal.as_mut() {
@@ -5198,6 +5232,21 @@ impl AppView {
                                     live_visualizer: live_visualizer_state.as_ref(),
                                 },
                             );
+                            if let Some(columns) = self.n_shot_columns.as_mut()
+                                && columns.parent == Some(id)
+                                && let Some(group) = self
+                                    .n_shot_groups
+                                    .iter()
+                                    .find(|g| g.parent == id && g.label == columns.label)
+                            {
+                                crate::views::n_shot::render_session_columns(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    columns,
+                                    group,
+                                    agents,
+                                );
+                            }
                             if let Some(modal) = self.import_claude_modal.as_mut() {
                                 let theme = crate::theme::Theme::current();
                                 crate::views::import_claude_modal::render_import_claude_modal(
@@ -6311,6 +6360,9 @@ pub(crate) mod tests {
             auth_return_view: None,
             agents: indexmap::IndexMap::new(),
             next_agent_id: 0,
+            n_shot_groups: Vec::new(),
+            n_shot_requests: Vec::new(),
+            n_shot_columns: None,
             models: ModelState::default(),
             registry: ActionRegistry::defaults(),
             settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),

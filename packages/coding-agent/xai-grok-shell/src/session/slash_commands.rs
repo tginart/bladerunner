@@ -1603,6 +1603,11 @@ pub(super) fn resolve(
     loop_fire_mode: LoopFireMode,
     wasm_commands: &[xai_grok_extension_api::WasmCommandDescriptor],
 ) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
+    if availability.allows(BuiltinGate::BackgroundWorkflows)
+        && let Some(args) = first_text(&prompt_blocks).and_then(find_n_shot_trigger)
+    {
+        return Err(SlashCommandOutcome::Builtin(BuiltinAction::NShot { args }));
+    }
     let Some((command_name, args)) = parse_slash_prefix(&prompt_blocks) else {
         return Ok(prompt_blocks);
     };
@@ -1685,7 +1690,7 @@ pub(super) fn resolve(
 /// Purpose: Parse the arguments of `/n-shot`.
 /// Input: The text after the command name, in the form `<N> <prompt>`.
 /// Output: The number of shots and the prompt, or a usage message.
-pub(super) fn parse_n_shot_args(args: &str) -> Result<(u64, String), String> {
+pub fn parse_n_shot_args(args: &str) -> Result<(u64, String), String> {
     let usage = format!(
         "Usage: /n-shot <N> <prompt>\nFork this conversation into N (1-{N_SHOT_MAX_SHOTS}) \
          parallel attempts, each in its own git worktree. When all finish, this session \
@@ -1701,6 +1706,51 @@ pub(super) fn parse_n_shot_args(args: &str) -> Result<(u64, String), String> {
         return Err(usage);
     }
     Ok((n, prompt.to_string()))
+}
+/// Purpose: Find a `/n-shot <N>` trigger anywhere in the prompt text.
+/// Input: The prompt text.
+/// Output: The `/n-shot` args (`<N> <prompt>`), or `None` when there is no trigger.
+/// Method:
+///     1. Find `/n-shot` at the start of the text or after whitespace.
+///     2. Require whitespace and then a number after it.
+///     3. Remove the trigger. The text before and after it is the shot prompt.
+/// Note: `/goal fix it /n-shot 3 fast` gives `3 /goal fix it fast`, so each shot
+///     handles the rest of the prompt as if the user had typed it.
+pub fn find_n_shot_trigger(text: &str) -> Option<String> {
+    const TRIGGER: &str = "/n-shot";
+    let mut search_from = 0;
+    while let Some(offset) = text[search_from..].find(TRIGGER) {
+        let start = search_from + offset;
+        search_from = start + TRIGGER.len();
+        let at_word_start = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        let after = &text[search_from..];
+        let count_text = after.trim_start();
+        let count_len = count_text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(count_text.len());
+        let rest = &count_text[count_len..];
+        let ends_count = rest.chars().next().is_none_or(char::is_whitespace);
+        if !at_word_start || count_text.len() == after.len() || count_len == 0 || !ends_count {
+            continue;
+        }
+        let before = text[..start].trim();
+        let prompt = match (before.is_empty(), rest.trim().is_empty()) {
+            (true, _) => rest.trim().to_string(),
+            (false, true) => before.to_string(),
+            (false, false) => format!("{before} {}", rest.trim()),
+        };
+        return Some(format!("{} {prompt}", &count_text[..count_len]));
+    }
+    None
+}
+fn first_text(prompt_blocks: &[acp::ContentBlock]) -> Option<&str> {
+    prompt_blocks.iter().find_map(|b| match b {
+        acp::ContentBlock::Text(t) => Some(t.text.as_str()),
+        _ => None,
+    })
 }
 /// Extract `(name, args)` if the first text block starts with `/`.
 ///
@@ -3265,6 +3315,41 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+    #[test]
+    fn n_shot_triggers_anywhere_in_the_prompt() {
+        let cases = [
+            ("/n-shot 4 /loop 10m check CI", Some("4 /loop 10m check CI")),
+            (
+                "/goal fix the parser /n-shot 3 keep it small",
+                Some("3 /goal fix the parser keep it small"),
+            ),
+            ("fix the parser /n-shot 2", Some("2 fix the parser")),
+            ("/n-shot 2\nmulti\nline", Some("2 multi\nline")),
+            ("explain what /n-shot does", None),
+            ("explain /n-shot", None),
+            ("see a/n-shot 3 b", None),
+            ("/n-shot 3x do it", None),
+            ("/n-shot3 do it", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(find_n_shot_trigger(text).as_deref(), expected, "{text:?}");
+        }
+        let outcome = resolve(
+            vec![text_block("/goal ship it /n-shot 2 carefully")],
+            &[],
+            all_gated(),
+            SkillSlashRewrite::default(),
+            &[],
+        )
+        .unwrap_err();
+        let SlashCommandOutcome::Builtin(BuiltinAction::NShot { args }) = outcome else {
+            panic!("expected NShot, got {outcome:?}");
+        };
+        assert_eq!(
+            parse_n_shot_args(&args),
+            Ok((2, "/goal ship it carefully".to_string()))
+        );
     }
     #[test]
     fn n_shot_needs_the_engine_not_the_workflow_tool() {

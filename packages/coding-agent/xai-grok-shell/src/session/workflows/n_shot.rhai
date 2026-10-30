@@ -106,6 +106,7 @@ full += "Each shot started from a copy of this conversation and worked in its ow
 
 let idx = 0;
 let succeeded = 0;
+let entries = [];
 for r in results {
     let shot = shots[idx];
     let heading = "## " + shot.label;
@@ -132,6 +133,16 @@ for r in results {
         output = json_encode(output);
     }
 
+    entries.push(#{
+        index: idx + 1,
+        label: shot.label,
+        agent_id: if r != () { r.agent_id } else { () },
+        model: shot.model,
+        prompt: shot.prompt,
+        status: status,
+        worktree: if worktree == "(none)" { () } else { worktree },
+        changes: changes,
+    });
     overview += "- " + shot.label + ": " + status + "; " + last_line(changes)
         + "; worktree " + worktree + "\n";
     full += heading + "\n\n- Status: " + status + "\n- Worktree: " + worktree
@@ -144,8 +155,15 @@ for r in results {
 }
 
 let path = write_scratch_file("report.md", full);
-overview += "\nRead the full report for each shot's final message and changed files, then "
-    + "compare the shots for the user.";
+write_scratch_file("shots.json", json_encode(#{
+    objective: args.prompt,
+    report: path,
+    shots: entries,
+}));
+overview += "\nFull report: " + path + "\nRead it for each shot's final message and changed "
+    + "files, then compare the shots for the user. After you apply the user's choice, call "
+    + "the n_shot tool with only `resolve` (the absolute path of report.md from this message, "
+    + "the outcome, the shot labels used, and a rationale) to record it.";
 complete(#{
     path: path,
     report: overview,

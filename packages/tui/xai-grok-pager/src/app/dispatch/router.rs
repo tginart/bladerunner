@@ -194,6 +194,7 @@ fn dispatch_cycle_scoped_model(app: &mut AppView, reverse: bool) -> Vec<Effect> 
         model_id,
         effort: None,
         prev_model_id: None,
+        scope: crate::app::actions::ModelSwitchScope::Preferred,
     }]
 }
 /// Dispatch an action: mutate state, return effects to execute.
@@ -1091,6 +1092,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 model_id,
                 effort,
                 prev_model_id: None,
+                scope: crate::app::actions::ModelSwitchScope::Preferred,
             }]
         }
         Action::AnnouncementsHide => {
@@ -1631,9 +1633,17 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenShots => {
             app.scroll_state.cancel_stream();
             app.last_scroll_pos = None;
-            with_active_agent(app, |agent| agent.open_latest_n_shot());
-            vec![]
+            match super::session::n_shot::open_latest_columns(app) {
+                Some(effects) => effects,
+                None => {
+                    with_active_agent(app, |agent| agent.open_latest_n_shot());
+                    vec![]
+                }
+            }
         }
+        Action::NShotColumnsAttach => super::session::n_shot::attach_focused_shot(app),
+        Action::OpenNShotColumns(label) => super::session::n_shot::open_columns(app, &label),
+        Action::OpenNShotParent => super::session::n_shot::open_parent_columns(app),
         Action::Rewind => dispatch_rewind(app),
         Action::RewindShowPicker => dispatch_rewind_show_picker(app),
         Action::RewindPickerSelect(prompt_index) => {
