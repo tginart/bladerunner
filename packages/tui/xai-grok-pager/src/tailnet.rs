@@ -71,13 +71,13 @@ mod tests {
             "BackendState": "Running",
             "Self": {"HostName": "mac", "OS": "macOS", "Online": true, "TailscaleIPs": ["100.1.1.1"]},
             "Peer": {
-                "a": {"HostName": "spark-500e", "OS": "linux", "Online": true, "TailscaleIPs": ["100.2.2.2"]},
+                "a": {"HostName": "dgx", "OS": "linux", "Online": true, "TailscaleIPs": ["100.2.2.2"]},
                 "b": {"HostName": "spark-b3fd", "OS": "linux", "Online": false, "TailscaleIPs": ["100.3.3.3"]}
             }
         });
         let report = format_report(&status).unwrap();
         assert!(report.starts_with("tailnet: 2 of 3 online"));
-        assert!(report.contains("spark-500e"));
+        assert!(report.contains("dgx"));
         assert!(report.contains("offline"));
     }
 
