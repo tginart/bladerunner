@@ -297,8 +297,9 @@ fn push_subagent_rows(
     }
 }
 
-/// Push the n-shot shots of `parent_id` as nested rows, in group and shot order.
-/// The rows keep their top-level id, so attach and pin work as for any session.
+/// Purpose: Append every session-shot descendant in group and shot order.
+/// Input: The rows with the parent last, the agent map, and dashboard view state.
+/// Output: Descendants keep their session ids, pin flags, and tree depth.
 fn push_n_shot_rows(
     rows: &mut Vec<DashboardRow>,
     agents: &IndexMap<AgentId, AgentView>,
@@ -308,6 +309,7 @@ fn push_n_shot_rows(
     active: Option<AgentId>,
     home: Option<&str>,
 ) {
+    let indent = rows.last().expect("parent row precedes its shots").indent + 1;
     let mut shots: Vec<(&crate::app::n_shot::NShotMember, AgentId, &AgentView)> = agents
         .iter()
         .filter_map(|(id, agent)| {
@@ -325,9 +327,10 @@ fn push_n_shot_rows(
             home,
         );
         row.label = format!("{} \u{00b7} {}", member.label, member.shot_label);
-        row.indent = 1;
+        row.indent = indent;
         row.parent_label = Some(top_level_label(parent));
         rows.push(row);
+        push_n_shot_rows(rows, agents, id, agent, pinned, active, home);
     }
 }
 /// Map a leader [`RosterActivity`] to the dashboard's coarse [`RowState`].
@@ -1323,6 +1326,97 @@ mod tests {
                 .all(|row| matches!(row.id, DashboardRowId::TopLevel(_)))
         );
         assert_eq!(live.len(), 2);
+    }
+
+    /// Purpose: Keep all session-shot descendants visible and attached to their tree.
+    /// Input: Three shot levels, a sibling, and a pinned descendant with a question.
+    /// Output: Both builders retain each session once at its correct depth.
+    #[test]
+    fn nested_session_shots_keep_depth_pins_questions_and_subagents() {
+        let mut agents = n_shot_agents_with_children(0);
+        for (id, parent, index) in [(2, 1, 1), (3, 2, 1), (4, 1, 2)] {
+            let mut shot = crate::app::agent_view::test_fixtures::make_agent();
+            shot.session.id = AgentId(id);
+            shot.n_shot = Some(crate::app::n_shot::NShotMember {
+                shot_label: format!("shot-{index}"),
+                creation_error: None,
+                label: "n-shot-1".into(),
+                index,
+                total: 2,
+                parent: AgentId(parent),
+            });
+            agents.insert(AgentId(id), shot);
+        }
+        let deepest = agents.get_mut(&AgentId(3)).unwrap();
+        deepest.question_view = Some(crate::views::question_view::QuestionViewState::new(
+            "question".into(),
+            vec![],
+            Default::default(),
+        ));
+        deepest.subagent_sessions.insert(
+            "nested-child".into(),
+            make_subagent("nested-child", false, None),
+        );
+        let pinned = std::collections::BTreeSet::from([DashboardRowId::TopLevel(AgentId(3))]);
+        for grouping in [
+            super::super::state::Grouping::State,
+            super::super::state::Grouping::Directory,
+        ] {
+            for include_subagents in [false, true] {
+                let rows = if include_subagents {
+                    build_rows(&agents, &pinned, &[], None, grouping, &Filter::None, None)
+                } else {
+                    build_rows_with_roster(
+                        &agents,
+                        &pinned,
+                        &[],
+                        None,
+                        grouping,
+                        &Filter::None,
+                        None,
+                        &[],
+                    )
+                };
+                let sessions: Vec<_> = rows
+                    .iter()
+                    .filter_map(|row| match row.id {
+                        DashboardRowId::TopLevel(id) => Some((id, row.indent)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    sessions,
+                    [
+                        (AgentId(0), 0),
+                        (AgentId(1), 1),
+                        (AgentId(2), 2),
+                        (AgentId(3), 3),
+                        (AgentId(4), 2),
+                    ]
+                );
+                let deepest = rows
+                    .iter()
+                    .find(|row| row.id == DashboardRowId::TopLevel(AgentId(3)))
+                    .unwrap();
+                assert!(deepest.pinned);
+                assert_eq!(deepest.state, RowState::NeedsInput);
+                let children: Vec<_> = rows
+                    .iter()
+                    .filter(|row| matches!(row.id, DashboardRowId::Subagent { .. }))
+                    .collect();
+                assert_eq!(children.len(), usize::from(include_subagents));
+                if include_subagents {
+                    assert_eq!(children[0].indent, 4);
+                    assert_eq!(
+                        children[0].id,
+                        DashboardRowId::Subagent {
+                            parent: AgentId(3),
+                            child_session_id: "nested-child".into(),
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

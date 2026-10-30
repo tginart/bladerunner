@@ -5152,8 +5152,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_impl/spawn.rs",
-      "bytes": 124284,
-      "sha256": "5423b6b9bab38168f209d208417ef395e0de97535b27680e74b9ec940aaf2a98",
+      "bytes": 125106,
+      "sha256": "b966681d6e004afa4a83ad695d45607a4ddbfb1c8a635a0d73ba1e635acdfbdd",
       "mode": "0644"
     },
     {
@@ -9820,8 +9820,8 @@
     },
     {
       "path": "packages/tools/xai-grok-tools/src/implementations/grok_build/n_shot/mod.rs",
-      "bytes": 13222,
-      "sha256": "f76972986517201f37007ebf3a462fbe81a55bd267f1c132a64b5d1d9391a09e",
+      "bytes": 13301,
+      "sha256": "ddba462bb4b7d7d47748ab9317cc46fa590f7ac99df22edb023d0ff84033226f",
       "mode": "0644"
     },
     {
@@ -10114,8 +10114,8 @@
     },
     {
       "path": "packages/tools/xai-grok-tools/src/implementations/grok_build/workflow/mod.rs",
-      "bytes": 17775,
-      "sha256": "4a7db38b73b9e0951b99e318e5a35a88f5397bccfce6a2a50269ac5030c7f6fd",
+      "bytes": 18141,
+      "sha256": "f3fe8908631b7b16a3f85cb8edff297ecb2659b9d04e5d4154d81304f9f775d3",
       "mode": "0644"
     },
     {
@@ -14710,8 +14710,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/session/n_shot.rs",
-      "bytes": 50016,
-      "sha256": "1eafa06ff52ed2c40ecc1757f106a2f085e24fa2b3a71e7f5be7e5d6c284551d",
+      "bytes": 53319,
+      "sha256": "d41e93d406bdca8b32f8e26d9d137a53c2dab84f55ac30676bd639dbb2408082",
       "mode": "0644"
     },
     {
@@ -16954,8 +16954,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/views/dashboard/row.rs",
-      "bytes": 87429,
-      "sha256": "016522f00f5e2124f39931a19d16c6e67b47874b7cac517aca0c667d1880533e",
+      "bytes": 91388,
+      "sha256": "85dc70f487c468aac25d955cb87b76a0ed927ecce7ebc5d90fccdd34e82becb4",
       "mode": "0644"
     },
     {

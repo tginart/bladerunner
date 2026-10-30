@@ -681,7 +681,7 @@ pub(in crate::app::dispatch) fn attach_focused_shot(app: &mut AppView) -> Vec<Ef
 /// Input: The app and the agent whose session loaded.
 /// Output: Load effects for the shots of groups that had not joined yet.
 /// Method:
-///     1. Skip shot sessions, and groups that are already in memory.
+///     1. Include shot sessions. Skip groups that are already in memory.
 ///     2. Read each `n-shot/<label>/shots.json` in the parent's session dir.
 ///     3. Record each group with its stored shots and show its block again.
 ///     4. Load the shots of a group that had not joined, so the tick can join it.
@@ -693,14 +693,22 @@ pub(in crate::app::dispatch) fn restore_groups(
     let Some(parent) = app.agents.get(&parent_id) else {
         return vec![];
     };
-    if parent.n_shot.is_some() {
-        return vec![];
-    }
     let Some(root) = n_shot_root(parent) else {
         return vec![];
     };
+    restore_stored_groups(app, parent_id, read_stored_groups(&root))
+}
+
+/// Purpose: Restore saved groups owned by any session, including a shot session.
+/// Input: The app, the owner session, and its saved group records.
+/// Output: Load effects for open groups. Known groups remain unchanged.
+fn restore_stored_groups(
+    app: &mut AppView,
+    parent_id: AgentId,
+    groups: Vec<StoredGroup>,
+) -> Vec<Effect> {
     let mut effects = Vec::new();
-    for stored in read_stored_groups(&root) {
+    for stored in groups {
         let is_known = app
             .n_shot_groups
             .iter()
@@ -1157,6 +1165,66 @@ mod tests {
         assert_eq!(classify_shot(Some(shot)), ShotStatus::Working);
         shot.subagent_sessions.get_mut("child").unwrap().finished = true;
         assert_eq!(classify_shot(Some(shot)), ShotStatus::Settled);
+    }
+
+    /// Purpose: Restore a shot's own groups without loss of its outer membership.
+    /// Input: Saved nested groups, both open and joined, read from an isolated directory.
+    /// Output: Open groups load at once. Joined groups load through the shot's columns.
+    #[test]
+    fn n_shot_restores_nested_groups_and_preserves_outer_membership() {
+        for joined in [false, true] {
+            let mut app = settled_group_app();
+            let shot_id = app.n_shot_groups[0].shots[0];
+            let membership = app.agents[&shot_id].n_shot.clone();
+            let dir = tempfile::tempdir().unwrap();
+            let group_dir = dir.path().join("n-shot-1");
+            std::fs::create_dir(&group_dir).unwrap();
+            let record = serde_json::json!({
+                "label": "n-shot-1", "objective": "nested fix", "joined": joined,
+                "shots": [{
+                    "label": "nested-shot", "session_id": "restored-nested-session",
+                    "worktree": "/wt/nested", "status": "working",
+                }],
+            });
+            std::fs::write(group_dir.join("shots.json"), pretty(&record)).unwrap();
+            let effects = restore_stored_groups(&mut app, shot_id, read_stored_groups(dir.path()));
+            assert_eq!(app.n_shot_groups.len(), 2);
+            assert_eq!(app.agents[&shot_id].n_shot, membership);
+            assert_eq!(app.n_shot_groups[1].parent, shot_id);
+            assert_eq!(app.n_shot_groups[1].joined, joined);
+            assert_eq!(
+                effects
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::LoadSession { .. }))
+                    .count(),
+                usize::from(!joined)
+            );
+            if !joined {
+                assert_eq!(classify_session_shot(&app, shot_id), ShotStatus::Working);
+                tick(&mut app);
+                files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+                assert!(!app.n_shot_groups[0].joined);
+            }
+            assert!(
+                restore_stored_groups(&mut app, shot_id, read_stored_groups(dir.path())).is_empty()
+            );
+            assert_eq!(app.n_shot_groups.len(), 2);
+            app.active_view = ActiveView::Agent(shot_id);
+            let effects = open_latest_columns(&mut app).expect("shot has its own group");
+            assert_eq!(
+                effects
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::LoadSession { .. }))
+                    .count(),
+                usize::from(joined)
+            );
+            let columns = app.n_shot_columns.as_ref().unwrap();
+            assert_eq!(columns.parent, Some(shot_id));
+            let nested_id = app.n_shot_groups[1].shots[0];
+            let nested = app.agents[&nested_id].n_shot.as_ref().unwrap();
+            assert_eq!(nested.parent, shot_id);
+            assert_eq!(nested.shot_label, "nested-shot");
+        }
     }
 
     #[test]

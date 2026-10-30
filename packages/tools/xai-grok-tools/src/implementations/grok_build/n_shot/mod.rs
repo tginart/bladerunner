@@ -11,7 +11,8 @@ mod decision;
 
 use super::task::types::SubagentDepthCounter;
 use super::workflow::{
-    WorkflowLaunchAck, WorkflowLaunchHandle, WorkflowLaunchRequest, WorkflowToolInput,
+    WorkflowLaunchAck, WorkflowLaunchHandle, WorkflowLaunchRequest, WorkflowLaunchSource,
+    WorkflowToolInput,
 };
 
 pub use decision::{NShotOutcome, NShotResolve};
@@ -219,6 +220,7 @@ impl xai_tool_runtime::Tool for NShotTool {
             )
         })?;
         let request = WorkflowLaunchRequest {
+            source: WorkflowLaunchSource::NShotTool,
             input: WorkflowToolInput {
                 agent_budget: None,
                 name: Some(N_SHOT_WORKFLOW_NAME.to_string()),
