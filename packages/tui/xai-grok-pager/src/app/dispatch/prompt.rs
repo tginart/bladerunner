@@ -496,6 +496,14 @@ pub(super) fn dispatch_send_prompt_inner(
     // checked before any slash command, so `/goal …` or `/loop …` around it
     // runs inside each shot instead of here.
     if !literal && let Some(args) = xai_grok_shell::session::find_n_shot_trigger(text.trim()) {
+        if let Some(agent) = app.agents.get_mut(&id)
+            && (!agent.prompt.images.is_empty() || agent.paste_probe_in_flight > 0)
+        {
+            agent.show_toast(
+                "/n-shot supports text only. Your draft and image attachments were kept.",
+            );
+            return vec![];
+        }
         let effects = super::session::n_shot::dispatch_n_shot(app, id, &args);
         // Keep the text when n-shot refused, so the user can fix and resend.
         if consume_input

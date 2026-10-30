@@ -202,65 +202,95 @@ fn build_local_rows(
         );
         rows.push(row);
         push_n_shot_rows(&mut rows, agents, *id, agent, pinned, active, home);
-        if !include_subagents {
-            continue;
-        }
-        let mut subagents: Vec<&SubagentInfo> = agent
-            .subagent_sessions
-            .values()
-            .filter(|info| info.workflow_run_id.is_none())
-            .collect();
-        subagents.sort_by(|a, b| {
-            let a_running = !a.finished;
-            let b_running = !b.finished;
-            match (a_running, b_running) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => b.started_at.cmp(&a.started_at),
-            }
-        });
-        let total = subagents.len();
-        let keep = MAX_VISIBLE_SUBAGENTS.min(total);
-        for info in subagents.iter().take(keep) {
-            rows.push(subagent_row(
-                *id,
-                agent,
-                info,
-                pinned.contains(&DashboardRowId::Subagent {
-                    parent: *id,
-                    child_session_id: info.child_session_id.to_string(),
-                }),
+    }
+    if include_subagents {
+        let parents = std::mem::take(&mut rows);
+        for row in parents {
+            let DashboardRowId::TopLevel(parent_id) = row.id else {
+                unreachable!("session rows must have top-level ids");
+            };
+            let indent = row.indent + 1;
+            rows.push(row);
+            push_subagent_rows(
+                &mut rows,
+                parent_id,
+                &agents[&parent_id],
+                pinned,
                 home,
-            ));
-        }
-        if total > keep {
-            let agent_label = top_level_label(agent);
-            rows.push(DashboardRow {
-                id: DashboardRowId::Subagent {
-                    parent: *id,
-                    child_session_id: format!("__more_{}", id.0),
-                },
-                label: format!("\u{2026} {} more", total - keep),
-                subtitle: None,
-                state: RowState::Idle,
-                activity: None,
-                secondary_line: None,
-                cwd_display: String::new(),
-                cwd: agent.session.cwd.clone(),
-                last_change_at: SystemTime::now(),
-                pinned: false,
-                is_active: false,
-                badges: Vec::new(),
-                context_pct: None,
-                indent: 1,
-                parent_label: Some(agent_label),
-                is_more_placeholder: true,
-                more_count: total - keep,
-            });
+                indent,
+            );
         }
     }
     rows
 }
+/// Purpose: Append the ordinary subagents of a session at the specified depth.
+/// Input: The rows, parent session, pin set, home directory, and child depth.
+/// Output: The rows include visible children and the existing collapse placeholder.
+fn push_subagent_rows(
+    rows: &mut Vec<DashboardRow>,
+    parent_id: AgentId,
+    agent: &AgentView,
+    pinned: &std::collections::BTreeSet<DashboardRowId>,
+    home: Option<&str>,
+    indent: u8,
+) {
+    let mut subagents: Vec<&SubagentInfo> = agent
+        .subagent_sessions
+        .values()
+        .filter(|info| info.workflow_run_id.is_none())
+        .collect();
+    subagents.sort_by(|a, b| {
+        let a_running = !a.finished;
+        let b_running = !b.finished;
+        match (a_running, b_running) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => b.started_at.cmp(&a.started_at),
+        }
+    });
+    let total = subagents.len();
+    let keep = MAX_VISIBLE_SUBAGENTS.min(total);
+    for info in subagents.iter().take(keep) {
+        let mut row = subagent_row(
+            parent_id,
+            agent,
+            info,
+            pinned.contains(&DashboardRowId::Subagent {
+                parent: parent_id,
+                child_session_id: info.child_session_id.to_string(),
+            }),
+            home,
+        );
+        row.indent = indent;
+        rows.push(row);
+    }
+    if total > keep {
+        let agent_label = top_level_label(agent);
+        rows.push(DashboardRow {
+            id: DashboardRowId::Subagent {
+                parent: parent_id,
+                child_session_id: format!("__more_{}", parent_id.0),
+            },
+            label: format!("\u{2026} {} more", total - keep),
+            subtitle: None,
+            state: RowState::Idle,
+            activity: None,
+            secondary_line: None,
+            cwd_display: String::new(),
+            cwd: agent.session.cwd.clone(),
+            last_change_at: SystemTime::now(),
+            pinned: false,
+            is_active: false,
+            badges: Vec::new(),
+            context_pct: None,
+            indent,
+            parent_label: Some(agent_label),
+            is_more_placeholder: true,
+            more_count: total - keep,
+        });
+    }
+}
+
 /// Push the n-shot shots of `parent_id` as nested rows, in group and shot order.
 /// The rows keep their top-level id, so attach and pin work as for any session.
 fn push_n_shot_rows(
@@ -1179,6 +1209,125 @@ mod tests {
                 .all(|row| !matches!(row.id, DashboardRowId::Subagent { .. }))
         );
     }
+    /// Purpose: Create a parent, one shot, and ordinary shot children.
+    /// Input: The number of ordinary children.
+    /// Output: The agent map. One extra workflow-owned child must stay hidden.
+    fn n_shot_agents_with_children(count: usize) -> IndexMap<AgentId, AgentView> {
+        let mut agents = IndexMap::new();
+        let mut parent = crate::app::agent_view::test_fixtures::make_agent();
+        parent
+            .scrollback
+            .push_block(crate::scrollback::block::RenderBlock::user_prompt(
+                "parent task",
+            ));
+        let mut shot = crate::app::agent_view::test_fixtures::make_agent();
+        shot.session.id = AgentId(1);
+        shot.n_shot = Some(crate::app::n_shot::NShotMember {
+            shot_label: "minimal-fix".into(),
+            creation_error: None,
+            label: "n-shot-1".into(),
+            index: 1,
+            total: 1,
+            parent: AgentId(0),
+        });
+        for i in 0..count {
+            let name = format!("child-{i}");
+            shot.subagent_sessions
+                .insert(name.clone(), make_subagent(&name, true, Some("completed")));
+        }
+        let mut workflow_child = make_subagent("workflow-child", false, None);
+        workflow_child.workflow_run_id = Some(Arc::from("wf-1"));
+        shot.subagent_sessions
+            .insert("workflow-child".into(), workflow_child);
+        agents.insert(AgentId(0), parent);
+        agents.insert(AgentId(1), shot);
+        agents
+    }
+
+    #[test]
+    fn full_tree_keeps_pinned_shot_children_and_live_dashboard_stays_session_only() {
+        let agents = n_shot_agents_with_children(2);
+        let child_id = DashboardRowId::Subagent {
+            parent: AgentId(1),
+            child_session_id: "child-0".into(),
+        };
+        let pinned = std::collections::BTreeSet::from([child_id.clone()]);
+        let rows = build_rows(
+            &agents,
+            &pinned,
+            &[],
+            None,
+            super::super::state::Grouping::State,
+            &Filter::None,
+            None,
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.id == DashboardRowId::TopLevel(AgentId(1)))
+                .count(),
+            1
+        );
+        let child = rows.iter().find(|row| row.id == child_id).unwrap();
+        assert!(child.pinned);
+        assert_eq!(child.indent, 2);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.id, DashboardRowId::Subagent { .. }))
+                .count(),
+            2
+        );
+        let shot_at = rows
+            .iter()
+            .position(|row| row.id == DashboardRowId::TopLevel(AgentId(1)))
+            .unwrap();
+        assert!(rows[shot_at + 1..].iter().all(|row| row.indent == 2));
+        let live = build_rows_with_roster(
+            &agents,
+            &pinned,
+            &[],
+            None,
+            super::super::state::Grouping::State,
+            &Filter::None,
+            None,
+            &[],
+        );
+        assert!(
+            live.iter()
+                .all(|row| matches!(row.id, DashboardRowId::TopLevel(_)))
+        );
+        assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn nested_shot_children_keep_the_collapse_limit_and_depth() {
+        let agents = n_shot_agents_with_children(MAX_VISIBLE_SUBAGENTS + 2);
+        let rows = build_rows(
+            &agents,
+            &Default::default(),
+            &[],
+            None,
+            super::super::state::Grouping::State,
+            &Filter::None,
+            None,
+        );
+        let children: Vec<&DashboardRow> = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.id,
+                    DashboardRowId::Subagent {
+                        parent: AgentId(1),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(children.len(), MAX_VISIBLE_SUBAGENTS + 1);
+        assert!(children.iter().all(|row| row.indent == 2));
+        let more = children.iter().find(|row| row.is_more_placeholder).unwrap();
+        assert_eq!(more.more_count, 2);
+    }
+
     #[test]
     fn classify_subagent_completed() {
         let info = make_subagent("a", true, Some("completed"));

@@ -4617,3 +4617,65 @@ fn suggestion_debounce_routes_by_agent_id_not_active_view() {
         "expiry must fetch for the arming agent even off-screen: {effects:?}"
     );
 }
+
+/// Purpose: Refuse text-only n-shot forks without loss of image attachments.
+/// Input: A draft with an image chip and a temporary image file.
+/// Output: The draft, attachment bytes, and temporary file remain unchanged.
+#[test]
+fn n_shot_image_submission_keeps_the_draft_and_staged_file() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = tmp.path().join("screenshot.png");
+    std::fs::write(&staged, [1, 2, 3]).unwrap();
+    let mut image = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
+        data: vec![1, 2, 3],
+        mime_type: "image/png".into(),
+    });
+    image.staged_temp_path = Some(staged.clone());
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.current_branch = Some("main".into());
+    agent.session.available_commands =
+        vec![acp::AvailableCommand::new("n-shot", "Parallel attempts")];
+    agent.prompt.set_text("/n-shot 2 inspect this screenshot ");
+    agent.prompt.insert_image(image).unwrap();
+    let draft = agent.prompt.text().to_string();
+    let effects = dispatch(Action::SendPrompt(draft.clone()), &mut app);
+    assert!(effects.is_empty());
+    assert_eq!(app.agents.len(), 1);
+    assert!(app.n_shot_groups.is_empty());
+    let agent = &app.agents[&id];
+    assert_eq!(agent.prompt.text(), draft);
+    assert_eq!(agent.prompt.images.len(), 1);
+    assert_eq!(
+        agent.prompt.images[0].staged_temp_path.as_ref(),
+        Some(&staged)
+    );
+    assert_eq!(std::fs::read(&staged).unwrap(), [1, 2, 3]);
+    assert!(agent.toast.as_ref().unwrap().0.contains("text only"));
+}
+
+#[test]
+fn n_shot_pending_image_probe_cannot_start_or_clear_the_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.current_branch = Some("main".into());
+    agent.session.available_commands =
+        vec![acp::AvailableCommand::new("n-shot", "Parallel attempts")];
+    let draft = "/n-shot 2 inspect this screenshot";
+    agent.prompt.set_text(draft);
+    agent.paste_probe_in_flight = 1;
+    let effects = dispatch(Action::SendPrompt(draft.into()), &mut app);
+    assert!(effects.is_empty());
+    assert_eq!(app.agents.len(), 1);
+    assert!(app.n_shot_groups.is_empty());
+    let agent = &app.agents[&id];
+    assert_eq!(agent.prompt.text(), draft);
+    assert_eq!(agent.paste_probe_in_flight, 1);
+    assert!(
+        agent.deferred_send.is_none(),
+        "the user must retry after the attachment arrives"
+    );
+    assert!(agent.session.pending_prompts.is_empty());
+}
