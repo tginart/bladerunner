@@ -469,15 +469,14 @@ async fn run_remote(sovereign: &Sovereign, remote_command: &str, output: Output)
     check_exit(result.status, remote_command, &sovereign.ssh, tail.as_deref().unwrap_or(""))
 }
 
-/// Copies the recipe's API key into the registry and the model entry when it changed.
+/// Copies the recipe's API key into the model entry and the registry.
 async fn refresh_api_key(home: &Path, name: &str, mut sovereign: Sovereign) -> Result<Sovereign> {
     let Some(key) = read_remote_key(&sovereign).await? else {
         return Ok(sovereign);
     };
-    if sovereign.api_key.as_deref() != Some(key.as_str()) {
-        sovereign.api_key = Some(key);
-        store_api_key(home, name, &sovereign)?;
-    }
+    sovereign.api_key = Some(key);
+    // Always store, so a model entry that drifted from the registry is repaired.
+    store_api_key(home, name, &sovereign)?;
     Ok(sovereign)
 }
 
@@ -545,20 +544,32 @@ fn load_registry(home: &Path) -> Result<Registry> {
 }
 
 fn save_registry(home: &Path, registry: &Registry) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let text = toml_edit::ser::to_string_pretty(registry)?;
-    let path = registry_path(home);
-    std::fs::write(&path, text)?;
     // The registry can hold an API key.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    write_private(&registry_path(home), &text)
+}
+
+/// Writes a file that only the owner can read, before any secret reaches the disk.
+fn write_private(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` applies only to a new file, so an existing one is restricted here.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(text.as_bytes())?;
     Ok(())
 }
 
+/// Copies the key into the model entry first, then the registry.
+///
+/// If the config write fails, the registry still lacks the key, so the next `up` fetches it again.
 fn store_api_key(home: &Path, name: &str, sovereign: &Sovereign) -> Result<()> {
     let key = sovereign.api_key.as_deref().context("no API key to store")?;
-    let mut registry = load_registry(home)?;
-    registry.sovereign.insert(name.to_string(), sovereign.clone());
-    save_registry(home, &registry)?;
     let mut doc = load_config_doc(home)?;
     let entry = doc
         .get_mut("model")
@@ -566,8 +577,10 @@ fn store_api_key(home: &Path, name: &str, sovereign: &Sovereign) -> Result<()> {
         .and_then(|entry| entry.as_table_mut())
         .with_context(|| format!("no model entry for {name} in config.toml"))?;
     entry["api_key"] = toml_edit::value(key);
-    std::fs::write(home.join(CONFIG_FILE), doc.to_string())?;
-    Ok(())
+    write_private(&home.join(CONFIG_FILE), &doc.to_string())?;
+    let mut registry = load_registry(home)?;
+    registry.sovereign.insert(name.to_string(), sovereign.clone());
+    save_registry(home, &registry)
 }
 
 fn load_config_doc(home: &Path) -> Result<toml_edit::DocumentMut> {
@@ -595,7 +608,11 @@ fn upsert_model_entry(home: &Path, name: &str, preset: &Preset, sovereign: &Sove
         .as_table_mut()
         .context("`model` in config.toml is not a table")?;
     models.insert(&model_key(name, &sovereign.slug), toml_edit::Item::Table(entry));
-    std::fs::write(home.join(CONFIG_FILE), doc.to_string())?;
+    let path = home.join(CONFIG_FILE);
+    if sovereign.api_key.is_some() {
+        return write_private(&path, &doc.to_string());
+    }
+    std::fs::write(path, doc.to_string())?;
     Ok(())
 }
 
@@ -762,6 +779,37 @@ mod tests {
         );
         let stored = load_registry(dir.path()).unwrap();
         assert_eq!(stored.sovereign["studio"].api_key.as_deref(), Some("mac-secret"));
+    }
+
+    #[test]
+    fn files_that_hold_a_key_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(CONFIG_FILE);
+        std::fs::write(&config, "[ui]\nyolo = false\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        add(dir.path(), "box", "qwen38-flash-mac-studio", "u@box", None, Some("k".into()), None).unwrap();
+        assert_eq!(mode(&config), 0o600);
+        assert_eq!(mode(&registry_path(dir.path())), 0o600);
+
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut sovereign = load_registry(dir.path()).unwrap().sovereign.remove("box").unwrap();
+        sovereign.api_key = Some("k2".into());
+        store_api_key(dir.path(), "box", &sovereign).unwrap();
+        assert_eq!(mode(&config), 0o600);
+    }
+
+    #[test]
+    fn a_failed_config_write_leaves_the_registry_key_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        add(dir.path(), "box", "qwen38-flash-mac-studio", "u@box", None, None, None).unwrap();
+        let mut sovereign = load_registry(dir.path()).unwrap().sovereign.remove("box").unwrap();
+        // The model entry is missing, as when config.toml was edited or restored.
+        std::fs::write(dir.path().join(CONFIG_FILE), "").unwrap();
+        sovereign.api_key = Some("k".into());
+        assert!(store_api_key(dir.path(), "box", &sovereign).is_err());
+        assert_eq!(load_registry(dir.path()).unwrap().sovereign["box"].api_key, None);
     }
 
     #[test]
