@@ -58,7 +58,7 @@ const PRESETS: &[Preset] = &[
         slug: "qwen-3.8-flash",
         model: "Qwen3.8-Flash-Next-4e8d8g",
         display: "Qwen 3.8 Flash",
-        context_window: 32_768,
+        context_window: 262_144,
     },
 ];
 
