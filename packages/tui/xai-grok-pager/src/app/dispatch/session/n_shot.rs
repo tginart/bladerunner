@@ -12,7 +12,7 @@ use crate::app::app_view::ActiveView;
 use crate::app::app_view::AppView;
 use crate::app::n_shot::{
     NShotColumnsState, NShotGroup, NShotMember, PendingShotStart, ShotSpec, ShotStatus,
-    ShotSummary, StoredGroup, build_record, build_report, classify_shot, join_prompt,
+    ShotSummary, StoredGroup, StoredShot, build_record, build_report, classify_shot, join_prompt,
     next_group_label, parse_record, shot_label,
 };
 use crate::scrollback::block::RenderBlock;
@@ -48,6 +48,7 @@ pub(in crate::app::dispatch) fn dispatch_n_shot(
     let label = next_group_label(&app.n_shot_groups, &app.n_shot_requests, parent_id);
     let shots = vec![
         ShotSpec {
+            label: None,
             prompt,
             model: None
         };
@@ -72,6 +73,7 @@ fn start_group(
     let total = shots.len();
     let objective = shots.first().map(|s| s.prompt.clone()).unwrap_or_default();
     let mut shot_ids = Vec::with_capacity(total);
+    let mut shot_labels = Vec::with_capacity(total);
     let mut effects = Vec::with_capacity(total);
     for (i, spec) in shots.into_iter().enumerate() {
         let first_prompt = spec.model.is_none().then(|| spec.prompt.clone());
@@ -80,8 +82,10 @@ fn start_group(
         else {
             break;
         };
+        let shot_name = spec.label.unwrap_or_else(|| shot_label(i + 1));
         if let Some(shot) = app.agents.get_mut(&shot_id) {
             shot.n_shot = Some(NShotMember {
+                shot_label: shot_name.clone(),
                 label: label.clone(),
                 index: i + 1,
                 total,
@@ -94,6 +98,7 @@ fn start_group(
             });
         }
         shot_ids.push(shot_id);
+        shot_labels.push(shot_name);
         effects.push(effect);
     }
     if shot_ids.is_empty() {
@@ -108,12 +113,15 @@ fn start_group(
         label,
         parent: parent_id,
         prompt: objective,
+        stored: vec![None; shot_ids.len()],
         shots: shot_ids,
+        shot_labels,
+        pending_write: None,
+        write_retry_at: None,
         joined: false,
         last_statuses: Vec::new(),
         started_at: std::time::Instant::now(),
         settled_after: None,
-        stored: Vec::new(),
     });
     effects
 }
@@ -213,13 +221,19 @@ fn push_parent_note(app: &mut AppView, parent_id: AgentId, text: String) {
 ///     1. Start accepted tool calls whose parent is idle, and model-held shots.
 ///     2. Classify each shot of each group that has not joined yet.
 ///     3. When a status changed, write `shots.json` and each shot's back-link.
-///     4. When every shot settled, write `report.md` and ask the parent to compare.
+///     4. When every shot settled, write `report.md`. Compare only after the write succeeds.
 pub(crate) fn tick(app: &mut AppView) -> Vec<Effect> {
     let mut effects = start_ready_requests(app);
     effects.extend(start_pending_shots(app));
     for group_idx in 0..app.n_shot_groups.len() {
+        remember_shots(app, group_idx);
         let group = app.n_shot_groups[group_idx].clone();
-        if group.joined {
+        if group.joined
+            || group.pending_write.is_some()
+            || group
+                .write_retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
+        {
             continue;
         }
         let Some(dir) = group_dir(app, &group) else {
@@ -239,7 +253,7 @@ pub(crate) fn tick(app: &mut AppView) -> Vec<Effect> {
         if all_settled {
             joined.settled_after = Some(group.started_at.elapsed());
         }
-        let mut files = vec![(
+        let record = (
             dir.join("shots.json"),
             pretty(&build_record(
                 &joined,
@@ -247,24 +261,97 @@ pub(crate) fn tick(app: &mut AppView) -> Vec<Effect> {
                 &report_path,
                 &shots,
             )),
-        )];
-        files.extend(back_links(app, &group, &parent_session_id, &dir));
+        );
+        let mut files = back_links(app, &group, &parent_session_id, &dir);
         if all_settled && !all_closed {
             files.push((report_path.clone(), build_report(&group, &shots)));
         }
-        effects.push(Effect::WriteNShotFiles { files });
-        upsert_group_block(app, &group, &shots, all_settled);
+        // Commit the joined record only after the report exists.
+        files.push(record);
+        effects.push(Effect::WriteNShotFiles {
+            parent: group.parent,
+            label: group.label.clone(),
+            files,
+        });
+        upsert_group_block(app, &group, &shots, false);
         let state = &mut app.n_shot_groups[group_idx];
-        state.last_statuses = statuses;
-        state.joined = all_settled;
-        if all_settled {
-            state.settled_after = Some(state.started_at.elapsed());
-        }
-        if all_settled && !all_closed {
-            effects.extend(ask_parent_to_compare(app, &group, &report_path));
-        }
+        state.pending_write = Some(shots);
+        state.write_retry_at = None;
+        state.settled_after = joined.settled_after;
     }
     effects
+}
+
+/// Purpose: Complete a group write before the parent can compare its report.
+/// Input: The app, the group identity, and the file writer result.
+/// Output: Compare effects on success. A failed write remains open for a retry.
+pub(in crate::app::dispatch) fn files_written(
+    app: &mut AppView,
+    parent: AgentId,
+    label: &str,
+    result: Result<(), String>,
+) -> Vec<Effect> {
+    let Some(state) = app
+        .n_shot_groups
+        .iter_mut()
+        .find(|g| g.parent == parent && g.label == label)
+    else {
+        return vec![];
+    };
+    let Some(shots) = state.pending_write.take() else {
+        return vec![];
+    };
+    if let Err(error) = result {
+        state.write_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        tracing::warn!(%error, %label, "failed to write n-shot files; will retry");
+        push_parent_note(
+            app,
+            parent,
+            format!("Cannot save {label}: {error}. Will retry before comparison."),
+        );
+        return vec![];
+    }
+    state.last_statuses = shots.iter().map(|s| s.status).collect();
+    state.joined = shots.iter().all(|s| s.status.is_settled());
+    let group = state.clone();
+    upsert_group_block(app, &group, &shots, group.joined);
+    if group.joined
+        && shots.iter().any(|s| s.status != ShotStatus::Closed)
+        && let Some(dir) = group_dir(app, &group)
+    {
+        return ask_parent_to_compare(app, &group, &dir.join("report.md"));
+    }
+    vec![]
+}
+
+/// Purpose: Retain each live shot's identity after its view closes.
+/// Input: The app and the group index.
+/// Output: The group stores the session id and worktree of each live shot.
+fn remember_shots(app: &mut AppView, group_idx: usize) {
+    let group = &mut app.n_shot_groups[group_idx];
+    for (i, shot_id) in group.shots.iter().enumerate() {
+        let Some(agent) = app.agents.get(shot_id) else {
+            continue;
+        };
+        let Some(session_id) = agent.session.session_id.as_ref() else {
+            continue;
+        };
+        group.stored[i] = Some(StoredShot {
+            label: group.shot_labels[i].clone(),
+            session_id: session_id.0.to_string(),
+            worktree: agent.session.is_worktree.then(|| agent.session.cwd.clone()),
+            status: classify_shot(Some(agent)),
+        });
+    }
+}
+
+/// Capture shot identities before the shared close helper removes a view.
+pub(in crate::app::dispatch) fn remember_closed_shot(app: &mut AppView, shot_id: AgentId) {
+    for i in 0..app.n_shot_groups.len() {
+        if app.n_shot_groups[i].shots.contains(&shot_id) {
+            remember_shots(app, i);
+        }
+    }
 }
 
 /// True while some group still waits for its shots.
@@ -309,7 +396,7 @@ fn upsert_group_block(app: &mut AppView, group: &NShotGroup, shots: &[ShotSummar
         block.phases = shots
             .iter()
             .map(|shot| WorkflowBlockPhase {
-                title: format!("{} {}", shot_label(shot.index), shot.status.label()),
+                title: format!("{} {}", shot.label, shot.status.label()),
                 state: match shot.status {
                     ShotStatus::Settled => "done",
                     ShotStatus::Closed => "closed",
@@ -336,14 +423,22 @@ fn summarize_shots(app: &AppView, group: &NShotGroup) -> Vec<ShotSummary> {
         .enumerate()
         .map(|(i, shot_id)| {
             let agent = app.agents.get(shot_id);
+            let stored = group.stored.get(i).and_then(Option::as_ref);
             ShotSummary {
+                label: group.shot_labels[i].clone(),
                 index: i + 1,
                 session_id: agent
                     .and_then(|a| a.session.session_id.as_ref())
-                    .map(|sid| sid.0.to_string()),
+                    .map(|sid| sid.0.to_string())
+                    .or_else(|| stored.map(|s| s.session_id.clone())),
                 worktree: agent
                     .filter(|a| a.session.is_worktree)
-                    .map(|a| a.session.cwd.to_string_lossy().into_owned()),
+                    .map(|a| a.session.cwd.to_string_lossy().into_owned())
+                    .or_else(|| {
+                        stored
+                            .and_then(|s| s.worktree.as_ref())
+                            .map(|p| p.to_string_lossy().into_owned())
+                    }),
                 status: classify_shot(agent),
                 final_message: agent.and_then(last_agent_message),
             }
@@ -408,7 +503,7 @@ fn back_links(
         };
         let link = serde_json::json!({
             "group": group.label,
-            "shot": shot_label(i + 1),
+            "shot": group.shot_labels[i],
             "index": i + 1,
             "total": group.shots.len(),
             "parent_session_id": parent_session_id,
@@ -620,13 +715,16 @@ fn restored_group(app: &mut AppView, parent_id: AgentId, stored: StoredGroup) ->
         parent: parent_id,
         prompt: stored.prompt,
         shots,
+        shot_labels: stored.shots.iter().map(|s| s.label.clone()).collect(),
+        pending_write: None,
+        write_retry_at: None,
         joined: stored.joined,
         last_statuses: stored.shots.iter().map(|s| s.status).collect(),
         started_at: std::time::Instant::now()
             .checked_sub(elapsed)
             .unwrap_or_else(std::time::Instant::now),
         settled_after: stored.joined.then_some(elapsed),
-        stored: stored.shots,
+        stored: stored.shots.into_iter().map(Some).collect(),
     }
 }
 
@@ -635,15 +733,19 @@ fn stored_summaries(group: &NShotGroup) -> Vec<ShotSummary> {
         .stored
         .iter()
         .enumerate()
-        .map(|(i, shot)| ShotSummary {
-            index: i + 1,
-            session_id: Some(shot.session_id.clone()),
-            worktree: shot
-                .worktree
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            status: shot.status,
-            final_message: None,
+        .filter_map(|(i, shot)| {
+            let shot = shot.as_ref()?;
+            Some(ShotSummary {
+                label: shot.label.clone(),
+                index: i + 1,
+                session_id: Some(shot.session_id.clone()),
+                worktree: shot
+                    .worktree
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                status: shot.status,
+                final_message: None,
+            })
         })
         .collect()
 }
@@ -668,7 +770,7 @@ fn load_stored_shots(app: &mut AppView, parent_id: AgentId, label: &str) -> Vec<
         if app.agents.contains_key(&group.shots[i]) {
             continue;
         }
-        let Some(stored) = group.stored.get(i).cloned() else {
+        let Some(stored) = group.stored.get(i).and_then(Clone::clone) else {
             continue;
         };
         if find_agent_by_session(app, &stored.session_id).is_none() {
@@ -684,6 +786,7 @@ fn load_stored_shots(app: &mut AppView, parent_id: AgentId, label: &str) -> Vec<
         };
         if let Some(shot) = app.agents.get_mut(&shot_id) {
             shot.n_shot = Some(NShotMember {
+                shot_label: stored.label.clone(),
                 label: label.to_string(),
                 index: i + 1,
                 total,
@@ -710,4 +813,116 @@ fn find_agent_by_session(app: &AppView, session_id: &str) -> Option<AgentId> {
         let sid = agent.session.session_id.as_ref()?;
         (*sid.0 == *session_id).then_some(*id)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::agent::AgentState;
+    use crate::app::dispatch::tests::test_app_with_agent;
+
+    /// Purpose: Create settled shots with custom labels and an inspectable parent queue.
+    /// Input: None.
+    /// Output: The app, without any filesystem or ACP effects.
+    fn settled_group_app() -> AppView {
+        let mut app = test_app_with_agent();
+        let specs = crate::app::n_shot::parse_request_shots(&serde_json::json!({
+            "prompt": "fix it",
+            "shots": [{ "label": "minimal-fix" }, { "label": "rewrite" }],
+        }))
+        .unwrap();
+        assert_eq!(
+            start_group(&mut app, AgentId(0), "n-shot-1".into(), specs).len(),
+            2
+        );
+        for shot_id in app.n_shot_groups[0].shots.clone() {
+            let shot = app.agents.get_mut(&shot_id).unwrap();
+            shot.session.session_id = Some(agent_client_protocol::SessionId::new(format!(
+                "s{}",
+                shot_id.0
+            )));
+            shot.session.cwd = std::path::PathBuf::from(format!("/wt/{}", shot_id.0));
+            shot.session.is_worktree = true;
+            shot.session.state = AgentState::Idle;
+            shot.pending_first_prompt = None;
+        }
+        // Hold comparison prompts in the queue so tests can inspect them.
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .loading_replay = true;
+        app
+    }
+
+    #[test]
+    fn n_shot_closed_view_keeps_identity_record_and_click_through() {
+        let mut app = settled_group_app();
+        let closed_id = app.n_shot_groups[0].shots[0];
+        // Close before the first tick to cover the earliest possible removal.
+        super::super::modal::remove_agent_and_cleanup(&mut app, closed_id);
+        let effects = tick(&mut app);
+        let group = &app.n_shot_groups[0];
+        let shots = group.pending_write.as_ref().unwrap();
+        assert_eq!(shots[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(shots[0].worktree.as_deref(), Some("/wt/1"));
+        assert_eq!(shots[0].status, ShotStatus::Closed);
+        let record = build_record(group, "parent", std::path::Path::new("/r/report.md"), shots);
+        let stored = parse_record(&record).unwrap();
+        assert_eq!(stored.shots.len(), 2);
+        assert_eq!(stored.shots[0].label, "minimal-fix");
+        assert_eq!(stored.shots[1].session_id, "s2");
+        assert!(matches!(&effects[0], Effect::WriteNShotFiles { .. }));
+        let restored = restored_group(&mut app, AgentId(0), stored);
+        assert_eq!(restored.shot_labels, ["minimal-fix", "rewrite"]);
+        assert_eq!(
+            stored_summaries(&restored)[0].session_id.as_deref(),
+            Some("s1")
+        );
+        let loads = open_columns(&mut app, "n-shot-1");
+        assert!(!loads.is_empty());
+        let group = &app.n_shot_groups[0];
+        let reloaded = &app.agents[&group.shots[0]];
+        assert_eq!(reloaded.n_shot.as_ref().unwrap().shot_label, "minimal-fix");
+    }
+
+    #[test]
+    fn n_shot_comparison_waits_for_report_write_success() {
+        let mut app = settled_group_app();
+        let effects = tick(&mut app);
+        assert!(!app.n_shot_groups[0].joined);
+        assert!(app.agents[&AgentId(0)].session.pending_prompts.is_empty());
+        assert!(tick(&mut app).is_empty(), "one write at a time");
+        let Effect::WriteNShotFiles { files, .. } = &effects[0] else {
+            panic!("missing writer")
+        };
+        assert!(files.last().unwrap().0.ends_with("shots.json"));
+        assert!(
+            files
+                .iter()
+                .any(|(path, report)| path.ends_with("report.md")
+                    && report.contains("## minimal-fix"))
+        );
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(app.n_shot_groups[0].joined);
+        assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+    }
+
+    #[test]
+    fn n_shot_failed_report_write_retries_without_join_or_comparison() {
+        let mut app = settled_group_app();
+        tick(&mut app);
+        files_written(&mut app, AgentId(0), "n-shot-1", Err("disk full".into()));
+        assert!(!app.n_shot_groups[0].joined);
+        assert!(app.n_shot_groups[0].pending_write.is_none());
+        assert!(app.agents[&AgentId(0)].session.pending_prompts.is_empty());
+        assert!(tick(&mut app).is_empty(), "wait for the retry delay");
+        app.n_shot_groups[0].write_retry_at = Some(std::time::Instant::now());
+        assert!(matches!(&tick(&mut app)[0], Effect::WriteNShotFiles { .. }));
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(app.n_shot_groups[0].joined);
+        assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+    }
 }

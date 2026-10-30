@@ -22,6 +22,10 @@ pub(crate) struct NShotGroup {
     pub prompt: String,
     /// Shot agents, in shot order.
     pub shots: Vec<AgentId>,
+    pub shot_labels: Vec<String>,
+    /// File snapshot that must complete before the join or another write.
+    pub pending_write: Option<Vec<ShotSummary>>,
+    pub write_retry_at: Option<std::time::Instant>,
     /// True after the parent was asked to compare the shots.
     pub joined: bool,
     /// Shot statuses at the last tick, to write the record only on change.
@@ -29,9 +33,9 @@ pub(crate) struct NShotGroup {
     pub started_at: std::time::Instant,
     /// Time from launch until every shot settled. Set at the join.
     pub settled_after: Option<std::time::Duration>,
-    /// Shots read back from `shots.json` after a resume, in shot order. Empty
-    /// for a group started in this run. A stored shot loads on demand.
-    pub stored: Vec<StoredShot>,
+    /// Durable shot identities, in shot order. A session can load on demand.
+    /// A slot is empty until the session has an id.
+    pub stored: Vec<Option<StoredShot>>,
 }
 
 impl NShotGroup {
@@ -45,6 +49,7 @@ impl NShotGroup {
 /// A shot as `shots.json` records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredShot {
+    pub label: String,
     pub session_id: String,
     pub worktree: Option<std::path::PathBuf>,
     pub status: ShotStatus,
@@ -63,6 +68,7 @@ pub(crate) struct StoredGroup {
 /// Marks an agent as shot `index` of `total` in the group `label`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NShotMember {
+    pub shot_label: String,
     pub label: String,
     pub index: usize,
     pub total: usize,
@@ -72,6 +78,7 @@ pub(crate) struct NShotMember {
 /// One shot to start: its first prompt and an optional model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShotSpec {
+    pub label: Option<String>,
     pub prompt: String,
     pub model: Option<String>,
 }
@@ -114,6 +121,7 @@ pub(crate) fn parse_request_shots(args: &serde_json::Value) -> Result<Vec<ShotSp
                     .or_else(|| default_prompt.clone())
                     .ok_or_else(|| "every shot needs a prompt".to_string())?;
                 Ok(ShotSpec {
+                    label: text(&item["label"]),
                     prompt,
                     model: text(&item["model"]),
                 })
@@ -124,6 +132,7 @@ pub(crate) fn parse_request_shots(args: &serde_json::Value) -> Result<Vec<ShotSp
             let n = args["n"].as_u64().unwrap_or(2) as usize;
             vec![
                 ShotSpec {
+                    label: None,
                     prompt,
                     model: None
                 };
@@ -247,6 +256,7 @@ pub(crate) fn next_group_label(
 /// One shot, as the record, the report, and the widget show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShotSummary {
+    pub label: String,
     pub index: usize,
     pub session_id: Option<String>,
     pub worktree: Option<String>,
@@ -272,7 +282,7 @@ pub(crate) fn build_record(
         .map(|shot| {
             serde_json::json!({
                 "index": shot.index,
-                "label": shot_label(shot.index),
+                "label": shot.label,
                 "session_id": shot.session_id,
                 "worktree": shot.worktree,
                 "status": shot.status.label(),
@@ -296,8 +306,12 @@ pub(crate) fn build_record(
 ///     no session id.
 pub(crate) fn parse_record(record: &serde_json::Value) -> Option<StoredGroup> {
     let mut shots = Vec::new();
-    for shot in record["shots"].as_array()? {
+    for (i, shot) in record["shots"].as_array()?.iter().enumerate() {
         shots.push(StoredShot {
+            label: shot["label"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| shot_label(i + 1)),
             session_id: shot["session_id"].as_str()?.to_string(),
             worktree: shot["worktree"].as_str().map(std::path::PathBuf::from),
             status: match shot["status"].as_str() {
@@ -334,7 +348,7 @@ pub(crate) fn build_report(group: &NShotGroup, shots: &[ShotSummary]) -> String 
     for shot in shots {
         report.push_str(&format!(
             "## {}\n\n- Status: {}\n- Session: {}\n- Worktree: {}\n\n### Final message\n\n{}\n\n",
-            shot_label(shot.index),
+            shot.label,
             shot.status.label(),
             shot.session_id.as_deref().unwrap_or("(none)"),
             shot.worktree.as_deref().unwrap_or("(none)"),
@@ -371,6 +385,9 @@ mod tests {
             parent: AgentId(0),
             prompt: "/goal fix it".into(),
             shots: vec![AgentId(1), AgentId(2)],
+            shot_labels: vec![shot_label(1), shot_label(2)],
+            pending_write: None,
+            write_retry_at: None,
             joined: false,
             last_statuses: vec![],
             started_at: std::time::Instant::now(),
@@ -381,6 +398,7 @@ mod tests {
 
     fn shot(index: usize, status: ShotStatus) -> ShotSummary {
         ShotSummary {
+            label: shot_label(index),
             index,
             session_id: Some(format!("s{index}")),
             worktree: Some(format!("/wt/{index}")),
@@ -432,6 +450,7 @@ mod tests {
         assert_eq!(
             stored.shots[1],
             StoredShot {
+                label: "shot-2".into(),
                 session_id: "s2".into(),
                 worktree: Some("/wt/2".into()),
                 status: ShotStatus::Closed,
@@ -440,6 +459,31 @@ mod tests {
         let mut no_session = record.clone();
         no_session["shots"][0]["session_id"] = serde_json::Value::Null;
         assert_eq!(parse_record(&no_session), None);
+    }
+
+    #[test]
+    fn custom_labels_survive_request_report_record_and_resume() {
+        let specs = parse_request_shots(&serde_json::json!({
+            "prompt": "fix it",
+            "shots": [{ "label": "minimal-fix" }, { "label": "rewrite" }, {}],
+        }))
+        .unwrap();
+        assert_eq!(specs[0].label.as_deref(), Some("minimal-fix"));
+        assert_eq!(specs[1].label.as_deref(), Some("rewrite"));
+        assert_eq!(specs[2].label, None);
+        let mut shots = vec![shot(1, ShotStatus::Settled), shot(2, ShotStatus::Closed)];
+        shots[0].label = "minimal-fix".into();
+        shots[1].label = "rewrite".into();
+        let mut record = build_record(&group(), "parent", Path::new("/r/report.md"), &shots);
+        assert_eq!(record["shots"][0]["label"], "minimal-fix");
+        let stored = parse_record(&record).unwrap();
+        assert_eq!(stored.shots[0].label, "minimal-fix");
+        assert_eq!(stored.shots[1].label, "rewrite");
+        let report = build_report(&group(), &shots);
+        assert!(report.contains("## minimal-fix"));
+        assert!(report.contains("## rewrite"));
+        record["shots"][0].as_object_mut().unwrap().remove("label");
+        assert_eq!(parse_record(&record).unwrap().shots[0].label, "shot-1");
     }
 
     #[test]
@@ -469,6 +513,7 @@ mod tests {
         assert_eq!(
             varied[0],
             ShotSpec {
+                label: None,
                 prompt: "fix it".into(),
                 model: Some("m1".into())
             }
@@ -476,6 +521,7 @@ mod tests {
         assert_eq!(
             varied[1],
             ShotSpec {
+                label: None,
                 prompt: "rewrite it".into(),
                 model: None
             }

@@ -2183,7 +2183,7 @@ pub(crate) fn execute(
                     TaskResult::CancelComplete
                 });
         }
-        Effect::WriteNShotFiles { files } => {
+        Effect::WriteNShotFiles { parent, label, files } => {
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     for (path, contents) in files {
@@ -2195,12 +2195,9 @@ pub(crate) fn execute(
                     Ok::<(), std::io::Error>(())
                 })
                 .await;
-                match result {
-                    Ok(Err(e)) => tracing::warn!(error = %e, "failed to write n-shot files"),
-                    Err(e) => tracing::warn!(error = %e, "n-shot file writer failed"),
-                    Ok(Ok(())) => {}
-                }
-                TaskResult::CancelComplete
+                let result = result.map_err(|e| e.to_string())
+                    .and_then(|result| result.map_err(|e| e.to_string()));
+                TaskResult::NShotFilesWritten { parent, label, result }
             });
         }
         Effect::PersistWorktreeMode { mode, config_key } => {

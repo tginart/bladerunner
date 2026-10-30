@@ -1735,6 +1735,8 @@ pub enum Effect {
     /// Write n-shot group files (`shots.json`, `report.md`, shot back-links).
     /// Each pair is a path and its full contents; parent dirs are created.
     WriteNShotFiles {
+        parent: AgentId,
+        label: String,
         files: Vec<(std::path::PathBuf, String)>,
     },
     /// Persist a per-command worktree mode preference to `[hints]` in
@@ -2639,6 +2641,12 @@ pub enum TaskResult {
     /// Cancel notification was sent (fire-and-forget).
     /// The real turn end comes via PromptResponse.
     CancelComplete,
+    /// The n-shot files are durable, or the group must retry before comparison.
+    NShotFilesWritten {
+        parent: AgentId,
+        label: String,
+        result: Result<(), String>,
+    },
     /// Response to `x.ai/subagent/cancel`; see [`SubagentKillOutcome`].
     KillSubagentComplete {
         session_id: acp::SessionId,

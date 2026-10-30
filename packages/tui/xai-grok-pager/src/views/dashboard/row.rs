@@ -288,11 +288,7 @@ fn push_n_shot_rows(
             active == Some(id),
             home,
         );
-        row.label = format!(
-            "{} \u{00b7} {}",
-            member.label,
-            crate::app::n_shot::shot_label(member.index)
-        );
+        row.label = format!("{} \u{00b7} {}", member.label, member.shot_label);
         row.indent = 1;
         row.parent_label = Some(top_level_label(parent));
         rows.push(row);

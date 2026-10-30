@@ -116,7 +116,7 @@ pub(crate) fn render_session_columns(
     group: &crate::app::n_shot::NShotGroup,
     agents: &indexmap::IndexMap<crate::app::agent::AgentId, crate::app::agent_view::AgentView>,
 ) {
-    use crate::app::n_shot::{classify_shot, shot_label};
+    use crate::app::n_shot::classify_shot;
     use crate::views::workflows::WorkflowAgentLiveStatus;
 
     let theme = Theme::current();
@@ -148,7 +148,7 @@ pub(crate) fn render_session_columns(
         let key = shot_id.0.to_string();
         rows.push(WorkflowAgentRowView {
             agent_id: key.clone(),
-            label: shot_label(i + 1),
+            label: group.shot_labels[i].clone(),
             phase: Some("Shots".to_string()),
             model: None,
             state: if status.is_settled() {

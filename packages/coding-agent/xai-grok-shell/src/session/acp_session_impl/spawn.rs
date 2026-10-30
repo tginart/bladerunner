@@ -9,6 +9,77 @@
 #![allow(clippy::items_after_test_module)]
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
+
+/// Purpose: Select n-shot requests that can use client sessions.
+/// Input: The workflow tool input.
+/// Output: The shot args, or None to preserve the workflow enforcement path.
+/// Note: Client sessions do not enforce explicit workflow agent budgets.
+fn n_shot_session_args(
+    input: &xai_grok_tools::implementations::grok_build::workflow::WorkflowToolInput,
+) -> Option<&serde_json::Value> {
+    use xai_grok_tools::implementations::grok_build::n_shot::N_SHOT_WORKFLOW_NAME;
+
+    if input.name.as_deref() != Some(N_SHOT_WORKFLOW_NAME)
+        || input.validate_only
+        || input.agent_budget.is_some()
+    {
+        return None;
+    }
+    input.args.as_ref()
+}
+
+#[cfg(test)]
+mod n_shot_session_budget_tests {
+    use super::n_shot_session_args;
+    use xai_grok_tools::implementations::grok_build::workflow::WorkflowToolInput;
+
+    fn input(args: serde_json::Value, agent_budget: Option<u64>) -> WorkflowToolInput {
+        serde_json::from_value(serde_json::json!({
+            "name": "n-shot",
+            "args": args,
+            "agent_budget": agent_budget,
+        }))
+        .unwrap()
+    }
+
+    /// Purpose: Keep explicit budgets on the workflow path for both shot formats.
+    /// Input: Two shots and a budget below, equal to, or above the shot count.
+    /// Output: No client-session interception, including for invalid budgets.
+    #[test]
+    fn explicit_budgets_preserve_workflow_enforcement() {
+        let cases = [
+            serde_json::json!({ "n": 2, "prompt": "fix it" }),
+            serde_json::json!({ "shots": [{ "prompt": "first" }, { "prompt": "second" }] }),
+        ];
+        for args in cases {
+            for budget in [0, 1, 2, WorkflowToolInput::MAX_AGENT_BUDGET + 1] {
+                let input = input(args.clone(), Some(budget));
+                assert!(
+                    n_shot_session_args(&input).is_none(),
+                    "budget {budget} must use workflow enforcement: {args}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_budget_keeps_client_session_shots() {
+        let input = input(serde_json::json!({ "n": 2, "prompt": "fix it" }), None);
+        assert_eq!(n_shot_session_args(&input), input.args.as_ref());
+        assert!(n_shot_session_args(&input).is_some());
+    }
+
+    #[test]
+    fn validation_and_other_workflows_keep_workflow_path() {
+        let mut input = input(serde_json::json!({ "n": 2, "prompt": "fix it" }), None);
+        input.validate_only = true;
+        assert!(n_shot_session_args(&input).is_none());
+        input.validate_only = false;
+        input.name = Some("deep-research".into());
+        assert!(n_shot_session_args(&input).is_none());
+    }
+}
+
 /// Partition CLI `--allow` rules under the pin: blanket catch-all allows
 /// (`Allow(Any)` `*` / `**`, plus bare/match-all Bash/MCP/WebFetch grants — see
 /// `resolution::is_catchall_allow`) substitute for the blocked `--yolo`, so drop them when
@@ -1306,16 +1377,12 @@ pub(crate) async fn spawn_session_actor(
         // Local: the client request for session shots is not `Send`.
         tokio::task::spawn_local(async move {
             use crate::session::workflow::registry;
-            use xai_grok_tools::implementations::grok_build::n_shot::{
-                N_SHOT_SESSION_TASK_ID, N_SHOT_WORKFLOW_NAME,
-            };
+            use xai_grok_tools::implementations::grok_build::n_shot::N_SHOT_SESSION_TASK_ID;
             use xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchAck;
             while let Some((req, ack)) = workflow_launch_rx.recv().await {
-                // An `n_shot` tool call runs as client sessions when the client
-                // supports them; otherwise it falls through to subagent shots.
-                if req.input.name.as_deref() == Some(N_SHOT_WORKFLOW_NAME)
-                    && !req.input.validate_only
-                    && let Some(args) = req.input.args.as_ref()
+                // Explicit budgets stay on the workflow path, which validates
+                // the cap and reserves the entire panel before any child starts.
+                if let Some(args) = n_shot_session_args(&req.input)
                     && let Some(label) =
                         crate::session::workflow::n_shot_sessions::request_session_shots(
                             &launch_gateway,
