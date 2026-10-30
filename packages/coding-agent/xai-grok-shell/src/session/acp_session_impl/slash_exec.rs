@@ -21,6 +21,11 @@ impl SessionActor {
                 self.send_host_turn_slash_command_output(&message).await;
                 ok_end_turn(0, None)
             }
+            BuiltinAction::Hub { args } => {
+                let message = self.run_hub_command(args).await;
+                self.send_host_turn_slash_command_output(&message).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::Compact { user_context } => {
                 self.run_compact(user_context).await?;
                 ok_end_turn(0, None)
@@ -1079,5 +1084,23 @@ impl SessionActor {
         }
 
         ok_end_turn(0, None)
+    }
+
+    /// Run `/hub` for the person. Hub calls touch disk, so they run off the actor.
+    async fn run_hub_command(self: &Arc<Self>, args: String) -> String {
+        let Some(bus) = self.rebuild_spec.agent_bus.as_ref() else {
+            return "/hub: hubs are not available in this session.".to_string();
+        };
+        let bus = bus.bus().clone();
+        let cwd_name = std::path::Path::new(&self.session_info.cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let default_handle = crate::session::hub::default_handle(&cwd_name);
+        tokio::task::spawn_blocking(move || {
+            crate::session::hub::run_command(&bus, &args, &default_handle)
+        })
+        .await
+        .unwrap_or_else(|e| format!("/hub: {e}"))
     }
 }

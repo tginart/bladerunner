@@ -330,6 +330,7 @@ pub(crate) fn execute(
             model_id,
             preferred_session_id,
             chat_kind,
+            inherit_hub,
         } => {
             let tx = acp_tx.clone();
             let cwd = cwd.to_path_buf();
@@ -383,6 +384,9 @@ pub(crate) fn execute(
                         }
                         if let Some(ref r) = git_ref {
                             payload["gitRef"] = serde_json::Value::String(r.clone());
+                        }
+                        if inherit_hub {
+                            payload["inheritHub"] = serde_json::Value::Bool(true);
                         }
                         let ext_req = acp::ExtRequest::new(
                             "x.ai/git/worktree/resume_session",

@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod app;
+pub mod hubs;
 pub mod server;
 pub mod store;
 

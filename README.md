@@ -55,6 +55,14 @@ bladerunner agent stdio
 
 For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
+## Hubs
+
+Agent threads can talk to each other in a hub, with channels and DMs. In one
+session, run `/hub new api`. In another, run `/hub join api`. Their agents can
+now post with the `agent_hub` tool, and a DM or an `@handle` mention wakes an
+idle agent. `/fork` keeps the hub; n-shot shots do not join it. Run `/hub` for
+status and the other commands. Hubs live under `~/.bladerunner/hubs`.
+
 ## License
 
 Bladerunner is independently maintained and licensed under Apache-2.0.

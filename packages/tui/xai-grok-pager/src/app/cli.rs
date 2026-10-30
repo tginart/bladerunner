@@ -782,6 +782,13 @@ pub struct PagerArgs {
     /// directory). Without this flag, resume restores conversation only.
     #[arg(long = "restore-code", requires = "resume_session")]
     pub restore_code: bool,
+    /// Join this agent hub at startup (`/hub join <name>`), so agent threads
+    /// started from scripts can talk to each other.
+    #[arg(long = "hub", value_name = "NAME")]
+    pub hub: Option<String>,
+    /// With `--hub`, create the hub when it does not exist yet.
+    #[arg(long = "hub-create", requires = "hub")]
+    pub hub_create: bool,
     /// Disable plan mode.
     #[arg(long = "no-plan")]
     pub no_plan: bool,
@@ -1201,6 +1208,17 @@ impl PagerArgs {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
+
+    /// The `/hub join` command that `--hub` runs before any initial prompt.
+    pub fn hub_join_command(&self) -> Option<String> {
+        let name = self
+            .hub
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let create = if self.hub_create { " --create" } else { "" };
+        Some(format!("/hub join {name}{create}"))
+    }
 }
 /// Credential helpers behind `bladerunner auth <helper>`.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -1550,6 +1568,20 @@ mod tests {
     fn debug_file_flag_defaults_to_none() {
         let args = PagerArgs::try_parse_from(["grok"]).expect("bare grok parses");
         assert!(args.debug_file.is_none());
+    }
+    #[test]
+    fn hub_flags_build_the_join_command() {
+        let args = PagerArgs::try_parse_from(["grok", "--hub", "api", "fix it"]).unwrap();
+        assert_eq!(args.hub_join_command().as_deref(), Some("/hub join api"));
+        assert_eq!(args.initial_prompt(), Some("fix it"));
+        let args = PagerArgs::try_parse_from(["grok", "--hub", "api", "--hub-create"]).unwrap();
+        assert_eq!(
+            args.hub_join_command().as_deref(),
+            Some("/hub join api --create")
+        );
+        assert!(PagerArgs::try_parse_from(["grok", "--hub-create"]).is_err());
+        let args = PagerArgs::try_parse_from(["grok"]).unwrap();
+        assert_eq!(args.hub_join_command(), None);
     }
     #[test]
     fn positional_prompt_seeds_interactive_session() {

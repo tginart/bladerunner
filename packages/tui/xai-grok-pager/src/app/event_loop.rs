@@ -1762,7 +1762,10 @@ pub(crate) async fn run(
             return Ok(finish_run(&mut app));
         }
         presenter.request_presentation(&mut app, terminal, false);
-    } else if args.initial_prompt().is_none() && !minimal_will_open_session(&term_state, &app) {
+    } else if args.initial_prompt().is_none()
+        && args.hub_join_command().is_none()
+        && !minimal_will_open_session(&term_state, &app)
+    {
         // No session work follows: startup ends at interactive.
         app.finish_startup(xai_grok_telemetry::startup::StartupOutcome::Ok);
     }
@@ -1773,11 +1776,20 @@ pub(crate) async fn run(
     // accounts cannot start a session, so drop the prompt — this mirrors the
     // deferred post-login path, which clears the startup prompt for ZDR-blocked
     // accounts. When not yet authenticated, stash it for `AuthComplete`.
-    if let Some(initial_prompt) = args.initial_prompt() {
+    // `--hub <name>` joins the hub first; a positional prompt follows it in
+    // the same session's queue.
+    let startup_prompts: Vec<String> = args
+        .hub_join_command()
+        .into_iter()
+        .chain(args.initial_prompt().map(str::to_string))
+        .collect();
+    if let Some((first_prompt, queued)) = startup_prompts.split_first() {
         if !app.session_startup_allowed() {
-            app.deferred_startup.prompt = Some(initial_prompt.to_string());
+            app.deferred_startup.prompt = Some(first_prompt.clone());
+            app.deferred_startup.queued_prompts = queued.to_vec();
         } else if !app.is_zdr_blocked() {
-            let effs = dispatch::dispatch_initial_prompt(&mut app, initial_prompt.to_string());
+            let effs = dispatch::dispatch_initial_prompt(&mut app, first_prompt.clone());
+            dispatch::enqueue_startup_prompts(&mut app, queued);
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(finish_run(&mut app));
             }
@@ -4294,6 +4306,7 @@ mod tests {
             model_id: None,
             preferred_session_id: None,
             chat_kind: false,
+            inherit_hub: false,
         };
         assert!(welcome_oneshot_applies_to_effects(std::slice::from_ref(
             &worktree
@@ -4380,6 +4393,7 @@ mod tests {
             model_id: None,
             preferred_session_id: None,
             chat_kind: false,
+            inherit_hub: false,
         };
         assert_eq!(
             take_load_restore_code(&mut app, std::slice::from_ref(&wt)),

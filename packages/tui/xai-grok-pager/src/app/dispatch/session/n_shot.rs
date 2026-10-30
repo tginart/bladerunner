@@ -970,6 +970,14 @@ mod tests {
                 .count(),
             2
         );
+        // Shots are independent replications: they never inherit a hub.
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CreateWorktreeSession {
+                inherit_hub: true,
+                ..
+            }
+        )));
         assert_eq!(app.n_shot_groups.len(), 1);
         assert_eq!(app.agents.len(), 3);
     }

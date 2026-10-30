@@ -1656,6 +1656,17 @@ impl AgentView {
             path_offset += shot_width;
             parts.push(Span::styled(shot_text, shot_style));
         }
+        let hub_label = self
+            .session
+            .session_id
+            .as_ref()
+            .and_then(|sid| crate::hub_status::hub_label_lazy(&sid.0));
+        if let Some(label) = hub_label {
+            let hub_text = format!("{label} ");
+            let hub_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
+            path_offset += hub_text.width() as u16;
+            parts.push(Span::styled(hub_text, hub_style));
+        }
         if let Some(git_text) = git_text {
             let git_style = Style::default()
                 .fg(theme.text_primary)

@@ -1552,6 +1552,9 @@ pub enum Effect {
         /// One-shot `/chat` or sticky `--chat` — stamp `_meta` kind=chat on
         /// fresh create (resume uses `LoadSession.chat_kind` instead).
         chat_kind: bool,
+        /// Give the new session the loaded session's hub membership
+        /// (`/fork --worktree`). n-shot shots leave it off.
+        inherit_hub: bool,
     },
     /// Load (resume) an existing ACP session by ID.
     ///

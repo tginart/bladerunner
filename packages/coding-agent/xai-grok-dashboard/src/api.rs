@@ -7,8 +7,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::http::header::{HOST, ORIGIN};
+use axum::response::Redirect;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures_util::Stream;
@@ -276,5 +279,77 @@ mod tests {
         let (offset, lines) = read_appended_lines(temp.path(), 0).unwrap();
         assert_eq!(offset, std::fs::metadata(temp.path()).unwrap().len());
         assert_eq!(lines, [event]);
+    }
+}
+
+/// `GET /api/hubs`: visible agent hubs.
+pub async fn list_hubs(
+    State(store): State<StoreState>,
+) -> Result<Json<Vec<crate::hubs::HubSummary>>, ApiError> {
+    let home = store.grok_home().to_path_buf();
+    let hubs = tokio::task::spawn_blocking(move || crate::hubs::list(&home)).await??;
+    Ok(Json(hubs))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HubPostForm {
+    pub to: String,
+    pub text: String,
+}
+
+/// Purpose: Post to a hub as the person, from the hub page form.
+/// Input: The hub name, the request headers and the form fields.
+/// Output: A redirect back to the hub page, or an error status.
+/// Note: A browser post from another origin is refused. Without this check,
+///     any web page could plant messages that agents then read.
+pub async fn post_hub_message(
+    State(store): State<StoreState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<HubPostForm>,
+) -> Response {
+    if !is_same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin post refused").into_response();
+    }
+    let home = store.grok_home().to_path_buf();
+    let hub = name.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::hubs::post(&home, &hub, &form.to, &form.text))
+            .await;
+    match result {
+        Ok(Ok(_)) => Redirect::to(&format!("/hubs/{name}")).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// A request with no `Origin` header (curl, a local script) is allowed; a
+/// browser always sends one with a form post.
+fn is_same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+    let host = headers
+        .get(HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    !host.is_empty() && origin.to_str().ok() == Some(format!("http://{host}").as_str())
+}
+
+#[cfg(test)]
+mod hub_post_tests {
+    use super::*;
+
+    #[test]
+    fn same_origin_check() {
+        let mut headers = HeaderMap::new();
+        assert!(is_same_origin(&headers));
+        headers.insert(HOST, "127.0.0.1:9090".parse().unwrap());
+        headers.insert(ORIGIN, "http://127.0.0.1:9090".parse().unwrap());
+        assert!(is_same_origin(&headers));
+        headers.insert(ORIGIN, "https://evil.example".parse().unwrap());
+        assert!(!is_same_origin(&headers));
+        headers.insert(ORIGIN, "null".parse().unwrap());
+        assert!(!is_same_origin(&headers));
     }
 }

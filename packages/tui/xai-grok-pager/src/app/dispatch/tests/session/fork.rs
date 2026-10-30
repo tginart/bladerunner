@@ -609,11 +609,13 @@ fn dispatch_fork_resolved_worktree_reuses_create_worktree_session() {
             Effect::CreateWorktreeSession {
                 agent_id,
                 load_session_id,
+                inherit_hub,
                 ..
             },
         ] => {
             assert_eq!(*agent_id, AgentId(1));
             assert_eq!(load_session_id.as_deref(), Some("test-session"));
+            assert!(*inherit_hub, "/fork --worktree keeps the hub membership");
         }
         other => panic!("expected CreateWorktreeSession, got {other:?}"),
     }
