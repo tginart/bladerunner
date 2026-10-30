@@ -14686,8 +14686,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/session/lifecycle.rs",
-      "bytes": 61990,
-      "sha256": "5c3d4114bd88662ba8441ec63766cdb5f23bde90727116277b1aa9c8c18d7953",
+      "bytes": 62193,
+      "sha256": "ff54456a7c91754dbb12542b5b63b2ed73af5a686d3c5ad846f76e7f97dc0649",
       "mode": "0644"
     },
     {
@@ -14710,8 +14710,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/session/n_shot.rs",
-      "bytes": 34277,
-      "sha256": "358f64299ec027873ef17c4e0823c8c039e41b6e48bfe8b9591a7721886cf70f",
+      "bytes": 38244,
+      "sha256": "591692ee766b4b20104859fe78b434719a339a4e74894e51019e0481abd0a929",
       "mode": "0644"
     },
     {
@@ -15034,8 +15034,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/n_shot.rs",
-      "bytes": 19499,
-      "sha256": "2bd4afc6de55f2d6edf2270f5bed74c028072db620333440668e7a55dc308a3a",
+      "bytes": 22926,
+      "sha256": "b6e496de98c25a01c31afd09f38d3d383313ec8e1bf8f491c820dd576f5fc446",
       "mode": "0644"
     },
     {
@@ -17098,8 +17098,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/views/n_shot.rs",
-      "bytes": 17453,
-      "sha256": "fb1cfe2c8d796b426e0fd86f888a39b7e46fd5ebb1541561743804603f195d11",
+      "bytes": 17820,
+      "sha256": "e0b503a3a2d42e3f3a3b3b74b6e1a6401271653fd0728225ebc7e72e89b4e10d",
       "mode": "0644"
     },
     {

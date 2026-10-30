@@ -116,7 +116,7 @@ pub(crate) fn render_session_columns(
     group: &crate::app::n_shot::NShotGroup,
     agents: &indexmap::IndexMap<crate::app::agent::AgentId, crate::app::agent_view::AgentView>,
 ) {
-    use crate::app::n_shot::classify_shot;
+    use crate::app::n_shot::{ShotStatus, classify_shot};
     use crate::views::workflows::WorkflowAgentLiveStatus;
 
     let theme = Theme::current();
@@ -144,14 +144,26 @@ pub(crate) fn render_session_columns(
     let mut rows = Vec::with_capacity(group.shots.len());
     for (i, shot_id) in group.shots.iter().enumerate() {
         let agent = agents.get(shot_id);
-        let status = classify_shot(agent);
+        let status = if agent.is_none()
+            && group
+                .stored
+                .get(i)
+                .and_then(Option::as_ref)
+                .is_some_and(|s| s.status == ShotStatus::Failed)
+        {
+            ShotStatus::Failed
+        } else {
+            classify_shot(agent)
+        };
         let key = shot_id.0.to_string();
         rows.push(WorkflowAgentRowView {
             agent_id: key.clone(),
             label: group.shot_labels[i].clone(),
             phase: Some("Shots".to_string()),
             model: None,
-            state: if status.is_settled() {
+            state: if status == ShotStatus::Failed {
+                "failed"
+            } else if status.is_settled() {
                 "done"
             } else {
                 "running"

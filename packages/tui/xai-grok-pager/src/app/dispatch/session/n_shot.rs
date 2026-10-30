@@ -86,6 +86,7 @@ fn start_group(
         if let Some(shot) = app.agents.get_mut(&shot_id) {
             shot.n_shot = Some(NShotMember {
                 shot_label: shot_name.clone(),
+                creation_error: None,
                 label: label.clone(),
                 index: i + 1,
                 total,
@@ -333,14 +334,21 @@ fn remember_shots(app: &mut AppView, group_idx: usize) {
         let Some(agent) = app.agents.get(shot_id) else {
             continue;
         };
-        let Some(session_id) = agent.session.session_id.as_ref() else {
+        let session_id = agent.session.session_id.as_ref();
+        let status = classify_shot(Some(agent));
+        if session_id.is_none() && status != ShotStatus::Failed {
             continue;
-        };
+        }
         group.stored[i] = Some(StoredShot {
             label: group.shot_labels[i].clone(),
-            session_id: session_id.0.to_string(),
-            worktree: agent.session.is_worktree.then(|| agent.session.cwd.clone()),
-            status: classify_shot(Some(agent)),
+            session_id: session_id.map(|id| id.0.to_string()),
+            creation_error: agent
+                .n_shot
+                .as_ref()
+                .and_then(|shot| shot.creation_error.clone()),
+            worktree: (session_id.is_some() && agent.session.is_worktree)
+                .then(|| agent.session.cwd.clone()),
+            status,
         });
     }
 }
@@ -400,6 +408,7 @@ fn upsert_group_block(app: &mut AppView, group: &NShotGroup, shots: &[ShotSummar
                 state: match shot.status {
                     ShotStatus::Settled => "done",
                     ShotStatus::Closed => "closed",
+                    ShotStatus::Failed => "failed",
                     _ => "active",
                 }
                 .to_string(),
@@ -430,17 +439,27 @@ fn summarize_shots(app: &AppView, group: &NShotGroup) -> Vec<ShotSummary> {
                 session_id: agent
                     .and_then(|a| a.session.session_id.as_ref())
                     .map(|sid| sid.0.to_string())
-                    .or_else(|| stored.map(|s| s.session_id.clone())),
+                    .or_else(|| stored.and_then(|s| s.session_id.clone())),
                 worktree: agent
-                    .filter(|a| a.session.is_worktree)
+                    .filter(|a| a.session.is_worktree && a.session.session_id.is_some())
                     .map(|a| a.session.cwd.to_string_lossy().into_owned())
                     .or_else(|| {
                         stored
                             .and_then(|s| s.worktree.as_ref())
                             .map(|p| p.to_string_lossy().into_owned())
                     }),
-                status: classify_shot(agent),
+                status: match agent {
+                    Some(agent) => classify_shot(Some(agent)),
+                    None if stored.is_some_and(|s| s.status == ShotStatus::Failed) => {
+                        ShotStatus::Failed
+                    }
+                    None => ShotStatus::Closed,
+                },
                 final_message: agent.and_then(last_agent_message),
+                creation_error: agent
+                    .and_then(|a| a.n_shot.as_ref())
+                    .and_then(|shot| shot.creation_error.clone())
+                    .or_else(|| stored.and_then(|s| s.creation_error.clone())),
             }
         })
         .collect()
@@ -738,13 +757,14 @@ fn stored_summaries(group: &NShotGroup) -> Vec<ShotSummary> {
             Some(ShotSummary {
                 label: shot.label.clone(),
                 index: i + 1,
-                session_id: Some(shot.session_id.clone()),
+                session_id: shot.session_id.clone(),
                 worktree: shot
                     .worktree
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
                 status: shot.status,
                 final_message: None,
+                creation_error: shot.creation_error.clone(),
             })
         })
         .collect()
@@ -773,20 +793,24 @@ fn load_stored_shots(app: &mut AppView, parent_id: AgentId, label: &str) -> Vec<
         let Some(stored) = group.stored.get(i).and_then(Clone::clone) else {
             continue;
         };
-        if find_agent_by_session(app, &stored.session_id).is_none() {
+        let Some(session_id) = stored.session_id.as_ref() else {
+            continue;
+        };
+        if find_agent_by_session(app, session_id).is_none() {
             effects.extend(super::load::dispatch_load_session(
                 app,
-                stored.session_id.clone(),
+                session_id.clone(),
                 stored.worktree.clone(),
                 false,
             ));
         }
-        let Some(shot_id) = find_agent_by_session(app, &stored.session_id) else {
+        let Some(shot_id) = find_agent_by_session(app, session_id) else {
             continue;
         };
         if let Some(shot) = app.agents.get_mut(&shot_id) {
             shot.n_shot = Some(NShotMember {
                 shot_label: stored.label.clone(),
+                creation_error: stored.creation_error.clone(),
                 label: label.to_string(),
                 index: i + 1,
                 total,
@@ -871,7 +895,7 @@ mod tests {
         let stored = parse_record(&record).unwrap();
         assert_eq!(stored.shots.len(), 2);
         assert_eq!(stored.shots[0].label, "minimal-fix");
-        assert_eq!(stored.shots[1].session_id, "s2");
+        assert_eq!(stored.shots[1].session_id.as_deref(), Some("s2"));
         assert!(matches!(&effects[0], Effect::WriteNShotFiles { .. }));
         let restored = restored_group(&mut app, AgentId(0), stored);
         assert_eq!(restored.shot_labels, ["minimal-fix", "rewrite"]);
@@ -884,6 +908,72 @@ mod tests {
         let group = &app.n_shot_groups[0];
         let reloaded = &app.agents[&group.shots[0]];
         assert_eq!(reloaded.n_shot.as_ref().unwrap().shot_label, "minimal-fix");
+    }
+
+    #[test]
+    fn n_shot_failed_creation_settles_reports_and_restores() {
+        let mut app = settled_group_app();
+        let failed_id = app.n_shot_groups[0].shots[0];
+        let shot = app.agents.get_mut(&failed_id).unwrap();
+        shot.session.session_id = None;
+        shot.session.state = AgentState::CommandRunning {
+            command: crate::app::agent::AgentCommand::CreateWorktree,
+            started_at: std::time::Instant::now(),
+        };
+        assert_eq!(classify_shot(Some(shot)), ShotStatus::Starting);
+        super::super::lifecycle::handle_worktree_session_failed(
+            &mut app,
+            failed_id,
+            "disk full".into(),
+        );
+        assert_eq!(
+            classify_shot(app.agents.get(&failed_id)),
+            ShotStatus::Failed
+        );
+        let effects = tick(&mut app);
+        let Effect::WriteNShotFiles { files, .. } = &effects[0] else {
+            panic!("missing writer")
+        };
+        let report = &files
+            .iter()
+            .find(|(path, _)| path.ends_with("report.md"))
+            .unwrap()
+            .1;
+        assert!(report.contains("- Status: failed"));
+        assert!(report.contains("Creation error: disk full"));
+        let record: serde_json::Value = serde_json::from_str(&files.last().unwrap().1).unwrap();
+        assert_eq!(record["joined"], true);
+        assert_eq!(record["shots"][0]["worktree"], serde_json::Value::Null);
+        let stored = parse_record(&record).unwrap();
+        assert_eq!(stored.shots.len(), 2);
+        files_written(&mut app, AgentId(0), "n-shot-1", Ok(()));
+        assert!(app.n_shot_groups[0].joined);
+        assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+        super::super::modal::remove_agent_and_cleanup(&mut app, failed_id);
+        assert_eq!(
+            summarize_shots(&app, &app.n_shot_groups[0])[0].status,
+            ShotStatus::Failed
+        );
+        let successful_id = app.n_shot_groups[0].shots[1];
+        super::super::modal::remove_agent_and_cleanup(&mut app, successful_id);
+        let restored = restored_group(&mut app, AgentId(0), stored);
+        let summaries = summarize_shots(&app, &restored);
+        assert_eq!(summaries[0].status, ShotStatus::Failed);
+        assert_eq!(summaries[0].creation_error.as_deref(), Some("disk full"));
+        app.n_shot_groups[0] = restored;
+        let loads = open_columns(&mut app, "n-shot-1");
+        let session_ids: Vec<&str> = loads
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::LoadSession { session_id, .. } => Some(session_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            session_ids,
+            ["s2"],
+            "only the successful shot has a session to load"
+        );
     }
 
     #[test]

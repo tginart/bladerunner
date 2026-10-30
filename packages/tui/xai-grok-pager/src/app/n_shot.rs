@@ -50,7 +50,8 @@ impl NShotGroup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredShot {
     pub label: String,
-    pub session_id: String,
+    pub session_id: Option<String>,
+    pub creation_error: Option<String>,
     pub worktree: Option<std::path::PathBuf>,
     pub status: ShotStatus,
 }
@@ -69,6 +70,7 @@ pub(crate) struct StoredGroup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NShotMember {
     pub shot_label: String,
+    pub creation_error: Option<String>,
     pub label: String,
     pub index: usize,
     pub total: usize,
@@ -113,6 +115,18 @@ pub(crate) fn parse_request_shots(args: &serde_json::Value) -> Result<Vec<ShotSp
             .map(String::from)
     };
     let default_prompt = text(&args["prompt"]);
+    let count = match args["shots"].as_array() {
+        Some(items) => items.len() as u64,
+        None => match args.get("n").filter(|value| !value.is_null()) {
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| format!("an n-shot run needs 1 to {max} shots"))?,
+            None => 2,
+        },
+    };
+    if count == 0 || count > max as u64 {
+        return Err(format!("an n-shot run needs 1 to {max} shots"));
+    }
     let shots: Vec<ShotSpec> = match args["shots"].as_array() {
         Some(items) => items
             .iter()
@@ -129,20 +143,16 @@ pub(crate) fn parse_request_shots(args: &serde_json::Value) -> Result<Vec<ShotSp
             .collect::<Result<_, String>>()?,
         None => {
             let prompt = default_prompt.ok_or_else(|| "no prompt".to_string())?;
-            let n = args["n"].as_u64().unwrap_or(2) as usize;
             vec![
                 ShotSpec {
                     label: None,
                     prompt,
                     model: None
                 };
-                n
+                count as usize
             ]
         }
     };
-    if shots.is_empty() || shots.len() > max {
-        return Err(format!("an n-shot run needs 1 to {max} shots"));
-    }
     Ok(shots)
 }
 
@@ -172,12 +182,14 @@ pub(crate) enum ShotStatus {
     Settled,
     /// The shot session was closed.
     Closed,
+    /// The fork or its worktree failed before a session was created.
+    Failed,
 }
 
 impl ShotStatus {
     /// True when the shot needs nothing more before the parent compares.
     pub fn is_settled(self) -> bool {
-        matches!(self, Self::Settled | Self::Closed)
+        matches!(self, Self::Settled | Self::Closed | Self::Failed)
     }
 
     pub fn label(self) -> String {
@@ -190,6 +202,7 @@ impl ShotStatus {
             Self::Looping { count } => format!("{count} loops active"),
             Self::Settled => "settled".into(),
             Self::Closed => "closed".into(),
+            Self::Failed => "failed".into(),
         }
     }
 }
@@ -198,7 +211,7 @@ impl ShotStatus {
 /// Input: The shot agent, or `None` when the agent was closed.
 /// Output: The shot status.
 /// Method:
-///     1. A missing agent is closed. An agent with no session is still starting.
+///     1. A creation error is failed. A missing session without an error is still starting.
 ///     2. Questions and permission prompts come first, then a running turn.
 ///     3. Between turns, an active goal or a live loop keeps the shot open.
 ///     4. Other background work counts as working. Else the shot is settled.
@@ -208,6 +221,13 @@ pub(crate) fn classify_shot(agent: Option<&AgentView>) -> ShotStatus {
     let Some(agent) = agent else {
         return ShotStatus::Closed;
     };
+    if agent
+        .n_shot
+        .as_ref()
+        .is_some_and(|shot| shot.creation_error.is_some())
+    {
+        return ShotStatus::Failed;
+    }
     if agent.session.session_id.is_none() {
         return ShotStatus::Starting;
     }
@@ -262,6 +282,7 @@ pub(crate) struct ShotSummary {
     pub worktree: Option<String>,
     pub status: ShotStatus,
     pub final_message: Option<String>,
+    pub creation_error: Option<String>,
 }
 
 pub(crate) fn shot_label(index: usize) -> String {
@@ -286,6 +307,7 @@ pub(crate) fn build_record(
                 "session_id": shot.session_id,
                 "worktree": shot.worktree,
                 "status": shot.status.label(),
+                "creation_error": shot.creation_error,
             })
         })
         .collect();
@@ -303,22 +325,29 @@ pub(crate) fn build_record(
 /// Purpose: Read a group back from its `shots.json` record.
 /// Input: The record that `build_record` wrote.
 /// Output: The group, or `None` when the record has no label or a shot has
-///     no session id.
+///     no session id without a creation failure.
 pub(crate) fn parse_record(record: &serde_json::Value) -> Option<StoredGroup> {
     let mut shots = Vec::new();
     for (i, shot) in record["shots"].as_array()?.iter().enumerate() {
+        let status = match shot["status"].as_str() {
+            Some("settled") => ShotStatus::Settled,
+            Some("closed") => ShotStatus::Closed,
+            Some("failed") => ShotStatus::Failed,
+            _ => ShotStatus::Working,
+        };
+        let session_id = shot["session_id"].as_str().map(String::from);
+        if session_id.is_none() && status != ShotStatus::Failed {
+            return None;
+        }
         shots.push(StoredShot {
             label: shot["label"]
                 .as_str()
                 .map(String::from)
                 .unwrap_or_else(|| shot_label(i + 1)),
-            session_id: shot["session_id"].as_str()?.to_string(),
+            session_id,
+            creation_error: shot["creation_error"].as_str().map(String::from),
             worktree: shot["worktree"].as_str().map(std::path::PathBuf::from),
-            status: match shot["status"].as_str() {
-                Some("settled") => ShotStatus::Settled,
-                Some("closed") => ShotStatus::Closed,
-                _ => ShotStatus::Working,
-            },
+            status,
         });
     }
     Some(StoredGroup {
@@ -347,11 +376,15 @@ pub(crate) fn build_report(group: &NShotGroup, shots: &[ShotSummary]) -> String 
     );
     for shot in shots {
         report.push_str(&format!(
-            "## {}\n\n- Status: {}\n- Session: {}\n- Worktree: {}\n\n### Final message\n\n{}\n\n",
+            "## {}\n\n- Status: {}\n- Session: {}\n- Worktree: {}\n{}\n### Final message\n\n{}\n\n",
             shot.label,
             shot.status.label(),
             shot.session_id.as_deref().unwrap_or("(none)"),
             shot.worktree.as_deref().unwrap_or("(none)"),
+            shot.creation_error
+                .as_ref()
+                .map(|error| format!("- Creation error: {error}\n"))
+                .unwrap_or_default(),
             shot.final_message.as_deref().unwrap_or("(no message)"),
         ));
     }
@@ -404,6 +437,7 @@ mod tests {
             worktree: Some(format!("/wt/{index}")),
             status,
             final_message: Some("done".into()),
+            creation_error: None,
         }
     }
 
@@ -411,6 +445,7 @@ mod tests {
     fn settled_means_nothing_left_to_run() {
         assert!(ShotStatus::Settled.is_settled());
         assert!(ShotStatus::Closed.is_settled());
+        assert!(ShotStatus::Failed.is_settled());
         for open in [
             ShotStatus::Starting,
             ShotStatus::Working,
@@ -451,7 +486,8 @@ mod tests {
             stored.shots[1],
             StoredShot {
                 label: "shot-2".into(),
-                session_id: "s2".into(),
+                session_id: Some("s2".into()),
+                creation_error: None,
                 worktree: Some("/wt/2".into()),
                 status: ShotStatus::Closed,
             }
@@ -499,6 +535,62 @@ mod tests {
         assert_eq!(next_group_label(&groups, &pending, AgentId(0)), "n-shot-3");
         groups.clear();
         assert_eq!(next_group_label(&groups, &[], AgentId(0)), "n-shot-1");
+    }
+
+    #[test]
+    fn validates_shot_count_before_allocation() {
+        for n in [0, 11, u64::MAX] {
+            let result = parse_request_shots(&serde_json::json!({ "prompt": "fix it", "n": n }));
+            assert!(result.is_err(), "invalid count {n}");
+        }
+        for n in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("10"),
+        ] {
+            assert!(
+                parse_request_shots(&serde_json::json!({ "prompt": "fix it", "n": n })).is_err()
+            );
+        }
+        for n in [1, 10] {
+            assert_eq!(
+                parse_request_shots(&serde_json::json!({ "prompt": "fix it", "n": n }))
+                    .unwrap()
+                    .len(),
+                n
+            );
+        }
+        let too_many = vec![serde_json::json!({ "prompt": "fix it" }); 11];
+        assert!(parse_request_shots(&serde_json::json!({ "shots": too_many })).is_err());
+        // A supplied shot list still overrides an otherwise invalid count.
+        assert_eq!(
+            parse_request_shots(
+                &serde_json::json!({ "n": u64::MAX, "shots": [{ "prompt": "fix it" }] })
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_creation_records_do_not_require_a_session_id() {
+        let mut failed = shot(1, ShotStatus::Failed);
+        failed.session_id = None;
+        failed.worktree = None;
+        failed.final_message = None;
+        failed.creation_error = Some("disk full".into());
+        let record = build_record(
+            &group(),
+            "parent",
+            Path::new("/r/report.md"),
+            &[failed.clone()],
+        );
+        let stored = parse_record(&record).unwrap();
+        assert_eq!(stored.shots[0].session_id, None);
+        assert_eq!(stored.shots[0].status, ShotStatus::Failed);
+        assert_eq!(stored.shots[0].creation_error.as_deref(), Some("disk full"));
+        assert!(build_report(&group(), &[failed]).contains("Creation error: disk full"));
     }
 
     #[test]

@@ -1418,6 +1418,12 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     error: String,
 ) -> Vec<Effect> {
     tracing::error!(agent = ?agent_id, error = %error, "Worktree session creation failed");
+    if let Some(agent) = app.agents.get_mut(&agent_id)
+        && let Some(shot) = agent.n_shot.as_mut()
+    {
+        shot.creation_error = Some(error.clone());
+        agent.n_shot_start = None;
+    }
     let is_orphan = app
         .agents
         .get(&agent_id)
