@@ -1159,14 +1159,7 @@ async fn run_agent_command(
             )
         );
         if should_check_for_updates(no_auto_update) {
-            auto_update::run_update_if_available(
-                auto_update::UpdateRunMode::NonBlocking,
-                false,
-                auto_update::CliUpdateTrigger::AutoBackground,
-                update_config,
-            )
-            .await
-            .ok();
+            spawn_agent_auto_update(update_config);
         }
     }
     let remote_settings = join_early_prefetch(early_prefetch);
@@ -1258,17 +1251,7 @@ async fn run_agent_command(
         should_check_for_updates(no_auto_update),
         managed_install,
     ) {
-        let update_config = update_config.clone();
-        tokio::spawn(async move {
-            auto_update::run_update_if_available(
-                auto_update::UpdateRunMode::NonBlocking,
-                false,
-                auto_update::CliUpdateTrigger::AutoBackground,
-                &update_config,
-            )
-            .await
-            .ok();
-        });
+        spawn_agent_auto_update(update_config);
     } else if is_stdio && !use_leader && !managed_install {
         tracing::debug!("stdio auto-update skipped: not the managed install");
     }
@@ -2783,6 +2766,25 @@ fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
     !(disabled("GROK_DISABLE_AUTOUPDATER")
         || cfg!(feature = "community-build") && disabled("BLADERUNNER_DISABLE_AUTOUPDATER"))
 }
+/// Purpose: Start the automatic update check without a wait on the agent startup path.
+/// Input: The update configuration.
+/// Output: A task handle. The check continues if the caller drops the handle.
+/// Note: NonBlocking detaches the installer, but the metadata requests still require an await.
+fn spawn_agent_auto_update(update_config: &UpdateConfig) -> tokio::task::JoinHandle<()> {
+    let update_config = update_config.clone();
+    tokio::spawn(async move {
+        if let Err(error) = auto_update::run_update_if_available(
+            auto_update::UpdateRunMode::NonBlocking,
+            false,
+            auto_update::CliUpdateTrigger::AutoBackground,
+            &update_config,
+        )
+        .await
+        {
+            tracing::debug!(%error, "Agent auto-update check failed");
+        }
+    })
+}
 /// Gate for the stdio agent's background auto-update: only the direct stdio
 /// agent, from the managed install. Other modes update in `run_agent_command`.
 fn stdio_auto_update_enabled(
@@ -3277,6 +3279,19 @@ mod tests {
         std::fs::write(&pinned, b"binary").unwrap();
         assert!(!is_managed_install(Some(pinned), &managed));
         let _ = std::fs::remove_dir_all(&home);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_auto_update_returns_before_the_check_runs() {
+        let update_config =
+            UpdateConfig::from_environment(&xai_grok_shell::env::GrokBuildEnvironment::Production);
+        let task = spawn_agent_auto_update(&update_config);
+        // This runtime cannot poll the check until the startup task yields.
+        assert!(
+            !task.is_finished(),
+            "startup must not wait for the update check"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
     /// Pins the gate composition; a dropped conjunct fails its named case.
     #[test]
