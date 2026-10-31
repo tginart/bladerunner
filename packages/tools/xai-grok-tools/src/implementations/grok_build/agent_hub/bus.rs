@@ -413,26 +413,28 @@ impl AgentBus {
         Ok((messages, remaining))
     }
 
-    /// Create a channel in the current hub.
+    /// Purpose: Create a channel in the current hub under the metadata lock.
+    /// Input: The channel name and its purpose.
+    /// Output: The normalized name, or an error for archived hubs or duplicate channels.
     pub fn create_channel(&self, channel: &str, purpose: &str) -> Result<String> {
         let hub = self.lock().hub.clone();
         let Some(name) = store::normalize_channel(channel) else {
             bail!("invalid channel name {channel:?}: use lowercase letters, digits, - or _");
         };
-        let created = hub.update_meta(|meta| {
+        hub.update_meta(|meta| -> Result<()> {
+            if meta.archived {
+                bail!("hub {:?} is archived (read-only)", meta.name);
+            }
             if meta.has_channel(&name) {
-                return false;
+                bail!("channel #{name} already exists");
             }
             meta.channels.push(Channel {
                 name: name.clone(),
                 purpose: purpose.trim().to_string(),
                 created_ms: store::now_ms(),
             });
-            true
-        })?;
-        if !created {
-            bail!("channel #{name} already exists");
-        }
+            Ok(())
+        })??;
         Ok(name)
     }
 
@@ -1676,6 +1678,23 @@ mod tests {
         let hub = Hub::open(root.path(), "team").unwrap();
         assert!(format_messages(&hub, &meta, &inbox).contains("from @tony (person)"));
         assert!(bus.view(MAIN_PEER_ID).unwrap().channels[1].tokens > 0);
+    }
+
+    #[test]
+    fn archived_hub_rejects_channel_creation_from_an_existing_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "lead", true).unwrap();
+        let hub = Hub::open(root.path(), "team").unwrap();
+        hub.update_meta(|meta| meta.archived = true).unwrap();
+        let archived = hub.meta().unwrap();
+
+        for channel in ["tasks", "general"] {
+            let error = bus.create_channel(channel, "new purpose").unwrap_err();
+            assert!(error.to_string().contains("archived (read-only)"));
+            assert_eq!(hub.meta().unwrap(), archived);
+        }
     }
 
     #[test]

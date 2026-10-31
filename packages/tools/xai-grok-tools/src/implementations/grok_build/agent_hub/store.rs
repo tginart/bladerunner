@@ -608,6 +608,7 @@ pub fn handle_candidate(base: &str, suffix: &str) -> String {
 /// Input: The message text and the hub members.
 /// Output: The named handles, plus `here` when the text has `@here`.
 /// Note: A handle must be a whole word. `@backend` does not match `@backend/scout`.
+/// Match the longest registered handle before removal of trailing sentence periods.
 pub fn parse_mentions(text: &str, members: &[Member]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for word in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')'))
@@ -615,7 +616,13 @@ pub fn parse_mentions(text: &str, members: &[Member]) -> Vec<String> {
         let Some(raw) = word.strip_prefix('@') else {
             continue;
         };
-        let name = raw.trim_end_matches(['.', '!', '?', '\'', '"']);
+        let mut name = raw;
+        while name != HERE_MENTION && !members.iter().any(|m| m.handle == name) {
+            let Some(shorter) = name.strip_suffix(['.', '!', '?', '\'', '"']) else {
+                break;
+            };
+            name = shorter;
+        }
         let is_known = name == HERE_MENTION || members.iter().any(|m| m.handle == name);
         if is_known && !out.iter().any(|h| h == name) {
             out.push(name.to_string());
@@ -932,6 +939,27 @@ mod tests {
             "backend"
         );
         assert_eq!(unique_handle(&meta, "frontend", None), "frontend");
+    }
+
+    #[test]
+    fn mentions_preserve_registered_trailing_periods() {
+        let members = vec![agent("worker"), agent("worker."), agent("worker..")];
+        for (text, expected) in [
+            ("@worker", "worker"),
+            ("@worker.", "worker."),
+            ("@worker.!", "worker."),
+            ("@worker!.", "worker"),
+            ("@worker..", "worker.."),
+            ("@worker...", "worker.."),
+        ] {
+            assert_eq!(parse_mentions(text, &members), vec![expected]);
+        }
+        assert_eq!(
+            parse_mentions("@worker.", &[agent("worker")]),
+            vec!["worker"]
+        );
+        assert_eq!(parse_mentions("@here.", &members), vec![HERE_MENTION]);
+        assert!(parse_mentions("@unknown.", &members).is_empty());
     }
 
     #[test]
