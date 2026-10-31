@@ -55,10 +55,7 @@ impl AgentView {
                 HubKeyOutcome::Post { to, text } => {
                     let result =
                         agent_hub::post_as_person(&browser.hub, &browser.person, &to, &text, &[]);
-                    browser.notice = Some(match result {
-                        Ok(_) => format!("Posted to {to} as @{}.", browser.person),
-                        Err(error) => format!("Not posted: {error}"),
-                    });
+                    browser.finish_post(&to, result);
                     if let Err(error) = browser.reload() {
                         tracing::warn!(%error, "hub browser: reload failed");
                     }
@@ -96,5 +93,67 @@ impl AgentView {
         let hub = store::Hub::open(&root, &name)?;
         let person = agent_hub::ensure_person(&hub, &store::person_handle())?;
         HubBrowserState::open(hub, person, channel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_hub::{AgentBus, MAIN_PEER_ID, MAX_MESSAGE_BYTES};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn browser_with_agent() -> (tempfile::TempDir, AgentView, AgentBus) {
+        let root = tempfile::tempdir().unwrap();
+        let bus = AgentBus::new(root.path().to_path_buf(), "root").unwrap();
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", Some("worker"), "unused", true).unwrap();
+        let person = agent_hub::ensure_person(&bus.hub(), "me").unwrap();
+        let mut view = crate::test_util::make_agent_view(None, "/tmp");
+        view.hub_browser = Some(HubBrowserState::open(bus.hub(), person, None).unwrap());
+        (root, view, bus)
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn oversized_post_keeps_the_draft_until_a_successful_retry() {
+        let (_root, mut view, bus) = browser_with_agent();
+        view.handle_hub_browser_input(&key_event(KeyCode::Tab));
+        let draft = format!("  {}  ", "x".repeat(MAX_MESSAGE_BYTES + 1));
+        view.handle_hub_browser_input(&Event::Paste(draft.clone()));
+        view.handle_hub_browser_input(&key_event(KeyCode::Enter));
+        let browser = view.hub_browser.as_mut().unwrap();
+        assert_eq!(browser.draft, draft);
+        assert!(browser.is_composing);
+        assert_eq!(browser.post_target().as_deref(), Some("#general"));
+        assert!(browser.notice.as_ref().unwrap().starts_with("Not posted:"));
+        browser.draft = "retry".to_string();
+        view.handle_hub_browser_input(&key_event(KeyCode::Enter));
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert!(browser.draft.is_empty());
+        assert!(browser.notice.as_ref().unwrap().starts_with("Posted to"));
+        let messages = bus.hub().messages("#general", 0).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "retry");
+    }
+
+    #[test]
+    fn post_to_a_gone_recipient_keeps_the_draft_and_destination() {
+        let (_root, mut view, bus) = browser_with_agent();
+        view.handle_hub_browser_input(&key_event(KeyCode::Down));
+        view.handle_hub_browser_input(&key_event(KeyCode::Tab));
+        view.handle_hub_browser_input(&Event::Paste("please check".to_string()));
+        bus.mark_gone(MAIN_PEER_ID);
+        view.handle_hub_browser_input(&key_event(KeyCode::Enter));
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert_eq!(browser.draft, "please check");
+        assert_eq!(browser.post_target().as_deref(), Some("@worker"));
+        assert!(browser.notice.as_ref().unwrap().contains("gone"));
+        bus.register(MAIN_PEER_ID, "main", None);
+        view.handle_hub_browser_input(&key_event(KeyCode::Enter));
+        assert!(view.hub_browser.as_ref().unwrap().draft.is_empty());
+        assert_eq!(bus.inbox(MAIN_PEER_ID).unwrap()[0].text, "please check");
     }
 }

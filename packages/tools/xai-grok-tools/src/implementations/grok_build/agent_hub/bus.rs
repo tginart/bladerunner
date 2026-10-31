@@ -590,6 +590,19 @@ impl AgentBus {
 }
 
 impl BusInner {
+    /// Purpose: Copy the hub and its delivery targets from the same bus state.
+    /// Input: The bus state while the caller holds its lock.
+    /// Output: One hub and the local peers eligible for automatic delivery.
+    fn delivery_snapshot(&self) -> (Hub, Vec<(String, PeerWakeFn)>) {
+        let targets = self
+            .peers
+            .values()
+            .filter(|peer| peer.status == PeerStatus::Running && peer.waiting == 0)
+            .filter_map(|peer| peer.wake.clone().map(|wake| (peer.handle.clone(), wake)))
+            .collect();
+        (self.hub.clone(), targets)
+    }
+
     fn handle_base_for(&self, id: &str, label: &str) -> String {
         let is_session_hub = self.hub.name() == store::session_hub_name(&self.root_session_id);
         peer_handle_base(is_session_hub, &self.main_handle, id, label)
@@ -643,15 +656,7 @@ async fn watch(weak: Weak<Mutex<BusInner>>) {
         let Some(inner) = weak.upgrade() else {
             return;
         };
-        let targets: Vec<(String, PeerWakeFn)> = {
-            let g = inner.lock().expect("agent bus lock");
-            g.peers
-                .values()
-                .filter(|p| p.status == PeerStatus::Running && p.waiting == 0)
-                .filter_map(|p| p.wake.clone().map(|w| (p.handle.clone(), w)))
-                .collect()
-        };
-        let hub = inner.lock().expect("agent bus lock").hub.clone();
+        let (hub, targets) = inner.lock().expect("agent bus lock").delivery_snapshot();
         drop(inner);
         let result = tokio::task::spawn_blocking(move || deliver(&hub, &targets)).await;
         if let Ok(Err(e)) = result {
@@ -1399,6 +1404,61 @@ mod tests {
             hub.meta().unwrap().member("lead").unwrap().kind,
             MemberKind::Person
         );
+    }
+
+    #[test]
+    fn watcher_snapshot_keeps_the_hub_and_handles_together_on_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_wake = received.clone();
+        let wake: PeerWakeFn = Arc::new(move |body, _| {
+            received_wake.lock().unwrap().push(body);
+        });
+        let moving = session_bus(root.path(), "moving");
+        moving.register(MAIN_PEER_ID, "main", Some(wake));
+        moving
+            .join("left", Some("backend"), "unused", true)
+            .unwrap();
+        let owner = session_bus(root.path(), "owner");
+        owner.register(MAIN_PEER_ID, "main", None);
+        owner
+            .join("right", Some("backend"), "unused", true)
+            .unwrap();
+        let sender = session_bus(root.path(), "sender");
+        sender.register(MAIN_PEER_ID, "main", None);
+        sender
+            .join("right", Some("sender"), "unused", false)
+            .unwrap();
+
+        let (old_hub, old_targets) = moving.lock().delivery_snapshot();
+        moving
+            .join("right", Some("backend"), "unused", false)
+            .unwrap();
+        sender
+            .send(MAIN_PEER_ID, "@backend", "private to owner", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(old_hub.name(), "left");
+        assert_eq!(old_targets[0].0, "backend");
+        deliver(&old_hub, &old_targets).unwrap();
+        assert!(received.lock().unwrap().is_empty());
+        assert_eq!(
+            texts(&owner.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["private to owner"]
+        );
+
+        let (new_hub, new_targets) = moving.lock().delivery_snapshot();
+        assert_eq!(new_hub.name(), "right");
+        assert_eq!(new_targets[0].0, "backend-2");
+        sender
+            .send(MAIN_PEER_ID, "@backend-2", "for moving", None, &[])
+            .into_result()
+            .unwrap();
+        deliver(&new_hub, &new_targets).unwrap();
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].contains("for moving"));
+        assert!(!received[0].contains("private to owner"));
     }
 
     #[test]

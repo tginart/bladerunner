@@ -677,13 +677,13 @@ fn has_messages(dir: &Path) -> bool {
         .any(|entry| entry.metadata().is_ok_and(|m| m.len() > 0))
 }
 
-/// Escape paths and underscores so `__` separates exactly two encoded handles.
+/// Use one-byte escapes outside the handle alphabet to keep DM filenames bounded.
 fn encode_handle(handle: &str) -> String {
-    handle.replace('/', "~").replace('_', "%5F")
+    handle.replace('/', "~").replace('_', "!")
 }
 
 fn decode_handle(encoded: &str) -> String {
-    encoded.replace("%5F", "_").replace('~', "/")
+    encoded.replace('!', "_").replace('~', "/")
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -831,6 +831,32 @@ mod tests {
         }
         assert_eq!(hub.dm_convs_for("a").unwrap(), vec![dm_conv("a", "b__z")]);
         assert_eq!(hub.dm_convs_for("z").unwrap(), vec![dm_conv("a__b", "z")]);
+    }
+
+    #[test]
+    fn maximum_length_handles_fit_in_dm_filenames() {
+        let root = tempfile::tempdir().unwrap();
+        for (index, (a, b)) in [
+            ("_".repeat(64), "a".repeat(64)),
+            ("_".repeat(64), "b_".repeat(32)),
+            ("_/".repeat(32), "c_".repeat(32)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(normalize_handle(&a), Some(a.clone()));
+            assert_eq!(normalize_handle(&b), Some(b.clone()));
+            let hub = Hub::create(root.path(), &format!("h{index}")).unwrap();
+            let conv = dm_conv(&a, &b);
+            let path = hub.conv_path(&conv).unwrap();
+            assert_eq!(path.file_name().unwrap().as_encoded_bytes().len(), 136);
+            hub.append(&message(&conv, &a, "long handle DM")).unwrap();
+            assert_eq!(hub.dm_convs_for(&a).unwrap(), vec![conv.clone()]);
+            assert_eq!(hub.dm_convs_for(&b).unwrap(), vec![conv.clone()]);
+            assert_eq!(hub.messages(&conv, 0).unwrap()[0].text, "long handle DM");
+            let _cursor_lock = hub.lock_cursors(&a).unwrap();
+            hub.save_cursors(&a, &Cursors::default()).unwrap();
+        }
     }
 
     #[test]

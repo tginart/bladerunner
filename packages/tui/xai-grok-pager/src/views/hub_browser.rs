@@ -154,6 +154,19 @@ impl HubBrowserState {
             .or_else(|| post_target(&self.selected_row()?, &self.person))
     }
 
+    /// Purpose: Accept a post result without loss of a failed draft.
+    /// Input: The destination and the post result from the controller.
+    /// Output: A status notice. Only a successful post clears the draft.
+    pub fn finish_post(&mut self, to: &str, result: Result<String>) {
+        self.notice = Some(match result {
+            Ok(_) => {
+                self.draft.clear();
+                format!("Posted to {to} as @{}.", self.person)
+            }
+            Err(error) => format!("Not posted: {error}"),
+        });
+    }
+
     /// Purpose: Apply one key press to the browser.
     /// Input: The key event.
     /// Output: What the caller must do next. A selection change reloads the feed.
@@ -203,7 +216,6 @@ impl HubBrowserState {
             KeyCode::Enter => {
                 let text = self.draft.trim().to_string();
                 if let (false, Some(to)) = (text.is_empty(), self.post_target()) {
-                    self.draft.clear();
                     return HubKeyOutcome::Post { to, text };
                 }
             }
@@ -807,6 +819,8 @@ mod tests {
                 text: "hi all".to_string()
             }
         );
+        assert_eq!(state.draft, "hi all", "the post has not succeeded yet");
+        state.finish_post("#general", Ok("message-id".to_string()));
         assert!(state.draft.is_empty());
         state.handle_key(&key(KeyCode::Esc));
         assert_eq!(state.handle_key(&key(KeyCode::Esc)), HubKeyOutcome::Close);
@@ -950,6 +964,7 @@ mod tests {
                 text: "hello".to_string(),
             }
         );
+        state.finish_post("#general", Ok("message-id".to_string()));
         state.handle_key(&key(KeyCode::Esc));
         assert_eq!(state.post_target().as_deref(), Some("@front"));
     }
