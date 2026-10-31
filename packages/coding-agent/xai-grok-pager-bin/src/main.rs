@@ -2778,15 +2778,6 @@ fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
     if no_auto_update_flag {
         return false;
     }
-    // Private Bladerunner releases are not anonymously discoverable. Keep
-    // startup deterministic until the updater has an explicit credentialed
-    // release channel; `bladerunner update` remains available manually.
-    if cfg!(feature = "community-build")
-        && !std::env::var_os("BLADERUNNER_ENABLE_AUTOUPDATER")
-            .is_some_and(|v| env_flag_enabled(&v.to_string_lossy()))
-    {
-        return false;
-    }
     let disabled =
         |name: &str| std::env::var_os(name).is_some_and(|v| env_flag_enabled(&v.to_string_lossy()));
     !(disabled("GROK_DISABLE_AUTOUPDATER")
