@@ -2615,6 +2615,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         {
             args.output_format = xai_grok_pager::headless::OutputFormat::Json;
         }
+        let hub_startup_command = args.hub_join_command();
         return xai_grok_pager::headless::run_single_turn(
             prompt,
             args.verbatim,
@@ -2635,6 +2636,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 fork_session: args.fork_session,
                 worktree: args.worktree,
                 restore_code: args.restore_code,
+                hub_startup_command,
                 agent: args.agent.clone(),
                 agents_json: args.agents_json.clone(),
                 cli_tools: args.cli_tools.clone(),

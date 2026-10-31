@@ -639,6 +639,9 @@ fn feed_lines(
     persons: &BTreeSet<String>,
 ) -> Vec<Vec<(String, LinePart)>> {
     let mut lines = Vec::new();
+    if width == 0 {
+        return lines;
+    }
     for message in messages {
         let time = chrono::DateTime::from_timestamp_millis(message.ts_unix_ms as i64)
             .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
@@ -654,7 +657,17 @@ fn feed_lines(
             sender.push_str(&format!(" → @{to}"));
         }
         let prefix_w = time.width() + 1 + sender.width() + 2;
-        let text_w = width.saturating_sub(prefix_w).max(10);
+        if prefix_w + 10 > width {
+            let header = format!("{time} {sender}");
+            for chunk in textwrap::wrap(&header, width) {
+                lines.push(vec![(chunk.into_owned(), sender_part)]);
+            }
+            for chunk in textwrap::wrap(&message.text, width) {
+                lines.push(vec![(chunk.into_owned(), LinePart::Text)]);
+            }
+            continue;
+        }
+        let text_w = width - prefix_w;
         let wrapped = textwrap::wrap(&message.text, text_w);
         for (i, chunk) in wrapped.iter().enumerate() {
             if i == 0 {
@@ -967,6 +980,52 @@ mod tests {
         state.finish_post("#general", Ok("message-id".to_string()));
         state.handle_key(&key(KeyCode::Esc));
         assert_eq!(state.post_target().as_deref(), Some("@front"));
+    }
+
+    #[test]
+    fn feed_lines_keep_message_bodies_visible_with_long_sender_headers() {
+        let from = "a".repeat(64);
+        let message = store::Message {
+            id: "long-sender".to_string(),
+            conv: store::dm_conv(&from, &"b".repeat(64)),
+            from: from.clone(),
+            text: "one two three four five six".to_string(),
+            reply_to: None,
+            mentions: Vec::new(),
+            images: Vec::new(),
+            ts_unix_ms: 0,
+        };
+        for width in [1, 10, 20, 44] {
+            for show_peer in [false, true] {
+                let lines = feed_lines(
+                    std::slice::from_ref(&message),
+                    width,
+                    show_peer,
+                    &BTreeSet::from([from.clone()]),
+                );
+                for line in &lines {
+                    assert!(line.iter().map(|(text, _)| text.width()).sum::<usize>() <= width);
+                }
+                let visible_body = lines
+                    .iter()
+                    .flatten()
+                    .filter(|(_, part)| *part == LinePart::Text)
+                    .map(|(text, _)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(
+                    visible_body.split_whitespace().collect::<String>(),
+                    message.text.split_whitespace().collect::<String>(),
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .flatten()
+                        .any(|(_, part)| *part == LinePart::Person)
+                );
+            }
+        }
+        assert!(feed_lines(&[message], 0, false, &BTreeSet::new()).is_empty());
     }
 
     #[test]

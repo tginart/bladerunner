@@ -488,8 +488,8 @@ pub fn list_hubs(hubs_root: &Path, include_archived: bool) -> Result<Vec<HubMeta
 /// Output: The number of session hubs that this function removed.
 /// Method:
 ///     1. Find each hidden session hub that is older than IDLE_SESSION_HUB_MS.
-///     2. Skip it if a member is live or if it holds a message.
-///     3. Under the hub lock, remove its directory.
+///     2. Under the hub lock, check its age, live members, and messages.
+///     3. Remove its directory only if the hub is still idle.
 /// Note: Every session makes a session hub, so without this they pile up.
 ///     A resumed session makes its session hub again when it needs it.
 pub fn prune_idle_session_hubs(hubs_root: &Path, keep_session_id: &str) -> Result<usize> {
@@ -509,8 +509,8 @@ pub fn prune_idle_session_hubs(hubs_root: &Path, keep_session_id: &str) -> Resul
             dir: hubs_root.join(&name),
             name,
         };
+        let _lock = hub.lock()?;
         if is_idle_session_hub(&hub) {
-            let _lock = hub.lock()?;
             fs::remove_dir_all(&hub.dir)
                 .with_context(|| format!("remove {}", hub.dir.display()))?;
             removed += 1;
@@ -957,6 +957,49 @@ mod tests {
         assert!(left("old-message"));
         assert!(left("new-empty"));
         assert!(left("me"));
+    }
+
+    #[test]
+    fn prune_rechecks_a_hub_that_changes_while_its_lock_is_held() {
+        for change in ["member", "message"] {
+            let root = tempfile::tempdir().unwrap();
+            let hub = Hub::open_session_hub(root.path(), "old").unwrap();
+            hub.update_meta(|meta| meta.created_ms = 0).unwrap();
+            assert!(is_idle_session_hub(&hub));
+            let lock = hub.lock().unwrap();
+            let worker_root = root.path().to_path_buf();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let removed = prune_idle_session_hubs(&worker_root, "other").unwrap();
+                done_tx.send(removed).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err()
+            );
+            if change == "member" {
+                let mut meta = hub.meta().unwrap();
+                meta.members.push(agent("resumed"));
+                write_json_atomic(&hub.dir.join(META_FILE), &meta).unwrap();
+            } else {
+                let path = hub.conv_path("#general").unwrap();
+                let line = serde_json::to_string(&message("#general", "a", "keep me")).unwrap();
+                fs::write(path, format!("{line}\n")).unwrap();
+            }
+            drop(lock);
+            assert_eq!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                0
+            );
+            worker.join().unwrap();
+            assert!(hub.dir.exists(), "{change} keeps the hub alive");
+        }
     }
 
     #[test]

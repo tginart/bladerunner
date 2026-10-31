@@ -30,6 +30,7 @@ fn options() -> HeadlessOptions {
         fork_session: false,
         worktree: None,
         restore_code: false,
+        hub_startup_command: None,
         agent: None,
         agents_json: None,
         cli_tools: None,
