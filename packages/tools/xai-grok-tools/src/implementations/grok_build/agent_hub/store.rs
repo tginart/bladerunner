@@ -57,6 +57,9 @@ pub struct Member {
     #[serde(default)]
     pub session_id: Option<String>,
     pub active: bool,
+    /// The root actor ended, but its membership remains available for resume.
+    #[serde(default)]
+    pub disconnected: bool,
     pub joined_ms: u64,
     /// Process that runs the session. A member whose process ended is gone.
     #[serde(default)]
@@ -64,9 +67,9 @@ pub struct Member {
 }
 
 impl Member {
-    /// True when the member is active and its process, if known, still runs.
+    /// True when the member is active, connected, and its process still runs.
     pub fn is_live(&self) -> bool {
-        self.active && self.pid.is_none_or(is_process_alive)
+        self.active && !self.disconnected && self.pid.is_none_or(is_process_alive)
     }
 }
 
@@ -570,13 +573,35 @@ pub fn unique_handle(meta: &HubMeta, base: &str, session_id: Option<&str>) -> St
                 || (member.session_id.as_deref() == session_id && session_id.is_some())
         }
     };
-    if is_free(base) {
-        return base.to_string();
+    let base = handle_candidate(base, "");
+    if is_free(&base) {
+        return base;
     }
     (2..)
-        .map(|n| format!("{base}-{n}"))
+        .map(|n| handle_candidate(&base, &format!("-{n}")))
         .find(|candidate| is_free(candidate))
         .expect("an unused handle exists")
+}
+
+/// Purpose: Keep a generated handle within the recipient handle limit.
+/// Input: The preferred handle and a uniqueness suffix.
+/// Output: A handle of at most MAX_HANDLE_CHARS characters, with its namespace and suffix preserved.
+pub fn handle_candidate(base: &str, suffix: &str) -> String {
+    let budget = MAX_HANDLE_CHARS - suffix.chars().count();
+    assert!(budget >= 3, "the suffix must leave room for a handle");
+    let base = match base.rsplit_once('/') {
+        Some((namespace, label)) => {
+            let label_len = label.chars().count().min(budget - 2);
+            let namespace_len = budget - label_len - 1;
+            format!(
+                "{}/{}",
+                namespace.chars().take(namespace_len).collect::<String>(),
+                label.chars().take(label_len).collect::<String>()
+            )
+        }
+        None => base.chars().take(budget).collect(),
+    };
+    format!("{base}{suffix}")
 }
 
 /// Purpose: Find the members that a message names with `@`.
@@ -741,6 +766,7 @@ mod tests {
             kind: MemberKind::Agent,
             session_id: Some(format!("sid-{handle}")),
             active: true,
+            disconnected: false,
             joined_ms: 0,
             pid: None,
         }
@@ -905,6 +931,15 @@ mod tests {
         assert!(left("old-message"));
         assert!(left("new-empty"));
         assert!(left("me"));
+    }
+
+    #[test]
+    fn old_member_metadata_keeps_process_based_presence() {
+        let mut value = serde_json::to_value(agent("worker")).unwrap();
+        value.as_object_mut().unwrap().remove("disconnected");
+        let member: Member = serde_json::from_value(value).unwrap();
+        assert!(!member.disconnected);
+        assert!(member.is_live());
     }
 
     #[test]

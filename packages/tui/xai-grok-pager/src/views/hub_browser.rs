@@ -729,6 +729,7 @@ mod tests {
                     },
                     session_id: None,
                     active: true,
+                    disconnected: false,
                     joined_ms: 0,
                     pid: None,
                 });

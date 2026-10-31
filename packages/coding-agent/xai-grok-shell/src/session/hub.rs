@@ -21,6 +21,26 @@ pub fn hubs_root() -> PathBuf {
     grok_home().join(store::HUBS_DIR)
 }
 
+/// Purpose: Disconnect hub presence when the root actor exits or its task is cancelled.
+/// Input: The root actor's bus.
+/// Output: A guard that preserves membership for resume when it drops.
+pub(crate) fn track_presence(bus: AgentBus) -> PresenceGuard {
+    PresenceGuard(bus)
+}
+
+/// Purpose: Tie hub presence to the root actor's lifetime, not the host process.
+/// Input: The root actor's bus.
+/// Output: A disconnect operation when the guard drops.
+pub(crate) struct PresenceGuard(AgentBus);
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.disconnect() {
+            tracing::warn!(%error, "agent_hub: could not disconnect the root actor");
+        }
+    }
+}
+
 /// Purpose: Connect a root session to its hub.
 /// Input: The root session id.
 /// Output: A bus in the named hub where the session is a member, or in the
@@ -77,6 +97,7 @@ fn inherit_membership_in(
             kind: MemberKind::Agent,
             session_id: Some(child_session_id.to_string()),
             active: true,
+            disconnected: false,
             joined_ms: store::now_ms(),
             pid: Some(std::process::id()),
         });
@@ -468,6 +489,72 @@ mod tests {
 
         let stranger = connect_in(root.path().to_path_buf(), "other").unwrap();
         assert!(stranger.is_session_hub());
+    }
+
+    #[test]
+    fn root_exit_ends_presence_and_resume_restores_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "root");
+        dispatch(&bus, "new team", "worker").unwrap();
+        let hub = bus.hub();
+        let joined_ms = hub.meta().unwrap().member("worker").unwrap().joined_ms;
+        let presence = track_presence(bus.clone());
+        drop(presence);
+        assert!(!hub.meta().unwrap().member("worker").unwrap().is_live());
+        let other = bus_in(root.path(), "other");
+        dispatch(&other, "join team", "other").unwrap();
+        assert!(
+            other
+                .send(MAIN_PEER_ID, "@worker", "no actor", None, &[])
+                .into_result()
+                .is_err()
+        );
+        let resumed = connect_in(root.path().to_path_buf(), "root").unwrap();
+        resumed.register(MAIN_PEER_ID, "main", None);
+        assert_eq!(resumed.hub_name(), "team");
+        assert_eq!(resumed.view(MAIN_PEER_ID).unwrap().handle, "worker");
+        let meta = hub.meta().unwrap();
+        assert!(meta.member("worker").unwrap().is_live());
+        assert_eq!(meta.member("worker").unwrap().joined_ms, joined_ms);
+    }
+
+    #[tokio::test]
+    async fn cancelled_root_task_disconnects_its_hub_presence() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "root");
+        dispatch(&bus, "new team", "worker").unwrap();
+        let hub = bus.hub();
+        let presence = track_presence(bus);
+        let actor = tokio::spawn(async move {
+            let _presence = presence;
+            std::future::pending::<()>().await;
+        });
+        actor.abort();
+        assert!(actor.await.unwrap_err().is_cancelled());
+        assert!(!hub.meta().unwrap().member("worker").unwrap().is_live());
+        assert!(store::find_membership(root.path(), "root").is_some());
+    }
+
+    #[test]
+    fn fork_handles_stay_addressable_at_the_length_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = bus_in(root.path(), "parent");
+        parent
+            .join("team", Some(&"p".repeat(64)), "unused", true)
+            .unwrap();
+        for id in ["first-child", "second-child"] {
+            let (_, handle) = inherit_membership_in(root.path(), "parent", id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(store::normalize_handle(&handle), Some(handle.clone()));
+            let child = connect_in(root.path().to_path_buf(), id).unwrap();
+            child.register(MAIN_PEER_ID, "main", None);
+            parent
+                .send(MAIN_PEER_ID, &handle, id, None, &[])
+                .into_result()
+                .unwrap();
+            assert_eq!(child.inbox(MAIN_PEER_ID).unwrap()[0].text, id);
+        }
     }
 
     #[test]

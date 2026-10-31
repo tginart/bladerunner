@@ -240,6 +240,30 @@ impl AgentBus {
         }
     }
 
+    /// Purpose: End local presence without removal of resumable hub membership.
+    /// Input: The bus of a root actor that has terminated.
+    /// Output: All owned members become disconnected, and local wake hooks stop.
+    pub fn disconnect(&self) -> Result<()> {
+        let mut g = self.lock();
+        let mut targets = vec![(g.main_handle.clone(), g.root_session_id.clone())];
+        for (id, peer) in &g.peers {
+            targets.push((peer.handle.clone(), g.session_id_for(id)));
+        }
+        for peer in g.peers.values_mut() {
+            peer.status = PeerStatus::Gone;
+            peer.wake = None;
+        }
+        g.hub.update_meta(|meta| {
+            for (handle, session_id) in targets {
+                if let Some(member) = meta.members.iter_mut().find(|m| m.handle == handle)
+                    && member.session_id.as_deref() == Some(session_id.as_str())
+                {
+                    member.disconnected = true;
+                }
+            }
+        })
+    }
+
     /// Hub roster and channel state as peer `id` sees it.
     pub fn view(&self, id: &str) -> Result<HubView> {
         let (hub, handle, is_session_hub) = self.peer_context(id)?;
@@ -912,8 +936,8 @@ fn peer_handle_base(is_session_hub: bool, main_handle: &str, id: &str, label: &s
 /// Input: The locked metadata, preferred handle, label, and owner session id.
 /// Output: The reserved handle. Person handles are never reassigned to agents.
 fn reserve_member(meta: &mut HubMeta, base: &str, label: &str, session_id: &str) -> String {
-    let handle = std::iter::once(base.to_string())
-        .chain((2..).map(|n| format!("{base}-{n}")))
+    let handle = std::iter::once(store::handle_candidate(base, ""))
+        .chain((2..).map(|n| store::handle_candidate(base, &format!("-{n}"))))
         .find(|handle| match meta.member(handle) {
             None => true,
             Some(member) => {
@@ -927,7 +951,11 @@ fn reserve_member(meta: &mut HubMeta, base: &str, label: &str, session_id: &str)
         .iter_mut()
         .find(|member| member.handle == handle)
     {
+        if member.session_id.as_deref() != Some(session_id) {
+            member.joined_ms = store::now_ms();
+        }
         member.active = true;
+        member.disconnected = false;
         member.label = label.to_string();
         member.session_id = Some(session_id.to_string());
         member.pid = Some(std::process::id());
@@ -939,6 +967,7 @@ fn reserve_member(meta: &mut HubMeta, base: &str, label: &str, session_id: &str)
         kind: MemberKind::Agent,
         session_id: Some(session_id.to_string()),
         active: true,
+        disconnected: false,
         joined_ms: store::now_ms(),
         pid: Some(std::process::id()),
     });
@@ -953,9 +982,9 @@ pub fn ensure_person(hub: &Hub, person: &str) -> Result<String> {
     hub.update_meta(|meta| {
         for n in 1.. {
             let handle = if n == 1 {
-                person.to_string()
+                store::handle_candidate(person, "")
             } else {
-                format!("{person}-{n}")
+                store::handle_candidate(person, &format!("-{n}"))
             };
             if let Some(member) = meta
                 .members
@@ -974,6 +1003,7 @@ pub fn ensure_person(hub: &Hub, person: &str) -> Result<String> {
                 kind: MemberKind::Person,
                 session_id: None,
                 active: true,
+                disconnected: false,
                 joined_ms: store::now_ms(),
                 pid: None,
             });
@@ -1369,6 +1399,136 @@ mod tests {
             hub.meta().unwrap().member("lead").unwrap().kind,
             MemberKind::Person
         );
+    }
+
+    #[test]
+    fn generated_handles_remain_addressable_at_the_length_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let base = "x".repeat(64);
+        let label = "s".repeat(64);
+        let bus = session_bus(root.path(), "first");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", Some(&base), "unused", true).unwrap();
+        bus.register("scout", "scout", None);
+        bus.register("long-a", &label, None);
+        bus.register("long-b", &label, None);
+        let other = session_bus(root.path(), "second");
+        other.register(MAIN_PEER_ID, "main", None);
+        other.join("team", Some(&base), "unused", false).unwrap();
+        for id in [MAIN_PEER_ID, "scout", "long-a", "long-b"] {
+            let handle = bus.view(id).unwrap().handle;
+            assert_eq!(
+                store::normalize_handle(&handle).as_deref(),
+                Some(handle.as_str())
+            );
+            if id != MAIN_PEER_ID {
+                assert!(handle.contains('/'), "a subagent keeps its namespace");
+            }
+            other
+                .send(MAIN_PEER_ID, &handle, id, None, &[])
+                .into_result()
+                .unwrap();
+            assert_eq!(texts(&bus.inbox(id).unwrap()), vec![id]);
+        }
+        let other_handle = other.view(MAIN_PEER_ID).unwrap().handle;
+        assert_eq!(
+            store::normalize_handle(&other_handle),
+            Some(other_handle.clone())
+        );
+        assert_ne!(other_handle, base);
+        let person = ensure_person(&bus.hub(), &base).unwrap();
+        assert_eq!(store::normalize_handle(&person), Some(person.clone()));
+        assert_ne!(person, other_handle);
+    }
+
+    #[test]
+    fn handle_replacement_filters_old_messages_but_resume_preserves_its_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let old = session_bus(root.path(), "old");
+        old.register(MAIN_PEER_ID, "main", None);
+        old.join("team", Some("worker"), "unused", true).unwrap();
+        let sender = session_bus(root.path(), "sender");
+        sender.register(MAIN_PEER_ID, "main", None);
+        sender
+            .join("team", Some("sender"), "unused", false)
+            .unwrap();
+        let hub = old.hub();
+        hub.update_meta(|meta| {
+            meta.members
+                .iter_mut()
+                .find(|m| m.handle == "worker")
+                .unwrap()
+                .joined_ms = 1;
+        })
+        .unwrap();
+        hub.append(&Message {
+            id: "old-dm".to_string(),
+            conv: store::dm_conv("sender", "worker"),
+            from: "sender".to_string(),
+            text: "for the previous task".to_string(),
+            reply_to: None,
+            mentions: Vec::new(),
+            images: Vec::new(),
+            ts_unix_ms: 2,
+        })
+        .unwrap();
+        old.disconnect().unwrap();
+        let resumed = session_bus(root.path(), "old");
+        resumed
+            .join("team", Some("worker"), "unused", false)
+            .unwrap();
+        resumed.register(MAIN_PEER_ID, "main", None);
+        assert_eq!(hub.meta().unwrap().member("worker").unwrap().joined_ms, 1);
+        resumed.leave().unwrap();
+        let replacement = session_bus(root.path(), "replacement");
+        replacement.register(MAIN_PEER_ID, "main", None);
+        replacement
+            .join("team", Some("worker"), "unused", false)
+            .unwrap();
+        assert!(hub.meta().unwrap().member("worker").unwrap().joined_ms > 2);
+        assert!(replacement.inbox(MAIN_PEER_ID).unwrap().is_empty());
+        sender
+            .send(MAIN_PEER_ID, "@worker", "new task", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            texts(&replacement.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["new task"]
+        );
+        old.disconnect().unwrap();
+        assert!(hub.meta().unwrap().member("worker").unwrap().is_live());
+    }
+
+    #[test]
+    fn disconnect_ends_presence_without_forgetting_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "root");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.register("child", "scout", None);
+        bus.join("team", Some("worker"), "unused", true).unwrap();
+        let hub = bus.hub();
+        let joined_ms = hub.meta().unwrap().member("worker").unwrap().joined_ms;
+        bus.disconnect().unwrap();
+        for member in hub.meta().unwrap().members {
+            assert!(member.active, "disconnect does not leave the hub");
+            assert!(member.disconnected);
+            assert!(!member.is_live(), "the host process still runs");
+        }
+        assert_eq!(
+            store::find_membership(root.path(), "root"),
+            Some(("team".into(), "worker".into()))
+        );
+        let meta = hub.meta().unwrap();
+        assert!(
+            resolve_target(&meta, "other", "@worker")
+                .unwrap_err()
+                .to_string()
+                .contains("gone")
+        );
+        bus.register(MAIN_PEER_ID, "main", None);
+        let meta = hub.meta().unwrap();
+        assert!(meta.member("worker").unwrap().is_live());
+        assert_eq!(meta.member("worker").unwrap().joined_ms, joined_ms);
     }
 
     #[test]
