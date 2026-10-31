@@ -35,7 +35,7 @@
     {
       "path": "Cargo.lock",
       "bytes": 411403,
-      "sha256": "91f900bc4102e770308574099d2dc92b1bff24484e4e4957b6447c0e5eb56f2e",
+      "sha256": "e2f8b48a2f8686fd89633225a2f1c16e4837ac5ba77a886220e6514a3a6da65f",
       "mode": "0644"
     },
     {
@@ -83,7 +83,7 @@
     {
       "path": "VERSION",
       "bytes": 7,
-      "sha256": "b07bb892d144e091a2e472e8c6b03b9635543840bbc61f8ababda8ee9cee2627",
+      "sha256": "5d69346d1666843c2b84f59537f98368788d28a075c9e8a02d4af5872813f83b",
       "mode": "0644"
     },
     {
@@ -3407,7 +3407,7 @@
     {
       "path": "packages/coding-agent/xai-grok-pager-bin/Cargo.toml",
       "bytes": 4451,
-      "sha256": "b7dc36ddcfa4c59a1a33aeacf24d2b5d546d238a3eafdfd3286c02c01a0f92f9",
+      "sha256": "b76e30195ce989b6164e429d9e772946253672565524a337cab841a215950c86",
       "mode": "0644"
     },
     {
@@ -3575,7 +3575,7 @@
     {
       "path": "packages/coding-agent/xai-grok-shell/Cargo.toml",
       "bytes": 10709,
-      "sha256": "d9cf80b7e6df6046209f2f247ab6ca81704f083ed396e3612bcca9148dd99b6d",
+      "sha256": "c17c634c1aa03d702d4d3c819366881333aa55731eef411dc1d288047c3129f6",
       "mode": "0644"
     },
     {
@@ -8717,7 +8717,7 @@
     {
       "path": "packages/platform/xai-grok-version/Cargo.toml",
       "bytes": 221,
-      "sha256": "6d13d2fcbf2202dbabc061fb71914cb165f65354dacd32b2f7f74b43a2caab75",
+      "sha256": "bc5d907d81abe2df24d650ad2a7897e8a36d29c9a54adfbbeb58740287284eee",
       "mode": "0644"
     },
     {
@@ -13481,7 +13481,7 @@
     {
       "path": "packages/tui/xai-grok-pager/Cargo.toml",
       "bytes": 11509,
-      "sha256": "5c12569c8c1a036846c0a31efa4610505334699c521a306ab9b00891cb076c10",
+      "sha256": "771f3c882b0c7e601e76d0ee29e9c8de290aeee92ba0d5698c01cae069e05e3f",
       "mode": "0644"
     },
     {
@@ -16786,8 +16786,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/sovereign_cmd.rs",
-      "bytes": 24778,
-      "sha256": "b74650d256d05543c0c6ec5d9121379ba253ea56e9829ec9c6c21a2ac70d58ac",
+      "bytes": 35737,
+      "sha256": "22f483794224b2eabf1fc45b591f330721609c9963c7b9f3334bf2a29713f5a5",
       "mode": "0644"
     },
     {
@@ -16798,8 +16798,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/tailnet.rs",
-      "bytes": 3172,
-      "sha256": "8397262a9dd00bdbffbb7d7eecd151fe95ee9bafec536f04d3e4c684539722bf",
+      "bytes": 3158,
+      "sha256": "2e6e703f2b37a3d8baa8e1eff34daa60cb1e4ae36d067cd51cd752c037a9a562",
       "mode": "0644"
     },
     {
