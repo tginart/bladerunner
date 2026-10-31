@@ -8,6 +8,10 @@ impl SessionActor {
     ) -> PromptTurnResult {
         // Builtin turns carry no user message, so a send-now may cancel from the start.
         self.mark_front_message_committed().await;
+        // Restamp the turn start: without it, this turn's updates carry the last
+        // model turn's `turnStartMs`, and the client times the builtin from there.
+        self.chat_state_handle
+            .record_turn_start(chrono::Utc::now().timestamp_millis());
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SlashCommandUsed {
             command: action.command_name().to_string(),
             args_provided: action.args_provided(),

@@ -59,7 +59,7 @@ For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
 Agent threads can talk to each other in a hub, with channels and DMs. In one
 session, run `/hub new api`. In another, run `/hub join api`. Their agents can
-now post with the `agent_hub` tool, and a DM or an `@handle` mention wakes an
+now post with the `message_agents` tool, and a DM or an `@handle` mention wakes an
 idle agent. `/fork` keeps the hub; n-shot shots do not join it. Run `/hub` for
 status and the other commands. Hubs live under `~/.bladerunner/hubs`.
 

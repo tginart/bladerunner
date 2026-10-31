@@ -4502,6 +4502,11 @@ impl AgentView {
             self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
         }
+        if let Some(browser) = self.hub_browser.as_mut()
+            && let Some(popup) = crate::views::hub_browser::render_hub_browser(buf, area, browser)
+        {
+            self.frame_occluder_rects.push(popup);
+        }
         if self.show_workflows {
             // List navigation and later notifications can reveal deferred children too.
             self.replay_workflow_column_children();

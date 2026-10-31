@@ -178,22 +178,20 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
     match command {
         "" => status(bus),
         "list" | "ls" => list(&bus.hubs_root(), rest == "--archived"),
-        "new" | "join" => {
-            // `join --create` (from `--hub-create`) makes the hub when it is missing.
-            let create_if_missing =
-                command == "join" && rest.split_whitespace().any(|w| w == "--create");
-            let rest = rest.replace("--create", "");
-            let (name, handle) = parse_name_and_handle(&rest)?;
+        "new" | "create" | "join" => {
+            // `join` never makes a hub, so a typo cannot. `new` joins a hub that
+            // already exists, so `--hub-create` works on every start.
+            let (name, handle) = parse_name_and_handle(rest)?;
             let exists = store::Hub::open(&bus.hubs_root(), &name).is_ok();
-            let create = command == "new" || (create_if_missing && !exists);
+            let create = command != "join" && !exists;
             let outcome = bus.join(&name, handle.as_deref(), default_handle, create)?;
-            let verb = if create {
-                "Created and joined"
-            } else {
-                "Joined"
+            let verb = match (create, command) {
+                (true, _) => "Created and joined",
+                (false, "join") => "Joined",
+                (false, _) => "Hub already exists. Joined",
             };
             Ok(format!(
-                "{verb} hub {} as @{}. Subagents of this session join as @{}/<type>. Agents here can now reach each other with the agent_hub tool.",
+                "{verb} hub {} as @{}. Subagents of this session join as @{}/<type>. Agents here can now reach each other with the message_agents tool.",
                 outcome.hub, outcome.handle, outcome.handle
             ))
         }
@@ -425,13 +423,16 @@ mod tests {
         assert!(out.contains("#tasks"), "{out}");
         assert!(dispatch(&bus, "join api as @a b", "x").is_err());
         let other = bus_in(root.path(), "s2");
-        let out = dispatch(&other, "join web --create", "front").unwrap();
+        let out = dispatch(&other, "create web", "front").unwrap();
         assert!(
             out.contains("Created and joined hub web as @front"),
             "{out}"
         );
-        let out = dispatch(&other, "join api --create", "front").unwrap();
-        assert!(out.starts_with("Joined hub api as @front"), "{out}");
+        let out = dispatch(&other, "new api", "front").unwrap();
+        assert!(
+            out.starts_with("Hub already exists. Joined hub api as @front"),
+            "{out}"
+        );
         assert!(
             dispatch(&bus, "bogus", "x")
                 .unwrap_err()

@@ -1602,6 +1602,13 @@ pub(crate) async fn run(
     const N_SHOT_POLL_INTERVAL: Duration = Duration::from_millis(500);
     let mut n_shot_poll_at: Option<Instant> = None;
 
+    // Agent hubs: refresh the status-bar unread count and any open hub browser
+    // while idle. Armed only while a session is in a named hub or a browser is open.
+    const HUB_LABEL_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    // An open hub browser reloads its feed this often.
+    const HUB_BROWSER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let mut hub_label_poll_at: Option<Instant> = None;
+
     // Pre-generate the automatic "return-from-away" recap while the terminal is
     // unfocused, so it's already in the scrollback (instant) when the user
     // returns. The arm is a cheap no-op while focused / not-yet-eligible; the
@@ -2090,6 +2097,17 @@ pub(crate) async fn run(
             app.gboom_release_all_games();
         }
 
+        let is_hub_browser_open = app.agents.values().any(|a| a.hub_browser.is_some());
+        if hub_label_poll_at.is_none()
+            && (is_hub_browser_open || crate::hub_status::any_session_in_hub())
+        {
+            let interval = if is_hub_browser_open {
+                HUB_BROWSER_POLL_INTERVAL
+            } else {
+                HUB_LABEL_POLL_INTERVAL
+            };
+            hub_label_poll_at = Some(Instant::now() + interval);
+        }
         if n_shot_poll_at.is_none() && dispatch::n_shot_has_open_groups(&app) {
             n_shot_poll_at = Some(Instant::now() + N_SHOT_POLL_INTERVAL);
         }
@@ -2204,6 +2222,13 @@ pub(crate) async fn run(
 
         let n_shot_poll = async {
             match n_shot_poll_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+
+        let hub_label_poll = async {
+            match hub_label_poll_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -2610,6 +2635,22 @@ pub(crate) async fn run(
                 if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                     break;
                 }
+            }
+
+            _ = hub_label_poll => {
+                hub_label_poll_at = None;
+                crate::hub_status::refresh_hub_labels();
+                let mut is_refreshed = false;
+                for agent in app.agents.values_mut() {
+                    is_refreshed |= agent.refresh_hub_browser();
+                }
+                if is_refreshed {
+                    presenter.request(false);
+                }
+            }
+
+            _ = crate::hub_status::label_changed().notified() => {
+                presenter.request(false);
             }
 
             _ = n_shot_poll => {

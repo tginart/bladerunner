@@ -517,6 +517,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "help",
     "history",
     "home",
+    "hub",
     "hooks",
     "hooks-add",
     "hooks-list",

@@ -1209,15 +1209,16 @@ impl PagerArgs {
             .filter(|s| !s.is_empty())
     }
 
-    /// The `/hub join` command that `--hub` runs before any initial prompt.
+    /// The `/hub join` (or, with `--hub-create`, `/hub new`) command that `--hub`
+    /// runs before any initial prompt.
     pub fn hub_join_command(&self) -> Option<String> {
         let name = self
             .hub
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())?;
-        let create = if self.hub_create { " --create" } else { "" };
-        Some(format!("/hub join {name}{create}"))
+        let command = if self.hub_create { "new" } else { "join" };
+        Some(format!("/hub {command} {name}"))
     }
 }
 /// Credential helpers behind `bladerunner auth <helper>`.
@@ -1577,7 +1578,7 @@ mod tests {
         let args = PagerArgs::try_parse_from(["grok", "--hub", "api", "--hub-create"]).unwrap();
         assert_eq!(
             args.hub_join_command().as_deref(),
-            Some("/hub join api --create")
+            Some("/hub new api")
         );
         assert!(PagerArgs::try_parse_from(["grok", "--hub-create"]).is_err());
         let args = PagerArgs::try_parse_from(["grok"]).unwrap();
