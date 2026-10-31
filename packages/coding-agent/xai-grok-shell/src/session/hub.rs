@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use xai_grok_tools::implementations::grok_build::agent_hub::{
-    AgentBus, HubView, MemberKind, store,
+    AgentBus, HubView, MemberKind, ensure_person, store,
 };
 
 use crate::util::grok_home::grok_home;
@@ -216,7 +216,7 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
                 bail!("{USAGE}");
             }
             require_named_hub(bus)?;
-            let person = store::person_handle();
+            let person = ensure_person(&bus.hub(), &store::person_handle())?;
             match bus
                 .post_as_person(&person, target, &text, &images)
                 .into_result()

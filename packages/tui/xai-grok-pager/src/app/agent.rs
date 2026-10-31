@@ -1091,7 +1091,9 @@ impl AgentSession {
             .zip(id_strings.iter())
             .map(|(p, id)| CombineGate {
                 id: id.as_str(),
-                is_plain_prompt: p.kind == QueueEntryKind::Prompt,
+                // Passthrough commands use PromptRequest but must remain separate turns.
+                is_plain_prompt: p.kind == QueueEntryKind::Prompt
+                    && !p.text.trim_start().starts_with('/'),
                 is_synthetic: false,
                 is_expanded_skill: !p.wire_matches_display(),
                 is_bash: p.kind == QueueEntryKind::BashCommand,
@@ -1677,6 +1679,23 @@ mod tests {
         let remaining = s.dequeue_prompt().unwrap();
         assert_eq!(remaining.kind, QueueEntryKind::Command);
         assert_eq!(remaining.text, "/compact");
+    }
+    #[test]
+    fn dequeue_combined_prompt_keeps_passthrough_commands_as_boundaries() {
+        for command in ["/hub join api", "  /hub new api"] {
+            let mut session = test_session();
+            for text in ["first", "second", command, "fix it", "test it"] {
+                session.enqueue_prompt(text.to_string());
+            }
+            let before = session.dequeue_combined_prompt(None).unwrap();
+            assert_eq!(before.text, "first\n\nsecond");
+            let boundary = session.dequeue_combined_prompt(None).unwrap();
+            assert_eq!(boundary.text, command);
+            assert!(boundary.combined_texts.is_empty());
+            let after = session.dequeue_combined_prompt(None).unwrap();
+            assert_eq!(after.text, "fix it\n\ntest it");
+            assert_eq!(session.queue_len(), 0);
+        }
     }
     #[test]
     fn dequeue_combined_prompt_stops_at_cron() {

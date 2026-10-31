@@ -247,6 +247,21 @@ impl Hub {
         read_json(&path)
     }
 
+    /// Hold this lock across the complete cursor read, change, and save transaction.
+    pub(super) fn lock_cursors(&self, handle: &str) -> Result<File> {
+        let path = self.cursor_path(handle).with_extension("lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(file)
+    }
+
+    /// Save cursors while the caller holds the member's cursor lock.
     pub fn save_cursors(&self, handle: &str, cursors: &Cursors) -> Result<()> {
         write_json_atomic(&self.cursor_path(handle), cursors)
     }
@@ -637,13 +652,13 @@ fn has_messages(dir: &Path) -> bool {
         .any(|entry| entry.metadata().is_ok_and(|m| m.len() > 0))
 }
 
-/// Handles may hold `/` (subagents), which is not allowed in a file name.
+/// Escape paths and underscores so `__` separates exactly two encoded handles.
 fn encode_handle(handle: &str) -> String {
-    handle.replace('/', "~")
+    handle.replace('/', "~").replace('_', "%5F")
 }
 
 fn decode_handle(encoded: &str) -> String {
-    encoded.replace('~', "/")
+    encoded.replace("%5F", "_").replace('~', "/")
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -778,6 +793,21 @@ mod tests {
     }
 
     #[test]
+    fn dm_filenames_escape_underscores_without_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        for (a, b) in [("a__b", "z"), ("a", "b__z"), ("a_/scout", "z_")] {
+            let conv = dm_conv(a, b);
+            hub.append(&message(&conv, a, a)).unwrap();
+            assert_eq!(hub.dm_convs_for(a).unwrap(), vec![conv.clone()]);
+            assert_eq!(hub.dm_convs_for(b).unwrap(), vec![conv.clone()]);
+            assert_eq!(hub.messages(&conv, 0).unwrap()[0].from, a);
+        }
+        assert_eq!(hub.dm_convs_for("a").unwrap(), vec![dm_conv("a", "b__z")]);
+        assert_eq!(hub.dm_convs_for("z").unwrap(), vec![dm_conv("a__b", "z")]);
+    }
+
+    #[test]
     fn images_are_copied_into_blobs() {
         let root = tempfile::tempdir().unwrap();
         let hub = Hub::create(root.path(), "h").unwrap();
@@ -800,6 +830,7 @@ mod tests {
         assert_eq!(hub.cursors("a").unwrap(), Cursors::default());
         let mut cursors = Cursors::default();
         cursors.read.insert("#general".into(), 3);
+        let _cursor_lock = hub.lock_cursors("a/b").unwrap();
         hub.save_cursors("a/b", &cursors).unwrap();
         assert_eq!(hub.cursors("a/b").unwrap(), cursors);
     }

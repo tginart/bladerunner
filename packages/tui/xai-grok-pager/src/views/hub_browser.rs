@@ -76,6 +76,8 @@ pub struct HubBrowserState {
     pub selected: usize,
     pub draft: String,
     pub is_composing: bool,
+    /// A draft keeps its destination even if the selected row disappears.
+    compose_target: Option<String>,
     /// Feed lines scrolled up from the newest message.
     pub feed_scroll: usize,
     /// Result of the last post, shown in the post box.
@@ -98,6 +100,7 @@ impl HubBrowserState {
             selected: 1,
             draft: String::new(),
             is_composing: false,
+            compose_target: None,
             feed_scroll: 0,
             notice: None,
             window: ModalWindowState::new(),
@@ -120,11 +123,23 @@ impl HubBrowserState {
         self.rows().get(self.selected).cloned()
     }
 
-    /// Read the hub again and rebuild the feed of the selected row.
+    /// Purpose: Refresh the hub without a selection change when the row still exists.
+    /// Input: The browser state and the hub files.
+    /// Output: The same selected row, or a valid fallback if the row no longer exists.
     pub fn reload(&mut self) -> Result<()> {
+        let selected_row = self.selected_row();
         self.snapshot = load_snapshot(&self.hub)?;
         let rows = self.rows();
-        self.selected = clamp_selection(&rows, self.selected);
+        self.selected = match rows
+            .iter()
+            .position(|row| Some(row) == selected_row.as_ref())
+        {
+            Some(idx) => idx,
+            None => {
+                self.feed_scroll = 0;
+                clamp_selection(&rows, self.selected)
+            }
+        };
         self.feed = match rows.get(self.selected) {
             Some(row) => load_feed(&self.hub, &self.snapshot, row)?,
             None => Vec::new(),
@@ -132,9 +147,11 @@ impl HubBrowserState {
         Ok(())
     }
 
-    /// Where a post from the person goes for the selected row, if anywhere.
+    /// Where the person's draft goes, or the selected row when no draft is active.
     pub fn post_target(&self) -> Option<String> {
-        post_target(&self.selected_row()?, &self.person)
+        self.compose_target
+            .clone()
+            .or_else(|| post_target(&self.selected_row()?, &self.person))
     }
 
     /// Purpose: Apply one key press to the browser.
@@ -154,6 +171,7 @@ impl HubBrowserState {
             KeyCode::PageUp => self.feed_scroll = self.feed_scroll.saturating_add(10),
             KeyCode::PageDown => self.feed_scroll = self.feed_scroll.saturating_sub(10),
             KeyCode::Tab | KeyCode::Char('i') if self.post_target().is_some() => {
+                self.compose_target = self.post_target();
                 self.is_composing = true;
                 self.notice = None;
             }
@@ -168,9 +186,17 @@ impl HubBrowserState {
         }
     }
 
+    /// Purpose: Edit or submit the draft without a destination change.
+    /// Input: A key event while the post box has focus.
+    /// Output: The next browser action. An empty draft releases its target on exit.
     fn handle_compose_key(&mut self, key: &KeyEvent) -> HubKeyOutcome {
         match key.code {
-            KeyCode::Esc | KeyCode::Tab => self.is_composing = false,
+            KeyCode::Esc | KeyCode::Tab => {
+                self.is_composing = false;
+                if self.draft.is_empty() {
+                    self.compose_target = None;
+                }
+            }
             KeyCode::Backspace => {
                 self.draft.pop();
             }
@@ -783,6 +809,148 @@ mod tests {
         assert!(state.draft.is_empty());
         state.handle_key(&key(KeyCode::Esc));
         assert_eq!(state.handle_key(&key(KeyCode::Esc)), HubKeyOutcome::Close);
+    }
+
+    #[test]
+    fn reload_preserves_row_identity_and_compose_destination_after_channel_insert() {
+        for selected in [
+            Row::Channel("general".to_string()),
+            Row::Member("front".to_string()),
+            Row::Dm {
+                owner: "front".to_string(),
+                peer: "me".to_string(),
+                conv: store::dm_conv("front", "me"),
+            },
+        ] {
+            let (_root, hub) = hub_with_dms();
+            let mut state = HubBrowserState::open(hub, "me".to_string(), None).unwrap();
+            state.expanded.insert("front".to_string());
+            let idx = state
+                .rows()
+                .iter()
+                .position(|row| *row == selected)
+                .unwrap();
+            state.select(idx);
+            let target = state.post_target().unwrap();
+            let feed = state.feed.clone();
+            state.handle_key(&key(KeyCode::Tab));
+            state.handle_paste("keep this destination");
+            state.feed_scroll = 10;
+            state
+                .hub
+                .update_meta(|meta| {
+                    meta.channels.insert(
+                        0,
+                        store::Channel {
+                            name: "alerts".to_string(),
+                            purpose: String::new(),
+                            created_ms: 0,
+                        },
+                    );
+                })
+                .unwrap();
+
+            state.reload().unwrap();
+
+            assert_eq!(state.selected_row(), Some(selected));
+            assert_eq!(state.selected, idx + 1);
+            assert_eq!(state.feed, feed);
+            assert_eq!(state.feed_scroll, 10);
+            assert_eq!(
+                state.handle_key(&key(KeyCode::Enter)),
+                HubKeyOutcome::Post {
+                    to: target,
+                    text: "keep this destination".to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn reload_preserves_dm_row_after_an_earlier_dm_appears() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub, "me".to_string(), None).unwrap();
+        state.expanded.insert("front".to_string());
+        let selected = Row::Dm {
+            owner: "front".to_string(),
+            peer: "me".to_string(),
+            conv: store::dm_conv("front", "me"),
+        };
+        let idx = state
+            .rows()
+            .iter()
+            .position(|row| *row == selected)
+            .unwrap();
+        state.select(idx);
+        state
+            .hub
+            .append(&store::Message {
+                id: "new-dm".to_string(),
+                conv: store::dm_conv("aaa", "front"),
+                from: "aaa".to_string(),
+                text: "new conversation".to_string(),
+                reply_to: None,
+                mentions: Vec::new(),
+                images: Vec::new(),
+                ts_unix_ms: store::now_ms(),
+            })
+            .unwrap();
+
+        state.reload().unwrap();
+
+        assert_eq!(state.selected_row(), Some(selected));
+        assert_eq!(state.selected, idx + 1);
+        assert_eq!(state.post_target().as_deref(), Some("@front"));
+        assert_eq!(state.feed[0].text, "status?");
+    }
+
+    #[test]
+    fn reload_does_not_redirect_a_draft_when_its_row_disappears() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub, "me".to_string(), None).unwrap();
+        state.handle_key(&key(KeyCode::Down));
+        assert_eq!(state.selected_row(), Some(Row::Member("front".to_string())));
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("for front only");
+        state
+            .hub
+            .update_meta(|meta| {
+                meta.members.retain(|member| member.handle != "front");
+            })
+            .unwrap();
+
+        state.reload().unwrap();
+
+        assert_eq!(state.selected_row(), Some(Row::Member("back".to_string())));
+        assert_eq!(state.post_target().as_deref(), Some("@front"));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post {
+                to: "@front".to_string(),
+                text: "for front only".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn compose_keeps_a_paused_draft_target_until_the_draft_is_empty() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub, "me".to_string(), None).unwrap();
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("hello");
+        state.handle_key(&key(KeyCode::Esc));
+        state.handle_key(&key(KeyCode::Down));
+        assert_eq!(state.selected_row(), Some(Row::Member("front".to_string())));
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post {
+                to: "#general".to_string(),
+                text: "hello".to_string(),
+            }
+        );
+        state.handle_key(&key(KeyCode::Esc));
+        assert_eq!(state.post_target().as_deref(), Some("@front"));
     }
 
     #[test]

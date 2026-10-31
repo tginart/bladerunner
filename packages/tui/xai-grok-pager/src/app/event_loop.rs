@@ -4334,6 +4334,45 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
 
+    #[test]
+    fn startup_hub_command_does_not_combine_with_positional_prompt() {
+        use crate::app::agent::AgentId;
+        use clap::Parser;
+
+        for command in ["join", "new"] {
+            let mut argv = vec!["grok", "--hub", "api"];
+            if command == "new" {
+                argv.push("--hub-create");
+            }
+            argv.push("fix it");
+            let args = PagerArgs::try_parse_from(argv).unwrap();
+            let mut app = crate::app::app_view::tests::test_app();
+            let id = AgentId(0);
+            app.agents
+                .insert(id, crate::test_util::make_agent_view(None, "/tmp"));
+            app.active_view = ActiveView::Agent(id);
+
+            let effects =
+                dispatch::dispatch_initial_prompt(&mut app, args.hub_join_command().unwrap());
+            dispatch::enqueue_startup_prompts(
+                &mut app,
+                &[args.initial_prompt().unwrap().to_string()],
+            );
+            assert!(effects.is_empty(), "startup waits for the session to bind");
+
+            // This is the dequeue path when combine_queued_prompts is enabled.
+            let session = &mut app.agents.get_mut(&id).unwrap().session;
+            let first = session.dequeue_combined_prompt(None).unwrap();
+            assert_eq!(first.text, format!("/hub {command} api"));
+            assert!(first.combined_texts.is_empty());
+            assert_eq!(session.queue_len(), 1);
+            assert_eq!(
+                session.dequeue_combined_prompt(None).unwrap().text,
+                "fix it"
+            );
+        }
+    }
+
     #[cfg(feature = "local-workspace")]
     #[test]
     fn welcome_oneshot_applies_to_create_worktree_session() {

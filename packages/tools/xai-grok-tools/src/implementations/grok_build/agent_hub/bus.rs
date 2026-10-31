@@ -192,13 +192,23 @@ impl AgentBus {
         let label = label.into();
         {
             let mut g = self.lock();
-            let handle = match g.peers.get(&id) {
+            let base = match g.peers.get(&id) {
                 Some(peer) => peer.handle.clone(),
-                None => g.handle_for(&id, &label),
+                None => g.handle_base_for(&id, &label),
             };
             let session_id = g.session_id_for(&id);
-            if let Err(e) = upsert_member(&g.hub, &handle, &label, &session_id) {
-                tracing::warn!(error = %e, hub = g.hub.name(), "agent_hub: register failed");
+            let handle = match g
+                .hub
+                .update_meta(|meta| reserve_member(meta, &base, &label, &session_id))
+            {
+                Ok(handle) => handle,
+                Err(e) => {
+                    tracing::warn!(error = %e, hub = g.hub.name(), "agent_hub: register failed");
+                    return;
+                }
+            };
+            if id == MAIN_PEER_ID {
+                g.main_handle = handle.clone();
             }
             g.peers.insert(
                 id,
@@ -305,10 +315,12 @@ impl AgentBus {
     /// Drain unread DMs and mentions for peer `id` (non-blocking).
     pub fn inbox(&self, id: &str) -> Result<Vec<Message>> {
         let (hub, handle, _) = self.peer_context(id)?;
+        let cursor_lock = hub.lock_cursors(&handle)?;
         let (pending, cursors) = collect_pending(&hub, &handle)?;
         if let Some(cursors) = cursors {
             hub.save_cursors(&handle, &cursors)?;
         }
+        drop(cursor_lock);
         record_tokens(&hub, &pending)?;
         Ok(pending)
     }
@@ -350,6 +362,7 @@ impl AgentBus {
             bail!("unknown channel #{name}; call message_agents op list");
         }
         let conv = format!("#{name}");
+        let cursor_lock = hub.lock_cursors(&handle)?;
         let mut cursors = hub.cursors(&handle)?;
         let start = since.unwrap_or_else(|| cursors.read.get(&conv).copied().unwrap_or(0));
         let mut messages = hub.messages(&conv, start)?;
@@ -357,6 +370,7 @@ impl AgentBus {
         messages.truncate(limit);
         cursors.read.insert(conv, start + messages.len());
         hub.save_cursors(&handle, &cursors)?;
+        drop(cursor_lock);
         record_tokens(&hub, &messages)?;
         Ok((messages, remaining))
     }
@@ -444,37 +458,58 @@ impl AgentBus {
     }
 
     fn switch_hub(&self, hub: Hub, main_base: &str) -> Result<()> {
-        let (old_hub, old_handles) = {
-            let g = self.lock();
-            let handles: Vec<String> = g.peers.values().map(|p| p.handle.clone()).collect();
-            (g.hub.clone(), handles)
-        };
-        old_hub.update_meta(|meta| {
-            for handle in &old_handles {
-                set_active(meta, handle, false);
+        let mut g = self.lock();
+        g.hub.update_meta(|meta| {
+            if meta.member(&g.main_handle).is_some_and(|member| {
+                member.kind == MemberKind::Agent
+                    && member.session_id.as_deref() == Some(g.root_session_id.as_str())
+            }) {
+                set_active(meta, &g.main_handle, false);
+            }
+            for peer in g.peers.values() {
+                set_active(meta, &peer.handle, false);
             }
         })?;
 
-        let meta = hub.meta()?;
-        let mut g = self.lock();
         let is_session_hub = hub.name() == store::session_hub_name(&g.root_session_id);
-        g.main_handle = if is_session_hub {
-            MAIN_PEER_ID.to_string()
-        } else {
-            store::unique_handle(&meta, main_base, Some(&g.root_session_id))
-        };
-        g.hub = hub;
-        let ids: Vec<String> = g.peers.keys().cloned().collect();
-        for id in ids {
-            // Upsert one peer at a time so the next unique handle sees it.
-            let label = g.peers[&id].label.clone();
-            let handle = g.handle_for(&id, &label);
-            let session_id = g.session_id_for(&id);
-            let peer = g.peers.get_mut(&id).expect("peer listed above");
-            peer.handle = handle.clone();
-            if peer.status == PeerStatus::Running {
-                upsert_member(&g.hub, &handle, &label, &session_id)?;
+        let (main_handle, handles) = hub.update_meta(|meta| {
+            let main_label = g
+                .peers
+                .get(MAIN_PEER_ID)
+                .map(|peer| peer.label.as_str())
+                .unwrap_or("main");
+            // Reserve Main even before its local peer is registered.
+            let main_handle = reserve_member(
+                meta,
+                if is_session_hub {
+                    MAIN_PEER_ID
+                } else {
+                    main_base
+                },
+                main_label,
+                &g.root_session_id,
+            );
+            let mut handles = BTreeMap::new();
+            for (id, peer) in &g.peers {
+                let handle = if id == MAIN_PEER_ID {
+                    main_handle.clone()
+                } else {
+                    let base = peer_handle_base(is_session_hub, &main_handle, id, &peer.label);
+                    reserve_member(meta, &base, &peer.label, &g.session_id_for(id))
+                };
+                handles.insert(id.clone(), handle);
             }
+            for (id, handle) in &handles {
+                if g.peers[id].status == PeerStatus::Gone {
+                    set_active(meta, handle, false);
+                }
+            }
+            (main_handle, handles)
+        })?;
+        g.main_handle = main_handle;
+        g.hub = hub;
+        for (id, handle) in handles {
+            g.peers.get_mut(&id).expect("peer listed above").handle = handle;
         }
         Ok(())
     }
@@ -531,22 +566,9 @@ impl AgentBus {
 }
 
 impl BusInner {
-    fn handle_for(&self, id: &str, label: &str) -> String {
+    fn handle_base_for(&self, id: &str, label: &str) -> String {
         let is_session_hub = self.hub.name() == store::session_hub_name(&self.root_session_id);
-        if is_session_hub {
-            return id.to_string();
-        }
-        if id == MAIN_PEER_ID {
-            return self.main_handle.clone();
-        }
-        let base_label = store::normalize_handle(label)
-            .map(|l| l.replace('/', "-"))
-            .unwrap_or_else(|| "subagent".to_string());
-        let base = format!("{}/{base_label}", self.main_handle);
-        match self.hub.meta() {
-            Ok(meta) => store::unique_handle(&meta, &base, Some(id)),
-            Err(_) => base,
-        }
+        peer_handle_base(is_session_hub, &self.main_handle, id, label)
     }
 
     fn session_id_for(&self, id: &str) -> String {
@@ -616,6 +638,7 @@ async fn watch(weak: Weak<Mutex<BusInner>>) {
 
 fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
     for (handle, wake) in targets {
+        let cursor_lock = hub.lock_cursors(handle)?;
         let (pending, cursors) = collect_pending(hub, handle)?;
         if pending.is_empty() {
             if let Some(cursors) = cursors {
@@ -643,6 +666,7 @@ fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
         if let Some(cursors) = cursors {
             hub.save_cursors(handle, &cursors)?;
         }
+        drop(cursor_lock);
         record_tokens(hub, &pending)?;
         wake(
             format_messages(hub, &meta, &pending),
@@ -703,14 +727,14 @@ pub fn post_as_person(
     text: &str,
     images: &[PathBuf],
 ) -> Result<String> {
-    ensure_person(hub, person)?;
+    let person = ensure_person(hub, person)?;
     let draft = Draft {
         to,
         text,
         reply_to: None,
         images,
     };
-    let id = post(hub, person, MemberKind::Person, &draft)?;
+    let id = post(hub, &person, MemberKind::Person, &draft)?;
     hub.update_meta(|meta| meta.agent_wake_streak = 0)?;
     Ok(id)
 }
@@ -868,41 +892,94 @@ fn open_with_suggestion(hubs_root: &Path, name: &str) -> Result<Hub> {
     }
 }
 
-fn upsert_member(hub: &Hub, handle: &str, label: &str, session_id: &str) -> Result<()> {
-    hub.update_meta(|meta| {
-        if let Some(member) = meta.members.iter_mut().find(|m| m.handle == handle) {
-            member.active = true;
-            member.label = label.to_string();
-            member.session_id = Some(session_id.to_string());
-            member.pid = Some(std::process::id());
-            return;
-        }
-        meta.members.push(Member {
-            handle: handle.to_string(),
-            label: label.to_string(),
-            kind: MemberKind::Agent,
-            session_id: Some(session_id.to_string()),
-            active: true,
-            joined_ms: store::now_ms(),
-            pid: Some(std::process::id()),
-        });
-    })
+/// Purpose: Build a peer's preferred handle without access to hub metadata.
+/// Input: The hub type, Main's handle, the peer id, and the peer label.
+/// Output: The preferred handle. The caller must reserve it under the hub lock.
+fn peer_handle_base(is_session_hub: bool, main_handle: &str, id: &str, label: &str) -> String {
+    if is_session_hub {
+        return id.to_string();
+    }
+    if id == MAIN_PEER_ID {
+        return main_handle.to_string();
+    }
+    let base_label = store::normalize_handle(label)
+        .map(|label| label.replace('/', "-"))
+        .unwrap_or_else(|| "subagent".to_string());
+    format!("{main_handle}/{base_label}")
 }
 
-fn ensure_person(hub: &Hub, person: &str) -> Result<()> {
+/// Purpose: Select and reserve an agent handle in one metadata transaction.
+/// Input: The locked metadata, preferred handle, label, and owner session id.
+/// Output: The reserved handle. Person handles are never reassigned to agents.
+fn reserve_member(meta: &mut HubMeta, base: &str, label: &str, session_id: &str) -> String {
+    let handle = std::iter::once(base.to_string())
+        .chain((2..).map(|n| format!("{base}-{n}")))
+        .find(|handle| match meta.member(handle) {
+            None => true,
+            Some(member) => {
+                member.kind == MemberKind::Agent
+                    && (!member.is_live() || member.session_id.as_deref() == Some(session_id))
+            }
+        })
+        .expect("an unused handle exists");
+    if let Some(member) = meta
+        .members
+        .iter_mut()
+        .find(|member| member.handle == handle)
+    {
+        member.active = true;
+        member.label = label.to_string();
+        member.session_id = Some(session_id.to_string());
+        member.pid = Some(std::process::id());
+        return handle;
+    }
+    meta.members.push(Member {
+        handle: handle.clone(),
+        label: label.to_string(),
+        kind: MemberKind::Agent,
+        session_id: Some(session_id.to_string()),
+        active: true,
+        joined_ms: store::now_ms(),
+        pid: Some(std::process::id()),
+    });
+    handle
+}
+
+/// Purpose: Reserve the person's handle without a collision with an agent.
+/// Input: The hub and the person's preferred handle.
+/// Output: The stable person handle, with a numeric suffix when necessary.
+/// Note: Use this handle for UI identity, DM keys, and posts.
+pub fn ensure_person(hub: &Hub, person: &str) -> Result<String> {
     hub.update_meta(|meta| {
-        if meta.member(person).is_some() {
-            return;
+        for n in 1.. {
+            let handle = if n == 1 {
+                person.to_string()
+            } else {
+                format!("{person}-{n}")
+            };
+            if let Some(member) = meta
+                .members
+                .iter_mut()
+                .find(|member| member.handle == handle)
+            {
+                if member.kind == MemberKind::Person {
+                    member.active = true;
+                    return handle;
+                }
+                continue;
+            }
+            meta.members.push(Member {
+                handle: handle.clone(),
+                label: "person".to_string(),
+                kind: MemberKind::Person,
+                session_id: None,
+                active: true,
+                joined_ms: store::now_ms(),
+                pid: None,
+            });
+            return handle;
         }
-        meta.members.push(Member {
-            handle: person.to_string(),
-            label: "person".to_string(),
-            kind: MemberKind::Person,
-            session_id: None,
-            active: true,
-            joined_ms: store::now_ms(),
-            pid: None,
-        });
+        unreachable!("an unused person handle exists")
     })
 }
 
@@ -960,6 +1037,84 @@ mod tests {
         assert_eq!(texts(&bus.inbox("b").unwrap()), vec!["hello peer"]);
         assert!(bus.inbox("b").unwrap().is_empty());
         assert!(bus.inbox("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_inbox_and_delivery_hold_the_member_cursor_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        let hub = bus.hub();
+        let wake: PeerWakeFn = Arc::new(|_, _| {});
+        for operation in ["read", "inbox", "deliver"] {
+            let cursor_lock = hub.lock_cursors("a").unwrap();
+            let worker_bus = bus.clone();
+            let worker_hub = hub.clone();
+            let worker_wake = wake.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                match operation {
+                    "read" => {
+                        worker_bus.read("a", "general", 1, None).unwrap();
+                    }
+                    "inbox" => {
+                        worker_bus.inbox("a").unwrap();
+                    }
+                    "deliver" => {
+                        deliver(&worker_hub, &[("a".to_string(), worker_wake)]).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            let blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+            drop(cursor_lock);
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert!(blocked, "{operation} must wait for the cursor transaction");
+        }
+    }
+
+    #[test]
+    fn concurrent_channel_reads_do_not_replay_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let hub = bus.hub();
+        for index in 0..20 {
+            bus.send("b", "#general", &format!("message {index}"), None, &[])
+                .into_result()
+                .unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let bus = bus.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut seen = Vec::new();
+                for _ in 0..20 {
+                    seen.extend(bus.read("a", "general", 1, None).unwrap().0);
+                    bus.inbox("a").unwrap();
+                }
+                seen
+            }));
+        }
+        let mut ids = Vec::new();
+        for worker in workers {
+            ids.extend(worker.join().unwrap().into_iter().map(|message| message.id));
+        }
+        assert_eq!(ids.len(), 20);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 20);
+        assert_eq!(hub.cursors("a").unwrap().read["#general"], 20);
+        assert_eq!(hub.cursors("a").unwrap().notified["#general"], 20);
     }
 
     #[test]
@@ -1024,6 +1179,196 @@ mod tests {
         assert!(backend.is_session_hub());
         let meta = Hub::open(root.path(), "api").unwrap().meta().unwrap();
         assert!(!meta.member("backend").unwrap().active);
+    }
+
+    #[test]
+    fn concurrent_joins_preserve_each_session_and_subagent() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        let buses: Vec<_> = (0..12)
+            .map(|i| {
+                let session_id = format!("session-{i}");
+                let bus = session_bus(root.path(), &session_id);
+                bus.register(MAIN_PEER_ID, "main", None);
+                bus.register(format!("{session_id}-a"), "scout", None);
+                bus.register(format!("{session_id}-b"), "scout", None);
+                (session_id, bus)
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(buses.len()));
+        let threads: Vec<_> = buses
+            .into_iter()
+            .map(|(session_id, bus)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let joined = bus.join("team", None, "lead", false).unwrap();
+                    (session_id, bus, joined)
+                })
+            })
+            .collect();
+        let joined: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let meta = hub.meta().unwrap();
+        assert_eq!(meta.members.len(), joined.len() * 3);
+        for (session_id, bus, joined) in joined {
+            assert_eq!(
+                meta.member(&joined.handle).unwrap().session_id.as_deref(),
+                Some(session_id.as_str())
+            );
+            for (id, label) in [
+                (MAIN_PEER_ID.to_string(), "main"),
+                (format!("{session_id}-a"), "scout"),
+                (format!("{session_id}-b"), "scout"),
+            ] {
+                let handle = bus.view(&id).unwrap().handle;
+                let member = meta.member(&handle).unwrap();
+                let owner = if id == MAIN_PEER_ID { &session_id } else { &id };
+                assert_eq!(member.session_id.as_deref(), Some(owner.as_str()));
+                assert_eq!(member.kind, MemberKind::Agent);
+                assert!(member.active);
+                bus.register(&id, label, None);
+                assert_eq!(bus.view(&id).unwrap().handle, handle);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_joins_reserve_main_before_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        let buses: Vec<_> = (0..12)
+            .map(|i| session_bus(root.path(), &format!("session-{i}")))
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(buses.len()));
+        let threads: Vec<_> = buses
+            .into_iter()
+            .map(|bus| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let joined = bus.join("team", None, "lead", false).unwrap();
+                    (bus, joined)
+                })
+            })
+            .collect();
+        let joined: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(hub.meta().unwrap().members.len(), joined.len());
+        for (bus, joined) in joined {
+            bus.register(MAIN_PEER_ID, "main", None);
+            assert_eq!(bus.view(MAIN_PEER_ID).unwrap().handle, joined.handle);
+            let meta = hub.meta().unwrap();
+            assert_eq!(
+                meta.member(&joined.handle).unwrap().session_id.as_deref(),
+                Some(bus.lock().root_session_id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_subagent_registrations_reserve_distinct_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        // Separate connections to the same root stand in for separate processes.
+        let buses: Vec<_> = (0..12)
+            .map(|i| {
+                let bus = session_bus(root.path(), "shared-root");
+                bus.join("team", None, "lead", false).unwrap();
+                (format!("subagent-{i}"), bus)
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(buses.len()));
+        let threads: Vec<_> = buses
+            .into_iter()
+            .map(|(id, bus)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    bus.register(&id, "scout", None);
+                    (id.clone(), bus.view(&id).unwrap().handle)
+                })
+            })
+            .collect();
+        let handles: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let meta = hub.meta().unwrap();
+        assert_eq!(meta.members.len(), handles.len() + 1);
+        for (id, handle) in handles {
+            assert_eq!(
+                meta.member(&handle).unwrap().session_id.as_deref(),
+                Some(id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn person_collision_uses_a_stable_distinct_sender() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "session-1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "tony", true).unwrap();
+        let other = session_bus(root.path(), "session-2");
+        other.register(MAIN_PEER_ID, "main", None);
+        other.join("team", None, "tony-2", false).unwrap();
+        let hub = bus.hub();
+        let agent = hub.meta().unwrap().member("tony").unwrap().clone();
+        assert_eq!(ensure_person(&hub, "tony").unwrap(), "tony-3");
+        bus.post_as_person("tony", "@tony", "person DM", &[])
+            .into_result()
+            .unwrap();
+        bus.post_as_person("tony", "#general", "@here person mention", &[])
+            .into_result()
+            .unwrap();
+        let meta = hub.meta().unwrap();
+        assert_eq!(meta.member("tony").unwrap(), &agent);
+        assert_eq!(meta.member("tony-3").unwrap().kind, MemberKind::Person);
+        assert_eq!(ensure_person(&hub, "tony").unwrap(), "tony-3");
+        let dm = hub.messages(&store::dm_conv("tony", "tony-3"), 0).unwrap();
+        assert_eq!(dm[0].from, "tony-3");
+        let messages = hub.messages("#general", 0).unwrap();
+        assert_eq!(messages[0].from, "tony-3");
+        assert_eq!(messages[0].mentions, vec![HERE_MENTION]);
+        assert!(format_messages(&hub, &meta, &messages).contains("from @tony-3 (person)"));
+        bus.mark_gone(MAIN_PEER_ID);
+        assert_eq!(ensure_person(&hub, "tony").unwrap(), "tony-3");
+    }
+
+    #[test]
+    fn agent_allocation_preserves_person_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "session-1");
+        let session_hub = bus.hub();
+        ensure_person(&session_hub, MAIN_PEER_ID).unwrap();
+        bus.register(MAIN_PEER_ID, "main", None);
+        assert_eq!(bus.view(MAIN_PEER_ID).unwrap().handle, "Main-2");
+        assert_eq!(
+            session_hub
+                .meta()
+                .unwrap()
+                .member(MAIN_PEER_ID)
+                .unwrap()
+                .kind,
+            MemberKind::Person
+        );
+        let hub = Hub::create(root.path(), "team").unwrap();
+        ensure_person(&hub, "lead").unwrap();
+        hub.update_meta(|meta| set_active(meta, "lead", false))
+            .unwrap();
+        assert_eq!(
+            bus.join("team", None, "lead", false).unwrap().handle,
+            "lead-2"
+        );
+        assert_eq!(
+            hub.meta().unwrap().member("lead").unwrap().kind,
+            MemberKind::Person
+        );
     }
 
     #[test]

@@ -94,6 +94,7 @@ impl AgentView {
         let (name, _handle) = store::find_membership(&root, &session_id.0)
             .context("this session is in no hub. Use /hub join <name> or /hub new <name>.")?;
         let hub = store::Hub::open(&root, &name)?;
-        HubBrowserState::open(hub, store::person_handle(), channel)
+        let person = agent_hub::ensure_person(&hub, &store::person_handle())?;
+        HubBrowserState::open(hub, person, channel)
     }
 }

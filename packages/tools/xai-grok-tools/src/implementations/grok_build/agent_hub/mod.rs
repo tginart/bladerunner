@@ -9,7 +9,8 @@ pub mod store;
 
 pub use bus::{
     AgentBus, ChannelView, HubView, JoinOutcome, LOOP_GUARD_WAKES, MAIN_PEER_ID, MAX_MESSAGE_BYTES,
-    PeerStatus, PeerWakeFn, SendOutcome, format_messages, image_paths, post_as_person,
+    PeerStatus, PeerWakeFn, SendOutcome, ensure_person, format_messages, image_paths,
+    post_as_person,
 };
 pub use store::{Member, MemberKind, Message};
 
