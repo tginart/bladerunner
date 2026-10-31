@@ -1641,6 +1641,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 }
             }
         }
+        Action::OpenHubBrowser(channel) => {
+            with_active_agent(app, |agent| agent.open_hub_browser(channel.as_deref()));
+            vec![]
+        }
         Action::NShotColumnsAttach => super::session::n_shot::attach_focused_shot(app),
         Action::OpenNShotColumns(label) => super::session::n_shot::open_columns(app, &label),
         Action::OpenNShotParent => super::session::n_shot::open_parent_columns(app),

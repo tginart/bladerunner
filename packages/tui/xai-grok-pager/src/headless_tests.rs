@@ -26,6 +26,119 @@ async fn signalled_exit_bounds_an_unresponsive_log_flush() {
 
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn hub_startup_completes_before_the_headless_task_and_reports_errors() {
+    use clap::Parser;
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage};
+    use xai_grok_tools::implementations::grok_build::agent_hub::{AgentBus, MAIN_PEER_ID, store};
+
+    for mode in ["join", "new", "missing"] {
+        let root = tempfile::tempdir().unwrap();
+        if mode == "join" {
+            store::Hub::create(root.path(), "team").unwrap();
+        }
+        let bus = AgentBus::new(root.path().to_path_buf(), "headless").unwrap();
+        bus.register(MAIN_PEER_ID, "main", None);
+        let mut argv = vec!["grok", "--hub", "team", "-p", "task"];
+        if mode == "new" {
+            argv.push("--hub-create");
+        }
+        let args = crate::app::cli::PagerArgs::try_parse_from(argv).unwrap();
+        let command = args.hub_join_command().unwrap();
+        let session_id = acp::SessionId::new("headless");
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = async {
+            let Some(AcpAgentMessage::Prompt(request)) = agent_rx.recv().await else {
+                panic!("the first request must be the hub command");
+            };
+            let acp::ContentBlock::Text(text) = &request.request.prompt[0] else {
+                panic!("expected a text command");
+            };
+            assert_eq!(text.text, command);
+            let output = xai_grok_shell::session::hub::run_command(
+                &bus,
+                text.text.strip_prefix("/hub ").unwrap(),
+                "worker",
+            );
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            client_tx
+                .send(AcpClientMessage::SessionNotification(AcpArgs {
+                    request: acp::SessionNotification::new(
+                        session_id.clone(),
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(output)),
+                        )),
+                    ),
+                    response_tx,
+                }))
+                .unwrap();
+            response_rx.await.unwrap().unwrap();
+            request
+                .response_tx
+                .send(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+                .unwrap();
+            if mode != "missing" {
+                let Some(AcpAgentMessage::Prompt(task)) = agent_rx.recv().await else {
+                    panic!("the task must follow the hub command");
+                };
+                let acp::ContentBlock::Text(text) = &task.request.prompt[0] else {
+                    panic!("expected a text task");
+                };
+                assert_eq!(text.text, "task");
+                assert_eq!(bus.hub_name(), "team");
+                task.response_tx
+                    .send(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+                    .unwrap();
+            }
+        };
+        let client = async {
+            let mut pending = HashSet::new();
+            let mut completed = HashSet::new();
+            let result = super::run_hub_startup(
+                &agent_tx,
+                &mut client_rx,
+                &session_id,
+                &command,
+                &mut pending,
+                &mut completed,
+            )
+            .await;
+            if mode == "missing" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Hub startup failed")
+                );
+                assert!(bus.is_session_hub());
+                return;
+            }
+            result.unwrap();
+            assert_eq!(bus.hub_name(), "team");
+            let response: acp::PromptResponse = acp_send(
+                acp::PromptRequest::new(
+                    session_id.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new("task"))],
+                ),
+                &agent_tx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
+        assert!(
+            client_rx.try_recv().is_err(),
+            "hub output is consumed before the task"
+        );
+    }
+}
+
 #[test]
 fn lifecycle_tracking_is_independent_of_wait_flag() {
     let mut pending = std::collections::HashSet::new();

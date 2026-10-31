@@ -51,6 +51,7 @@ impl AgentView {
             || self.block_viewer.is_some()
             || self.gboom.is_some()
             || self.show_goal_detail
+            || self.hub_browser.is_some()
             || self.btw_focused
             || !self.permission_queue.is_empty()
             || self.question_view.is_some()
@@ -120,6 +121,7 @@ impl AgentView {
             || self.active_subagent.is_some()
             || self.show_goal_detail
             || self.show_workflows
+            || self.hub_browser.is_some()
             || self.prompt.any_dropdown_open()
     }
     /// Whether FocusGained should move focus from Scrollback → Prompt.
@@ -187,6 +189,7 @@ impl AgentView {
             && self.highlighted_link_idx.is_none()
             && !self.show_goal_detail
             && !self.show_workflows
+            && self.hub_browser.is_none()
             && self.rewind_state.is_none()
             && self.btw_state.is_none()
             && self.jump_state.is_none()
@@ -603,6 +606,9 @@ impl AgentView {
                 Event::Mouse(mouse) => self.handle_gboom_mouse(mouse),
                 _ => InputOutcome::Changed,
             };
+        }
+        if let Some(outcome) = self.handle_hub_browser_input(ev) {
+            return outcome;
         }
         if let Some(outcome) = self.handle_workflows_overlay_input(ev) {
             return outcome;

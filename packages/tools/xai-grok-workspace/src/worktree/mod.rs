@@ -2290,6 +2290,10 @@ pub struct ResumeSessionInWorktreeRequest {
     /// When set, the worktree is a clean checkout of this ref (dirty overlay is ignored).
     #[serde(default)]
     pub git_ref: Option<String>,
+    /// Give the new worktree session the source session's hub membership.
+    /// `/fork --worktree` sets it; n-shot shots do not.
+    #[serde(default)]
+    pub inherit_hub: bool,
 }
 
 /// Response from `x.ai/git/worktree/resume_session`.

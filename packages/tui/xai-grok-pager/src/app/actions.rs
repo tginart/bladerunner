@@ -1090,6 +1090,8 @@ pub enum Action {
     ToggleWorkflows,
     /// Open the side-by-side columns of the latest n-shot run.
     OpenShots,
+    /// Open the hub browser, optionally on a `#channel`.
+    OpenHubBrowser(Option<String>),
     /// Switch to the focused shot of the open n-shot columns view.
     NShotColumnsAttach,
     /// Open the columns view of the active agent's n-shot group with this label.
@@ -1552,6 +1554,9 @@ pub enum Effect {
         /// One-shot `/chat` or sticky `--chat` — stamp `_meta` kind=chat on
         /// fresh create (resume uses `LoadSession.chat_kind` instead).
         chat_kind: bool,
+        /// Give the new session the loaded session's hub membership
+        /// (`/fork --worktree`). n-shot shots leave it off.
+        inherit_hub: bool,
     },
     /// Load (resume) an existing ACP session by ID.
     ///

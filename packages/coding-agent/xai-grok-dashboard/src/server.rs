@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use axum::extract::FromRef;
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list};
 
@@ -86,6 +89,8 @@ pub fn build_router_with_options(
         .route("/api/metrics/server", get(api::get_server_metrics))
         .route("/api/metrics/resources", get(api::get_resource_metrics))
         .route("/api/logs", get(api::get_logs))
+        .route("/api/hubs", get(api::list_hubs))
+        .route("/hubs/{name}/post", post(api::post_hub_message))
         .leptos_routes_with_context(&state, routes, provide_store.clone(), {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())

@@ -1656,6 +1656,17 @@ impl AgentView {
             path_offset += shot_width;
             parts.push(Span::styled(shot_text, shot_style));
         }
+        let hub_label = self
+            .session
+            .session_id
+            .as_ref()
+            .and_then(|sid| crate::hub_status::hub_label_lazy(&sid.0));
+        if let Some(label) = hub_label {
+            let hub_text = format!("{label} ");
+            let hub_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
+            path_offset += hub_text.width() as u16;
+            parts.push(Span::styled(hub_text, hub_style));
+        }
         if let Some(git_text) = git_text {
             let git_style = Style::default()
                 .fg(theme.text_primary)
@@ -4490,6 +4501,11 @@ impl AgentView {
             );
             self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
+        }
+        if let Some(browser) = self.hub_browser.as_mut()
+            && let Some(popup) = crate::views::hub_browser::render_hub_browser(buf, area, browser)
+        {
+            self.frame_occluder_rects.push(popup);
         }
         if self.show_workflows {
             // List navigation and later notifications can reveal deferred children too.

@@ -400,6 +400,7 @@ pub fn minimal_btw_surface_available(v: &AgentView) -> bool {
         && v.video_viewer.is_none()
         && v.gboom.is_none()
         && !(v.show_goal_detail && v.goal_state.is_some())
+        && v.hub_browser.is_none()
         && v.line_viewer.is_none()
         && v.extensions_modal.is_none()
         && v.persona_detail.is_none()

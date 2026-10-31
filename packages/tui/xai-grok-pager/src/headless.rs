@@ -65,6 +65,8 @@ pub struct HeadlessOptions {
     pub fork_session: bool,
     pub worktree: Option<String>,
     pub restore_code: bool,
+    /// A `/hub join` or `/hub new` command to complete before the user task.
+    pub hub_startup_command: Option<String>,
     pub agent: Option<String>,
     pub agents_json: Option<String>,
     pub cli_tools: Option<String>,
@@ -747,6 +749,64 @@ fn headless_materialize_ctx(
     }
 }
 
+/// Purpose: Complete the hub startup command before the headless user task.
+/// Input: The ACP channels, session id, command, and background task state.
+/// Output: Success after the command completes, or its error without submission of the task.
+/// Note: The command output does not become part of the task's stdout stream.
+async fn run_hub_startup(
+    acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
+    session_id: &acp::SessionId,
+    command: &str,
+    pending_bg: &mut HashSet<BackgroundWork>,
+    completed_bg: &mut HashSet<BackgroundWork>,
+) -> Result<()> {
+    let request = acp::PromptRequest::new(
+        session_id.clone(),
+        vec![acp::ContentBlock::Text(acp::TextContent::new(command))],
+    );
+    let mut response = Box::pin(acp_send(request, acp_tx));
+    let mut output = String::new();
+    loop {
+        tokio::select! {
+            biased;
+            message = acp_rx.recv() => {
+                let message = message.ok_or_else(|| anyhow::anyhow!("Connection closed during hub startup"))?;
+                match message.boxed() {
+                    AcpClientMessageBox::SessionNotification(args) => {
+                        if args.request.session_id == *session_id
+                            && let acp::SessionUpdate::AgentMessageChunk(chunk) = &args.request.update
+                            && let acp::ContentBlock::Text(text) = &chunk.content
+                        {
+                            output.push_str(&text.text);
+                        }
+                        let _ = args.response_tx.send(Ok(()));
+                    }
+                    AcpClientMessageBox::ExtNotification(args) => {
+                        track_background_lifecycle(handle_ext_notification(&args), pending_bg, completed_bg);
+                        let _ = args.response_tx.send(Ok(()));
+                    }
+                    AcpClientMessageBox::ExtMethod(args) => reply_headless_ext_method(args),
+                    AcpClientMessageBox::RequestPermission(args) => {
+                        let _ = args.response_tx.send(Ok(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Cancelled,
+                        )));
+                    }
+                    _ => anyhow::bail!("Unexpected client request during hub startup"),
+                }
+            }
+            result = &mut response => {
+                result?;
+                break;
+            }
+        }
+    }
+    if output.trim_start().starts_with("/hub:") {
+        anyhow::bail!("Hub startup failed: {}", output.trim());
+    }
+    Ok(())
+}
+
 /// Run a headless single-turn prompt: spawn the agent, drive the ACP lifecycle, stream to stdout.
 pub async fn run_single_turn(
     prompt: HeadlessPrompt,
@@ -1094,6 +1154,24 @@ pub async fn run_single_turn(
         anyhow::bail!("{msg}");
     }
 
+    // Track resumed background work even while the hub startup command runs.
+    let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
+    let mut completed_bg: HashSet<BackgroundWork> = HashSet::new();
+    if let Some(command) = options.hub_startup_command.as_deref()
+        && let Err(error) = run_hub_startup(
+            &acp_tx,
+            &mut acp_rx,
+            &session_id,
+            command,
+            &mut pending_bg,
+            &mut completed_bg,
+        )
+        .await
+    {
+        emitter.on_error(&error.to_string(), None);
+        return Err(error);
+    }
+
     let prompt_blocks = prompt.into_content_blocks();
 
     let prompt_meta = {
@@ -1117,10 +1195,6 @@ pub async fn run_single_turn(
     let mut ttf_logged = false;
     let mut prompt_fut = Box::pin(acp_send(request, &acp_tx));
     let mut prompt_result = None;
-    // Tracked regardless of wait_for_background so the exit reaper always sees running work.
-    let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
-    // Tombstone of completed ids so an out-of-order backgrounded never re-arms them.
-    let mut completed_bg: HashSet<BackgroundWork> = HashSet::new();
     let mut prompt_done_at: Option<Instant> = None;
     // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
     let mut connection_closed = false;

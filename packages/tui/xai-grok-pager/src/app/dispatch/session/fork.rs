@@ -277,6 +277,7 @@ pub(in crate::app::dispatch) fn spawn_fork(
             model_id: None,
             preferred_session_id: None,
             chat_kind: parent_chat_kind,
+            inherit_hub: focus == ForkFocus::SwitchToFork,
         }
     } else {
         Effect::ForkSession {

@@ -1609,6 +1609,61 @@ async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
         })
         .await;
 }
+/// Purpose: Verify that only a root user turn restores private-hub delivery.
+/// Input: User, synthetic, and subagent turns with an exhausted loop guard.
+/// Output: Only the root user turn clears the persisted guard.
+#[tokio::test(flavor = "current_thread")]
+async fn handle_prompt_resets_private_hub_guard_only_for_root_user_turns() {
+    use xai_grok_tools::implementations::grok_build::agent_hub::{
+        AgentBus, AgentBusResource, LOOP_GUARD_WAKES,
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for (prompt_id, depth, expected_streak) in [
+                ("user-hub-reset", 0, 0),
+                ("scheduler-fired-hub-reset", 0, LOOP_GUARD_WAKES),
+                ("user-hub-child", 1, LOOP_GUARD_WAKES),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let bus = AgentBus::new(root.path().to_path_buf(), "test-actor").unwrap();
+                bus.hub()
+                    .update_meta(|meta| meta.agent_wake_streak = LOOP_GUARD_WAKES)
+                    .unwrap();
+                let mut actor = actor_with_persistence_drain().await;
+                let mutable = Arc::get_mut(&mut actor).expect("actor has no other owners");
+                mutable.tool_context.agent_bus = Some(AgentBusResource(bus.clone()));
+                mutable.tool_context.subagent_depth = depth;
+                actor
+                    .handle_prompt(
+                        prompt_id,
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "/hub".to_string(),
+                        ))],
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    bus.hub_meta().unwrap().agent_wake_streak,
+                    expected_streak,
+                    "{prompt_id}"
+                );
+            }
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_running_task_interactive_preserves_queued_work() {
     use tokio::sync::oneshot::error::TryRecvError;

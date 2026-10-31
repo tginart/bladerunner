@@ -1602,6 +1602,13 @@ pub(crate) async fn run(
     const N_SHOT_POLL_INTERVAL: Duration = Duration::from_millis(500);
     let mut n_shot_poll_at: Option<Instant> = None;
 
+    // Agent hubs: refresh the status-bar unread count and any open hub browser
+    // while idle. Armed only while a session is in a named hub or a browser is open.
+    const HUB_LABEL_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    // An open hub browser reloads its feed this often.
+    const HUB_BROWSER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let mut hub_label_poll_at: Option<Instant> = None;
+
     // Pre-generate the automatic "return-from-away" recap while the terminal is
     // unfocused, so it's already in the scrollback (instant) when the user
     // returns. The arm is a cheap no-op while focused / not-yet-eligible; the
@@ -1762,7 +1769,10 @@ pub(crate) async fn run(
             return Ok(finish_run(&mut app));
         }
         presenter.request_presentation(&mut app, terminal, false);
-    } else if args.initial_prompt().is_none() && !minimal_will_open_session(&term_state, &app) {
+    } else if args.initial_prompt().is_none()
+        && args.hub_join_command().is_none()
+        && !minimal_will_open_session(&term_state, &app)
+    {
         // No session work follows: startup ends at interactive.
         app.finish_startup(xai_grok_telemetry::startup::StartupOutcome::Ok);
     }
@@ -1773,11 +1783,20 @@ pub(crate) async fn run(
     // accounts cannot start a session, so drop the prompt — this mirrors the
     // deferred post-login path, which clears the startup prompt for ZDR-blocked
     // accounts. When not yet authenticated, stash it for `AuthComplete`.
-    if let Some(initial_prompt) = args.initial_prompt() {
+    // `--hub <name>` joins the hub first; a positional prompt follows it in
+    // the same session's queue.
+    let startup_prompts: Vec<String> = args
+        .hub_join_command()
+        .into_iter()
+        .chain(args.initial_prompt().map(str::to_string))
+        .collect();
+    if let Some((first_prompt, queued)) = startup_prompts.split_first() {
         if !app.session_startup_allowed() {
-            app.deferred_startup.prompt = Some(initial_prompt.to_string());
+            app.deferred_startup.prompt = Some(first_prompt.clone());
+            app.deferred_startup.queued_prompts = queued.to_vec();
         } else if !app.is_zdr_blocked() {
-            let effs = dispatch::dispatch_initial_prompt(&mut app, initial_prompt.to_string());
+            let effs = dispatch::dispatch_initial_prompt(&mut app, first_prompt.clone());
+            dispatch::enqueue_startup_prompts(&mut app, queued);
             if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                 return Ok(finish_run(&mut app));
             }
@@ -2078,6 +2097,17 @@ pub(crate) async fn run(
             app.gboom_release_all_games();
         }
 
+        let is_hub_browser_open = app.agents.values().any(|a| a.hub_browser.is_some());
+        if hub_label_poll_at.is_none()
+            && (is_hub_browser_open || crate::hub_status::any_session_in_hub())
+        {
+            let interval = if is_hub_browser_open {
+                HUB_BROWSER_POLL_INTERVAL
+            } else {
+                HUB_LABEL_POLL_INTERVAL
+            };
+            hub_label_poll_at = Some(Instant::now() + interval);
+        }
         if n_shot_poll_at.is_none() && dispatch::n_shot_has_open_groups(&app) {
             n_shot_poll_at = Some(Instant::now() + N_SHOT_POLL_INTERVAL);
         }
@@ -2192,6 +2222,13 @@ pub(crate) async fn run(
 
         let n_shot_poll = async {
             match n_shot_poll_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+
+        let hub_label_poll = async {
+            match hub_label_poll_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -2598,6 +2635,22 @@ pub(crate) async fn run(
                 if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                     break;
                 }
+            }
+
+            _ = hub_label_poll => {
+                hub_label_poll_at = None;
+                crate::hub_status::refresh_hub_labels();
+                let mut is_refreshed = false;
+                for agent in app.agents.values_mut() {
+                    is_refreshed |= agent.refresh_hub_browser();
+                }
+                if is_refreshed {
+                    presenter.request(false);
+                }
+            }
+
+            _ = crate::hub_status::label_changed().notified() => {
+                presenter.request(false);
             }
 
             _ = n_shot_poll => {
@@ -4281,6 +4334,45 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
 
+    #[test]
+    fn startup_hub_command_does_not_combine_with_positional_prompt() {
+        use crate::app::agent::AgentId;
+        use clap::Parser;
+
+        for command in ["join", "new"] {
+            let mut argv = vec!["grok", "--hub", "api"];
+            if command == "new" {
+                argv.push("--hub-create");
+            }
+            argv.push("fix it");
+            let args = PagerArgs::try_parse_from(argv).unwrap();
+            let mut app = crate::app::app_view::tests::test_app();
+            let id = AgentId(0);
+            app.agents
+                .insert(id, crate::test_util::make_agent_view(None, "/tmp"));
+            app.active_view = ActiveView::Agent(id);
+
+            let effects =
+                dispatch::dispatch_initial_prompt(&mut app, args.hub_join_command().unwrap());
+            dispatch::enqueue_startup_prompts(
+                &mut app,
+                &[args.initial_prompt().unwrap().to_string()],
+            );
+            assert!(effects.is_empty(), "startup waits for the session to bind");
+
+            // This is the dequeue path when combine_queued_prompts is enabled.
+            let session = &mut app.agents.get_mut(&id).unwrap().session;
+            let first = session.dequeue_combined_prompt(None).unwrap();
+            assert_eq!(first.text, format!("/hub {command} api"));
+            assert!(first.combined_texts.is_empty());
+            assert_eq!(session.queue_len(), 1);
+            assert_eq!(
+                session.dequeue_combined_prompt(None).unwrap().text,
+                "fix it"
+            );
+        }
+    }
+
     #[cfg(feature = "local-workspace")]
     #[test]
     fn welcome_oneshot_applies_to_create_worktree_session() {
@@ -4294,6 +4386,7 @@ mod tests {
             model_id: None,
             preferred_session_id: None,
             chat_kind: false,
+            inherit_hub: false,
         };
         assert!(welcome_oneshot_applies_to_effects(std::slice::from_ref(
             &worktree
@@ -4380,6 +4473,7 @@ mod tests {
             model_id: None,
             preferred_session_id: None,
             chat_kind: false,
+            inherit_hub: false,
         };
         assert_eq!(
             take_load_restore_code(&mut app, std::slice::from_ref(&wt)),

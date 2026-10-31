@@ -8,6 +8,10 @@ impl SessionActor {
     ) -> PromptTurnResult {
         // Builtin turns carry no user message, so a send-now may cancel from the start.
         self.mark_front_message_committed().await;
+        // Restamp the turn start: without it, this turn's updates carry the last
+        // model turn's `turnStartMs`, and the client times the builtin from there.
+        self.chat_state_handle
+            .record_turn_start(chrono::Utc::now().timestamp_millis());
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SlashCommandUsed {
             command: action.command_name().to_string(),
             args_provided: action.args_provided(),
@@ -18,6 +22,11 @@ impl SessionActor {
                     Ok(message) => message,
                     Err(error) => format!("Computer use: {error}"),
                 };
+                self.send_host_turn_slash_command_output(&message).await;
+                ok_end_turn(0, None)
+            }
+            BuiltinAction::Hub { args } => {
+                let message = self.run_hub_command(args).await;
                 self.send_host_turn_slash_command_output(&message).await;
                 ok_end_turn(0, None)
             }
@@ -1079,5 +1088,23 @@ impl SessionActor {
         }
 
         ok_end_turn(0, None)
+    }
+
+    /// Run `/hub` for the person. Hub calls touch disk, so they run off the actor.
+    async fn run_hub_command(self: &Arc<Self>, args: String) -> String {
+        let Some(bus) = self.rebuild_spec.agent_bus.as_ref() else {
+            return "/hub: hubs are not available in this session.".to_string();
+        };
+        let bus = bus.bus().clone();
+        let cwd_name = std::path::Path::new(&self.session_info.cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let default_handle = crate::session::hub::default_handle(&cwd_name);
+        tokio::task::spawn_blocking(move || {
+            crate::session::hub::run_command(&bus, &args, &default_handle)
+        })
+        .await
+        .unwrap_or_else(|e| format!("/hub: {e}"))
     }
 }
