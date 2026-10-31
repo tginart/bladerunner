@@ -341,6 +341,15 @@ impl SessionActor {
             self.invalidate_side_calls_for_new_prompt();
         }
         self.ensure_session_disk_writable().await?;
+        if matches!(origin, super::super::PromptOrigin::User)
+            && self.tool_context.subagent_depth == 0
+            && let Some(bus) = &self.tool_context.agent_bus
+        {
+            bus.bus().reset_session_loop_guard().map_err(|e| {
+                acp::Error::internal_error()
+                    .data(format!("failed to reset private hub loop guard: {e}"))
+            })?;
+        }
         self.signals_handle().increment_turn();
         let prompt_mode = self.resolve_turn_prompt_mode(&origin, prompt_mode);
         *self.turn_start_prompt_mode.lock() = prompt_mode;

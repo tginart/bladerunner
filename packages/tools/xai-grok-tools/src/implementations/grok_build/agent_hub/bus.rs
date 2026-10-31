@@ -27,7 +27,7 @@ pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 /// Soft rate limit: max sends per sender per window.
 const RATE_LIMIT_COUNT: u32 = 20;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-/// Agent-to-agent wakes in a row, with no post by a person, before wakes pause.
+/// Agent-to-agent wakes before a person post or private-hub user turn resets the guard.
 pub const LOOP_GUARD_WAKES: u32 = 10;
 /// How often the watcher checks the hub for new DMs and mentions.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
@@ -178,6 +178,20 @@ impl AgentBus {
     pub fn is_session_hub(&self) -> bool {
         let g = self.lock();
         g.hub.name() == store::session_hub_name(&g.root_session_id)
+    }
+
+    /// Purpose: Restore private-hub delivery for a new user turn.
+    /// Input: The root session bus.
+    /// Output: The private hub's loop guard resets. Named hubs do not change.
+    pub fn reset_session_loop_guard(&self) -> Result<()> {
+        let hub = {
+            let g = self.lock();
+            if g.hub.name() != store::session_hub_name(&g.root_session_id) {
+                return Ok(());
+            }
+            g.hub.clone()
+        };
+        hub.update_meta(|meta| meta.agent_wake_streak = 0)
     }
 
     /// Register or refresh a local peer. `wake` is invoked when a DM or a
@@ -943,6 +957,7 @@ fn peer_handle_base(is_session_hub: bool, main_handle: &str, id: &str, label: &s
 fn reserve_member(meta: &mut HubMeta, base: &str, label: &str, session_id: &str) -> String {
     let handle = std::iter::once(store::handle_candidate(base, ""))
         .chain((2..).map(|n| store::handle_candidate(base, &format!("-{n}"))))
+        .filter(|handle| handle != HERE_MENTION)
         .find(|handle| match meta.member(handle) {
             None => true,
             Some(member) => {
@@ -991,6 +1006,9 @@ pub fn ensure_person(hub: &Hub, person: &str) -> Result<String> {
             } else {
                 store::handle_candidate(person, &format!("-{n}"))
             };
+            if handle == HERE_MENTION {
+                continue;
+            }
             if let Some(member) = meta
                 .members
                 .iter_mut()
@@ -1376,6 +1394,55 @@ mod tests {
     }
 
     #[test]
+    fn member_handles_do_not_use_the_broadcast_name() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "first");
+        bus.register(MAIN_PEER_ID, "main", None);
+        assert_eq!(
+            bus.join("team", None, "here", true).unwrap().handle,
+            "here-2"
+        );
+        let other = session_bus(root.path(), "second");
+        other.register(MAIN_PEER_ID, "main", None);
+        assert_eq!(
+            other
+                .join("team", Some("@here"), "unused", false)
+                .unwrap()
+                .handle,
+            "here-3"
+        );
+        let hub = bus.hub();
+        let person = ensure_person(&hub, "here").unwrap();
+        assert_eq!(person, "here-4");
+        assert_eq!(ensure_person(&hub, "here").unwrap(), person);
+        assert!(hub.meta().unwrap().member(HERE_MENTION).is_none());
+
+        other
+            .send(MAIN_PEER_ID, "#general", "@here-2 hello", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["@here-2 hello"]
+        );
+        post_as_person(&hub, &person, "#general", "@here-2 just one", &[]).unwrap();
+        assert_eq!(
+            texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["@here-2 just one"]
+        );
+        assert!(other.inbox(MAIN_PEER_ID).unwrap().is_empty());
+        post_as_person(&hub, &person, "#general", "@here everyone", &[]).unwrap();
+        assert_eq!(
+            texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["@here everyone"]
+        );
+        assert_eq!(
+            texts(&other.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["@here everyone"]
+        );
+    }
+
+    #[test]
     fn agent_allocation_preserves_person_handles() {
         let root = tempfile::tempdir().unwrap();
         let bus = session_bus(root.path(), "session-1");
@@ -1632,6 +1699,52 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), LOOP_GUARD_WAKES as usize);
         assert_eq!(bus.inbox("b").unwrap().len(), 2);
         assert!(bus.view("b").unwrap().paused);
+    }
+
+    #[test]
+    fn new_user_turn_recovers_private_hub_delivery_after_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let received = hits.clone();
+        let wake: PeerWakeFn = Arc::new(move |_, _| {
+            received.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register("a", "a", None);
+        bus.register("b", "b", Some(wake.clone()));
+        let hub = bus.hub();
+        let targets = vec![("b".to_string(), wake.clone())];
+        for i in 0..=LOOP_GUARD_WAKES {
+            bus.send("a", "b", &format!("ping {i}"), None, &[])
+                .into_result()
+                .unwrap();
+            deliver(&hub, &targets).unwrap();
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), LOOP_GUARD_WAKES as usize);
+        assert!(bus.view("b").unwrap().paused);
+        drop(bus);
+
+        let resumed = session_bus(root.path(), "s1");
+        resumed.register("b", "b", Some(wake));
+        assert!(resumed.view("b").unwrap().paused);
+        resumed.reset_session_loop_guard().unwrap();
+        assert!(!resumed.view("b").unwrap().paused);
+        deliver(&hub, &targets).unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), LOOP_GUARD_WAKES as usize + 1);
+        assert!(resumed.inbox("b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_turn_does_not_reset_a_named_hub_loop_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "worker", true).unwrap();
+        bus.hub()
+            .update_meta(|meta| meta.agent_wake_streak = LOOP_GUARD_WAKES)
+            .unwrap();
+        bus.reset_session_loop_guard().unwrap();
+        assert!(bus.view(MAIN_PEER_ID).unwrap().paused);
     }
 
     #[tokio::test]

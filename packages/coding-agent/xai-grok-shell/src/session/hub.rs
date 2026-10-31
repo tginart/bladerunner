@@ -203,9 +203,19 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
             // `join` never makes a hub, so a typo cannot. `new` joins a hub that
             // already exists, so `--hub-create` works on every start.
             let (name, handle) = parse_name_and_handle(rest)?;
-            let exists = store::Hub::open(&bus.hubs_root(), &name).is_ok();
-            let create = command != "join" && !exists;
-            let outcome = bus.join(&name, handle.as_deref(), default_handle, create)?;
+            let create = if command == "join" {
+                false
+            } else {
+                match store::Hub::create(&bus.hubs_root(), &name) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        // Another session can create the hub before this one does.
+                        store::Hub::open(&bus.hubs_root(), &name).map_err(|_| error)?;
+                        false
+                    }
+                }
+            };
+            let outcome = bus.join(&name, handle.as_deref(), default_handle, false)?;
             let verb = match (create, command) {
                 (true, _) => "Created and joined",
                 (false, "join") => "Joined",
@@ -463,6 +473,73 @@ mod tests {
         let out = dispatch(&bus, "leave", "x").unwrap();
         assert!(out.contains("Left hub api"), "{out}");
         assert!(dispatch(&bus, "post #general hi", "x").is_err());
+    }
+
+    /// Purpose: Check that concurrent new commands join the same hub without loss of members.
+    /// Input: Two sessions with the same requested handle and a shared hub directory.
+    /// Output: Both commands succeed, and both sessions retain distinct handles.
+    #[test]
+    fn concurrent_new_commands_create_or_join() {
+        for _ in 0..16 {
+            let root = tempfile::tempdir().unwrap();
+            let first = bus_in(root.path(), "first");
+            let second = bus_in(root.path(), "second");
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    barrier.wait();
+                    dispatch(&first, "new team as @worker", "unused").unwrap()
+                });
+                let second = scope.spawn(|| {
+                    barrier.wait();
+                    dispatch(&second, "new team as @worker", "unused").unwrap()
+                });
+                assert!(first.join().unwrap().contains("hub team as @worker"));
+                assert!(second.join().unwrap().contains("hub team as @worker"));
+            });
+            assert_eq!(first.hub_name(), "team");
+            assert_eq!(second.hub_name(), "team");
+            let meta = first.hub_meta().unwrap();
+            assert_eq!(meta.members.len(), 2);
+            for session_id in ["first", "second"] {
+                assert!(meta.members.iter().any(|member| {
+                    member.session_id.as_deref() == Some(session_id) && member.is_live()
+                }));
+            }
+            assert_ne!(meta.members[0].handle, meta.members[1].handle);
+        }
+    }
+
+    /// Purpose: Check that create-or-join does not hide creation or join errors.
+    /// Input: A blocked hub path, an archived hub, and an invalid handle.
+    /// Output: Each command reports its error and leaves the session in its private hub.
+    #[test]
+    fn new_preserves_creation_and_join_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "s1");
+        std::fs::write(root.path().join("blocked"), b"not a directory").unwrap();
+        let error = store::Hub::create(root.path(), "blocked")
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            dispatch(&bus, "new blocked", "worker")
+                .unwrap_err()
+                .to_string(),
+            error
+        );
+        let hub = store::Hub::create(root.path(), "team").unwrap();
+        let error = dispatch(&bus, "new team as @bad/handle", "worker")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid handle"), "{error}");
+        hub.update_meta(|meta| meta.archived = true).unwrap();
+        let error = dispatch(&bus, "create team", "worker")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("archived"), "{error}");
+        assert!(bus.is_session_hub());
+        assert!(hub.meta().unwrap().members.is_empty());
     }
 
     #[test]
