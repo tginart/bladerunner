@@ -953,6 +953,9 @@ pub(crate) fn map_hyperlinks_to_overlay(
     for h in hyperlinks {
         let target = if crate::app::link_opener::is_safe_to_open(&h.url, scheme_filter) {
             crate::render::osc8::LinkTarget::Url(Arc::from(h.url.as_str()))
+        } else if let Some(command_target) = crate::render::osc8::slash_command_link_target(&h.url)
+        {
+            command_target
         } else if let Some(file_target) =
             crate::render::osc8::local_link_to_file_target(&h.url, media_paths)
         {

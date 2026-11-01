@@ -8,6 +8,14 @@ use crate::session::mcp_servers::McpClient;
 use crate::session::tool_index::{Bm25ToolSearchIndex, ToolMetadataSnapshot};
 use xai_grok_tools::types::tool_index::ToolSearchIndex;
 
+const INSTALLER_FIXTURE_SCRIPT: &str = r#"
+/bin/bash -c 'echo "$$" > "$INSTALLER_FIXTURE_DIR/download.pid"; exec sleep 30' |
+/bin/bash -c 'echo "$$" > "$INSTALLER_FIXTURE_DIR/installer.pid";
+    sleep 30 & echo "$!" > "$INSTALLER_FIXTURE_DIR/worker.pid"; wait' &
+wait
+"#;
+const INSTALLER_PID_FILES: &[&str] = &["download.pid", "installer.pid", "worker.pid"];
+
 const SERVER_SCRIPT: &str = r#"
 import json
 import os
@@ -362,6 +370,133 @@ async fn empty_or_failed_early_server_keeps_computer_use_discovery_available() {
                 );
                 client.shutdown().await;
             }
+        })
+        .await;
+}
+
+#[test]
+fn not_installed_message_links_the_install_command() {
+    // The pager runs only allowlisted link commands; keep both sides in sync.
+    let message = not_installed_message();
+    assert!(
+        message.contains("[Click here to install it](</computer-use install>)"),
+        "{message}"
+    );
+}
+
+#[test]
+fn installer_errors_keep_the_last_lines_of_stderr_or_stdout() {
+    let stderr = b"one\ntwo\nthree\n";
+    assert_eq!(tail_lines(stderr, b"ignored", 2), "two\nthree");
+    assert_eq!(tail_lines(b" \n", b"only stdout\n", 2), "only stdout");
+    assert_eq!(tail_lines(b"", b"", 2), "");
+}
+
+#[tokio::test]
+async fn installer_output_captures_both_streams_and_exit_status() {
+    let mut command = tokio::process::Command::new("/bin/bash");
+    command.args(["-c", "printf output; printf error >&2; exit 7"]);
+    let output = installer_output(command, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"output");
+    assert_eq!(output.stderr, b"error");
+}
+
+/// Purpose: Verify that an installer timeout stops the whole process tree.
+/// Input: A synthetic installer pipeline with a live grandchild.
+/// Output: No fixture process survives the timeout.
+#[tokio::test]
+async fn installer_timeout_kills_pipeline_and_grandchildren() {
+    let root = tempfile::tempdir().unwrap();
+    let error = installer_output(
+        installer_fixture_command(root.path()),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("timed out"), "{error}");
+    let pids = wait_for_installer_pids(root.path()).await;
+    assert_installer_processes_stopped(&pids).await;
+}
+
+/// Purpose: Verify that a dropped installer future stops the whole process tree.
+/// Input: A synthetic installer pipeline with a live grandchild.
+/// Output: No fixture process survives cancellation.
+#[tokio::test]
+async fn canceled_installer_kills_pipeline_and_grandchildren() {
+    let root = tempfile::tempdir().unwrap();
+    let pids = {
+        let output = installer_output(
+            installer_fixture_command(root.path()),
+            Duration::from_secs(30),
+        );
+        tokio::pin!(output);
+        tokio::select! {
+            result = &mut output => panic!("installer finished before cancellation: {result:?}"),
+            pids = wait_for_installer_pids(root.path()) => pids,
+        }
+    };
+    assert_installer_processes_stopped(&pids).await;
+}
+
+fn installer_fixture_command(root: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("/bin/bash");
+    command
+        .args(["-c", INSTALLER_FIXTURE_SCRIPT])
+        .env("INSTALLER_FIXTURE_DIR", root);
+    command
+}
+
+/// Purpose: Wait until every pipeline process reports its PID.
+/// Input: The temporary installer fixture directory.
+/// Output: The pipeline and grandchild PIDs, or a bounded assertion failure.
+async fn wait_for_installer_pids(root: &Path) -> Vec<nix::unistd::Pid> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut pids = Vec::new();
+            for name in INSTALLER_PID_FILES {
+                if let Ok(text) = std::fs::read_to_string(root.join(name))
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    pids.push(nix::unistd::Pid::from_raw(pid));
+                }
+            }
+            if pids.len() == INSTALLER_PID_FILES.len() {
+                return pids;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all installer fixture processes must start")
+}
+
+/// Purpose: Verify that cancellation stops every installer fixture process.
+/// Input: The pipeline and grandchild PIDs.
+/// Output: An assertion failure if any process survives the deadline.
+async fn assert_installer_processes_stopped(pids: &[nix::unistd::Pid]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pids
+            .iter()
+            .any(|&pid| nix::sys::signal::kill(pid, None) != Err(nix::errno::Errno::ESRCH))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("installer pipeline and grandchildren must stop");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn usage_lists_install() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            let error = actor.configure_computer_use("bogus").await.unwrap_err();
+            assert!(error.contains("install"), "{error}");
         })
         .await;
 }
