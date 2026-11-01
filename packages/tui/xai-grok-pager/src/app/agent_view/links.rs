@@ -155,6 +155,26 @@ impl AgentView {
             app_should_open_link_on_click(link).then(|| (col, row, link.target.clone()));
         true
     }
+    /// Arm [`Self::pending_link_click`] for a slash-command link on a plain click.
+    ///
+    /// These links have no OSC 8 URL, so the terminal never opens them, and
+    /// they read as buttons ("Click here to install it"). Returns `true` on a hit.
+    pub(in crate::app) fn try_arm_command_link_click(&mut self, col: u16, row: u16) -> bool {
+        if self.pos_occluded(col, row) {
+            return false;
+        }
+        let Some(link) = self.visible_link_map.link_at(col, row) else {
+            return false;
+        };
+        if !matches!(
+            link.target,
+            crate::render::osc8::LinkTarget::SlashCommand(_)
+        ) {
+            return false;
+        }
+        self.pending_link_click = Some((col, row, link.target.clone()));
+        true
+    }
     /// Re-evaluate which link (if any) is under the cursor for the given
     /// modifier state.  Returns `true` when `hovered_link_idx` changed.
     pub(in crate::app) fn update_hovered_link(&mut self, modifier_held: bool) -> bool {
@@ -1397,6 +1417,51 @@ mod link_click_tests {
             }
             other => panic!("expected Action::OpenLink, got {other:?}"),
         }
+    }
+    /// A plain click runs a slash-command link; a plain click on a URL does not.
+    #[test]
+    fn plain_click_on_command_link_opens_it() {
+        let mut agent = make_agent();
+        let area = Rect::new(0, 0, 80, 24);
+        setup_scrollback_area(&mut agent, area);
+        let command = crate::render::osc8::slash_command_link_target("/computer-use install")
+            .expect("allowlisted command");
+        let mut overlay = LinkOverlay::new();
+        for (row, target) in [
+            (5, command.clone()),
+            (
+                7,
+                crate::render::osc8::LinkTarget::Url("https://example.com".into()),
+            ),
+        ] {
+            overlay.push(OverlayLink {
+                screen_row: row,
+                col_start: 10,
+                col_end: 30,
+                target,
+                presentation: crate::render::osc8::LinkPresentation::Opaque,
+                id: Some(u32::from(row)),
+            });
+        }
+        agent.visible_link_map.rebuild(1, &overlay, vec![]);
+
+        assert!(matches!(
+            agent.handle_mouse(&mouse_down(15, 5)),
+            InputOutcome::Changed
+        ));
+        match agent.handle_mouse(&mouse_up(15, 5)) {
+            InputOutcome::Action(Action::OpenLink(target)) => assert_eq!(target, command),
+            other => panic!("expected Action::OpenLink(command), got {other:?}"),
+        }
+
+        agent.handle_mouse(&mouse_down(15, 7));
+        assert!(
+            !matches!(
+                agent.handle_mouse(&mouse_up(15, 7)),
+                InputOutcome::Action(Action::OpenLink(_))
+            ),
+            "a plain click on a URL must stay a text click"
+        );
     }
     /// A modifier+click preserves a filesystem target through app activation
     /// (Ctrl on Linux/Windows; macOS polls CoreGraphics so the Down step isn't

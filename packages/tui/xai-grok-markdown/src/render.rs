@@ -1222,6 +1222,19 @@ mod tests {
         );
     }
 
+    /// Pretty mode hides the angle brackets of a `[text](<dest>)` destination.
+    #[test]
+    fn test_pretty_link_angle_brackets_removed() {
+        let text = "Run [it](</computer-use install>) now.\n\n";
+        let (output, _) = render_markdown_ratatui_full(text, test_style::STYLE, true, None);
+        let lines = lines_to_text(&output.lines);
+
+        assert_eq!(lines[0], "Run it (/computer-use install) now.");
+        assert_eq!(output.hyperlinks.len(), 1, "{:?}", output.hyperlinks);
+        assert_eq!(output.hyperlinks[0].url, "/computer-use install");
+        assert_eq!(output.hyperlinks[0].column_range, 4..6);
+    }
+
     /// Same regression for images: `![img](src)` should not show `[img`.
     #[test]
     fn test_pretty_image_bracket_removed() {

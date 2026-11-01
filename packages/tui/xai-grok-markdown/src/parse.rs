@@ -1175,6 +1175,21 @@ impl<'a, 'b, 'syn, 'oc> MarkdownParser<'a, 'b, 'syn, 'oc> {
                         to: " (".to_string(),
                         force: false,
                     });
+                    // `[text](<dest>)` lets a destination hold spaces. Hide the
+                    // angle brackets, as for the brackets around the text.
+                    if let Some(url_rel) = &url_rel_opt
+                        && url_rel.start == bracket_pos.end + 1
+                        && tag_str.as_bytes()[bracket_pos.end] == b'<'
+                        && tag_str.as_bytes().get(url_rel.end) == Some(&b'>')
+                    {
+                        for at in [bracket_abs + 2, range.start + url_rel.end] {
+                            self.buffers.transforms.push(Transform {
+                                range: at..at + 1,
+                                to: "".to_string(),
+                                force: false,
+                            });
+                        }
+                    }
                     if text_end > text_start {
                         self.buffers.link_targets.push(LinkTarget {
                             source_range: text_start..text_end,

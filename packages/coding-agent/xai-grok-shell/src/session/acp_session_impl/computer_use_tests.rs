@@ -365,3 +365,33 @@ async fn empty_or_failed_early_server_keeps_computer_use_discovery_available() {
         })
         .await;
 }
+
+#[test]
+fn not_installed_message_links_the_install_command() {
+    // The pager runs only allowlisted link commands; keep both sides in sync.
+    let message = not_installed_message();
+    assert!(
+        message.contains("[Click here to install it](</computer-use install>)"),
+        "{message}"
+    );
+}
+
+#[test]
+fn installer_errors_keep_the_last_lines_of_stderr_or_stdout() {
+    let stderr = b"one\ntwo\nthree\n";
+    assert_eq!(tail_lines(stderr, b"ignored", 2), "two\nthree");
+    assert_eq!(tail_lines(b" \n", b"only stdout\n", 2), "only stdout");
+    assert_eq!(tail_lines(b"", b"", 2), "");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn usage_lists_install() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            let error = actor.configure_computer_use("bogus").await.unwrap_err();
+            assert!(error.contains("install"), "{error}");
+        })
+        .await;
+}

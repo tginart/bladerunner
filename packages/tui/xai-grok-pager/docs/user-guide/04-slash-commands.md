@@ -10,7 +10,7 @@ Every command below lists its aliases where it has them. A few commands only app
 
 ## Session Management
 
-### `/computer-use [on|off|status]`
+### `/computer-use [on|off|status|install]`
 
 Toggle browser and desktop control through [Cua Driver](https://cua.ai/docs/cua-driver/quickstart).
 Alias: `/cua`. No startup flag or manual MCP configuration is needed.
@@ -18,6 +18,11 @@ Alias: `/cua`. No startup flag or manual MCP configuration is needed.
 Install Cua Driver once, then run `/computer-use` to enable it. The command finds
 `cua-driver` on PATH or in its standard installation directory and saves the
 `computer-use` MCP definition. Your on/off preference carries across sessions.
+If the driver is missing, the message has a "Click here to install it" link.
+The link runs `/computer-use install` in the same session. That command runs the
+official driver installer from `cua.ai` without prompts, then turns computer use
+on. The installer puts `cua-driver` in `~/.local/bin` and does not edit your shell
+profile. Automatic installation is not available on Windows.
 `/computer-use off` disconnects that server and removes its tools from the session.
 Normal tool approval rules and organization MCP policies still apply.
 
