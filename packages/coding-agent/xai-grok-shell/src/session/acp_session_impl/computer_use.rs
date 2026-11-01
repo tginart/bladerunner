@@ -332,13 +332,8 @@ async fn run_installer() -> Result<(), String> {
     let mut command = tokio::process::Command::new("/bin/bash");
     command
         .args(["-c", INSTALL_SCRIPT])
-        .env("CUA_DRIVER_NO_MODIFY_PATH", "1")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(INSTALL_TIMEOUT, command.output())
-        .await
-        .map_err(|_| "The Cua Driver installer timed out.".to_string())?
-        .map_err(|error| format!("Could not start the Cua Driver installer: {error}"))?;
+        .env("CUA_DRIVER_NO_MODIFY_PATH", "1");
+    let output = installer_output(command, INSTALL_TIMEOUT).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -347,6 +342,53 @@ async fn run_installer() -> Result<(), String> {
         "The Cua Driver installer failed ({}). Install it from {QUICKSTART_URL} instead.\n\n```\n{details}\n```",
         output.status
     ))
+}
+
+/// Purpose: Capture installer output and stop its process tree on cancellation.
+/// Input: The installer command and its maximum duration.
+/// Output: The process output, or a timeout or process error.
+async fn installer_output(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    xai_tty_utils::detach_command(&mut command);
+    let mut group = xai_tty_utils::ProcessGroup::new()
+        .map_err(|error| format!("Could not create the installer process group: {error}"))?;
+    #[allow(clippy::disallowed_methods)] // The drop guard owns the detached process group below.
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Could not start the Cua Driver installer: {error}"))?;
+    group
+        .attach(&child)
+        .map_err(|error| format!("Could not track the installer process group: {error}"))?;
+    let mut guard = InstallerProcessGuard(Some(group));
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| "The Cua Driver installer timed out.".to_string())?
+        .map_err(|error| format!("Could not read the Cua Driver installer output: {error}"))?;
+    // The leader and its output pipes are complete. Do not signal a reusable PID.
+    guard.0 = None;
+    Ok(output)
+}
+
+/// Purpose: Stop all installer processes when its future does not finish.
+/// Input: The detached process group, or None after normal completion.
+/// Output: The process group receives SIGKILL when the guard drops while armed.
+struct InstallerProcessGuard(Option<xai_tty_utils::ProcessGroup>);
+
+impl Drop for InstallerProcessGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take()
+            && let Err(error) = group.kill()
+        {
+            tracing::warn!(%error, "Could not stop the installer process group");
+        }
+    }
 }
 
 /// Purpose: Keep the last lines of installer output for an error message.

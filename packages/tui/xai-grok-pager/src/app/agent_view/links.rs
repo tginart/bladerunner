@@ -1463,6 +1463,83 @@ mod link_click_tests {
             "a plain click on a URL must stay a text click"
         );
     }
+    /// Purpose: Prevent a child transcript click from dispatch to the parent session.
+    /// Input: A plain click on a command link in a fullscreen child view.
+    /// Output: The input is consumed without a command action.
+    #[test]
+    fn fullscreen_subagent_command_link_click_does_not_escape_to_parent() {
+        let registry = ActionRegistry::defaults();
+        let mut parent = make_agent();
+        parent.prompt.set_text("parent draft");
+        let mut child = make_agent();
+        setup_scrollback_area(&mut child, Rect::new(0, 0, 80, 24));
+        let command = crate::render::osc8::slash_command_link_target("/computer-use install")
+            .expect("allowlisted command");
+        add_visible_target(&mut child, 5, 10, 30, command);
+        parent
+            .subagent_views
+            .insert("child".into(), Box::new(child));
+        parent.active_subagent = Some("child".into());
+
+        assert!(matches!(
+            parent.handle_input(&Event::Mouse(mouse_down(15, 5)), &registry),
+            InputOutcome::Changed
+        ));
+        assert!(parent.subagent_views["child"].pending_link_click.is_some());
+        assert!(matches!(
+            parent.handle_input(&Event::Mouse(mouse_up(15, 5)), &registry),
+            InputOutcome::Changed
+        ));
+        assert!(parent.subagent_views["child"].pending_link_click.is_none());
+        assert_eq!(parent.prompt.text(), "parent draft");
+        assert_eq!(parent.active_subagent.as_deref(), Some("child"));
+    }
+
+    /// Purpose: Limit the command-link block to fullscreen child views.
+    /// Input: Enter on command, URL, and file links in parent and child views.
+    /// Output: Only child command links are consumed without an open action.
+    #[test]
+    fn fullscreen_subagent_link_keyboard_policy_preserves_other_links() {
+        use crate::render::osc8::LinkTarget;
+        let registry = ActionRegistry::defaults();
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let command = crate::render::osc8::slash_command_link_target("/computer-use install")
+            .expect("allowlisted command");
+        for fullscreen_child in [false, true] {
+            for target in [
+                command.clone(),
+                LinkTarget::Url("https://example.com".into()),
+                LinkTarget::File(Arc::from(std::path::Path::new("/tmp/transcript.txt"))),
+            ] {
+                let mut parent = make_agent();
+                let mut viewer = make_agent();
+                setup_scrollback_area(&mut viewer, Rect::new(0, 0, 80, 24));
+                add_visible_target(&mut viewer, 5, 10, 30, target.clone());
+                viewer.highlighted_link_idx = Some(0);
+                if fullscreen_child {
+                    parent
+                        .subagent_views
+                        .insert("child".into(), Box::new(viewer));
+                    parent.active_subagent = Some("child".into());
+                } else {
+                    parent = viewer;
+                }
+
+                let outcome = parent.handle_input(&enter, &registry);
+                if fullscreen_child && matches!(target, LinkTarget::SlashCommand(_)) {
+                    assert!(matches!(outcome, InputOutcome::Changed));
+                } else {
+                    match outcome {
+                        InputOutcome::Action(Action::OpenLink(actual)) => {
+                            assert_eq!(actual, target);
+                        }
+                        other => panic!("expected Action::OpenLink, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
     /// A modifier+click preserves a filesystem target through app activation
     /// (Ctrl on Linux/Windows; macOS polls CoreGraphics so the Down step isn't
     /// reproducible in a unit test).

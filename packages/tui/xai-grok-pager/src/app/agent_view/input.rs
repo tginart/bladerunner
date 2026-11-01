@@ -516,7 +516,13 @@ impl AgentView {
             }
             if let Some(child_view) = self.subagent_views.get_mut(child_sid) {
                 child_view.mark_as_subagent_view();
-                return child_view.handle_input_inner(ev, registry, prompt_paging);
+                return match child_view.handle_input_inner(ev, registry, prompt_paging) {
+                    // Command dispatch targets the parent, not this read-only child.
+                    InputOutcome::Action(Action::OpenLink(
+                        crate::render::osc8::LinkTarget::SlashCommand(_),
+                    )) => InputOutcome::Changed,
+                    outcome => outcome,
+                };
             }
             return InputOutcome::Unchanged;
         }
