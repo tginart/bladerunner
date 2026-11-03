@@ -33,6 +33,8 @@ const TIMELINE_DEFAULT: bool = UiConfig::SHOW_TIMELINE_DEFAULT;
 const PAGE_FLIP_ON_SEND_DEFAULT: bool = UiConfig::PAGE_FLIP_ON_SEND_DEFAULT;
 /// Combine-queued-prompts rollout flag defaults OFF (opt-in).
 const COMBINE_QUEUED_PROMPTS_DEFAULT: bool = false;
+/// `/hooks mute` defaults OFF: hook results show in the transcript.
+const HOOKS_MUTED_DEFAULT: bool = false;
 const SIMPLE_MODE_DEFAULT: bool = true;
 /// Vim-mode scrollback default — matches the previous on-disk default.
 const VIM_MODE_DEFAULT: bool = false;
@@ -193,6 +195,34 @@ pub fn load_combine_queued_prompts() -> bool {
 pub fn set_combine_queued_prompts(enabled: bool) {
     COMBINE_QUEUED_PROMPTS_CURRENT.with(|c| c.set(enabled));
     COMBINE_QUEUED_PROMPTS_LOADED.with(|l| l.set(true));
+}
+
+// -- Hooks muted --------------------------------------------------------------
+
+thread_local! {
+    static HOOKS_MUTED_CURRENT: Cell<bool> = const { Cell::new(HOOKS_MUTED_DEFAULT) };
+    static HOOKS_MUTED_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cached `hooks_muted`, seeding from `[ui]` on first call.
+pub fn load_hooks_muted() -> bool {
+    HOOKS_MUTED_LOADED.with(|loaded| {
+        if !loaded.get() {
+            HOOKS_MUTED_CURRENT.with(|c| {
+                c.set(load_bool_from_effective_config(
+                    "hooks_muted",
+                    HOOKS_MUTED_DEFAULT,
+                ))
+            });
+            loaded.set(true);
+        }
+    });
+    HOOKS_MUTED_CURRENT.with(|c| c.get())
+}
+
+pub fn set_hooks_muted(muted: bool) {
+    HOOKS_MUTED_CURRENT.with(|c| c.set(muted));
+    HOOKS_MUTED_LOADED.with(|l| l.set(true));
 }
 
 // -- Simple mode --------------------------------------------------------------
@@ -610,6 +640,7 @@ pub fn prime(ui: &UiConfig) {
         ui.combine_queued_prompts
             .unwrap_or(COMBINE_QUEUED_PROMPTS_DEFAULT),
     );
+    set_hooks_muted(ui.hooks_muted.unwrap_or(HOOKS_MUTED_DEFAULT));
     set_simple_mode(ui.simple_mode.unwrap_or(SIMPLE_MODE_DEFAULT));
     set_keep_text_selection(text_selection_from_ui(ui));
     // Layered-config keys (not the `UiConfig` arg) — seed so the first frame
@@ -726,6 +757,10 @@ mod tests {
             COMBINE_QUEUED_PROMPTS_DEFAULT,
             ui.combine_queued_prompts
                 .unwrap_or(COMBINE_QUEUED_PROMPTS_DEFAULT)
+        );
+        assert_eq!(
+            HOOKS_MUTED_DEFAULT,
+            ui.hooks_muted.unwrap_or(HOOKS_MUTED_DEFAULT)
         );
         assert_eq!(SIMPLE_MODE_DEFAULT, ui.simple_mode.unwrap_or(true));
         assert_eq!(VIM_MODE_DEFAULT, ui.vim_mode.unwrap_or(false));

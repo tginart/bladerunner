@@ -1177,6 +1177,35 @@ pub(in crate::app::dispatch) fn set_combine_queued_prompts(
     }]
 }
 
+/// State-only mutation for `hooks_muted`.
+pub(super) fn set_hooks_muted_inner(app: &mut AppView, new: bool) {
+    app.current_ui.hooks_muted = Some(new);
+    crate::appearance::cache::set_hooks_muted(new);
+}
+
+/// SHARED: cache + `[ui].hooks_muted` via `Effect::PersistSetting`.
+pub(in crate::app::dispatch) fn set_hooks_muted(app: &mut AppView, new: bool) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_hooks_muted();
+    if prev == new {
+        app.show_toast(&save_success_toast(
+            &setting_label_l10n("hooks_muted", "Mute hooks"),
+            new,
+        ));
+        return vec![];
+    }
+    set_hooks_muted_inner(app, new);
+    tracing::info!(target: "settings", key = "hooks_muted", value = new, "setting changed");
+    app.show_toast(&save_success_toast(
+        &setting_label_l10n("hooks_muted", "Mute hooks"),
+        new,
+    ));
+    vec![Effect::PersistSetting {
+        key: "hooks_muted",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 /// State-only mutation for `simple_mode`.
 ///
 /// Propagates to every agent's `input_mode` so the toggle takes

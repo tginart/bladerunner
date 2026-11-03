@@ -59,6 +59,11 @@ pub async fn set_confirm_before_rewind(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.confirm_before_rewind = Some(value)).await
 }
 
+/// Persist `[ui].hooks_muted` via `update_config`.
+pub async fn set_hooks_muted(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.hooks_muted = Some(value)).await
+}
+
 /// Persist `[ui].combine_queued_prompts` via `update_config`.
 pub async fn set_combine_queued_prompts(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.combine_queued_prompts = Some(value)).await

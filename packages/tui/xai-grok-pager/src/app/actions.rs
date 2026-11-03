@@ -604,6 +604,11 @@ pub enum Action {
     /// drain site) and persists to `[ui].combine_queued_prompts` via
     /// `Effect::PersistSetting`.
     SetCombineQueuedPrompts(bool),
+    /// Set whether hook results are hidden in the transcript (`/hooks mute`).
+    /// Hooks still run. SHARED-owned: updates the process-wide cache (read
+    /// where hook notifications arrive) and persists to `[ui].hooks_muted`
+    /// via `Effect::PersistSetting`.
+    SetHooksMuted(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).

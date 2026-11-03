@@ -177,6 +177,11 @@ pub struct UiConfig {
     /// Combine consecutive queued follow-ups into one turn. `None` = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub combine_queued_prompts: Option<bool>,
+    /// Hide hook results (`[hooks: N]` badges, stop-hook summaries, hook
+    /// messages) in the transcript. Hooks still run. Set by `/hooks mute`.
+    /// `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks_muted: Option<bool>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -319,6 +324,7 @@ impl Default for UiConfig {
             double_click_action: None,
             contextual_hints: ContextualHints::default(),
             combine_queued_prompts: None,
+            hooks_muted: None,
             display_refresh: DisplayRefreshSettings::default(),
             notifications: UiNotificationsConfig::default(),
         }

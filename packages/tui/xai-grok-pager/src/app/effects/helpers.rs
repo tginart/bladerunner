@@ -1111,6 +1111,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "hooks_muted" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("hooks_muted", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_hooks_muted(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "combine_queued_prompts" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("combine_queued_prompts", "Bool", &value));
