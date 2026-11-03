@@ -4896,6 +4896,9 @@ pub struct ConfigModelOverride {
     pub base_url: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Platform label shown beside the model in `/model`, e.g. `"MyCorp"`.
+    /// Inherited from `[model_providers.<id>] platform_name` when unset.
+    pub platform_name: Option<String>,
     pub api_key: Option<String>,
     /// Env var name(s) for the provider key — string or array in config.toml.
     pub env_key: Option<EnvKeys>,
@@ -4965,6 +4968,9 @@ impl ConfigModelOverride {
         }
         if self.description.is_some() {
             entry.info.description.clone_from(&self.description);
+        }
+        if self.platform_name.is_some() {
+            entry.info.platform_name.clone_from(&self.platform_name);
         }
         if self.max_completion_tokens.is_some() {
             entry.info.max_completion_tokens = self.max_completion_tokens;
@@ -5080,6 +5086,10 @@ pub struct ModelInfo {
     /// to users in either consumer.
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Platform label for a config-file model (`platform_name` in
+    /// `[model.<id>]` or `[model_providers.<id>]`), shown beside it in `/model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_name: Option<String>,
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -5153,6 +5163,7 @@ impl ModelInfo {
             base_url: String::new(),
             name: None,
             description: None,
+            platform_name: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
@@ -5192,6 +5203,7 @@ impl ModelInfo {
             base_url: entry.base_url.clone(),
             name: entry.name.clone(),
             description: entry.description.clone(),
+            platform_name: None,
             max_completion_tokens: entry.max_completion_tokens,
             temperature: entry.temperature,
             top_p: entry.top_p,
@@ -6094,6 +6106,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 base_url: endpoints.resolve_inference_base_url(),
                 name: None,
                 description: None,
+                platform_name: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
@@ -6820,6 +6833,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             base_url: endpoints.resolve_inference_base_url(),
             name: None,
             description: None,
+            platform_name: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
@@ -6947,6 +6961,17 @@ pub(crate) fn to_acp_model_info(
                     map.insert(
                         REASONING_EFFORTS_META_KEY.to_string(),
                         reasoning_efforts_meta_value(&info.reasoning_efforts),
+                    );
+                }
+                if let Some(platform_name) = info
+                    .platform_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    map.insert(
+                        xai_grok_sampling_types::PLATFORM_NAME_META_KEY.to_string(),
+                        platform_name.into(),
                     );
                 }
                 if map.is_empty() { None } else { Some(map) }
@@ -8214,6 +8239,7 @@ reasoning_effort = "low"
                 base_url: base_url.to_string(),
                 name: None,
                 description: None,
+                platform_name: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
@@ -14444,6 +14470,7 @@ default = "grok-4.5"
                 base_url: "https://test.example.com/v1".to_owned(),
                 name: Some(slug.to_owned()),
                 description: None,
+                platform_name: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
