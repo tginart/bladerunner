@@ -42,6 +42,8 @@ pub struct DeferredStartupActions {
     pub worktree_ref: Option<String>,
     pub new_session: bool,
     pub prompt: Option<String>,
+    /// Prompts that follow `prompt` in the same session (after `--hub`).
+    pub queued_prompts: Vec<String>,
     pub open_dashboard: bool,
     pub pending_chat: bool,
     /// Welcome history local-disk bypass persisted across the startup gate.
@@ -74,6 +76,7 @@ pub fn fork_session_params(
         "sourceCwd": source_cwd,
         "newCwd": parent_cwd_str.clone(),
         "sessionKind": "fork",
+        "inheritHub": true,
     });
     if let Some(nid) = new_session_id {
         payload["newSessionId"] = serde_json::Value::String(nid.to_string());
@@ -1590,6 +1593,7 @@ mod tests {
         assert_eq!(p["newSessionId"], "child-uuid");
         assert_eq!(p["sourceWorkspaceDir"], "/wt");
         assert_eq!(p["sessionKind"], "fork");
+        assert_eq!(p["inheritHub"], true);
     }
     #[test]
     fn fork_session_params_omits_workspace_dir_when_not_worktree() {

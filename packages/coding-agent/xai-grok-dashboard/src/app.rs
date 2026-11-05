@@ -11,6 +11,7 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::path;
 
+use crate::hubs::{HubPage, HubSummary};
 use crate::store::{
     ChatMessage, DashboardStore, EventKind, LogEntry, NamedMetric, ResourceMetrics, ServerMetrics,
     SessionCharts, SessionDetail, SessionMeta, SessionPage, SessionQuery, TimelineEvent,
@@ -32,6 +33,7 @@ pub fn App() -> impl IntoView {
                         <a href="/sessions">"Sessions"</a>
                         <a href="/resources">"Resources"</a>
                         <a href="/logs">"Logs"</a>
+                        <a href="/hubs">"Hubs"</a>
                         <a href="/api/sessions">"JSON API"</a>
                     </nav>
                 </header>
@@ -46,6 +48,8 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/sessions/:id/live") view=LivePage/>
                         <Route path=path!("/resources") view=ResourcesPage/>
                         <Route path=path!("/logs") view=LogsPage/>
+                        <Route path=path!("/hubs") view=HubsPage/>
+                        <Route path=path!("/hubs/:name") view=HubDetailPage/>
                     </Routes>
                 </main>
             </div>
@@ -520,6 +524,169 @@ fn render_logs(result: Result<Vec<LogEntry>, ServerFnError>) -> AnyView {
 }
 
 #[component]
+fn HubsPage() -> impl IntoView {
+    let hubs = Resource::new(|| (), |_| fetch_hubs());
+    view! {
+        <section>
+            <h2>"Agent hubs"</h2>
+            <p class="muted">"Channels and DMs shared by agent threads. Join one with /hub join <name>."</p>
+            <Suspense fallback=loading_rows>
+                {move || hubs.get().map(render_hub_table)}
+            </Suspense>
+        </section>
+    }
+}
+
+fn render_hub_table(result: Result<Vec<HubSummary>, ServerFnError>) -> AnyView {
+    match result {
+        Ok(hubs) if hubs.is_empty() => empty_view("No hubs yet. Create one with /hub new <name>."),
+        Ok(hubs) => view! {
+            <div class="card table-wrap">
+                <table>
+                    <thead><tr><th>"Hub"</th><th>"Active members"</th><th>"Channels"</th><th>"Tokens to agents"</th><th>"State"</th></tr></thead>
+                    <tbody>
+                        {hubs.into_iter().map(|hub| {
+                            let href = format!("/hubs/{}", hub.name);
+                            let state = if hub.archived { "archived" } else { "open" };
+                            view! {
+                                <tr>
+                                    <td><a href=href>{hub.name}</a></td>
+                                    <td>{hub.active_members}</td>
+                                    <td>{hub.channels}</td>
+                                    <td>{format_number(hub.tokens)}</td>
+                                    <td><span class="badge">{state}</span></td>
+                                </tr>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any(),
+        Err(error) => error_view(error),
+    }
+}
+
+#[component]
+fn HubDetailPage() -> impl IntoView {
+    let params = use_params_map();
+    let query_map = use_query_map();
+    let key = Memo::new(move |_| {
+        (
+            params.get().get("name").unwrap_or_default(),
+            query_map.get().get("channel").unwrap_or_default(),
+        )
+    });
+    let page = Resource::new(
+        move || key.get(),
+        |(name, channel)| fetch_hub_page(name, channel),
+    );
+    view! {
+        <section>
+            <Suspense fallback=loading_detail>
+                {move || page.get().map(render_hub_page)}
+            </Suspense>
+        </section>
+    }
+}
+
+fn render_hub_page(result: Result<HubPage, ServerFnError>) -> AnyView {
+    let page = match result {
+        Ok(page) => page,
+        Err(error) => return error_view(error),
+    };
+    let name = page.meta.name.clone();
+    let base = format!("/hubs/{name}");
+    let action = format!("/hubs/{name}/post");
+    let active: Vec<_> = page
+        .meta
+        .members
+        .iter()
+        .filter(|m| m.active)
+        .cloned()
+        .collect();
+    let targets: Vec<String> = page
+        .meta
+        .channels
+        .iter()
+        .map(|c| format!("#{}", c.name))
+        .chain(active.iter().map(|m| format!("@{}", m.handle)))
+        .collect();
+    let selected = page
+        .channel
+        .clone()
+        .map(|c| format!("#{c}"))
+        .unwrap_or_else(|| "#general".to_string());
+    let tokens_by_channel: Vec<NamedMetric> = page
+        .meta
+        .tokens
+        .iter()
+        .map(|(key, value)| NamedMetric {
+            name: key.clone(),
+            value: *value,
+        })
+        .collect();
+    let members_text = active
+        .iter()
+        .map(|m| format!("@{} ({})", m.handle, m.label))
+        .collect::<Vec<_>>()
+        .join(", ");
+    view! {
+        <div>
+            <h2>{format!("Hub {name}")}</h2>
+            <div class="grid">
+                <MetricCard label="Active members" value=active.len().to_string() accent="green"/>
+                <MetricCard label="Channels" value=page.meta.channels.len().to_string() accent="blue"/>
+                <MetricCard label="Tokens to agents" value=format_number(page.tokens) accent="purple"/>
+            </div>
+            <div class="card"><h3>"Members"</h3><p class="muted">{members_text}</p></div>
+            <div class="tabs">
+                <a href=base.clone()>"All"</a>
+                {page.meta.channels.iter().map(|c| {
+                    let href = format!("{base}?channel={}", c.name);
+                    view! { <a href=href>{format!("#{}", c.name)}</a> }
+                }).collect::<Vec<_>>()}
+            </div>
+            <form class="filters" method="post" action=action>
+                <select name="to">
+                    {targets.into_iter().map(|t| {
+                        let is_selected = t == selected;
+                        view! { <option value=t.clone() selected=is_selected>{t.clone()}</option> }
+                    }).collect::<Vec<_>>()}
+                </select>
+                <input name="text" placeholder="Post as you (a person); @handle wakes an agent" size="60" required=true/>
+                <button type="submit">"Post"</button>
+            </form>
+            {if page.messages.is_empty() {
+                empty_view("No messages yet.")
+            } else {
+                view! {
+                    <div class="card">
+                        {page.messages.into_iter().map(|m| {
+                            let who = if m.is_person { format!("@{} (person)", m.from) } else { format!("@{}", m.from) };
+                            let images = if m.images > 0 { format!(" [{} image(s)]", m.images) } else { String::new() };
+                            view! {
+                                <div class="log-row">
+                                    <span>{format_epoch_ms(m.ts_unix_ms)}</span>
+                                    <span class="mono">{m.place}</span>
+                                    <span class="chat-role">{who}</span>
+                                    <span class="chat-message">{m.text}{images}</span>
+                                </div>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                }.into_any()
+            }}
+            <div class="card">
+                <h3>"Tokens put into agents' context"</h3>
+                <BarChart metrics=tokens_by_channel unit=""/>
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
 fn SessionHeading(meta: SessionMeta) -> impl IntoView {
     let title = meta.title.clone().unwrap_or_else(|| short_id(&meta.id));
     view! {
@@ -834,6 +1001,26 @@ async fn fetch_logs(
         )
         .await
         .map_err(server_error)
+}
+
+#[server]
+async fn fetch_hubs() -> Result<Vec<HubSummary>, ServerFnError> {
+    let home = dashboard_store()?.grok_home().to_path_buf();
+    tokio::task::spawn_blocking(move || crate::hubs::list(&home))
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .map_err(server_error)
+}
+
+#[server]
+async fn fetch_hub_page(name: String, channel: String) -> Result<HubPage, ServerFnError> {
+    let home = dashboard_store()?.grok_home().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::hubs::page(&home, &name, nonempty(channel).as_deref())
+    })
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?
+    .map_err(server_error)
 }
 
 fn dashboard_store() -> Result<Arc<DashboardStore>, ServerFnError> {

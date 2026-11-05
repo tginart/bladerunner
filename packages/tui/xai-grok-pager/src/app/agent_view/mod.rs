@@ -158,6 +158,7 @@ use std::time::Instant;
 mod cta;
 mod input;
 pub(crate) use input::ExternalPromptEditorAccess;
+mod hub_overlay;
 mod interactions;
 mod jump;
 mod key_owner;
@@ -964,6 +965,8 @@ pub struct AgentView {
     /// Toggled by `Action::ToggleGoalDetail`. Only shown when
     /// `goal_state` is `Some`.
     pub show_goal_detail: bool,
+    /// The open hub browser (`/hub open`), if any.
+    pub hub_browser: Option<crate::views::hub_browser::HubBrowserState>,
     /// UTC ms when the current turn started (`turnStartMs` from notification meta).
     /// Used for turn elapsed display.
     pub turn_start_ms: Option<i64>,

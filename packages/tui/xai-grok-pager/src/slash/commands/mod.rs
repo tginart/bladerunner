@@ -33,6 +33,7 @@ pub mod gboom;
 pub mod help;
 pub mod history;
 pub mod home;
+pub mod hub;
 pub mod imagine;
 pub mod imagine_video;
 pub mod import_claude;
@@ -153,6 +154,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         #[cfg(not(feature = "community-build"))]
         Arc::new(workflows::WorkflowsCommand),
         Arc::new(shots::ShotsCommand),
+        Arc::new(hub::HubCommand),
         Arc::new(btw::BtwCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(doctor::DoctorCommand),
@@ -339,6 +341,7 @@ mod tests {
             "help",
             "history",
             "home",
+            "hub",
             "hooks",
             "howto",
             "imagine",

@@ -18,6 +18,7 @@ pub mod doctor_cmd;
 pub mod export_cmd;
 pub(crate) mod fs_size;
 pub mod git_info;
+pub mod hub_status;
 pub mod headless;
 mod signal_streams;
 pub mod hyperlink_route;

@@ -2373,6 +2373,35 @@ async fn builtin_turn_commits_immediately() {
         .await;
 }
 
+/// A builtin turn restamps the turn start, so the client does not time a
+/// slash command from the previous model turn.
+#[tokio::test(flavor = "current_thread")]
+async fn builtin_turn_restamps_turn_start() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            let stale_ms = chrono::Utc::now().timestamp_millis() - 60_000;
+            actor.chat_state_handle.record_turn_start(stale_ms);
+
+            let _ = actor
+                .execute_builtin_slash_command(BuiltinAction::ContextInfo)
+                .await;
+
+            let turn_start_ms = actor
+                .chat_state_handle
+                .get_notification_meta()
+                .await
+                .and_then(|meta| meta.turn_start_ms)
+                .expect("a builtin turn must stamp the turn start");
+            assert!(
+                turn_start_ms > stale_ms,
+                "a builtin turn must not keep the previous turn start"
+            );
+        })
+        .await;
+}
+
 /// `rewindIfPristine` must not pop a promoted interjection-fallback front —
 /// it is not the prompt the client rewound; it takes the normal cancel.
 #[tokio::test(flavor = "current_thread")]

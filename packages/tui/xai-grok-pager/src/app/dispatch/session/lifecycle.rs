@@ -679,6 +679,7 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
         worktree_ref,
         new_session,
         prompt,
+        queued_prompts,
         open_dashboard,
         pending_chat,
         #[cfg(feature = "local-workspace")]
@@ -794,6 +795,7 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
     }
     if let Some(prompt) = prompt {
         effects.extend(dispatch_initial_prompt(app, prompt));
+        crate::app::dispatch::enqueue_startup_prompts(app, &queued_prompts);
     }
     if open_dashboard {
         effects.extend(dispatch(Action::OpenDashboard, app));
@@ -1001,6 +1003,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         model_id,
         preferred_session_id,
         chat_kind,
+        inherit_hub: false,
     }];
     effects
 }

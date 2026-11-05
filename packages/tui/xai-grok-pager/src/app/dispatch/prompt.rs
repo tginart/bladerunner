@@ -57,6 +57,19 @@ pub(crate) fn dispatch_initial_prompt(app: &mut AppView, prompt: String) -> Vec<
     effects
 }
 
+/// Queue prompts behind the startup prompt in the active agent, such as the
+/// positional prompt after `--hub`'s `/hub join`.
+pub(crate) fn enqueue_startup_prompts(app: &mut AppView, prompts: &[String]) {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return;
+    };
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        for prompt in prompts {
+            agent.session.enqueue_prompt(prompt.clone());
+        }
+    }
+}
+
 pub(super) fn collect_live_doctor_report_for_terminal(
     app: &AppView,
     agent_id: AgentId,

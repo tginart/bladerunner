@@ -167,15 +167,11 @@ fn wait_tasks_tool_config() -> ToolConfig {
 fn kill_task_tool_config() -> ToolConfig {
     ToolConfig::from(&grok_build::KillTaskTool).with_name("kill_command_or_subagent")
 }
-/// Peer messaging tool renamed to describe its model-facing purpose.
+/// Peer messaging tool renamed to describe its model-facing purpose. It keeps
+/// the tool's own description, which documents hubs and channels.
 fn agent_hub_tool_config() -> ToolConfig {
     ToolConfig::from(&grok_build::AgentHubTool)
-        .with_name("message_agents")
-        .with_description(
-            "List running agents, send messages, read the inbox, or wait for a message. \
-This tool does not start agents; use `spawn_subagent` for that and \
-`get_command_or_subagent_output` for final results.",
-        )
+        .with_name(grok_build::agent_hub::AGENT_HUB_MODEL_NAME)
 }
 /// Complete workspace-executable toolset for hub registration.
 ///
@@ -1920,12 +1916,7 @@ mod tests {
 
         let messaging = agent_hub_tool_config();
         assert_eq!(messaging.name_override.as_deref(), Some("message_agents"));
-        assert!(
-            messaging
-                .description_override
-                .as_deref()
-                .is_some_and(|description| description.contains("does not start agents"))
-        );
+        assert!(messaging.description_override.is_none());
     }
 
     /// Pins the `spawn_subagent` rename to the shared predicate.

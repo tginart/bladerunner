@@ -397,7 +397,7 @@ display_name = "alice"
 
 在同一父会话树内，**Main** 与存活的 depth-1 子智能体共享进程内 **agent hub** 总线。对等体可直接互发消息，无需每条都经父会话中转。
 
-面向模型的工具名为 `agent_hub`（与 workspace 远程 hub 不同）。操作：
+面向模型的工具名为 `message_agents`（内部 id 为 `agent_hub`，与 workspace 远程 hub 不同）。操作：
 
 | Op | 行为 |
 |----|------|

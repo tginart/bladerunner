@@ -16061,6 +16061,7 @@ dependencies = [
  "uuid",
  "webbrowser",
  "xai-grok-config",
+ "xai-grok-tools",
 ]
 
 [[package]]

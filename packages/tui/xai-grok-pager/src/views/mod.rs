@@ -15,6 +15,7 @@ pub mod extensions_modal;
 pub mod file_search;
 pub mod fps_hud;
 pub mod goal_detail;
+pub mod hub_browser;
 pub mod history_search;
 pub mod import_claude_modal;
 pub mod jump;

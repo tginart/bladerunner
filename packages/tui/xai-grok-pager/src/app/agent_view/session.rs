@@ -182,6 +182,7 @@ impl AgentView {
             pending_stop_hooks: None,
             last_cleared_goal_id: None,
             show_goal_detail: false,
+            hub_browser: None,
             turn_start_ms: None,
             turn_start_ms_prompt: None,
             turn_started_at: None,

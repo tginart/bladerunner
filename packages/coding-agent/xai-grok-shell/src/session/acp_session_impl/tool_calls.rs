@@ -2246,6 +2246,7 @@ impl SessionActor {
                 vec![],
                 vec![],
             ),
+            ToolInput::AgentHub(ref hub) => (hub.title(), acp::ToolKind::Other, vec![], vec![]),
             ToolInput::SchedulerList(_) => (
                 "List scheduled tasks".to_string(),
                 acp::ToolKind::Other,

@@ -35,6 +35,10 @@ pub struct ForkSessionRequest {
     /// The original workspace directory this worktree session was spawned from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_workspace_dir: Option<String>,
+    /// Give the fork the source session's hub membership (`/fork`). n-shot
+    /// shots leave this off so they stay independent replications.
+    #[serde(default)]
+    pub inherit_hub: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -113,6 +117,18 @@ pub async fn fork_session(
     .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))??;
 
     let copy_ms = t0.elapsed().as_millis() as u64;
+
+    if request.inherit_hub {
+        match crate::session::hub::inherit_membership(&request.source_session_id, &new_session_id) {
+            Ok(Some((hub, handle))) => {
+                tracing::info!(target: FORK_LOG, %hub, %handle, "FORK_HUB: fork joined the parent's hub")
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(target: FORK_LOG, error = %e, "FORK_HUB: hub inheritance failed")
+            }
+        }
+    }
 
     // Writeback session to backend (fire-and-forget).
     // This is telemetry-grade: the local fork works without it. All fork

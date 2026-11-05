@@ -454,7 +454,7 @@ display_name = "alice"
 
 Within one parent session tree, **Main** and live depth-1 subagents share an in-process **agent hub** bus. Peers can message each other without routing every note through the parent’s switchboard.
 
-The model-facing tool is `agent_hub` (distinct from the workspace remote hub). Ops:
+The model-facing tool is `message_agents` (internal id `agent_hub`, distinct from the workspace remote hub). Ops:
 
 | Op | Behavior |
 |----|----------|

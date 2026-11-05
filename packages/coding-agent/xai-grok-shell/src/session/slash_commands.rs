@@ -268,6 +268,18 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         },
     },
     BuiltinCommand {
+        name: "hub",
+        description: "Join a hub where agent threads talk in channels and DMs",
+        argument_hint: Some(
+            "[list | new <name> | join <name> [as @handle] | leave | open [#channel] | channel <#name> | post <#channel|@handle> <text> | archive <name>]",
+        ),
+        aliases: &[],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |args| BuiltinAction::Hub {
+            args: args.trim().to_string(),
+        },
+    },
+    BuiltinCommand {
         name: "n-shot",
         description: "Fork this conversation into N parallel attempts in separate worktrees, then compare them",
         argument_hint: Some("<N> <prompt>"),
@@ -505,6 +517,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "help",
     "history",
     "home",
+    "hub",
     "hooks",
     "hooks-add",
     "hooks-list",
@@ -1260,6 +1273,9 @@ pub(super) enum BuiltinAction {
     ComputerUse {
         args: String,
     },
+    Hub {
+        args: String,
+    },
     Compact {
         user_context: Option<String>,
     },
@@ -1342,6 +1358,7 @@ impl BuiltinAction {
     pub(crate) fn command_name(&self) -> &str {
         match self {
             BuiltinAction::ComputerUse { .. } => "computer-use",
+            BuiltinAction::Hub { .. } => "hub",
             BuiltinAction::Compact { .. } => "compact",
             BuiltinAction::Deadline { .. } => "deadline",
             BuiltinAction::SetYolo { .. } => "yolo",
@@ -1380,6 +1397,7 @@ impl BuiltinAction {
     pub(crate) fn args_provided(&self) -> bool {
         match self {
             BuiltinAction::ComputerUse { args } => !args.is_empty(),
+            BuiltinAction::Hub { args } => !args.is_empty(),
             BuiltinAction::Compact { user_context } => user_context.is_some(),
             BuiltinAction::Deadline { duration } => !duration.is_empty(),
             BuiltinAction::SetYolo { .. } => true,
@@ -2407,6 +2425,7 @@ mod tests {
                 "session-info",
                 "feedback",
                 "deep-research-workflow",
+                "hub",
                 "n-shot",
                 "workflow",
                 "goal",

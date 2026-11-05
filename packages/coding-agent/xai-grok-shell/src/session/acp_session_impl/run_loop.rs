@@ -194,6 +194,15 @@ pub(super) async fn run_session(
     index_root: std::path::PathBuf,
     fs_watch_caps: fs_watch::FsWatchCapabilities,
 ) {
+    let _hub_presence = if session.startup_hints.is_subagent {
+        None
+    } else {
+        session
+            .rebuild_spec
+            .agent_bus
+            .as_ref()
+            .map(|resource| crate::session::hub::track_presence(resource.bus().clone()))
+    };
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<(String, PromptTurnResult)>();
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
