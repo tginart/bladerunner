@@ -53,7 +53,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "computer-use",
         description: "Toggle browser and desktop control through Cua Driver",
-        argument_hint: Some("on | off | status"),
+        argument_hint: Some("on | off | status | install"),
         aliases: &["cua"],
         gate: BuiltinGate::AlwaysOn,
         resolve: |args| BuiltinAction::ComputerUse {

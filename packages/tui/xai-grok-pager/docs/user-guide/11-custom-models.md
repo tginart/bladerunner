@@ -97,6 +97,7 @@ model = "model-id"                        # Model identifier sent to the API
 base_url = "https://api.example.com/v1"   # OpenAI-compatible endpoint
 name = "Display Name"                     # Shown in the model picker
 description = "Model description"          # Optional description
+platform_name = "MyCorp"                  # Platform label in the model picker (optional)
 api_key = "sk-..."                        # API key for this provider (optional)
 env_key = "XAI_API_KEY"                   # Env var holding the API key (optional; string or array)
 api_backend = "chat_completions"          # chat_completions, responses, codex_responses, or messages
@@ -117,6 +118,22 @@ Bladerunner resolves the API key in this order:
 2. The environment variable(s) named by `env_key` — a single string or an array of names. The first set, non-empty value wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
 3. Your signed-in session token (from `bladerunner login`), for a model with no `api_key`/`env_key` of its own
 4. The `XAI_API_KEY` environment variable (global fallback; Bladerunner also accepts `GROK_CODE_XAI_API_KEY` for backward compatibility)
+
+### Platform Label
+
+Built-in models show their platform (for example "OpenAI Codex" or "Palantir AIP") on the right side of the `/model` picker. Set `platform_name` to give a custom model the same label. You can set it on a `[model.<name>]` section, or once on a `[model_providers.<id>]` block for every model that uses that provider. A model's own `platform_name` wins over its provider's. The label replaces the model's `description` in the picker.
+
+```toml
+[model_providers.corp-gateway]
+base_url = "https://llm.corp.example/v1"
+env_key = "CORP_LLM_KEY"
+platform_name = "MyCorp"
+
+[model.corp-coder]
+model = "coder-large"
+name = "Corp Coder"
+model_provider = "corp-gateway"   # Shows "MyCorp" in /model
+```
 
 ### Context Window
 

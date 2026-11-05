@@ -515,7 +515,8 @@ mod hyperlink_tests {
         let text = "[t](<u](v>) end\n";
         let (full, _) = render_markdown_ratatui_full(text, test_style::STYLE, true, None);
         let line0 = line_to_string(&full.lines[0]);
-        assert!(line0.contains("t (<u](v>)") || line0.contains("t ( <u](v> )"));
+        // Pretty mode hides the angle brackets around the destination.
+        assert!(line0.contains("t (u](v) end"), "{line0:?}");
         let link = full
             .hyperlinks
             .iter()

@@ -2514,6 +2514,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             base_url: String::new(),
             name: None,
             description: None,
+            platform_name: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,

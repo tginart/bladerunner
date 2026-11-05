@@ -9,7 +9,9 @@
 
 use agent_client_protocol as acp;
 use xai_grok_models::parse_managed_model_key;
-use xai_grok_shell::sampling::types::{PlatformLockMeta, supports_reasoning_effort_meta};
+use xai_grok_shell::sampling::types::{
+    PLATFORM_NAME_META_KEY, PlatformLockMeta, supports_reasoning_effort_meta,
+};
 
 use crate::acp::model_state::{ModelState, platform_lock};
 use crate::app::actions::Action;
@@ -163,10 +165,12 @@ fn supports_reasoning_effort(info: &acp::ModelInfo) -> bool {
     supports_reasoning_effort_meta(info.meta.as_ref())
 }
 
-/// Provider label for a catalog row: lock meta, bundled Foundry, or managed platform.
+/// Provider label for a catalog row: lock meta, a config-file `platform_name`,
+/// bundled Foundry, or managed platform.
 /// Main caller: `build_model_items`, which puts this label in the right column.
-/// Why this exists: bundled Foundry models use `[model_providers]`, not the
-/// managed provider registry used by OpenAI Codex and other catalog models.
+/// Why this exists: bundled Foundry and other config-file models use
+/// `[model_providers]`, not the managed provider registry used by OpenAI Codex
+/// and other catalog models.
 fn provider_label(id: &acp::ModelId, info: &acp::ModelInfo) -> Option<String> {
     if let Some(lock) = platform_lock(info) {
         let name = if lock.platform_name.is_empty() {
@@ -175,6 +179,15 @@ fn provider_label(id: &acp::ModelId, info: &acp::ModelInfo) -> Option<String> {
             lock.platform_name
         };
         return Some(name);
+    }
+    if let Some(name) = info
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(PLATFORM_NAME_META_KEY))
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.trim().is_empty())
+    {
+        return Some(name.to_string());
     }
     if id.0.starts_with("palantir-aip/") {
         return Some("Palantir AIP".to_string());
@@ -1018,5 +1031,34 @@ mod tests {
         assert_eq!(items[0].display, "GLM-5.2");
         assert_eq!(items[0].description, "Z.AI Coding Plan (CN)");
         assert_eq!(items[0].insert_text, "zai-coding-cn/glm-5.2 ");
+    }
+
+    #[test]
+    fn config_model_platform_name_shows_in_provider_column() {
+        let mut state = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("corp-coder"));
+        let meta = serde_json::json!({ "platformName": "MyCorp" })
+            .as_object()
+            .cloned();
+        let info = acp::ModelInfo::new(id.clone(), "Corp Coder".to_string())
+            .description(Some("Internal gateway model".to_string()))
+            .meta(meta);
+        state.available.insert(id, info);
+
+        let cmd = ModelCommand;
+        let ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
+        };
+        let items = cmd.suggest_args(&ctx, "").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display, "Corp Coder");
+        assert_eq!(items[0].description, "MyCorp");
     }
 }

@@ -13,11 +13,19 @@ use linkify::{LinkFinder, LinkKind};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
+/// Slash commands that a markdown link may run when the user clicks it.
+///
+/// Message text can come from the model, so a link never runs an arbitrary
+/// command. Each entry must be safe to run on a single click.
+const RUNNABLE_LINK_COMMANDS: &[&str] = &["/computer-use install"];
+
 /// Semantic destination of a pager link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkTarget {
     Url(Arc<str>),
     File(Arc<Path>),
+    /// An allowlisted slash command that runs in the link's session.
+    SlashCommand(Arc<str>),
 }
 
 /// Whether the painted text can independently identify its semantic target.
@@ -77,7 +85,21 @@ pub fn resolve_link_target_for_context(
             osc8_url: file_path_to_url(path),
             open_target: Some(LinkTarget::File(Arc::clone(path))),
         }),
+        // The terminal cannot run a pager command, so only the app owns it.
+        LinkTarget::SlashCommand(command) => Some(ResolvedLinkTarget {
+            osc8_url: None,
+            open_target: Some(LinkTarget::SlashCommand(Arc::clone(command))),
+        }),
     }
+}
+
+/// Map a markdown link destination to a runnable slash command target.
+///
+/// Returns `None` unless the destination is exactly an allowlisted command.
+pub fn slash_command_link_target(dest: &str) -> Option<LinkTarget> {
+    RUNNABLE_LINK_COMMANDS
+        .contains(&dest)
+        .then(|| LinkTarget::SlashCommand(Arc::from(dest)))
 }
 
 /// Resolve the target for app-owned activation.
@@ -818,6 +840,24 @@ mod tests {
         let unsafe_url = LinkTarget::Url(Arc::from("javascript:alert(1)"));
         assert!(resolve_link_target(&unsafe_url).is_none());
         assert!(resolve_link_open_target(&unsafe_url).is_none());
+
+        // Only the app can run a slash command, so the terminal gets no URL.
+        let command = slash_command_link_target("/computer-use install").unwrap();
+        assert_eq!(
+            resolve_link_target(&command).unwrap(),
+            ResolvedLinkTarget {
+                osc8_url: None,
+                open_target: Some(command.clone()),
+            }
+        );
+        for dest in [
+            "/computer-use",
+            "/computer-use install now",
+            "/always-approve",
+            "/quit",
+        ] {
+            assert!(slash_command_link_target(dest).is_none(), "{dest}");
+        }
 
         let file = LinkTarget::File(Arc::from(Path::new("/tmp/a b.rs")));
         assert_eq!(

@@ -1,6 +1,7 @@
 //! Purpose: Control the built-in Cua MCP connection from a slash command.
 //! Input: A user command and the installed Cua Driver executable.
 //! Output: A live MCP connection or a status message.
+//! Note: `/computer-use install` runs the official Cua Driver installer first.
 
 use super::*;
 use crate::session::mcp_servers::McpClient;
@@ -8,7 +9,17 @@ use crate::util::config::{McpServerConfig, McpServerTransportConfig};
 use std::path::PathBuf;
 
 const SERVER_NAME: &str = "computer-use";
-const USAGE: &str = "Usage: /computer-use [on|off|status] (alias: /cua).";
+const USAGE: &str = "Usage: /computer-use [on|off|status|install] (alias: /cua).";
+const QUICKSTART_URL: &str = "https://cua.ai/docs/cua-driver/quickstart";
+/// The TUI runs this command when the user clicks the link in the
+/// not-installed message. Keep it in sync with the pager's link allowlist.
+const INSTALL_COMMAND: &str = "/computer-use install";
+// The driver-only installer. It installs to ~/.local/bin, which
+// `find_driver` checks, so there is no need to edit the shell profile.
+const INSTALL_SCRIPT: &str =
+    "set -o pipefail; curl -fsSL https://cua.ai/driver/install.sh | bash -s -- --no-modify-path";
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+const INSTALL_ERROR_LINES: usize = 8;
 const CAPTURE_CONSENT_ALERT_ENV: &str = "CUA_DRIVER_ALLOW_CAPTURE_CONSENT_ALERT";
 const DRIVER_ARGS: &[&str] = if cfg!(target_os = "macos") {
     &["mcp", "--embedded"]
@@ -18,7 +29,7 @@ const DRIVER_ARGS: &[&str] = if cfg!(target_os = "macos") {
 
 impl SessionActor {
     /// Purpose: Apply a computer-use command without a model request.
-    /// Input: An empty argument, on, off, or status.
+    /// Input: An empty argument, on, off, status, or install.
     /// Output: The actual connection state or an error.
     /// Note: The saved MCP definition preserves the user's choice across sessions.
     pub(super) async fn configure_computer_use(
@@ -37,6 +48,7 @@ impl SessionActor {
             "on" => true,
             "off" => false,
             "status" => return Ok(self.computer_use_status().await),
+            "install" => return self.install_computer_use().await,
             _ => return Err(USAGE.to_string()),
         };
         if !enabled {
@@ -46,13 +58,48 @@ impl SessionActor {
             return Ok("Computer use is off. Run /computer-use to enable it.".to_string());
         }
 
-        let path = find_driver()?;
-        let server = driver_server(&path);
-        let policy = xai_grok_workspace::permission::resolution::managed_settings();
-        if !policy.mcp_allowlist.is_server_allowed(&server) {
-            return Err("Cua Driver is blocked by your organization's MCP policy.".to_string());
+        let path = find_driver().ok_or_else(not_installed_message)?;
+        self.enable_computer_use(&path).await
+    }
+
+    /// Purpose: Install Cua Driver when it is missing, then turn computer use on.
+    /// Input: The installed driver, or the network for the official installer.
+    /// Output: The connection state, or an error with the installer's last output.
+    async fn install_computer_use(self: &Arc<Self>) -> Result<String, String> {
+        if let Some(path) = find_driver() {
+            return self.enable_computer_use(&path).await;
         }
-        crate::util::config::save_mcp_server_config(SERVER_NAME, &driver_config(&path))
+        if cfg!(windows) {
+            return Err(format!(
+                "Automatic installation is not available on Windows. Install Cua Driver from {QUICKSTART_URL}, then run /computer-use again."
+            ));
+        }
+        if let Some(home) = dirs::home_dir()
+            && !is_server_allowed(&driver_server(&home.join(".local/bin/cua-driver")))
+        {
+            return Err(POLICY_BLOCKED.to_string());
+        }
+        self.send_host_turn_slash_command_output(
+            "Installing Cua Driver from cua.ai. This can take a minute…\n\n",
+        )
+        .await;
+        run_installer().await?;
+        let path = find_driver().ok_or_else(|| {
+            "The installer finished, but Cua Driver was not found. Run /computer-use install again, or check ~/.local/bin.".to_string()
+        })?;
+        let message = self.enable_computer_use(&path).await?;
+        Ok(format!("Cua Driver is installed. {message}"))
+    }
+
+    /// Purpose: Save and connect the computer-use MCP server for a known driver.
+    /// Input: The driver executable path.
+    /// Output: The connection state or an error. A failed connection stays off.
+    async fn enable_computer_use(self: &Arc<Self>, path: &Path) -> Result<String, String> {
+        let server = driver_server(path);
+        if !is_server_allowed(&server) {
+            return Err(POLICY_BLOCKED.to_string());
+        }
+        crate::util::config::save_mcp_server_config(SERVER_NAME, &driver_config(path))
             .await
             .map_err(|error| format!("Could not save the Cua configuration: {error}"))?;
         self.set_mcp_server_enabled(SERVER_NAME, true, Some(server))
@@ -255,6 +302,109 @@ fn update_enabled_server(
     Ok(diff)
 }
 
+const POLICY_BLOCKED: &str = "Cua Driver is blocked by your organization's MCP policy.";
+
+fn is_server_allowed(server: &acp::McpServer) -> bool {
+    xai_grok_workspace::permission::resolution::managed_settings()
+        .mcp_allowlist
+        .is_server_allowed(server)
+}
+
+/// Purpose: Tell the user that the driver is missing and how to get it.
+/// Output: A message. On macOS and Linux, it has a link that runs the installer.
+/// Note: The angle brackets let the markdown link destination hold a space.
+fn not_installed_message() -> String {
+    if cfg!(windows) {
+        return format!(
+            "Cua Driver is not installed. Install it from {QUICKSTART_URL}, then run /computer-use again."
+        );
+    }
+    format!(
+        "Cua Driver is not installed. [Click here to install it](<{INSTALL_COMMAND}>), or see {QUICKSTART_URL}."
+    )
+}
+
+/// Purpose: Run the official Cua Driver installer without a terminal.
+/// Input: The network and the user's home directory.
+/// Output: Ok when the installer exits with status 0, or an error with its last lines.
+/// Note: stdin is null, so the installer cannot prompt or read the TUI's input.
+async fn run_installer() -> Result<(), String> {
+    let mut command = tokio::process::Command::new("/bin/bash");
+    command
+        .args(["-c", INSTALL_SCRIPT])
+        .env("CUA_DRIVER_NO_MODIFY_PATH", "1");
+    let output = installer_output(command, INSTALL_TIMEOUT).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = tail_lines(&output.stderr, &output.stdout, INSTALL_ERROR_LINES);
+    Err(format!(
+        "The Cua Driver installer failed ({}). Install it from {QUICKSTART_URL} instead.\n\n```\n{details}\n```",
+        output.status
+    ))
+}
+
+/// Purpose: Capture installer output and stop its process tree on cancellation.
+/// Input: The installer command and its maximum duration.
+/// Output: The process output, or a timeout or process error.
+async fn installer_output(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    xai_tty_utils::detach_command(&mut command);
+    let mut group = xai_tty_utils::ProcessGroup::new()
+        .map_err(|error| format!("Could not create the installer process group: {error}"))?;
+    #[allow(clippy::disallowed_methods)] // The drop guard owns the detached process group below.
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Could not start the Cua Driver installer: {error}"))?;
+    group
+        .attach(&child)
+        .map_err(|error| format!("Could not track the installer process group: {error}"))?;
+    let mut guard = InstallerProcessGuard(Some(group));
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| "The Cua Driver installer timed out.".to_string())?
+        .map_err(|error| format!("Could not read the Cua Driver installer output: {error}"))?;
+    // The leader and its output pipes are complete. Do not signal a reusable PID.
+    guard.0 = None;
+    Ok(output)
+}
+
+/// Purpose: Stop all installer processes when its future does not finish.
+/// Input: The detached process group, or None after normal completion.
+/// Output: The process group receives SIGKILL when the guard drops while armed.
+struct InstallerProcessGuard(Option<xai_tty_utils::ProcessGroup>);
+
+impl Drop for InstallerProcessGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take()
+            && let Err(error) = group.kill()
+        {
+            tracing::warn!(%error, "Could not stop the installer process group");
+        }
+    }
+}
+
+/// Purpose: Keep the last lines of installer output for an error message.
+/// Input: stderr, stdout, and the maximum number of lines.
+/// Output: The last lines of stderr, or of stdout when stderr is empty.
+fn tail_lines(stderr: &[u8], stdout: &[u8], max_lines: usize) -> String {
+    let stream = if stderr.iter().all(u8::is_ascii_whitespace) {
+        stdout
+    } else {
+        stderr
+    };
+    let text = String::from_utf8_lossy(stream);
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    lines[lines.len().saturating_sub(max_lines)..].join("\n")
+}
+
 fn driver_server(path: &Path) -> acp::McpServer {
     acp::McpServer::Stdio(
         acp::McpServerStdio::new(SERVER_NAME, path.to_path_buf())
@@ -291,8 +441,8 @@ fn driver_config(path: &Path) -> McpServerConfig {
 
 /// Purpose: Find the installed driver without a shell or an automatic download.
 /// Input: The executable search path and the user's home directory.
-/// Output: The driver path or an installation hint.
-fn find_driver() -> Result<PathBuf, String> {
+/// Output: The driver path, or `None` when no candidate is executable.
+fn find_driver() -> Option<PathBuf> {
     let executable = if cfg!(windows) {
         "cua-driver.exe"
     } else {
@@ -312,9 +462,7 @@ fn find_driver() -> Result<PathBuf, String> {
     candidates.push(PathBuf::from(
         "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
     ));
-    candidates.into_iter().find(|path| is_executable(path)).ok_or_else(|| {
-        "Cua Driver is not installed. Install it from https://cua.ai/docs/cua-driver/quickstart, then run /computer-use again.".to_string()
-    })
+    candidates.into_iter().find(|path| is_executable(path))
 }
 
 fn is_executable(path: &Path) -> bool {

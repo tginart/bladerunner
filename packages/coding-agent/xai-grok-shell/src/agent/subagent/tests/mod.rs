@@ -2499,6 +2499,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             base_url: String::new(),
             name: None,
             description: None,
+            platform_name: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,

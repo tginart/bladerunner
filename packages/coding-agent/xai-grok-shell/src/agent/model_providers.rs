@@ -22,6 +22,8 @@ pub struct ModelProviderConfig {
     pub auth_provider: Option<String>,
     pub auth: Option<crate::auth::AuthProviderConfig>,
     pub context_window: Option<u64>,
+    /// Platform label shown beside this provider's models in `/model`.
+    pub platform_name: Option<String>,
 }
 
 pub(crate) fn model_provider_auth_name(provider_id: &str) -> String {
@@ -195,6 +197,7 @@ impl ConfigModelOverride {
             auth_provider,
             auth,
             context_window,
+            platform_name,
         } = provider;
 
         let mut merged = self.clone();
@@ -216,6 +219,7 @@ impl ConfigModelOverride {
         merged.supports_backend_search =
             merged.supports_backend_search.or(*supports_backend_search);
         merged.context_window = merged.context_window.or(*context_window);
+        merged.platform_name = merged.platform_name.or_else(|| platform_name.clone());
         // Inherited wholesale only when the model sets none of its own.
         if merged.extra_headers.is_empty() {
             merged.extra_headers = extra_headers.clone();
@@ -253,7 +257,7 @@ impl ConfigModelOverride {
 #[cfg(test)]
 mod tests {
     use crate::agent::config::{
-        Config, adapter_kind_for_model, resolve_credentials, resolve_model_list,
+        Config, adapter_kind_for_model, resolve_credentials, resolve_model_list, to_acp_model_info,
     };
     use crate::sampling::ApiBackend;
     #[test]
@@ -418,6 +422,53 @@ mod tests {
         let model = resolved.get("override-url").expect("model should exist");
         assert_eq!(model.info.base_url, "https://model-specific.example/v1");
         assert_eq!(model.info.context_window.get(), 200000);
+    }
+
+    #[test]
+    fn platform_name_inherits_from_provider_and_reaches_acp_meta() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model_providers.gateway]
+            base_url = "https://gateway.example/v1"
+            platform_name = "MyCorp"
+
+            [model.inherits]
+            model = "a"
+            model_provider = "gateway"
+
+            [model.overrides]
+            model = "b"
+            model_provider = "gateway"
+            platform_name = "MyCorp EU"
+
+            [model.unlabeled]
+            model = "c"
+            base_url = "https://other.example/v1"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert!(
+            cfg.config_warnings.is_empty(),
+            "platform_name is a known key: {:?}",
+            cfg.config_warnings
+        );
+        let resolved = resolve_model_list(&cfg, None);
+        let infos = to_acp_model_info(&resolved);
+        let platform_name = |key: &str| {
+            let info = infos
+                .get(&agent_client_protocol::ModelId::new(key))
+                .expect("model should exist");
+            info.meta
+                .as_ref()
+                .and_then(|meta| meta.get(xai_grok_sampling_types::PLATFORM_NAME_META_KEY))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        };
+        assert_eq!(platform_name("inherits").as_deref(), Some("MyCorp"));
+        assert_eq!(platform_name("overrides").as_deref(), Some("MyCorp EU"));
+        assert_eq!(platform_name("unlabeled"), None);
     }
 
     #[test]

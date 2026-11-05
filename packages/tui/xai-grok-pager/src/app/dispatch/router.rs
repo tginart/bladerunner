@@ -1315,6 +1315,16 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 Some(LinkTarget::Url(url)) => {
                     crate::app::link_opener::open_url(&url);
                 }
+                Some(LinkTarget::SlashCommand(command)) => {
+                    // Like a palette command: run it and keep the user's draft.
+                    return dispatch_send_prompt_inner(
+                        app,
+                        command.to_string(),
+                        false,
+                        false,
+                        false,
+                    );
+                }
                 None => {}
             }
             vec![]
