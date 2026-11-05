@@ -2509,6 +2509,32 @@
         );
     }
 
+    #[test]
+    fn muted_hooks_leave_no_transcript_record() {
+        let mut app = make_app_with_agent("sess-muted-hooks");
+        crate::appearance::cache::set_hooks_muted(true);
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif("sess-muted-hooks", "session_start", false),
+            &mut app,
+        );
+        assert_eq!(
+            count_lifecycle_blocks(&app.agents[&AgentId(0)].scrollback),
+            0,
+            "a muted hook batch must not reach the transcript"
+        );
+
+        crate::appearance::cache::set_hooks_muted(false);
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif("sess-muted-hooks", "session_start", false),
+            &mut app,
+        );
+        assert_eq!(
+            count_lifecycle_blocks(&app.agents[&AgentId(0)].scrollback),
+            1,
+            "unmuted hook batches show again"
+        );
+    }
+
     /// No regression: a running prompt whose terminal did NOT arrive in replay is
     /// still adopted on load (the set is precise — it blocks only ended turns).
     #[test]

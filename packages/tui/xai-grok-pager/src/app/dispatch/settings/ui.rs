@@ -6,15 +6,16 @@ use super::setters::{
     set_combine_queued_prompts_inner, set_compact_mode, set_compact_mode_inner,
     set_confirm_before_rewind_inner, set_contextual_hint_inner, set_default_model_inner,
     set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
-    set_fork_secondary_model_inner, set_group_tool_verbs_inner, set_hunk_tracker_mode_inner,
-    set_invert_scroll_inner, set_keep_text_selection_inner, set_language_inner,
-    set_max_thoughts_width_inner, set_multiline_mode, set_page_flip_on_send_inner,
-    set_prompt_suggestions_inner, set_remember_tool_approvals_inner, set_render_mermaid_inner,
-    set_respect_manual_folds_inner, set_screen_mode_inner, set_scroll_lines_inner,
-    set_scroll_mode_inner, set_scroll_speed_inner, set_show_thinking_blocks_inner,
-    set_show_tips_inner, set_simple_mode_inner, set_theme_inner, set_timeline_inner,
-    set_timestamps, set_timestamps_inner, set_turn_complete_sound_inner, set_vim_mode_inner,
-    set_voice_capture_mode_inner, set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
+    set_fork_secondary_model_inner, set_group_tool_verbs_inner, set_hooks_muted_inner,
+    set_hunk_tracker_mode_inner, set_invert_scroll_inner, set_keep_text_selection_inner,
+    set_language_inner, set_max_thoughts_width_inner, set_multiline_mode,
+    set_page_flip_on_send_inner, set_prompt_suggestions_inner, set_remember_tool_approvals_inner,
+    set_render_mermaid_inner, set_respect_manual_folds_inner, set_screen_mode_inner,
+    set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
+    set_timeline_inner, set_timestamps, set_timestamps_inner, set_turn_complete_sound_inner,
+    set_vim_mode_inner, set_voice_capture_mode_inner, set_voice_keybind_enabled_inner,
+    set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -805,6 +806,7 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("combine_queued_prompts", SettingValue::Bool(b)) => {
             Some(Action::SetCombineQueuedPrompts(*b))
         }
+        ("hooks_muted", SettingValue::Bool(b)) => Some(Action::SetHooksMuted(*b)),
         ("simple_mode", SettingValue::Bool(b)) => Some(Action::SetSimpleMode(*b)),
         ("contextual_hints.undo", SettingValue::Bool(b)) => Some(Action::SetContextualHintUndo(*b)),
         ("contextual_hints.plan_mode", SettingValue::Bool(b)) => {
@@ -1034,6 +1036,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("combine_queued_prompts", SettingValue::Bool(b)) => {
             set_combine_queued_prompts_inner(app, *b)
         }
+        ("hooks_muted", SettingValue::Bool(b)) => set_hooks_muted_inner(app, *b),
         ("simple_mode", SettingValue::Bool(b)) => set_simple_mode_inner(app, *b),
         ("contextual_hints.undo", SettingValue::Bool(b)) => {
             set_contextual_hint_inner(app, |h, v| h.undo = v, *b)

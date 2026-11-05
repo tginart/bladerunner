@@ -311,6 +311,10 @@ Open the extensions modal on the Hooks tab, where you can view loaded hooks, add
 
 The shell also advertises individual `/hooks-list`, `/hooks-trust`, `/hooks-add`, `/hooks-remove`, and `/hooks-untrust` commands; in the pager these are folded into the `/hooks` modal.
 
+### `/hooks mute` / `/hooks unmute`
+
+`/hooks mute` runs hooks silently. Hooks still run and can still block a tool call, but the transcript does not show their results: no `[hooks: N]` badges, no stop-hook summaries, and no hook messages. `/hooks unmute` shows them again for new hook runs. The setting is saved as `[ui] hooks_muted` in your config file, so it applies to every session.
+
 ### `/plugins`
 
 Open the extensions modal on the Plugins tab to view installed plugins, install new ones from the marketplace, and manage trust.

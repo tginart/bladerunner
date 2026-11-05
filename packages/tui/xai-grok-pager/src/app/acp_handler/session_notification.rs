@@ -732,7 +732,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             true
         }
         XaiSessionUpdate::HookAnnotation { message } => {
-            if app.appearance.disable_plugins {
+            if app.appearance.disable_plugins || crate::appearance::cache::load_hooks_muted() {
                 return false;
             }
             tracing::debug!("Hook annotation: {message}");
@@ -749,6 +749,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             prompt_id: batch_prompt_id,
             runs,
         } => {
+            // `/hooks mute`: the hooks ran; only their transcript record is dropped.
+            if crate::appearance::cache::load_hooks_muted() {
+                return false;
+            }
             use crate::scrollback::blocks::tool::{HookPhase, HookRunEntry, HookRunStatus};
             let hook_entries: Vec<HookRunEntry> = runs
                 .into_iter()
