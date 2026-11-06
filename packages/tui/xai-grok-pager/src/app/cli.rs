@@ -861,6 +861,11 @@ pub struct PagerArgs {
     /// Disable web search and web fetch tools.
     #[arg(long = "disable-web-search")]
     pub disable_web_search: bool,
+    /// Web search provider for this run. Overrides `[web_search] provider`.
+    /// `auto` uses Codex native search on Codex models and DuckDuckGo
+    /// otherwise; `exa` and `perplexity` need a key (see `/web-search`).
+    #[arg(long = "web-search", value_name = "PROVIDER", value_enum)]
+    pub web_search: Option<xai_grok_shell::tools::web_search::WebSearchProvider>,
     /// Exit as soon as the first agent turn ends, without waiting for pending
     /// background bash/monitor tasks or background subagents (headless only).
     /// Default for all `grok -p` runs is to wait (up to `--background-wait-timeout`)

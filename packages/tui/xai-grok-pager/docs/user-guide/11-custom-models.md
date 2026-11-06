@@ -394,35 +394,30 @@ When you set `models_base_url`, Bladerunner uses API key auth (`Authorization: B
 
 ---
 
-## Web Search Model
+## Web Search
 
-The `web_search` tool uses a separate model. Configure it with:
-
-```toml
-[models]
-web_search = "grok-4.5"
-```
-
-Or via environment variable:
-
-```bash
-export GROK_WEB_SEARCH_MODEL="grok-4.5"
-```
-
-If you point the local `web_search` function at a custom model, you also need a `[model.*]` entry so Bladerunner can reach it. Provider-hosted ("backend") search is separate: it runs only on a Responses-compatible backend when the model supports it and backend tools are enabled:
+Pick the web search provider with `/web-search` (saved to `[web_search]` in
+`config.toml`) or for one run with `--web-search <provider>`:
 
 ```toml
-[models]
-web_search = "my-custom-model"
-
-[model.my-custom-model]
-model = "my-custom-model"
-supports_backend_search = true
+[web_search]
+provider = "auto"   # auto | off | exa | perplexity
 ```
 
-For `api_backend = "codex_responses"`, support defaults to `true`; an explicit
-`supports_backend_search = false` wins. The `disable_web_search` setting is the final kill
-switch for both local and provider-hosted web search.
+- `auto` (default): Codex models use OpenAI's native hosted search; every
+  other model gets a local `web_search` tool backed by DuckDuckGo. DuckDuckGo
+  can answer automated requests with a human-check page; the tool then
+  reports an error instead of results.
+- `off`: no web search, local or hosted.
+- `exa` / `perplexity`: the local `web_search` tool calls that provider. This
+  also replaces Codex native search. The key comes from `/web-search exa
+  <key>` (stored in `~/.grok/auth.json`, mode 0600) or from `EXA_API_KEY` /
+  `PERPLEXITY_API_KEY` (`PPLX_API_KEY`). A key in the environment never
+  selects a provider by itself.
+
+For `api_backend = "codex_responses"`, hosted search support defaults to
+`true`; an explicit `supports_backend_search = false` wins. The
+`disable_web_search` setting turns off every provider.
 
 ---
 

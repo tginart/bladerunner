@@ -598,6 +598,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "view-plan",
     "vim-mode",
     "voice",
+    "web-search",
     "welcome",
     "workflows",
     "yolo",

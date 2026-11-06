@@ -176,7 +176,7 @@ pub(crate) struct SubagentSpawnContext {
     /// cross-session memory store.
     pub memory_config: Option<crate::config::MemoryConfig>,
     /// Resolved sampling config for web_search.
-    pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    pub web_search_config: xai_grok_tools::implementations::WebSearchConfig,
     /// Resolved config for web fetch.
     pub web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     /// Image generation config (parent-inherited).

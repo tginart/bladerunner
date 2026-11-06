@@ -1727,6 +1727,29 @@ pub(crate) fn execute(
                 }
             });
         }
+        Effect::WebSearchSettings(request) => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let mut params = serde_json::json!({ "apiKey": request.api_key });
+                if let Some(provider) = request.provider {
+                    params["provider"] = serde_json::Value::String(provider);
+                }
+                if let Some(key_provider) = request.key_provider {
+                    params["keyProvider"] = serde_json::Value::String(key_provider);
+                }
+                let req = acp::ExtRequest::new(
+                    "x.ai/internal/web_search_settings",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize web_search_settings params")
+                        .into(),
+                );
+                let result = match acp_send(req, &tx).await {
+                    Ok(resp) => Ok(parse_web_search_status(resp.0.get())),
+                    Err(e) => Err(sanitize_user_error(&e.to_string())),
+                };
+                TaskResult::WebSearchSettingsComplete(result)
+            });
+        }
         Effect::ReloadSubagentModels { agent_id } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move {
@@ -4942,3 +4965,18 @@ fn parse_subagent_models_reload_response(raw: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+
+/// Read the `x.ai/internal/web_search_settings` response. Accepts both the
+/// `{"result": …}` envelope and a flat object, like the other internal calls.
+fn parse_web_search_status(raw: &str) -> crate::app::actions::WebSearchStatus {
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let body = value.get("result").cloned().unwrap_or(value);
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_owned);
+    crate::app::actions::WebSearchStatus {
+        provider: text(&body["provider"]).unwrap_or_else(|| "auto".to_owned()),
+        cli_override: text(&body["cliOverride"]),
+        exa_key: text(&body["keys"]["exa"]).unwrap_or_else(|| "missing".to_owned()),
+        perplexity_key: text(&body["keys"]["perplexity"])
+            .unwrap_or_else(|| "missing".to_owned()),
+    }
+}

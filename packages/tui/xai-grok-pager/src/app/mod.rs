@@ -834,6 +834,7 @@ pub async fn run(
         experimental_memory: args.experimental_memory,
         no_memory: args.no_memory,
         disable_web_search: args.disable_web_search,
+        web_search: args.web_search,
         todo_gate: args.todo_gate,
         laziness_debug_log: None,
         storage_mode: args.storage_mode.clone(),

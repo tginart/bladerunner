@@ -71,8 +71,8 @@ pub use storage::{
     clear_platform_api_key, clear_platform_api_keys, clear_radius_auth, read_anthropic_claude_auth,
     read_api_key, read_auth_json, read_bedrock_auth_marker, read_bedrock_profile,
     read_github_copilot_auth, read_kimi_code_auth, read_openai_codex_auth, read_platform_api_key,
-    read_platform_base_url, read_radius_auth, read_token_by_scope, store_anthropic_claude_auth,
-    store_api_key, store_bedrock_credential_chain, store_bedrock_profile,
-    store_github_copilot_auth, store_kimi_code_auth, store_openai_codex_auth,
-    store_platform_api_key, store_radius_auth,
+    read_platform_base_url, read_radius_auth, read_token_by_scope, read_web_search_api_key,
+    store_anthropic_claude_auth, store_api_key, store_bedrock_credential_chain,
+    store_bedrock_profile, store_github_copilot_auth, store_kimi_code_auth,
+    store_openai_codex_auth, store_platform_api_key, store_radius_auth, store_web_search_api_key,
 };

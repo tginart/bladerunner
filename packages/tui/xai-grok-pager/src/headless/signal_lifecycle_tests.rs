@@ -36,6 +36,7 @@ fn options() -> HeadlessOptions {
         cli_tools: None,
         cli_disallowed_tools: None,
         disable_web_search: true,
+        web_search: None,
         allow_rules: vec![],
         deny_rules: vec![],
         max_turns: None,

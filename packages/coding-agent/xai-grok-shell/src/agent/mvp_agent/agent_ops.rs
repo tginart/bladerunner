@@ -2284,28 +2284,12 @@ impl MvpAgent {
             zdr_restricted,
         }
     }
-    pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
-        let model_id = self.cfg.borrow().web_search_model.clone();
-        let models = self.models_manager.models();
-        let session = self.current_or_buffered_auth();
-        let alpha_test_key = self.cfg.borrow().endpoints.alpha_test_key.clone();
-        let client_version = self.cfg.borrow().client_version.clone();
-        let mut cfg = config::resolve_web_search_sampling_config(
-            &model_id,
-            &models,
-            session.as_ref().map(|a| a.key.as_str()),
-            self.cfg.borrow().grok_com_config.api_key_auth_disabled(),
-            alpha_test_key.clone(),
-            client_version,
-            &self.cfg.borrow().endpoints,
-        )?;
-        inject_proxy_headers(
-            &mut cfg.extra_headers,
-            cfg.client_version.as_deref(),
-            alpha_test_key.as_deref(),
-            &cfg.base_url,
-        );
-        Some(cfg)
+    /// Resolve the local web search tool config for a new session. The key is
+    /// read from auth.json or env at this point, so a key saved with
+    /// `/web-search` applies to the next session without a restart.
+    pub(super) fn prepare_web_search_config(&self) -> xai_grok_tools::implementations::WebSearchConfig {
+        let provider = self.cfg.borrow().web_search_provider;
+        crate::tools::web_search::load_web_search_config(provider)
     }
     /// Returns `Err` with a user-facing message on invalid config; the caller at
     /// the process boundary prints it and exits.
@@ -4454,7 +4438,7 @@ impl MvpAgent {
             .find(|entry| entry.info.model == sampling_config.model)
             .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
-        let web_search_sampling_config = self.prepare_web_search_sampling_config();
+        let web_search_config = self.prepare_web_search_config();
         // xAI-only media clients are inactive in Bladerunner. Keep the original
         // setup calls here for a future provider-specific media integration.
         // let image_gen_config = self.prepare_image_gen_config();
@@ -4706,7 +4690,7 @@ impl MvpAgent {
                     origin_client.as_ref().map(|o| o.product.clone()),
                     inference_idle_timeout_secs,
                     model_max_retries,
-                    web_search_sampling_config,
+                    web_search_config,
                     web_fetch_config,
                     image_gen_config,
                     video_gen_config,

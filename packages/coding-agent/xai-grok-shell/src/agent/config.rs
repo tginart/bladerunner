@@ -636,7 +636,8 @@ pub struct RuntimeResolutionContext<'a> {
     pub is_headless: bool,
     /// `Some(true)` = CLI explicitly enabled, `None` = defer to config/env/remote.
     pub cli_subagents: Option<bool>,
-    pub cli_web_search_model: Option<&'a str>,
+    /// CLI `--web-search <provider>`. Overrides `[web_search] provider`.
+    pub cli_web_search_provider: Option<crate::tools::web_search::WebSearchProvider>,
     pub cli_session_summary_model: Option<&'a str>,
     /// CLI `--experimental-memory` flag. Enables cross-session memory.
     pub cli_experimental_memory: bool,
@@ -1576,9 +1577,12 @@ pub struct Config {
     /// CLI override for reasoning effort.
     #[serde(skip)]
     pub reasoning_effort_override: Option<ReasoningEffort>,
-    /// CLI override for the web search model ID.
+    /// CLI override for the web search provider (`--web-search`).
     #[serde(skip)]
-    pub web_search_model_override: Option<String>,
+    pub web_search_provider_override: Option<crate::tools::web_search::WebSearchProvider>,
+    /// Resolved web search provider: CLI override, else `[web_search] provider`.
+    #[serde(skip)]
+    pub web_search_provider: crate::tools::web_search::WebSearchProvider,
     /// CLI override for the session summary model ID.
     #[serde(skip)]
     pub session_summary_model_override: Option<String>,
@@ -1955,7 +1959,8 @@ impl Default for Config {
             storage_mode: StorageMode::resolve(None, None),
             default_model_override: None,
             reasoning_effort_override: None,
-            web_search_model_override: None,
+            web_search_provider_override: None,
+            web_search_provider: Default::default(),
             session_summary_model_override: None,
             default_yolo_mode: false,
             default_auto_mode: false,
@@ -2339,6 +2344,7 @@ impl Config {
     ///   prompt_suggest_model_pin via `ModelOverrideConfig::resolve`
     /// - memory_config via `MemoryConfig::resolve`
     /// - disable_web_search (CLI flag ORed with config.toml)
+    /// - web_search_provider (CLI `--web-search`, else `[web_search] provider`)
     /// - storage_mode via `StorageMode::resolve`
     /// - path_not_found_hints from remote_settings
     ///
@@ -2346,7 +2352,10 @@ impl Config {
     /// `resolve_worktree_type` since it's an agent-level field, not a Config field.
     pub fn resolve_runtime_fields(&mut self, ctx: &RuntimeResolutionContext<'_>) {
         self.cli_subagents = ctx.cli_subagents;
-        self.web_search_model_override = ctx.cli_web_search_model.map(|s| s.to_owned());
+        self.web_search_provider_override = ctx.cli_web_search_provider;
+        self.web_search_provider = ctx.cli_web_search_provider.unwrap_or_else(|| {
+            crate::tools::web_search::WebSearchSettings::from_raw_config(ctx.raw_config).provider
+        });
         self.session_summary_model_override = ctx.cli_session_summary_model.map(|s| s.to_owned());
         let cli_flag = ctx.cli_subagents.unwrap_or(false);
         self.resolve_subagents(cli_flag, ctx.raw_config);
@@ -2394,7 +2403,7 @@ impl Config {
         self.managed_mcps_enabled = mcps.enabled;
         self.managed_mcp_gateway_tools_enabled = mcps.gateway_tools_enabled;
         let models = crate::config::ModelOverrideConfig::resolve(
-            ctx.cli_web_search_model,
+            None,
             ctx.cli_session_summary_model,
             ctx.raw_config,
             ctx.remote_settings,
@@ -2435,7 +2444,6 @@ impl Config {
     /// Integration test coverage: `tests/test_settings_refresh.rs`.
     pub(crate) fn re_resolve_runtime_fields(&mut self, raw_config: &toml::Value) {
         let remote_settings = self.remote_settings.clone();
-        let cli_web_search_model = self.web_search_model_override.clone();
         let cli_session_summary_model = self.session_summary_model_override.clone();
         let laziness_debug_log = self.laziness_debug_log.clone();
         let ctx = RuntimeResolutionContext {
@@ -2443,7 +2451,7 @@ impl Config {
             remote_settings: remote_settings.as_ref(),
             is_headless: self.mode == AgentMode::Headless,
             cli_subagents: self.cli_subagents,
-            cli_web_search_model: cli_web_search_model.as_deref(),
+            cli_web_search_provider: self.web_search_provider_override,
             cli_session_summary_model: cli_session_summary_model.as_deref(),
             cli_experimental_memory: self.cli_experimental_memory,
             cli_no_memory: self.cli_no_memory,
@@ -6818,114 +6826,6 @@ pub fn resolve_model_to_sampling_config(
         None,
     ))
 }
-fn resolve_hidden_default_web_search_sampling_config(
-    model_id: &str,
-    session_key: Option<&str>,
-    disable_api_key_auth: bool,
-    alpha_test_key: Option<String>,
-    client_version: Option<String>,
-    endpoints: &EndpointsConfig,
-) -> SamplerConfig {
-    let entry = ModelEntry {
-        info: ModelInfo {
-            id: None,
-            model: model_id.to_owned(),
-            base_url: endpoints.resolve_inference_base_url(),
-            name: None,
-            description: None,
-            platform_name: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            api_backend: ApiBackend::Responses,
-            request_compat: None,
-            endpoint_path: None,
-            auth_scheme: Default::default(),
-            extra_headers: IndexMap::new(),
-            query_params: IndexMap::new(),
-            env_http_headers: IndexMap::new(),
-            context_window: NonZeroU64::new(200_000).unwrap(),
-            auto_compact_threshold_percent: None,
-            system_prompt_label: None,
-            use_concise: false,
-            agent_type: default_agent_type(),
-            inference_idle_timeout_secs: None,
-            max_retries: None,
-            hidden: true,
-            user_selectable: true,
-            supported_in_api: true,
-            reasoning_effort: None,
-            supports_reasoning_effort: false,
-            reasoning_efforts: Vec::new(),
-            supports_backend_search: false,
-            compactions_remaining: None,
-            compaction_at_tokens: None,
-            show_model_fingerprint: false,
-            stream_tool_calls: None,
-            laziness_detector: LazinessDetectorPerModelConfig::default(),
-        },
-        api_key: None,
-        env_key: None,
-        auth_provider: None,
-        platform_oauth_active: false,
-        api_base_url: None,
-    };
-    let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-    sampling_config_for_model(
-        &entry,
-        credentials,
-        alpha_test_key,
-        client_version,
-        None,
-        None,
-    )
-}
-pub(crate) fn resolve_web_search_sampling_config(
-    model_id: &str,
-    models: &IndexMap<String, ModelEntry>,
-    session_key: Option<&str>,
-    disable_api_key_auth: bool,
-    alpha_test_key: Option<String>,
-    client_version: Option<String>,
-    endpoints: &EndpointsConfig,
-) -> Option<SamplerConfig> {
-    let resolved = if let Some(entry) = find_model_by_id(models, model_id).cloned() {
-        let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
-        if credentials.api_key.is_none() && entry.effective_auth_provider().is_some() {
-            tracing::warn!(
-                web_search_model = %model_id,
-                "web search model uses an auth provider with no cached token; disabling web search"
-            );
-            return None;
-        }
-        Some(sampling_config_for_model(
-            &entry,
-            credentials,
-            alpha_test_key,
-            client_version,
-            None,
-            None,
-        ))
-    } else if model_id == crate::models::default_web_search_model() {
-        Some(resolve_hidden_default_web_search_sampling_config(
-            model_id,
-            session_key,
-            disable_api_key_auth,
-            alpha_test_key,
-            client_version,
-            endpoints,
-        ))
-    } else {
-        None
-    };
-    if resolved.is_none() {
-        tracing::warn!(
-            web_search_model = %model_id,
-            "configured web_search model not found; disabling web search"
-        );
-    }
-    resolved.map(crate::tools::config::web_search_sampling_config)
-}
 pub(crate) fn to_acp_model_info(
     models: &IndexMap<String, ModelEntry>,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
@@ -7435,7 +7335,7 @@ reasoning_effort = "low"
                 remote_settings: None,
                 is_headless: false,
                 cli_subagents: None,
-                cli_web_search_model: None,
+                cli_web_search_provider: None,
                 cli_session_summary_model: None,
                 cli_experimental_memory: false,
                 cli_no_memory: false,
@@ -7463,7 +7363,7 @@ reasoning_effort = "low"
                 remote_settings: None,
                 is_headless: true,
                 cli_subagents: None,
-                cli_web_search_model: None,
+                cli_web_search_provider: None,
                 cli_session_summary_model: None,
                 cli_experimental_memory: false,
                 cli_no_memory: false,
@@ -7522,28 +7422,6 @@ reasoning_effort = "low"
         assert_eq!(
             cfg2.image_description_model,
             Some("custom-id-model".to_owned())
-        );
-    }
-    #[test]
-    fn hidden_default_web_search_resolution_is_explicit_and_responses_only() {
-        let endpoints = EndpointsConfig::default();
-        let resolved = resolve_web_search_sampling_config(
-            crate::models::default_web_search_model(),
-            &IndexMap::new(),
-            Some("session-token"),
-            false,
-            None,
-            None,
-            &endpoints,
-        )
-        .expect("hidden default web search model should resolve");
-        assert_eq!(resolved.model, crate::models::default_web_search_model());
-        assert_eq!(resolved.base_url, endpoints.proxy_url());
-        assert_eq!(resolved.api_backend, ApiBackend::Responses);
-        assert_eq!(
-            resolved.api_key.as_deref(),
-            Some("session-token"),
-            "hidden default should still use normal credential resolution"
         );
     }
     #[test]
@@ -7683,52 +7561,6 @@ reasoning_effort = "low"
             first_party.bearer_resolver.is_some(),
             "first-party aux samplers keep the session refresh behavior"
         );
-    }
-    /// A cold cache disables web search rather than sending an
-    /// unauthenticated request.
-    #[tokio::test]
-    async fn web_search_with_auth_provider_requires_warm_cache() {
-        let endpoints = EndpointsConfig::default();
-        let provider = crate::auth::AuthProviderRef::new(
-            "web-search-provider-test".into(),
-            crate::auth::AuthProviderConfig {
-                command: "printf ws-token".into(),
-                args: None,
-                token_ttl_secs: Some(3600),
-                timeout_secs: None,
-                cwd: None,
-                rejection_aware: false,
-            },
-        );
-        let mut entry = test_model_entry("m", "https://litellm.example/v1", None, None, None);
-        entry.auth_provider = Some(provider.clone());
-        let mut catalog = IndexMap::new();
-        catalog.insert("proxied-search".to_string(), entry);
-        assert!(
-            resolve_web_search_sampling_config(
-                "proxied-search",
-                &catalog,
-                Some("session-jwt"),
-                false,
-                None,
-                None,
-                &endpoints,
-            )
-            .is_none(),
-            "a cold provider cache must disable web search, not send an unauthenticated request"
-        );
-        let _ = provider.ensure_fresh_token(None).await;
-        let resolved = resolve_web_search_sampling_config(
-            "proxied-search",
-            &catalog,
-            Some("session-jwt"),
-            false,
-            None,
-            None,
-            &endpoints,
-        )
-        .expect("warm cache resolves");
-        assert_eq!(resolved.api_key.as_deref(), Some("ws-token"));
     }
     /// GBT-4128: bad `[mcp_servers.*]` entries are dropped, not fatal.
     #[test]
@@ -7947,36 +7779,6 @@ reasoning_effort = "low"
             set: _,
             include_only: _,
         } = ShellEnvironmentPolicyKnownKeys::default();
-    }
-    #[test]
-    fn web_search_disable_api_key_auth_swaps_first_party_key_for_session() {
-        let endpoints = EndpointsConfig::default();
-        let mut models = IndexMap::new();
-        models.insert(
-            "ws-model".to_string(),
-            test_model_entry(
-                "ws-model",
-                "https://api.x.ai/v1",
-                Some("first-party-key"),
-                None,
-                None,
-            ),
-        );
-        let resolved = resolve_web_search_sampling_config(
-            "ws-model",
-            &models,
-            Some("session-token"),
-            true,
-            None,
-            None,
-            &endpoints,
-        )
-        .expect("web search model should resolve");
-        assert_eq!(
-            resolved.api_key.as_deref(),
-            Some("session-token"),
-            "first-party API key must be swapped for the session token when disabled"
-        );
     }
     #[test]
     fn parses_model_api_key() {
@@ -13928,7 +13730,7 @@ hooks = true
             remote_settings: Some(&remote),
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -13953,7 +13755,7 @@ hooks = true
             remote_settings: None,
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -13988,7 +13790,7 @@ hooks = true
             remote_settings: None,
             is_headless: true,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14019,7 +13821,7 @@ hooks = true
             remote_settings: Some(&remote),
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14041,7 +13843,7 @@ hooks = true
             remote_settings: None,
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14103,7 +13905,7 @@ hooks = true
                     remote_settings: None,
                     is_headless,
                     cli_subagents,
-                    cli_web_search_model: None,
+                    cli_web_search_provider: None,
                     cli_session_summary_model: None,
                     cli_experimental_memory: false,
                     cli_no_memory: false,
@@ -14143,7 +13945,7 @@ hooks = true
             remote_settings: None,
             is_headless: false,
             cli_subagents: Some(true),
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14166,7 +13968,7 @@ hooks = true
             remote_settings: None,
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14189,7 +13991,7 @@ hooks = true
             remote_settings: None,
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: Some("custom-ws"),
+            cli_web_search_provider: Some(crate::tools::web_search::WebSearchProvider::Exa),
             cli_session_summary_model: Some("custom-ss"),
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14198,7 +14000,10 @@ hooks = true
             laziness_debug_log: None,
             storage_mode: None,
         });
-        assert_eq!(cfg.web_search_model, "custom-ws");
+        assert_eq!(
+            cfg.web_search_provider,
+            crate::tools::web_search::WebSearchProvider::Exa
+        );
         assert_eq!(cfg.session_summary_model, Some("custom-ss".to_owned()));
     }
     #[test]
@@ -14216,7 +14021,7 @@ hooks = true
             remote_settings: Some(&remote),
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,
@@ -14238,7 +14043,7 @@ hooks = true
             remote_settings: None,
             is_headless: false,
             cli_subagents: None,
-            cli_web_search_model: None,
+            cli_web_search_provider: None,
             cli_session_summary_model: None,
             cli_experimental_memory: false,
             cli_no_memory: false,

@@ -263,7 +263,7 @@ pub(crate) async fn spawn_session_actor(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    web_search_config: xai_grok_tools::implementations::WebSearchConfig,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -479,22 +479,8 @@ pub(crate) async fn spawn_session_actor(
     let primary_model_id = sampling_config.model.clone();
     let web_search_config = if disable_web_search {
         xai_grok_tools::implementations::WebSearchConfig::Disabled
-    } else if let Some(cfg) = web_search_sampling_config {
-        if let Some(api_key) = cfg.api_key {
-            xai_grok_tools::implementations::WebSearchConfig::Enabled {
-                api_key,
-                base_url: cfg.base_url,
-                model: cfg.model,
-                extra_headers: cfg.extra_headers,
-                alpha_test_key: credentials.alpha_test_key.clone(),
-            }
-        } else {
-            tracing::warn!("web_search disabled: resolved config has no API key");
-            xai_grok_tools::implementations::WebSearchConfig::Disabled
-        }
     } else {
-        tracing::warn!("web_search disabled: configured model could not be resolved");
-        xai_grok_tools::implementations::WebSearchConfig::Disabled
+        web_search_config
     };
     let embed_base_url = sampling_config.base_url.clone();
     let embed_api_key = sampling_config.api_key.clone();
@@ -993,9 +979,10 @@ pub(crate) async fn spawn_session_actor(
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
         web_search_config: web_search_config.clone(),
-        // `disable_web_search` is the final kill switch for both the local
-        // function tool and provider-hosted search.
-        backend_search: backend_tools_enabled && !disable_web_search,
+        // Provider-hosted search (Codex) runs only in `auto` mode, so `off`
+        // and an explicit Exa/Perplexity choice both turn it off.
+        backend_search: backend_tools_enabled
+            && crate::tools::web_search::allows_hosted_search(&web_search_config),
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),
         video_gen_config: video_gen_config.clone(),
@@ -2342,7 +2329,7 @@ pub(crate) async fn spawn_session_on_thread(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    web_search_config: xai_grok_tools::implementations::WebSearchConfig,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -2517,7 +2504,7 @@ pub(crate) async fn spawn_session_on_thread(
                         session_client_identifier,
                         inference_idle_timeout_secs,
                         max_retries,
-                        web_search_sampling_config,
+                        web_search_config,
                         web_fetch_config,
                         image_gen_config,
                         video_gen_config,

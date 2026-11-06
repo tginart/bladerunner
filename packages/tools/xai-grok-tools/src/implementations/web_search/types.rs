@@ -1,50 +1,46 @@
-use indexmap::IndexMap;
-
-/// Configuration for the web search tool.
+/// Backend for the local `web_search` tool.
 ///
-/// Use `Disabled` when no API key is available or web search should be turned off.
-/// Use `Enabled { … }` to provide credentials and endpoint configuration.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+/// `Disabled` removes the tool. `DuckDuckGo` needs no key and is the
+/// default when no provider is configured. `Exa` and `Perplexity` are
+/// used only when the user selects them explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
 pub enum WebSearchConfig {
     #[default]
     Disabled,
-    Enabled {
+    DuckDuckGo,
+    Exa {
         api_key: String,
-        base_url: String,
-        model: String,
-        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-        extra_headers: IndexMap<String, String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        alpha_test_key: Option<String>,
+    },
+    Perplexity {
+        api_key: String,
     },
 }
 
 impl WebSearchConfig {
-    /// Returns `true` when the config is the `Enabled` variant.
+    /// Returns `true` unless the config is `Disabled`.
     pub fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled { .. })
+        !matches!(self, Self::Disabled)
     }
 
-    /// Return a copy safe for returning to clients.
-    ///
-    /// The `api_key` is replaced with `"***REDACTED***"` and the optional
-    /// extra access key field is stripped.
+    /// Short provider label for logs and status lines.
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::Disabled => "off",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Exa { .. } => "exa",
+            Self::Perplexity { .. } => "perplexity",
+        }
+    }
+
+    /// Return a copy safe for returning to clients, with any key replaced.
     pub fn redacted(&self) -> Self {
+        let hidden = "***REDACTED***".to_string();
         match self {
             Self::Disabled => Self::Disabled,
-            Self::Enabled {
-                base_url,
-                model,
-                extra_headers,
-                ..
-            } => Self::Enabled {
-                api_key: "***REDACTED***".to_string(),
-                base_url: base_url.clone(),
-                model: model.clone(),
-                extra_headers: extra_headers.clone(),
-                alpha_test_key: None,
-            },
+            Self::DuckDuckGo => Self::DuckDuckGo,
+            Self::Exa { .. } => Self::Exa { api_key: hidden },
+            Self::Perplexity { .. } => Self::Perplexity { api_key: hidden },
         }
     }
 }
@@ -54,76 +50,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_config_default_is_disabled() {
-        let config = WebSearchConfig::default();
-        assert!(!config.is_enabled());
+    fn default_is_disabled() {
+        assert!(!WebSearchConfig::default().is_enabled());
     }
 
     #[test]
-    fn test_config_enabled() {
-        let config = WebSearchConfig::Enabled {
-            api_key: "test-key".to_string(),
-            base_url: "https://api.x.ai/v1".to_string(),
-            model: "test-web-search-model".to_string(),
-            extra_headers: IndexMap::new(),
-            alpha_test_key: None,
+    fn redacted_hides_key() {
+        let config = WebSearchConfig::Exa {
+            api_key: "secret".to_string(),
         };
-        assert!(config.is_enabled());
-    }
-
-    #[test]
-    fn test_config_redacted() {
-        let mut headers = IndexMap::new();
-        headers.insert("X-Custom".to_string(), "value".to_string());
-        let config = WebSearchConfig::Enabled {
-            api_key: "secret-key-12345".to_string(),
-            base_url: "https://api.x.ai/v1".to_string(),
-            model: "test-web-search-model".to_string(),
-            extra_headers: headers,
-            alpha_test_key: Some("alpha-secret".to_string()),
-        };
-        let redacted = config.redacted();
-        match redacted {
-            WebSearchConfig::Enabled {
-                api_key,
-                base_url,
-                model,
-                extra_headers,
-                alpha_test_key,
-            } => {
-                assert_eq!(api_key, "***REDACTED***");
-                assert_eq!(base_url, "https://api.x.ai/v1");
-                assert_eq!(model, "test-web-search-model");
-                assert_eq!(extra_headers.get("X-Custom").unwrap(), "value");
-                assert!(alpha_test_key.is_none());
+        assert_eq!(
+            config.redacted(),
+            WebSearchConfig::Exa {
+                api_key: "***REDACTED***".to_string()
             }
-            _ => panic!("Expected Enabled variant"),
-        }
+        );
+        assert_eq!(
+            WebSearchConfig::DuckDuckGo.redacted(),
+            WebSearchConfig::DuckDuckGo
+        );
     }
 
     #[test]
-    fn test_config_serde_roundtrip() {
-        let config = WebSearchConfig::Enabled {
+    fn serde_roundtrip() {
+        let config = WebSearchConfig::Perplexity {
             api_key: "key".to_string(),
-            base_url: "https://api.x.ai/v1".to_string(),
-            model: "test-web-search-model".to_string(),
-            extra_headers: IndexMap::new(),
-            alpha_test_key: None,
         };
         let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(json, r#"{"provider":"perplexity","api_key":"key"}"#);
         let parsed: WebSearchConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.is_enabled());
-    }
-
-    #[test]
-    fn test_config_deserialize_from_set_options_payload() {
-        let json = r#"{
-            "status": "enabled",
-            "api_key": "xai-abc123",
-            "base_url": "https://api.x.ai/v1",
-            "model": "test-web-search-model"
-        }"#;
-        let config: WebSearchConfig = serde_json::from_str(json).unwrap();
-        assert!(config.is_enabled());
+        assert_eq!(parsed, config);
     }
 }

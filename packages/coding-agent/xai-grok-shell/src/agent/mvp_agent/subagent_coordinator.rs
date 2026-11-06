@@ -538,7 +538,7 @@ impl MvpAgent {
             terminal,
             session_env,
             memory_config: self.memory_config.clone(),
-            web_search_sampling_config: self.prepare_web_search_sampling_config(),
+            web_search_config: self.prepare_web_search_config(),
             web_fetch_config: self.prepare_web_fetch_config(),
             // xAI-only media tools stay out of subagent tool registries.
             // image_gen_config: self.prepare_image_gen_config(),

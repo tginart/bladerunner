@@ -80,6 +80,7 @@ pub mod usage;
 pub mod view_plan;
 pub mod vim_mode;
 pub mod voice;
+pub mod web_search;
 pub mod workflows;
 use super::command::SlashCommand;
 use std::sync::Arc;
@@ -188,6 +189,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(nexus::NexusCommand),
         #[cfg(not(feature = "community-build"))]
         Arc::new(providers::ProvidersCommand),
+        Arc::new(web_search::WebSearchCommand),
         Arc::new(import_claude::ImportClaudeCommand),
         Arc::new(usage::UsageCommand),
         Arc::new(queue::QueueCommand),
@@ -418,6 +420,7 @@ mod tests {
             "view-plan",
             "vim-mode",
             "voice",
+            "web-search",
             "welcome",
             "workflows",
             "yolo",

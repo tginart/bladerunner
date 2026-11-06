@@ -411,6 +411,7 @@ pub(crate) enum InternalMethod {
     ReloadSubagentModels,
     ReloadWorkflows,
     SetPlatformApiKey,
+    WebSearchSettings,
 }
 
 impl InternalMethod {
@@ -426,6 +427,7 @@ impl InternalMethod {
             Self::ReloadSubagentModels => "x.ai/internal/reload_subagent_models",
             Self::ReloadWorkflows => "x.ai/internal/reload_workflows",
             Self::SetPlatformApiKey => "x.ai/internal/set_platform_api_key",
+            Self::WebSearchSettings => "x.ai/internal/web_search_settings",
         }
     }
 
