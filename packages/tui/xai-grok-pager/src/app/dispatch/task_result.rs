@@ -1286,6 +1286,16 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             }
             vec![]
         }
+        TaskResult::WebSearchSettingsComplete(result) => {
+            let message = match result {
+                Ok(status) => format_web_search_status(&status),
+                Err(err) => format!("✗ Web search: {err}"),
+            };
+            if let Some(agent) = get_active_agent_mut(app) {
+                agent.scrollback.push_block(RenderBlock::system(message));
+            }
+            vec![]
+        }
         TaskResult::SubagentModelsReloaded { agent_id, result } => {
             if let Some(modal) = app
                 .agents
@@ -1754,4 +1764,32 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             vec![]
         }
     }
+}
+
+/// Render the `/web-search` status block shown in the scrollback.
+fn format_web_search_status(status: &crate::app::actions::WebSearchStatus) -> String {
+    let describe = |provider: &str| match provider {
+        "auto" => "auto (Codex native search on Codex models, DuckDuckGo otherwise)".to_owned(),
+        "off" => "off".to_owned(),
+        "exa" => "Exa".to_owned(),
+        "perplexity" => "Perplexity".to_owned(),
+        other => other.to_owned(),
+    };
+    let key = |source: &str| match source.strip_prefix("env:") {
+        Some(name) => format!("from ${name}"),
+        None if source == "stored" => "saved in ~/.grok/auth.json".to_owned(),
+        None => "not set".to_owned(),
+    };
+    let mut out = format!("Web search: {}", describe(&status.provider));
+    if let Some(cli) = &status.cli_override {
+        out.push_str(&format!("\n  This run uses --web-search {cli} instead."));
+    }
+    out.push_str(&format!("\n  Exa key: {}", key(&status.exa_key)));
+    out.push_str(&format!(
+        "\n  Perplexity key: {}",
+        key(&status.perplexity_key)
+    ));
+    out.push_str("\n  Changes apply to new sessions (/new).\n");
+    out.push_str(crate::slash::commands::web_search::USAGE);
+    out
 }

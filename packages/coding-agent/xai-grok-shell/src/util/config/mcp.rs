@@ -53,6 +53,8 @@ pub struct Config {
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
     /// `[privacy]` — local banner ack (not auth-metadata).
     pub privacy: PrivacyConfig,
+    /// `[web_search]` — provider chosen with `/web-search`.
+    pub web_search: crate::tools::web_search::WebSearchSettings,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

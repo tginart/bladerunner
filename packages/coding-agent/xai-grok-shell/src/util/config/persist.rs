@@ -29,6 +29,11 @@ async fn save_config_locked(config: &Config) -> Result<()> {
     } else {
         merge_section(table, "privacy", &config.privacy);
     }
+    if config.web_search == crate::tools::web_search::WebSearchSettings::default() {
+        table.remove("web_search");
+    } else {
+        merge_section(table, "web_search", &config.web_search);
+    }
     if config.skills == SkillsConfig::default() {
         table.remove("skills");
     } else {

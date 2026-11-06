@@ -1026,6 +1026,53 @@ pub fn clear_platform_api_key(grok_home: &Path, platform: &str) -> std::io::Resu
     with_auth_json_scope_lock(&path, || clear_scope_from_auth_json(&path, &scope))
 }
 
+/// Read a web search provider API key from `auth.json` (`web_search/<id>`).
+///
+/// Set by the TUI `/web-search` flow. Never log the returned value.
+pub fn read_web_search_api_key(grok_home: &Path, provider: &str) -> Option<String> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let key = map.get(&web_search_api_key_scope(provider))?.key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_owned())
+    }
+}
+
+/// Persist a web search provider API key under `web_search/<id>`.
+///
+/// An empty key removes the scope. Uses the same lock and 0600 write path as
+/// [`store_platform_api_key`], so sibling scopes are preserved.
+pub fn store_web_search_api_key(
+    grok_home: &Path,
+    provider: &str,
+    api_key: &str,
+) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    let scope = web_search_api_key_scope(provider);
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return with_auth_json_scope_lock(&path, || clear_scope_from_auth_json(&path, &scope));
+    }
+    with_auth_json_scope_lock(&path, || {
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+        map.insert(
+            scope.clone(),
+            GrokAuth {
+                key: trimmed.to_owned(),
+                auth_mode: AuthMode::ApiKey,
+                ..Default::default()
+            },
+        );
+        write_auth_json(&path, &map)
+    })
+}
+
+fn web_search_api_key_scope(provider: &str) -> String {
+    format!("web_search/{provider}")
+}
+
 pub fn read_bedrock_auth_marker(grok_home: &Path) -> Option<GrokAuth> {
     let path = resolve_auth_json_path(grok_home);
     let map = read_auth_json(&path).ok()?;

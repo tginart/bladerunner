@@ -1237,6 +1237,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             api_key,
             base_url,
         } => dispatch_set_platform_api_key(app, platform, api_key, base_url),
+        Action::WebSearchSettings(request) => vec![Effect::WebSearchSettings(request)],
         Action::ClearDefaultModel => clear_default_model(app),
         Action::SetForkSecondaryModel(v) => set_fork_secondary_model(app, v),
         Action::ClearForkSecondaryModel => clear_fork_secondary_model(app),

@@ -429,27 +429,21 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 tier_restricted: false,
                             },
                             VideoGenConfig::Enabled {
-                                api_key: token.clone(),
+                                api_key: token,
                                 base_url: url.clone(),
-                                extra_headers: headers.clone(),
+                                extra_headers: headers,
                                 zdr_video_output_s3: None,
                                 tier_restricted: false,
                                 zdr_restricted: false,
                             },
-                            WebSearchConfig::Enabled {
-                                api_key: token,
-                                base_url: url.clone(),
-                                model: default_web_search_model(),
-                                extra_headers: headers,
-                                alpha_test_key: None,
-                            },
+                            WebSearchConfig::DuckDuckGo,
                             AppBuilderDeployerConfig::default(),
                         )
                     }
                     _ => (
                         ImageGenConfig::default(),
                         VideoGenConfig::default(),
-                        WebSearchConfig::default(),
+                        WebSearchConfig::DuckDuckGo,
                         AppBuilderDeployerConfig::default(),
                     ),
                 }
@@ -457,7 +451,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                 (
                     ImageGenConfig::default(),
                     VideoGenConfig::default(),
-                    WebSearchConfig::default(),
+                    WebSearchConfig::DuckDuckGo,
                     AppBuilderDeployerConfig::default(),
                 )
             };
@@ -539,9 +533,6 @@ fn build_web_fetch_config() -> xai_grok_tools::implementations::grok_build::web_
         params.allow_local = Some(true);
     }
     WebFetchConfig::Enabled { params }
-}
-fn default_web_search_model() -> String {
-    std::env::var("GROK_WEB_SEARCH_MODEL").unwrap_or_else(|_| "grok-4.5".to_string())
 }
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {

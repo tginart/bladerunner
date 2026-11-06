@@ -458,6 +458,24 @@ Open context-window and session token usage. Alias: `/cost`.
 
 These measurements work across OpenAI Codex and Palantir AIP models. The session view stays available without a provider billing account.
 
+### `/web-search`
+
+Show or change the web search provider. The choice is saved to
+`[web_search] provider` in `config.toml` and applies to new sessions.
+
+```text
+/web-search                      # show provider and where each key comes from
+/web-search auto                 # Codex native search on Codex models, DuckDuckGo otherwise
+/web-search off                  # no web search
+/web-search exa                  # use Exa (key from auth.json or EXA_API_KEY)
+/web-search perplexity <key>     # save the key and use Perplexity
+/web-search exa clear            # remove the saved Exa key
+```
+
+Exa and Perplexity are used only after you select them here or pass
+`--web-search`; a key in the environment alone does not switch providers.
+Saved keys live in `~/.grok/auth.json` (mode 0600).
+
 ### Coding-data sharing
 
 Bladerunner always opts out of coding-data retention and training. The

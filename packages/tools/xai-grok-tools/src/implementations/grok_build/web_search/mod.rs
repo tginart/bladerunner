@@ -1,8 +1,8 @@
 //! `web_search` tool — new architecture (`Tool` trait).
 //!
-//! Calls the Responses API with web search capability. Reads the
-//! pre-constructed `WebSearchClient` from Resources (inserted by
-//! `with_backend()` when the config is `Enabled`).
+//! Searches DuckDuckGo, Exa or Perplexity through the pre-constructed
+//! `WebSearchClient` in Resources (inserted by `with_backend()` when the
+//! config is not `Disabled`).
 
 use crate::implementations::web_search::client::WebSearchClient;
 use crate::types::output::WebSearchOutput;

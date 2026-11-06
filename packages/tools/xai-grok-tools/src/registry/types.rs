@@ -259,10 +259,10 @@ pub struct SessionContext {
     /// When `Some`, injected into `Resources` so `memory_search` / `memory_get`
     /// tools can access it. When `None`, the tools return "not enabled".
     pub memory_backend: Option<Arc<dyn crate::types::memory_backend::MemoryBackend>>,
-    /// Optional web search configuration. When `Enabled`, a `WebSearchClient`
-    /// is created and injected into `Resources` so the `web_search` tool can
-    /// call the Responses API. When `Disabled` (default), the tool returns a
-    /// graceful error if invoked.
+    /// Optional web search configuration. When not `Disabled`, a
+    /// `WebSearchClient` for the chosen provider is injected into `Resources`
+    /// for the `web_search` tool. When `Disabled` (default), the tool returns
+    /// a graceful error if invoked.
     pub web_search_config: crate::implementations::web_search::WebSearchConfig,
     /// Optional web fetch configuration. When `Enabled`, a `WebFetchClient`
     /// is created and injected into `Resources` so the `web_fetch` tool can
@@ -1038,11 +1038,9 @@ impl ToolRegistryBuilder {
         if let Some(auth_provider) = ctx.auth_provider.clone() {
             resources.insert(auth_provider);
         }
-        if let Ok(client) = crate::implementations::web_search::client::WebSearchClient::new(
-            &ctx.web_search_config,
-            ctx.api_key_provider.clone(),
-        ) {
-            let client = client.with_attribution_callback(ctx.attribution_callback.clone());
+        if let Ok(client) =
+            crate::implementations::web_search::client::WebSearchClient::new(&ctx.web_search_config)
+        {
             resources.insert(client);
         }
         if let Some(lsp) = ctx.lsp {

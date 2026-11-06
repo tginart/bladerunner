@@ -1110,6 +1110,7 @@ async fn run_agent_command(
     trust: bool,
     no_auto_update: bool,
     disable_web_search: bool,
+    web_search: Option<xai_grok_shell::tools::web_search::WebSearchProvider>,
     update_config: &UpdateConfig,
 ) -> Result<()> {
     let _signal_flush = tokio::spawn(async {
@@ -1204,7 +1205,7 @@ async fn run_agent_command(
         remote_settings: remote_settings.as_ref(),
         is_headless: !is_leader,
         cli_subagents: None,
-        cli_web_search_model: None,
+        cli_web_search_provider: web_search,
         cli_session_summary_model: None,
         cli_experimental_memory: false,
         cli_no_memory: false,
@@ -2272,6 +2273,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                     args.trust,
                     args.no_auto_update,
                     args.disable_web_search,
+                    args.web_search,
                     &update_config,
                 )
                 .await;
@@ -2625,6 +2627,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 cli_tools: args.cli_tools.clone(),
                 cli_disallowed_tools: args.cli_disallowed_tools.clone(),
                 disable_web_search: args.disable_web_search,
+                web_search: args.web_search,
                 allow_rules: args.allow_rules.clone(),
                 deny_rules: args.deny_rules.clone(),
                 max_turns: args.max_turns,

@@ -1,6 +1,5 @@
 use crate::models;
 use serde::{Deserialize, Serialize};
-use xai_grok_sampler::SamplerConfig;
 use xai_grok_tools::implementations::grok_build;
 use xai_grok_tools::registry::types::ToolConfig;
 
@@ -160,15 +159,13 @@ impl WebFetchToolConfig {
 
 /// Top-level toolset configuration for the shell layer.
 ///
-/// This is the *shell-side* config that holds sampling-level settings
-/// (e.g., web search API key from the sampling client). It is distinct
-/// from `xai_grok_tools::registry::types::ToolsetConfig` which holds
+/// This is the *shell-side* config from `[toolset]`. It is distinct from
+/// `xai_grok_tools::registry::types::ToolsetConfig`, which holds
 /// tool-implementation-level config (bash limits, web search mode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellToolsetConfig {
     pub bash: BashToolConfig,
-    pub web_search: SamplerConfig,
     /// Web fetch tool parameters (`[toolset.web_fetch]`).
     #[serde(default)]
     pub web_fetch: WebFetchToolConfig,
@@ -185,92 +182,17 @@ pub struct ShellToolsetConfig {
 
 impl Default for ShellToolsetConfig {
     fn default() -> Self {
-        Self::new(None, None)
-    }
-}
-
-/// Web-search-specific sampling overrides applied on top of a base `SamplerConfig`.
-pub(crate) fn web_search_sampling_config(base: SamplerConfig) -> SamplerConfig {
-    let model = if base.model.is_empty() {
-        models::default_web_search_model().to_string()
-    } else {
-        base.model.clone()
-    };
-    SamplerConfig {
-        model,
-        max_completion_tokens: Some(8192),
-        temperature: Some(0.1),
-        top_p: Some(0.95),
-        force_http1: false,
-        max_retries: None,
-        ..base
-    }
-}
-
-impl ShellToolsetConfig {
-    /// Optionally layers sampling credentials onto the web search config.
-    pub fn new(base: Option<Self>, sampling_config: Option<SamplerConfig>) -> Self {
-        let default_base = SamplerConfig {
-            api_key: None,
-            base_url: "https://api.x.ai/v1".to_string(),
-            model: String::new(),
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            api_backend: Default::default(),
-            adapter_kind: Default::default(),
-            request_compat: None,
-            endpoint_path: None,
-            auth_scheme: Default::default(),
-            extra_headers: indexmap::IndexMap::new(),
-            query_params: indexmap::IndexMap::new(),
-            env_http_headers: indexmap::IndexMap::new(),
-            context_window: 256_000,
-            client_version: None,
-            reasoning_effort: None,
-            force_http1: false,
-            max_retries: None,
-            stream_tool_calls: false,
-            idle_timeout_secs: None,
-            client_identifier: None,
-            deployment_id: None,
-            user_id: None,
-            origin_client: None,
-            // Default base for the in-process web-search tool config.
-            // Real `SamplerConfig`s (e.g. from `sampling_config_for_model`)
-            // overwrite this entire struct via the `..base` pattern in
-            // `web_search_sampling_config`, so leaving the callback
-            // `None` here is fine -- it is only the placeholder for the
-            // "no base provided" path. The live attribution
-            // wiring lives at the production SamplerConfig sites in
-            // agent/config.rs and acp_session.rs.
-            attribution_callback: None,
-            bearer_resolver: None,
-            supports_backend_search: false,
-            compactions_remaining: None,
-            compaction_at_tokens: None,
-            doom_loop_recovery: None,
-            header_injector: None,
-            responses_codex_dialect: false,
-            bedrock_request_metadata: Default::default(),
-            bedrock_headers: Default::default(),
-            bedrock_profile: None,
-            kimi_dialect: false,
-        };
-        let mut toolset = base.unwrap_or_else(|| Self {
+        Self {
             bash: BashToolConfig::default(),
-            web_search: web_search_sampling_config(default_base),
             web_fetch: WebFetchToolConfig::default(),
             ask_user_question: AskUserQuestionToolConfig::default(),
             file_toolset: FileToolset::default(),
             hashline: HashlineSchemeConfig::default(),
-        });
-        if let Some(sc) = sampling_config {
-            toolset.web_search = web_search_sampling_config(sc);
         }
-        toolset
     }
+}
 
+impl ShellToolsetConfig {
     /// Resolve the effective file toolset. Local config takes precedence;
     /// remote `/v1/settings` is used as fallback when local is the default.
     pub(crate) fn resolve_file_toolset(

@@ -642,6 +642,9 @@ pub enum Action {
         api_key: String,
         base_url: Option<String>,
     },
+    /// `/web-search`: read or change the web search provider and keys via
+    /// `x.ai/internal/web_search_settings`. All `None` / empty shows status.
+    WebSearchSettings(WebSearchSettingsRequest),
     /// Clear the persisted default model (`cfg.models.default = None`).
     /// Active session's model is unchanged; next session resolves
     /// via the shell's default-resolution chain.
@@ -1697,6 +1700,8 @@ pub enum Effect {
         api_key: String,
         base_url: Option<String>,
     },
+    /// Send `x.ai/internal/web_search_settings` for `/web-search`.
+    WebSearchSettings(WebSearchSettingsRequest),
     /// Reload live subagent model pins from the just-committed config file and
     /// wait for the shell acknowledgement before releasing modal input.
     ReloadSubagentModels { agent_id: AgentId },
@@ -2688,6 +2693,8 @@ pub enum TaskResult {
         env_still_active: Vec<String>,
         error: Option<String>,
     },
+    /// `/web-search` request completed with the shell's status or an error.
+    WebSearchSettingsComplete(Result<WebSearchStatus, String>),
     /// Live subagent model-pin reload completed.
     SubagentModelsReloaded {
         agent_id: AgentId,
@@ -3307,4 +3314,23 @@ mod tests {
              dispatcher arms",
         );
     }
+}
+
+/// Fields of a `/web-search` request. `key_provider` with an empty `api_key`
+/// clears that stored key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebSearchSettingsRequest {
+    pub provider: Option<String>,
+    pub key_provider: Option<String>,
+    pub api_key: String,
+}
+
+/// Web search state reported by the shell. Key sources are `stored`,
+/// `env:<NAME>` or `missing`; key values never reach the TUI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebSearchStatus {
+    pub provider: String,
+    pub cli_override: Option<String>,
+    pub exa_key: String,
+    pub perplexity_key: String,
 }

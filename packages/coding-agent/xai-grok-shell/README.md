@@ -450,6 +450,7 @@ grok [OPTIONS]
 | `--no-memory`              | Force-disable cross-session memory (overrides all other settings)      |
 | `--subagents`              | Enable subagent/task tool support (see [Subagents](#subagents))        |
 | `--disable-web-search`     | Remove web search tool from the agent toolset                          |
+| `--web-search <provider>`  | Web search provider for this run: `auto`, `off`, `exa`, `perplexity`   |
 | `--agent-profile <PATH>`   | Load a custom agent definition file (see [Agent Profiles](#agent-profiles)) |
 | `--experimental-memory`    | Enable cross-session memory persistence (see [Memory](#memory))        |
 | `--allow <RULE>`           | Permission allow rule with glob patterns (repeatable). See [Permission Rules](#permission-rules-allow--deny). |
@@ -1339,7 +1340,9 @@ auto_update = true                     # check for updates on launch
 
 [models]
 default = "grok-4.5"                   # model used for new sessions
-web_search = "grok-4.5"                # model used by the web_search tool
+
+[web_search]
+provider = "auto"                      # auto | off | exa | perplexity
 
 [ui]
 max_thoughts_width = 120               # max column width for reasoning display
@@ -1856,22 +1859,7 @@ api_key = "sk-custom"
 2. Prefetched models from remote `/v1/models`
 3. Hardcoded defaults — lowest priority
 
-**Web search model:** Set `[models] web_search`, `GROK_WEB_SEARCH_MODEL`, or `--web-search-model` to point the `web_search` tool at a different model. The target endpoint must support the Responses API and web search.
-
-> **Overriding with a custom model:** Setting `[models] web_search` alone is not
-> enough if the model isn't already in the catalog (built-in defaults or
-> `grok models` output). You also need a `[model.*]` entry so Grok knows
-> how to reach it. Without both, web search is silently disabled.
->
-> ```toml
-> [models]
-> web_search = "my-custom-model"       # 1. tell web search which model to use
->
-> [model.my-custom-model]              # 2. tell Grok how to reach it
-> model = "my-custom-model"
-> api_backend = "responses"            # required — web search uses the Responses API
-> # base_url, api_key, env_key optional — defaults to cli-chat-proxy
-> ```
+**Web search:** `[web_search] provider` (or `--web-search`, or `/web-search` in the TUI) picks `auto` (Codex native search on Codex models, DuckDuckGo otherwise), `off`, `exa`, or `perplexity`. Exa and Perplexity need a key saved with `/web-search <provider> <key>` or set in `EXA_API_KEY` / `PERPLEXITY_API_KEY`, and they apply only when selected explicitly.
 
 ### Examples
 

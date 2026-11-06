@@ -10,6 +10,7 @@ pub mod retry;
 pub(crate) mod task_completed_frame;
 pub mod todo;
 pub mod tool_context;
+pub mod web_search;
 
 pub use self::{
     config::{BashToolConfig, FileToolset, ShellToolsetConfig},

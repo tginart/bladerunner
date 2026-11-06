@@ -74,6 +74,7 @@ async fn handle_internal(
         InternalMethod::ReloadModels => handle_reload_models(agent),
         InternalMethod::ReloadModelsCache => handle_reload_models_cache(agent),
         InternalMethod::SetPlatformApiKey => handle_set_platform_api_key(agent, args),
+        InternalMethod::WebSearchSettings => handle_web_search_settings(agent, args).await,
         InternalMethod::AuthCleared => handle_auth_cleared(agent),
         // Arrives as a notification, so it never reaches this request path.
         InternalMethod::EvictSessions => Err(acp::Error::method_not_found()),
@@ -787,7 +788,7 @@ pub(crate) fn reload_models_from_disk(agent: &MvpAgent) -> Result<usize, acp::Er
     {
         let agent_config = agent.cfg.borrow();
         let overrides = crate::config::ModelOverrideConfig::resolve(
-            agent_config.web_search_model_override.as_deref(),
+            None,
             agent_config.session_summary_model_override.as_deref(),
             &disk_config,
             agent_config.remote_settings.as_ref(),
@@ -864,6 +865,99 @@ fn handle_reload_subagent_models(agent: &MvpAgent) -> ExtResult {
     ExtMethodResult::success(serde_json::json!({ "reloaded": true, "pins": count }))
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
+// internal/web_search_settings
+
+/*
+Purpose: Read or change the web search setup for TUI `/web-search`.
+Input: Optional `provider`, and an optional `keyProvider` with `apiKey`.
+Output: The saved provider, any CLI override, and the source of each key.
+Method:
+    1. If `keyProvider` is set, store `apiKey` in auth.json. An empty key clears it.
+    2. If `provider` is set, refuse a key-based provider that has no key.
+    3. Save `[web_search] provider` and update the agent config for new sessions.
+Note: The response holds env var names only, never key values.
+*/
+async fn handle_web_search_settings(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    use crate::tools::web_search::{KeySource, WebSearchProvider, key_source};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WebSearchSettingsRequest {
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        key_provider: Option<String>,
+        #[serde(default)]
+        api_key: String,
+    }
+
+    let req: WebSearchSettingsRequest = parse_params(args)?;
+    let parse = |name: &str| {
+        WebSearchProvider::parse(name).ok_or_else(|| {
+            acp::Error::invalid_params().data(format!(
+                "unknown web search provider '{name}'; use auto, off, exa or perplexity"
+            ))
+        })
+    };
+    if let Some(name) = req.key_provider.as_deref() {
+        let key_provider = parse(name)?;
+        if !key_provider.needs_api_key() {
+            return Err(acp::Error::invalid_params().data(format!(
+                "{} does not take an API key",
+                key_provider.as_str()
+            )));
+        }
+        crate::auth::store_web_search_api_key(
+            &xai_grok_config::grok_home(),
+            key_provider.as_str(),
+            &req.api_key,
+        )
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    }
+    if let Some(name) = req.provider.as_deref() {
+        let provider = parse(name)?;
+        if provider.needs_api_key() && key_source(provider) == KeySource::Missing {
+            return Err(acp::Error::invalid_params().data(format!(
+                "no {} API key found; run /web-search {} <api_key> or set {}",
+                provider.as_str(),
+                provider.as_str(),
+                provider.key_env_vars().join(" or "),
+            )));
+        }
+        crate::util::config::set_web_search_provider(provider)
+            .await
+            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+        let mut cfg = agent.cfg.borrow_mut();
+        if cfg.web_search_provider_override.is_none() {
+            cfg.web_search_provider = provider;
+        }
+    }
+
+    let saved = crate::config::load_from_disk()
+        .map(|raw| crate::tools::web_search::WebSearchSettings::from_raw_config(&raw).provider)
+        .unwrap_or_default();
+    let cli_override = agent.cfg.borrow().web_search_provider_override;
+    let mut keys = serde_json::Map::new();
+    for provider in [WebSearchProvider::Exa, WebSearchProvider::Perplexity] {
+        let source = match key_source(provider) {
+            KeySource::Stored => "stored".to_string(),
+            KeySource::Env(name) => format!("env:{name}"),
+            KeySource::Missing => "missing".to_string(),
+        };
+        keys.insert(
+            provider.as_str().to_string(),
+            serde_json::Value::String(source),
+        );
+    }
+    ExtMethodResult::success(serde_json::json!({
+        "provider": saved.as_str(),
+        "cliOverride": cli_override.map(WebSearchProvider::as_str),
+        "keys": keys,
+    }))
+    .to_ext_response()
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
 // internal/set_platform_api_key
