@@ -868,6 +868,11 @@ impl ScrollbackState {
             let Some((start, end)) = self.measurement_window() else {
                 return;
             };
+            // Captured BEFORE measuring: the top entry is usually entered
+            // mid-span from its bottom, so its estimate->exact change would
+            // otherwise shift everything below it on screen (the scroll-up
+            // jump, in either direction depending on the estimate's error).
+            let screen_anchor = self.first_on_screen_entry_anchor();
             if !self.measure_window_exact(width, start, end) {
                 // Everything visible is exact: render will match the layout.
                 return;
@@ -879,18 +884,50 @@ impl ScrollbackState {
             if self.follow_mode {
                 // Bottom-anchored: re-pin to the (now exact) bottom.
                 self.follow_scroll_to_bottom();
+            } else if let Some((entry_idx, screen_row)) = screen_anchor {
+                self.repin_entry_to_screen_row(entry_idx, screen_row);
             } else {
-                // Top-anchored: the first visible entry's offset is unchanged
-                // (nothing above it was measured), so scroll stays put. Only
-                // clamp if the content shrank past the end.
-                let max_offset = self
-                    .total_height
-                    .saturating_sub(self.viewport_height as usize);
-                if self.scroll_offset > max_offset {
-                    self.scroll_offset = max_offset;
-                }
+                // No entry starts on screen (one entry spans the viewport):
+                // keep the offset, only clamp if the content shrank.
+                self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
             }
         }
+    }
+
+    /// `(entry_idx, screen_row)` of the first entry whose top row is on
+    /// screen, or `None` when no entry starts inside the viewport.
+    ///
+    /// Entries above the viewport are never measured, so this entry's top
+    /// moves only when the partly visible top entry changes height.
+    fn first_on_screen_entry_anchor(&self) -> Option<(usize, usize)> {
+        let (top, bottom) = self.viewport_virtual_bounds()?;
+        let cache = self.layout_cache.as_ref()?;
+        let range = self.visible_entry_range();
+        let vy = cache.virtual_y.get(range.clone())?;
+        let rel = vy.partition_point(|&y| y < top);
+        let entry_y = *vy.get(rel)?;
+        if entry_y >= bottom {
+            return None;
+        }
+        Some((range.start + rel, entry_y - top))
+    }
+
+    /// Set `scroll_offset` so the top of entry `entry_idx` sits at
+    /// `screen_row`, clamped to `[0, max_scroll_offset]`.
+    fn repin_entry_to_screen_row(&mut self, entry_idx: usize, screen_row: usize) {
+        let Some(cache) = self.layout_cache.as_ref() else {
+            return;
+        };
+        let range = self.visible_entry_range();
+        let (Some(&base_y), Some(&entry_y)) = (
+            cache.virtual_y.get(range.start),
+            cache.virtual_y.get(entry_idx),
+        ) else {
+            return;
+        };
+        self.scroll_offset = (entry_y - base_y)
+            .saturating_sub(screen_row)
+            .min(self.max_scroll_offset());
     }
 
     /// One-shot warm-up after a bottom-pinned full rebuild (resume): measure the
@@ -2668,6 +2705,40 @@ mod tests {
         );
         // Bottom entries measured earlier stay measured (monotonic).
         assert!(measured_at(&state, 199));
+    }
+
+    #[test]
+    fn lazy_scroll_up_into_estimated_entry_moves_exactly_the_scrolled_rows() {
+        let _theme = pin_theme();
+        // Regression: scrolling up enters an estimated entry from its bottom.
+        // Measuring it exactly must not shift the on-screen content below it,
+        // or a 3-row scroll-up jumps by 3 + (exact - estimate) rows (or even
+        // moves down when the estimate was too big).
+        let mut state = bulk_load_wrapping(200);
+        state.prepare_layout(20, 12);
+        // Jump far above the warmed region so every scroll-up meets estimates.
+        state.scroll_up(400);
+        state.prepare_layout(20, 12);
+        let mut measured_any = false;
+        for step in 0..60 {
+            let top = state.first_visible_entry().unwrap();
+            let probe = top + 1;
+            let screen_row = |s: &ScrollbackState| {
+                let vy = &s.layout_cache.as_ref().unwrap().virtual_y;
+                vy[probe] as i64 - vy[0] as i64 - s.scroll_offset as i64
+            };
+            let before = screen_row(&state);
+            let was_estimated = !measured_at(&state, top - 1);
+            state.scroll_up(3);
+            state.prepare_layout(20, 12);
+            measured_any |= was_estimated && measured_at(&state, top - 1);
+            assert_eq!(
+                screen_row(&state) - before,
+                3,
+                "step {step}: scroll_up(3) must move on-screen content exactly 3 rows"
+            );
+        }
+        assert!(measured_any, "the test must cross estimate->exact upgrades");
     }
 
     #[test]
