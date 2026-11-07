@@ -862,7 +862,7 @@ pub struct PagerArgs {
     #[arg(long = "disable-web-search")]
     pub disable_web_search: bool,
     /// Web search provider for this run. Overrides `[web_search] provider`.
-    /// `auto` uses Codex native search on Codex models and DuckDuckGo
+    /// `auto` uses Codex native search on Codex models and no web search
     /// otherwise; `exa` and `perplexity` need a key (see `/web-search`).
     #[arg(long = "web-search", value_name = "PROVIDER", value_enum)]
     pub web_search: Option<xai_grok_shell::tools::web_search::WebSearchProvider>,

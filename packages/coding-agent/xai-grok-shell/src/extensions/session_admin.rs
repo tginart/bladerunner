@@ -876,7 +876,8 @@ Output: The saved provider, any CLI override, and the source of each key.
 Method:
     1. If `keyProvider` is set, store `apiKey` in auth.json. An empty key clears it.
     2. If `provider` is set, refuse a key-based provider that has no key.
-    3. Save `[web_search] provider` and update the agent config for new sessions.
+    3. Save `[web_search] provider` and update the agent config.
+    4. If there is no CLI override, apply the change to the running sessions.
 Note: The response holds env var names only, never key values.
 */
 async fn handle_web_search_settings(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
@@ -933,6 +934,10 @@ async fn handle_web_search_settings(agent: &MvpAgent, args: &acp::ExtRequest) ->
         if cfg.web_search_provider_override.is_none() {
             cfg.web_search_provider = provider;
         }
+    }
+    let is_change = req.provider.is_some() || req.key_provider.is_some();
+    if is_change && agent.cfg.borrow().web_search_provider_override.is_none() {
+        agent.apply_web_search_all_sessions();
     }
 
     let saved = crate::config::load_from_disk()

@@ -263,7 +263,7 @@ pub(crate) async fn spawn_session_actor(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_config: xai_grok_tools::implementations::WebSearchConfig,
+    web_search: crate::tools::web_search::WebSearchSelection,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -477,10 +477,10 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     let primary_model_id = sampling_config.model.clone();
-    let web_search_config = if disable_web_search {
-        xai_grok_tools::implementations::WebSearchConfig::Disabled
+    let web_search = if disable_web_search {
+        crate::tools::web_search::WebSearchSelection::off()
     } else {
-        web_search_config
+        web_search
     };
     let embed_base_url = sampling_config.base_url.clone();
     let embed_api_key = sampling_config.api_key.clone();
@@ -978,11 +978,12 @@ pub(crate) async fn spawn_session_actor(
             .as_ref()
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
-        web_search_config: web_search_config.clone(),
-        // Provider-hosted search (Codex) runs only in `auto` mode, so `off`
-        // and an explicit Exa/Perplexity choice both turn it off.
-        backend_search: backend_tools_enabled
-            && crate::tools::web_search::allows_hosted_search(&web_search_config),
+        web_search_config: web_search.local.clone(),
+        // The live `WebSearchSelection` gates hosted search per request, so
+        // `/web-search` can turn it on or off in a running session.
+        backend_search: backend_tools_enabled,
+        // `--disable-web-search` is a hard off that `/web-search` cannot undo.
+        web_search_switchable: !disable_web_search,
         web_fetch_config: web_fetch_config.clone(),
         image_gen_config: image_gen_config.clone(),
         video_gen_config: video_gen_config.clone(),
@@ -1054,6 +1055,7 @@ pub(crate) async fn spawn_session_actor(
         .tool_bridge()
         .update_resource(task_wake_suppressed)
         .await;
+    crate::tools::web_search::install_web_search_selection(agent.tool_bridge(), web_search).await;
     let harness_metrics = if telemetry_enabled || xai_grok_telemetry::external::is_active() {
         let plugin_names = plugin_registry
             .as_ref()
@@ -2329,7 +2331,7 @@ pub(crate) async fn spawn_session_on_thread(
     session_client_identifier: Option<String>,
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
-    web_search_config: xai_grok_tools::implementations::WebSearchConfig,
+    web_search: crate::tools::web_search::WebSearchSelection,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -2504,7 +2506,7 @@ pub(crate) async fn spawn_session_on_thread(
                         session_client_identifier,
                         inference_idle_timeout_secs,
                         max_retries,
-                        web_search_config,
+                        web_search,
                         web_fetch_config,
                         image_gen_config,
                         video_gen_config,

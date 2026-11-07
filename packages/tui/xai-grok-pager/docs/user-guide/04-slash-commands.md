@@ -468,12 +468,13 @@ These measurements work across OpenAI Codex and Palantir AIP models. The session
 
 ### `/web-search`
 
-Show or change the web search provider. The choice is saved to
-`[web_search] provider` in `config.toml` and applies to new sessions.
+Show or change the web search provider in a pop-up. The choice is saved to
+`[web_search] provider` in `config.toml` and applies to running sessions at
+their next message (not when the run uses `--web-search`).
 
 ```text
 /web-search                      # show provider and where each key comes from
-/web-search auto                 # Codex native search on Codex models, DuckDuckGo otherwise
+/web-search auto                 # Codex native search on Codex models, off otherwise
 /web-search off                  # no web search
 /web-search exa                  # use Exa (key from auth.json or EXA_API_KEY)
 /web-search perplexity <key>     # save the key and use Perplexity

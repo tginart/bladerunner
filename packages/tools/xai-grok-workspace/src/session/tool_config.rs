@@ -436,14 +436,14 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 tier_restricted: false,
                                 zdr_restricted: false,
                             },
-                            WebSearchConfig::DuckDuckGo,
+                            WebSearchConfig::Disabled,
                             AppBuilderDeployerConfig::default(),
                         )
                     }
                     _ => (
                         ImageGenConfig::default(),
                         VideoGenConfig::default(),
-                        WebSearchConfig::DuckDuckGo,
+                        WebSearchConfig::Disabled,
                         AppBuilderDeployerConfig::default(),
                     ),
                 }
@@ -451,7 +451,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                 (
                     ImageGenConfig::default(),
                     VideoGenConfig::default(),
-                    WebSearchConfig::DuckDuckGo,
+                    WebSearchConfig::Disabled,
                     AppBuilderDeployerConfig::default(),
                 )
             };

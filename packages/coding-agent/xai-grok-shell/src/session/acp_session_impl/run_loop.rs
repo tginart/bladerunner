@@ -1752,6 +1752,9 @@ pub(super) async fn run_session(
                                 s.reload_skills_from_disk().await;
                             });
                         }
+                        SessionCommand::SetWebSearch { selection } => {
+                            session.apply_web_search_selection(selection).await;
+                        }
                         SessionCommand::DispatchSessionStartHook { source } => {
                             let envelope = session.fire_hook(
                                 xai_grok_hooks::event::HookEventName::SessionStart,

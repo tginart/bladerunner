@@ -180,6 +180,9 @@ impl SessionActor {
             self.compaction.prefire.finish();
         }
         self.compaction.prefire.clear();
+        // The rebuild spec holds the spawn-time web search config. Keep any
+        // `/web-search` change made since then.
+        let web_search = self.web_search_selection().await;
         *self.agent.borrow_mut() = new_agent;
         *self.active_agent_type.lock() = Some(new_agent_name.clone());
         self.emit_resolved_tool_overrides();
@@ -198,6 +201,9 @@ impl SessionActor {
         }
         {
             let bridge = self.agent.borrow().tool_bridge().clone();
+            if let Some(selection) = web_search {
+                crate::tools::web_search::install_web_search_selection(&bridge, selection).await;
+            }
             let snapshot = self.tool_metadata_snapshot.clone();
             let tool_index = crate::session::tool_index::Bm25ToolSearchIndex::new(snapshot);
             bridge

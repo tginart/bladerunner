@@ -1287,14 +1287,13 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             vec![]
         }
         TaskResult::WebSearchSettingsComplete(result) => {
-            let message = match result {
+            // A pop-up, not a scrollback block, so the status does not read
+            // like part of the conversation.
+            let content = match result {
                 Ok(status) => format_web_search_status(&status),
-                Err(err) => format!("✗ Web search: {err}"),
+                Err(err) => format!("✗ {err}\n\n```text\n{}\n```", web_search_usage()),
             };
-            if let Some(agent) = get_active_agent_mut(app) {
-                agent.scrollback.push_block(RenderBlock::system(message));
-            }
-            vec![]
+            super::status::dispatch_show_release_notes(app, "Web search".to_owned(), content)
         }
         TaskResult::SubagentModelsReloaded { agent_id, result } => {
             if let Some(modal) = app
@@ -1766,30 +1765,91 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
     }
 }
 
-/// Render the `/web-search` status block shown in the scrollback.
+/*
+Purpose: Render the `/web-search` status as markdown for the pop-up.
+Input: The status that the shell returned.
+Output: The markdown text.
+Note: A key-based provider without a key gives a warning, because the shell
+turns web search off in that case.
+*/
 fn format_web_search_status(status: &crate::app::actions::WebSearchStatus) -> String {
     let describe = |provider: &str| match provider {
-        "auto" => "auto (Codex native search on Codex models, DuckDuckGo otherwise)".to_owned(),
+        "auto" => "auto (Codex native search on Codex models, off otherwise)".to_owned(),
         "off" => "off".to_owned(),
         "exa" => "Exa".to_owned(),
         "perplexity" => "Perplexity".to_owned(),
         other => other.to_owned(),
     };
     let key = |source: &str| match source.strip_prefix("env:") {
-        Some(name) => format!("from ${name}"),
-        None if source == "stored" => "saved in ~/.grok/auth.json".to_owned(),
+        Some(name) => format!("from `${name}`"),
+        None if source == "stored" => "saved in auth.json".to_owned(),
         None => "not set".to_owned(),
     };
-    let mut out = format!("Web search: {}", describe(&status.provider));
+    let active = status.cli_override.as_deref().unwrap_or(&status.provider);
+    let active_key = match active {
+        "exa" => Some(status.exa_key.as_str()),
+        "perplexity" => Some(status.perplexity_key.as_str()),
+        _ => None,
+    };
+    let mut out = format!("**Provider:** {}\n\n", describe(&status.provider));
     if let Some(cli) = &status.cli_override {
-        out.push_str(&format!("\n  This run uses --web-search {cli} instead."));
+        out.push_str(&format!(
+            "**This run:** `--web-search {cli}` overrides the saved provider.\n\n"
+        ));
     }
-    out.push_str(&format!("\n  Exa key: {}", key(&status.exa_key)));
+    if active_key == Some("missing") {
+        out.push_str(&format!(
+            "⚠ No {} key, so web search is off.\n\n",
+            describe(active)
+        ));
+    }
+    out.push_str(&format!("**Exa key:** {}\n\n", key(&status.exa_key)));
     out.push_str(&format!(
-        "\n  Perplexity key: {}",
+        "**Perplexity key:** {}\n\n",
         key(&status.perplexity_key)
     ));
-    out.push_str("\n  Changes apply to new sessions (/new).\n");
-    out.push_str(crate::slash::commands::web_search::USAGE);
+    if status.cli_override.is_none() {
+        out.push_str("Changes apply to running sessions at the next message.\n\n");
+    }
+    out.push_str(&format!("```text\n{}\n```", web_search_usage()));
     out
+}
+
+fn web_search_usage() -> &'static str {
+    crate::slash::commands::web_search::USAGE
+}
+
+#[cfg(test)]
+mod web_search_status_tests {
+    use super::format_web_search_status;
+    use crate::app::actions::WebSearchStatus;
+
+    #[test]
+    fn warns_when_selected_provider_has_no_key() {
+        let status = WebSearchStatus {
+            provider: "perplexity".into(),
+            cli_override: None,
+            exa_key: "missing".into(),
+            perplexity_key: "missing".into(),
+        };
+        let text = format_web_search_status(&status);
+        assert!(text.contains("No Perplexity key, so web search is off"), "{text}");
+        assert!(text.contains("running sessions"), "{text}");
+        assert!(!text.contains("DuckDuckGo"), "{text}");
+    }
+
+    #[test]
+    fn cli_override_is_reported_and_drives_the_key_warning() {
+        let status = WebSearchStatus {
+            provider: "auto".into(),
+            cli_override: Some("exa".into()),
+            exa_key: "env:EXA_API_KEY".into(),
+            perplexity_key: "stored".into(),
+        };
+        let text = format_web_search_status(&status);
+        assert!(text.contains("`--web-search exa` overrides"), "{text}");
+        assert!(!text.contains("web search is off"), "{text}");
+        assert!(!text.contains("running sessions"), "{text}");
+        assert!(text.contains("from `$EXA_API_KEY`"), "{text}");
+    }
 }
