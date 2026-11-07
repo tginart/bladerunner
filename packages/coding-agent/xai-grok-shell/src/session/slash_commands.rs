@@ -578,6 +578,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "show-plan",
     "skills",
     "sovereign",
+    "subtask",
     "summarize",
     "t",
     "tailnet",

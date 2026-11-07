@@ -378,6 +378,14 @@ Send an aside to the agent without interrupting the current task. In minimal mod
 /btw also check the error handling
 ```
 
+### `/subtask <task>`
+
+Hand a task to a subagent. The agent launches one subagent with your task and the context it needs, waits for it to finish, and then summarizes the result. The subagent's work stays out of the main conversation's context.
+
+```
+/subtask find every caller of parse_config and list them by file
+```
+
 ### `/mcps`
 
 Open the MCP servers management modal.

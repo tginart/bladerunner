@@ -346,6 +346,14 @@ shell 还支持子命令（`/plugins list`、`/plugins install <source>`、`/plu
 /btw also check the error handling
 ```
 
+### `/subtask <task>`
+
+把任务交给子智能体。智能体会带着你的任务和必要的上下文启动一个子智能体，等待其完成，然后总结结果。子智能体的工作不会占用主对话的上下文。
+
+```
+/subtask find every caller of parse_config and list them by file
+```
+
 ### `/mcps`
 
 打开 MCP 服务器管理模态。
