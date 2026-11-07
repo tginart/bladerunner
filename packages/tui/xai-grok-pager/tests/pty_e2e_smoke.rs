@@ -11,6 +11,8 @@ mod common;
 
 #[path = "pty_e2e/agent_response.rs"]
 mod agent_response;
+#[path = "pty_e2e/mouse_tracking_stays_on.rs"]
+mod mouse_tracking_stays_on;
 #[path = "pty_e2e/auto_compact_top_row.rs"]
 mod auto_compact_top_row;
 #[path = "pty_e2e/basename_path_demo_pty.rs"]
