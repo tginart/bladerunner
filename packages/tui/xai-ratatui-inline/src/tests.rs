@@ -495,4 +495,65 @@ mod links {
             "non-origin mapping: {out:?}"
         );
     }
+
+    /// Render `text` as a ratatui `Line` (the scrollback path), which, unlike
+    /// `Buffer::set_string`, keeps control characters in cell symbols.
+    fn line_frame(t: &mut Terminal<RecordingBackend>, text: &str, spans: &[LinkSpan]) -> String {
+        t.backend_mut().buf.clear();
+        {
+            let mut f = t.get_frame();
+            let area = f.area();
+            f.render_widget(ratatui::text::Line::raw(text), area);
+        }
+        t.set_frame_links(spans);
+        t.flush_with_links().unwrap();
+        t.swap_buffers();
+        String::from_utf8(t.backend().buf.clone()).unwrap()
+    }
+
+    #[test]
+    fn control_chars_in_cells_never_reach_the_terminal() {
+        // A raw ESC in rendered text (tool output, file contents) must not be
+        // written: `ESC[?1000l` would switch mouse tracking off, and the
+        // terminal would then scroll its own view on the wheel.
+        let text = "a\x1b[?1000l\x1b[?1049lb\u{9b}c\x07";
+        let mut t = term(40, 2);
+        let out = line_frame(&mut t, text, &[]);
+        assert!(!out.chars().any(char::is_control), "plain flush: {out:?}");
+
+        let mut t = term(40, 2);
+        let out = line_frame(&mut t, text, &[span(0, 3, "https://x.ai", None)]);
+        let without_osc8 = out
+            .replace("\x1b]8;;https://x.ai\x07", "")
+            .replace("\x1b]8;;\x07", "");
+        assert!(
+            !without_osc8.chars().any(char::is_control),
+            "linked flush: {out:?}"
+        );
+        assert!(without_osc8.contains("[?1000l"), "text is kept: {without_osc8:?}");
+    }
+
+    #[test]
+    fn insert_before_strips_control_chars() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.backend_mut().buf.clear();
+        t.insert_before(1, |buf| {
+            let area = buf.area;
+            ratatui::widgets::Widget::render(
+                ratatui::text::Line::raw("x\x1b[?1000ly"),
+                area,
+                buf,
+            );
+        })
+        .unwrap();
+        let out = String::from_utf8(t.backend().buf.clone()).unwrap();
+        assert!(!out.chars().any(char::is_control), "{out:?}");
+        assert!(out.contains("[?1000ly"), "text is kept: {out:?}");
+    }
 }

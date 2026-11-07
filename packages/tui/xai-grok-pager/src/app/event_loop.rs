@@ -519,6 +519,9 @@ fn restore_after_child(
     moved_cursor: Option<(u16, u16)>,
 ) {
     use ratatui::backend::Backend as _;
+    // Editors and pagers (vim, less) turn off mouse tracking and bracketed
+    // paste at exit; nothing else turns them back on.
+    crate::app::reassert_terminal_input_modes();
     if let Some((_x, y)) = moved_cursor
         && screen_mode.is_minimal()
     {
@@ -3522,6 +3525,9 @@ async fn drain_and_process(
         let ev = &routed.event;
         match ev {
             Event::FocusGained => {
+                // Heal input modes that something else turned off while the
+                // pane was away, so the wheel reaches the pager again.
+                crate::app::reassert_terminal_input_modes();
                 // Force a full repaint on refocus to heal out-of-band stranded rows.
                 // Sets needs_draw (not had_non_resize_change); the draw site honors force_repaint
                 // ahead of the resize debounce, clearing even a coalesced same-size resize.
