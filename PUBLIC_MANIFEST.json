@@ -35,7 +35,7 @@
     {
       "path": "Cargo.lock",
       "bytes": 411403,
-      "sha256": "0d2021e52704007f3e3dc3b60de02aef5b44f4e06011af6af31cb7b909fed51c",
+      "sha256": "3e09dd0b093430a70ac9bfd63db68cb7c6d19fe68e577619edba8e83b1e4e84e",
       "mode": "0644"
     },
     {
@@ -83,7 +83,7 @@
     {
       "path": "VERSION",
       "bytes": 7,
-      "sha256": "630bf476293ccfa06ce40878def74e5fd79f8e209cad1451abaa97830589b71d",
+      "sha256": "f788eb0c60930fd7a6c76243fbf7a5acb4cd6d336de36d493818b9e438bfdc94",
       "mode": "0644"
     },
     {
@@ -3407,7 +3407,7 @@
     {
       "path": "packages/coding-agent/xai-grok-pager-bin/Cargo.toml",
       "bytes": 4451,
-      "sha256": "a7be244b6625bd09038a8e7c1a2f41ecdfe12f22a7a146ec29dac154b9ce568b",
+      "sha256": "9e017e40743e196d2ac020b8e71985f02e83bb2c799a41fcca1caf98d56807f7",
       "mode": "0644"
     },
     {
@@ -3575,7 +3575,7 @@
     {
       "path": "packages/coding-agent/xai-grok-shell/Cargo.toml",
       "bytes": 10709,
-      "sha256": "84f2a76966a4b58cf6b91aae0e65ee987e5be5b875a0409f8e6d65e09d834e11",
+      "sha256": "49190e685afa2b9d32daec759cfa8a9b5e7d25553e5c9322c30e92db7d121350",
       "mode": "0644"
     },
     {
@@ -8717,7 +8717,7 @@
     {
       "path": "packages/platform/xai-grok-version/Cargo.toml",
       "bytes": 221,
-      "sha256": "dbe99411849dc80b2d9dbdacb61a5db223972188011f9fe8e0b12515415ab995",
+      "sha256": "ad0c3b63cd0677bd0521f8512b09f2b02347790e5ec76d8acf27a63257da2860",
       "mode": "0644"
     },
     {
@@ -13481,7 +13481,7 @@
     {
       "path": "packages/tui/xai-grok-pager/Cargo.toml",
       "bytes": 11509,
-      "sha256": "9f22987b532261ef2d74cd5e512d7c442895c9332c5fb00a64a5cec324dcb423",
+      "sha256": "d2d3d6266875b53e27eb7667bdbff43de200b08566211310a77acb53a756576e",
       "mode": "0644"
     },
     {
@@ -16126,8 +16126,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/scrollback/state/layout.rs",
-      "bytes": 175146,
-      "sha256": "0a716ae77e26ebb665043515315778ae34a276b07759fdfbdc1fcd613a616ffe",
+      "bytes": 178441,
+      "sha256": "d0caa55293072ba9ef5cc761e4e4f69f95a61c8702076fcf186d7799ee945b57",
       "mode": "0644"
     },
     {
