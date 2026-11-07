@@ -49,6 +49,7 @@ pub mod multiline;
 pub mod new;
 pub mod nexus;
 pub mod sovereign;
+pub mod subtask;
 pub mod personas;
 pub mod plan;
 pub mod plugin;
@@ -157,6 +158,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(shots::ShotsCommand),
         Arc::new(hub::HubCommand),
         Arc::new(btw::BtwCommand),
+        Arc::new(subtask::SubtaskCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(doctor::DoctorCommand),
         Arc::new(readiness::ReadinessCommand),
@@ -400,6 +402,7 @@ mod tests {
             "show-plan",
             "skills",
             "sovereign",
+            "subtask",
             "summarize",
             "tailnet",
             "tasks",
