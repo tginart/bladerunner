@@ -339,6 +339,7 @@ where
     /// `width * height > 65 535`.  On extra-large terminals (e.g. 420×160 = 67 200
     /// cells) this causes the entire UI to be rendered into a tiny corner.
     pub fn flush(&mut self) -> io::Result<bool> {
+        strip_control_chars(&mut self.buffers[self.current]);
         let previous_buffer = &self.buffers[1 - self.current];
         let current_buffer = &self.buffers[self.current];
         let updates = diff_large(previous_buffer, current_buffer);
@@ -424,6 +425,7 @@ where
             return self.flush();
         }
 
+        strip_control_chars(&mut self.buffers[cur]);
         let updates = diff_large_with_links(
             &self.buffers[prev],
             &self.buffers[cur],
@@ -854,6 +856,10 @@ where
     where
         F: FnOnce(&mut Buffer),
     {
+        let draw_fn = |buf: &mut Buffer| {
+            draw_fn(buf);
+            strip_control_chars(buf);
+        };
         match self.viewport {
             #[cfg(feature = "scrolling-regions")]
             Viewport::Inline(_) => self.insert_before_scrolling_regions(height, draw_fn),
@@ -1170,6 +1176,34 @@ where
             self.backend.append_lines(lines_to_scroll)?;
         }
         Ok(())
+    }
+}
+
+/*
+Purpose: This function removes control characters from the cell symbols of a buffer.
+Input: The buffer that the next write sends to the terminal.
+Output: None. The function changes the buffer in place.
+Method:
+    1. Skip each cell whose symbol has no byte that can start a control character.
+    2. Remove the C0, DEL and C1 characters from the symbol of each other cell.
+    3. Write a space to a cell whose symbol becomes empty.
+Note: ratatui `Span` render keeps control characters (only `Buffer::set_string`
+    removes them). The backend writes symbols verbatim, so a raw ESC in rendered
+    text gets parsed by the terminal. For example, `ESC[?1000l` turns off mouse
+    tracking, and `ESC[?1049l` leaves the alternate screen.
+*/
+fn strip_control_chars(buf: &mut Buffer) {
+    for cell in &mut buf.content {
+        // 0xC2 is the UTF-8 lead byte of U+0080..=U+00BF, which holds C1.
+        let may_have_control = cell
+            .symbol()
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b == 0xc2);
+        if !may_have_control || !cell.symbol().contains(char::is_control) {
+            continue;
+        }
+        let clean: String = cell.symbol().chars().filter(|c| !c.is_control()).collect();
+        cell.set_symbol(if clean.is_empty() { " " } else { &clean });
     }
 }
 

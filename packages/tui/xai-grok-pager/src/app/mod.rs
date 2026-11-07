@@ -1616,6 +1616,28 @@ fn drain_writer_thread_before_teardown(
 /// (zellij/tmux) stop buffering before the resets arrive. Does NOT call
 /// `disable_raw_mode`. Callers should drain queued writer-thread frames
 /// first when possible; the panic hook can't (would deadlock).
+/*
+Purpose: This function sends the enable sequences for the terminal input modes again.
+Input: None. The function reads MOUSE_CAPTURE_ENABLED.
+Output: None. The function writes to stderr.
+Method:
+    1. If mouse capture is on, send EnableMouseCapture.
+    2. Send EnableFocusChange and EnableBracketedPaste.
+Note: Each sequence sets a mode, so a second send is a no-op when the mode is
+    already on. Something outside the pager can turn a mode off, for example a
+    `$EDITOR` child that resets mouse tracking at exit. Without mouse tracking,
+    a terminal such as Apple Terminal scrolls its own view on the wheel.
+*/
+pub(crate) fn reassert_terminal_input_modes() {
+    let is_mouse_capture_on = MOUSE_CAPTURE_ENABLED.load(Ordering::Acquire);
+    xai_grok_shell::util::with_locked_stderr(|stderr| {
+        if is_mouse_capture_on {
+            let _ = execute!(stderr, event::EnableMouseCapture);
+        }
+        let _ = execute!(stderr, event::EnableFocusChange, event::EnableBracketedPaste);
+    });
+}
+
 fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<u16>) {
     xai_grok_shell::util::with_locked_stderr(|stderr| {
         let _ = stderr.write_all(crate::notifications::progress::OSC_CLEAR.as_bytes());
