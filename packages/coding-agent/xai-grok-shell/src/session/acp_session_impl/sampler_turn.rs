@@ -134,15 +134,21 @@ impl SessionActor {
     /// a verbatim-fork child's tool prefix can never silently drift from what the
     /// parent turn actually sends. `defs` is the already-resolved tool list
     /// (`prepare_tool_definitions_*`); this applies only the `web_search` drop
-    /// under backend search and the `ToolSpec::from` mapping.
+    /// (under backend search, or while `/web-search` has no local provider)
+    /// and the `ToolSpec::from` mapping.
     pub(crate) async fn turn_base_tool_specs(&self, defs: &[ToolDefinition]) -> Vec<ToolSpec> {
         let hosted_web_search_active = self
             .projected_hosted_tools()
             .await
             .iter()
             .any(|tool| matches!(tool, xai_grok_sampling_types::HostedTool::WebSearch { .. }));
+        let local_web_search_off = self
+            .web_search_selection()
+            .await
+            .is_some_and(|selection| !selection.local.is_enabled());
+        let hide_local_web_search = hosted_web_search_active || local_web_search_off;
         defs.iter()
-            .filter(|td| !hosted_web_search_active || td.function.name != "web_search")
+            .filter(|td| !hide_local_web_search || td.function.name != "web_search")
             .cloned()
             .map(ToolSpec::from)
             .collect()
@@ -152,6 +158,13 @@ impl SessionActor {
     /// switching updates chat state without rebuilding the agent.
     async fn projected_hosted_tools(&self) -> Vec<xai_grok_sampling_types::HostedTool> {
         if !self.agent.borrow().backend_search_enabled() || !self.supports_backend_search.get() {
+            return Vec::new();
+        }
+        if self
+            .web_search_selection()
+            .await
+            .is_some_and(|selection| !selection.allows_hosted)
+        {
             return Vec::new();
         }
         let Some(config) = self.chat_state_handle.get_sampling_config().await else {
@@ -177,6 +190,28 @@ impl SessionActor {
             tools.clear();
         }
         tools
+    }
+    /// The live `/web-search` choice on the tool bridge. `None` only in tests
+    /// that build a bare bridge; then no extra web search gate applies.
+    pub(crate) async fn web_search_selection(
+        &self,
+    ) -> Option<crate::tools::web_search::WebSearchSelection> {
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        bridge
+            .read_resource::<crate::tools::web_search::WebSearchSelection>()
+            .await
+    }
+    /// Install a new `/web-search` choice on this session's tool bridge. The
+    /// next request picks it up. `--disable-web-search` sessions ignore it.
+    pub(crate) async fn apply_web_search_selection(
+        &self,
+        selection: crate::tools::web_search::WebSearchSelection,
+    ) {
+        if !self.rebuild_spec.web_search_switchable {
+            return;
+        }
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        crate::tools::web_search::install_web_search_selection(&bridge, selection).await;
     }
     /// Hosted tools with overrides applied, plus the applied overrides to echo, in one pass.
     async fn resolve_hosted(

@@ -84,6 +84,20 @@ impl MvpAgent {
         }
         session_ids.len()
     }
+    /// Send the current web search selection to every resident session, so a
+    /// `/web-search` change applies without `/new`. Returns the session count.
+    pub fn apply_web_search_all_sessions(&self) -> usize {
+        let selection = self.prepare_web_search();
+        let session_ids = self.resident_ids();
+        for session_id in &session_ids {
+            if let Some(handle) = self.resident_handle(session_id) {
+                let _ = handle.cmd_tx.send(SessionCommand::SetWebSearch {
+                    selection: selection.clone(),
+                });
+            }
+        }
+        session_ids.len()
+    }
     pub fn advertise_commands_all_sessions(&self) -> usize {
         let session_ids = self.resident_ids();
         for session_id in &session_ids {
@@ -2284,12 +2298,11 @@ impl MvpAgent {
             zdr_restricted,
         }
     }
-    /// Resolve the local web search tool config for a new session. The key is
-    /// read from auth.json or env at this point, so a key saved with
-    /// `/web-search` applies to the next session without a restart.
-    pub(super) fn prepare_web_search_config(&self) -> xai_grok_tools::implementations::WebSearchConfig {
+    /// Resolve the web search selection for the current provider. The key is
+    /// read from auth.json or env at this point.
+    pub(crate) fn prepare_web_search(&self) -> crate::tools::web_search::WebSearchSelection {
         let provider = self.cfg.borrow().web_search_provider;
-        crate::tools::web_search::load_web_search_config(provider)
+        crate::tools::web_search::load_web_search_selection(provider)
     }
     /// Returns `Err` with a user-facing message on invalid config; the caller at
     /// the process boundary prints it and exits.
@@ -4438,7 +4451,7 @@ impl MvpAgent {
             .find(|entry| entry.info.model == sampling_config.model)
             .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
-        let web_search_config = self.prepare_web_search_config();
+        let web_search = self.prepare_web_search();
         // xAI-only media clients are inactive in Bladerunner. Keep the original
         // setup calls here for a future provider-specific media integration.
         // let image_gen_config = self.prepare_image_gen_config();
@@ -4690,7 +4703,7 @@ impl MvpAgent {
                     origin_client.as_ref().map(|o| o.product.clone()),
                     inference_idle_timeout_secs,
                     model_max_retries,
-                    web_search_config,
+                    web_search,
                     web_fetch_config,
                     image_gen_config,
                     video_gen_config,

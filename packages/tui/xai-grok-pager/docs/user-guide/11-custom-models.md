@@ -404,10 +404,8 @@ Pick the web search provider with `/web-search` (saved to `[web_search]` in
 provider = "auto"   # auto | off | exa | perplexity
 ```
 
-- `auto` (default): Codex models use OpenAI's native hosted search; every
-  other model gets a local `web_search` tool backed by DuckDuckGo. DuckDuckGo
-  can answer automated requests with a human-check page; the tool then
-  reports an error instead of results.
+- `auto` (default): Codex models use OpenAI's native hosted search; other
+  models get no web search. Select `exa` or `perplexity` to give them one.
 - `off`: no web search, local or hosted.
 - `exa` / `perplexity`: the local `web_search` tool calls that provider. This
   also replaces Codex native search. The key comes from `/web-search exa

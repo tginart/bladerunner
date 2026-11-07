@@ -1,6 +1,6 @@
 //! `web_search` tool — new architecture (`Tool` trait).
 //!
-//! Searches DuckDuckGo, Exa or Perplexity through the pre-constructed
+//! Searches Exa or Perplexity through the pre-constructed
 //! `WebSearchClient` in Resources (inserted by `with_backend()` when the
 //! config is not `Disabled`).
 
