@@ -15,7 +15,7 @@ const CLEAR_WORDS: [&str; 3] = ["clear", "remove", "logout"];
 
 pub const USAGE: &str = "Usage:\n  \
     /web-search                      show the current provider and keys\n  \
-    /web-search auto                 Codex native search on Codex models, DuckDuckGo otherwise\n  \
+    /web-search auto                 Codex native search on Codex models, off otherwise\n  \
     /web-search off                  turn web search off\n  \
     /web-search exa|perplexity       use that provider (key from auth.json or env)\n  \
     /web-search exa|perplexity <key> save the key and use that provider\n  \

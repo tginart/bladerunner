@@ -701,6 +701,11 @@ pub enum SessionCommand {
     /// Re-discover skills from disk, update the SkillManager baseline,
     /// and re-advertise slash commands to the client.
     ReloadSkills,
+    /// Apply a `/web-search` change to this running session. Ignored when
+    /// the session started with `--disable-web-search`.
+    SetWebSearch {
+        selection: crate::tools::web_search::WebSearchSelection,
+    },
     /// Dispatch session_start hook using the actor's loaded HookRegistry.
     DispatchSessionStartHook {
         /// "new" for brand new sessions, "load" for sessions loaded from disk.

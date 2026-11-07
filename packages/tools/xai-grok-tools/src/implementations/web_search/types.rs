@@ -1,14 +1,12 @@
 /// Backend for the local `web_search` tool.
 ///
-/// `Disabled` removes the tool. `DuckDuckGo` needs no key and is the
-/// default when no provider is configured. `Exa` and `Perplexity` are
-/// used only when the user selects them explicitly.
+/// `Disabled` gives no local search client. `Exa` and `Perplexity` are
+/// used only when the user selects them explicitly and has a key.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum WebSearchConfig {
     #[default]
     Disabled,
-    DuckDuckGo,
     Exa {
         api_key: String,
     },
@@ -27,7 +25,6 @@ impl WebSearchConfig {
     pub fn provider_name(&self) -> &'static str {
         match self {
             Self::Disabled => "off",
-            Self::DuckDuckGo => "duckduckgo",
             Self::Exa { .. } => "exa",
             Self::Perplexity { .. } => "perplexity",
         }
@@ -38,7 +35,6 @@ impl WebSearchConfig {
         let hidden = "***REDACTED***".to_string();
         match self {
             Self::Disabled => Self::Disabled,
-            Self::DuckDuckGo => Self::DuckDuckGo,
             Self::Exa { .. } => Self::Exa { api_key: hidden },
             Self::Perplexity { .. } => Self::Perplexity { api_key: hidden },
         }
@@ -66,8 +62,8 @@ mod tests {
             }
         );
         assert_eq!(
-            WebSearchConfig::DuckDuckGo.redacted(),
-            WebSearchConfig::DuckDuckGo
+            WebSearchConfig::Disabled.redacted(),
+            WebSearchConfig::Disabled
         );
     }
 

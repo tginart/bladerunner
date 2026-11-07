@@ -88,6 +88,9 @@ pub struct AgentBuilder {
     state_path: Option<PathBuf>,
     memory_backend: Option<Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>>,
     web_search_config: xai_grok_tools::implementations::web_search::WebSearchConfig,
+    /// When true, the local `web_search` tool is registered even without a
+    /// search client, so the session can turn it on later.
+    switchable_web_search: bool,
     /// When true, web search and X search are available as native server-side
     /// tool candidates. The session projects these candidates onto the active
     /// provider on every request; local web-search credentials are unrelated.
@@ -232,6 +235,7 @@ impl AgentBuilder {
             state_path: None,
             memory_backend: None,
             web_search_config: Default::default(),
+            switchable_web_search: false,
             backend_search: false,
             web_fetch_config: Default::default(),
             lsp: None,
@@ -441,6 +445,13 @@ impl AgentBuilder {
         config: xai_grok_tools::implementations::web_search::WebSearchConfig,
     ) -> Self {
         self.web_search_config = config;
+        self
+    }
+    /// When true, register the local `web_search` tool even when the web
+    /// search config is `Disabled`. The host session hides the tool at request
+    /// time until it installs a search client, so `/web-search` can apply live.
+    pub fn with_switchable_web_search(mut self, enabled: bool) -> Self {
+        self.switchable_web_search = enabled;
         self
     }
     /// When true, web search and X search are sent as native server-side
@@ -726,7 +737,7 @@ impl AgentBuilder {
                     .tools
                     .push((&memory::get_tool::MemoryGetImpl).into());
             }
-            if self.web_search_config.is_enabled() {
+            if self.web_search_config.is_enabled() || self.switchable_web_search {
                 use xai_grok_tools::implementations::grok_build;
                 tool_config.tools.push((&grok_build::WebSearchTool).into());
             }
@@ -2392,7 +2403,9 @@ mod tests {
             ToolNotificationHandle::noop(),
         )
         .from_definition(definition)
-        .with_web_search_config(WebSearchConfig::DuckDuckGo)
+        .with_web_search_config(WebSearchConfig::Exa {
+            api_key: "test-key".into(),
+        })
         .with_web_fetch_config(WebFetchConfig::Enabled {
             params: Default::default(),
         })
@@ -2513,7 +2526,9 @@ mod tests {
         use xai_grok_tools::implementations::web_search::WebSearchConfig;
         use xai_grok_tools::notification::ToolNotificationHandle;
         let web_search_config = if web_search_enabled {
-            WebSearchConfig::DuckDuckGo
+            WebSearchConfig::Exa {
+                api_key: "test-key".into(),
+            }
         } else {
             WebSearchConfig::Disabled
         };
@@ -2531,6 +2546,46 @@ mod tests {
         .build()
         .await
         .expect("agent should build for backend-search test case")
+    }
+    /// A switchable session gets the local `web_search` tool without a
+    /// search client, so `/web-search` can turn it on later.
+    #[tokio::test]
+    async fn switchable_web_search_registers_tool_without_client() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::implementations::web_search::client::WebSearchClient;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let build = |switchable: bool| async move {
+            AgentBuilder::new(
+                std::env::temp_dir(),
+                Arc::new(LocalTerminalBackend::new()),
+                ToolNotificationHandle::noop(),
+            )
+            .from_definition(crate::config::AgentDefinition::default_grok_build())
+            .with_switchable_web_search(switchable)
+            .build()
+            .await
+            .expect("agent should build")
+        };
+        let has_web_search = |agent: &crate::agent::Agent| {
+            let agent_tools = agent.tool_bridge().clone();
+            async move {
+                agent_tools
+                    .tool_definitions_builtins_only()
+                    .await
+                    .iter()
+                    .any(|td| short_tool_name(&td.function.name) == "web_search")
+            }
+        };
+        let agent = build(true).await;
+        assert!(has_web_search(&agent).await);
+        assert!(
+            agent
+                .tool_bridge()
+                .read_resource::<WebSearchClient>()
+                .await
+                .is_none()
+        );
+        assert!(!has_web_search(&build(false).await).await);
     }
     #[tokio::test]
     async fn disallowed_web_search_strips_function_and_hosted_tools() {

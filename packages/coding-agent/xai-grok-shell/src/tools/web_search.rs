@@ -1,18 +1,20 @@
 //! Web search provider selection.
 //!
 //! Purpose: This module turns the user's `[web_search] provider` setting into
-//! the `WebSearchConfig` for the local `web_search` tool.
+//! the `WebSearchSelection` of a session.
 //! Method:
 //!     1. `off` removes web search. This includes Codex native search.
 //!     2. `exa` and `perplexity` apply only when the user selects them and a
 //!        key is available. The stored key has priority over the env var.
-//!     3. `auto` (the default) gives DuckDuckGo. On Codex models the sampler
-//!        uses the native hosted search and hides the local tool.
+//!     3. `auto` (the default) permits only provider-hosted search. Codex
+//!        models get native search. Other models get no web search.
 //! Note: A detected env var does not select a provider. Only an explicit
 //! setting or `--web-search` flag does.
 
 use serde::{Deserialize, Serialize};
+use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::implementations::WebSearchConfig;
+use xai_grok_tools::implementations::web_search::client::WebSearchClient;
 
 const EXA_ENV_VARS: &[&str] = &["EXA_API_KEY"];
 const PERPLEXITY_ENV_VARS: &[&str] = &["PERPLEXITY_API_KEY", "PPLX_API_KEY"];
@@ -21,7 +23,7 @@ const PERPLEXITY_ENV_VARS: &[&str] = &["PERPLEXITY_API_KEY", "PPLX_API_KEY"];
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSearchProvider {
-    /// Codex native search on Codex models, DuckDuckGo otherwise.
+    /// Codex native search on Codex models, no web search otherwise.
     #[default]
     Auto,
     /// No web search.
@@ -92,40 +94,73 @@ pub enum KeySource {
     Missing,
 }
 
-/// Build the tool config for `provider` from a stored key and an env key.
+/// The live web search choice of one session.
 ///
-/// Pure. A key-based provider without a key falls back to DuckDuckGo, so the
-/// user keeps a working search after a bad setup.
-pub fn resolve_web_search_config(
-    provider: WebSearchProvider,
-    stored_key: Option<String>,
-    env_key: Option<String>,
-) -> WebSearchConfig {
-    let key = stored_key.or(env_key);
-    match (provider, key) {
-        (WebSearchProvider::Off, _) => WebSearchConfig::Disabled,
-        (WebSearchProvider::Auto, _) => WebSearchConfig::DuckDuckGo,
-        (WebSearchProvider::Exa, Some(api_key)) => WebSearchConfig::Exa { api_key },
-        (WebSearchProvider::Perplexity, Some(api_key)) => WebSearchConfig::Perplexity { api_key },
-        (provider, None) => {
-            tracing::warn!(
-                provider = provider.as_str(),
-                "web search provider has no API key; using DuckDuckGo"
-            );
-            WebSearchConfig::DuckDuckGo
+/// The session keeps it as a tool bridge resource and reads it on each
+/// request, so `/web-search` changes a running session without a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSearchSelection {
+    /// Client config for the local `web_search` tool.
+    pub local: WebSearchConfig,
+    /// Whether provider-hosted search (Codex native) can run.
+    pub allows_hosted: bool,
+}
+
+impl WebSearchSelection {
+    /// No local search and no hosted search.
+    pub fn off() -> Self {
+        Self {
+            local: WebSearchConfig::Disabled,
+            allows_hosted: false,
+        }
+    }
+
+    /// Build the selection for `provider` from a stored key and an env key.
+    ///
+    /// Pure. A key-based provider without a key gives no search. It does not
+    /// fall back to another provider.
+    pub fn resolve(
+        provider: WebSearchProvider,
+        stored_key: Option<String>,
+        env_key: Option<String>,
+    ) -> Self {
+        Self {
+            local: resolve_web_search_config(provider, stored_key.or(env_key)),
+            allows_hosted: provider == WebSearchProvider::Auto,
         }
     }
 }
 
 /// Read the key for `provider` from auth.json and env, then resolve.
-pub fn load_web_search_config(provider: WebSearchProvider) -> WebSearchConfig {
+pub fn load_web_search_selection(provider: WebSearchProvider) -> WebSearchSelection {
     let stored_key = if provider.needs_api_key() {
         crate::auth::read_web_search_api_key(&xai_grok_config::grok_home(), provider.as_str())
     } else {
         None
     };
     let env_key = first_env_key(provider).map(|(_, value)| value);
-    resolve_web_search_config(provider, stored_key, env_key)
+    WebSearchSelection::resolve(provider, stored_key, env_key)
+}
+
+/*
+Purpose: Install a web search selection on the tool bridge of a session.
+Input: The tool bridge. The new selection.
+Output: None. The bridge resources change.
+Method:
+    1. If the selection has a local config, insert a new `WebSearchClient`.
+    2. If not, remove the old `WebSearchClient`.
+    3. Insert the selection. The session reads it on each request.
+*/
+pub async fn install_web_search_selection(bridge: &ToolBridge, selection: WebSearchSelection) {
+    let resources = bridge.shared_resources().await;
+    let mut resources = resources.lock().await;
+    match WebSearchClient::new(&selection.local) {
+        Ok(client) => resources.insert(client),
+        Err(_) => {
+            resources.remove::<WebSearchClient>();
+        }
+    }
+    resources.insert(selection);
 }
 
 /// Report where `provider`'s key would come from, without the key itself.
@@ -143,10 +178,20 @@ pub fn key_source(provider: WebSearchProvider) -> KeySource {
     }
 }
 
-/// Codex hosted search is used only in `auto` mode, so an explicit provider
-/// or `off` always wins over it.
-pub fn allows_hosted_search(config: &WebSearchConfig) -> bool {
-    matches!(config, WebSearchConfig::DuckDuckGo)
+/// Pure. Map a provider and its key to the local tool config.
+fn resolve_web_search_config(provider: WebSearchProvider, key: Option<String>) -> WebSearchConfig {
+    match (provider, key) {
+        (WebSearchProvider::Off | WebSearchProvider::Auto, _) => WebSearchConfig::Disabled,
+        (WebSearchProvider::Exa, Some(api_key)) => WebSearchConfig::Exa { api_key },
+        (WebSearchProvider::Perplexity, Some(api_key)) => WebSearchConfig::Perplexity { api_key },
+        (provider, None) => {
+            tracing::warn!(
+                provider = provider.as_str(),
+                "web search provider has no API key; web search is off"
+            );
+            WebSearchConfig::Disabled
+        }
+    }
 }
 
 fn first_env_key(provider: WebSearchProvider) -> Option<(&'static str, String)> {
@@ -165,32 +210,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_and_off_ignore_keys() {
+    fn auto_allows_only_hosted_search() {
         let key = || Some("k".to_string());
         assert_eq!(
-            resolve_web_search_config(WebSearchProvider::Auto, key(), key()),
-            WebSearchConfig::DuckDuckGo
+            WebSearchSelection::resolve(WebSearchProvider::Auto, key(), key()),
+            WebSearchSelection {
+                local: WebSearchConfig::Disabled,
+                allows_hosted: true,
+            }
         );
         assert_eq!(
-            resolve_web_search_config(WebSearchProvider::Off, key(), key()),
-            WebSearchConfig::Disabled
+            WebSearchSelection::resolve(WebSearchProvider::Off, key(), key()),
+            WebSearchSelection::off()
         );
     }
 
     #[test]
     fn stored_key_beats_env_key() {
         assert_eq!(
-            resolve_web_search_config(
+            WebSearchSelection::resolve(
                 WebSearchProvider::Exa,
                 Some("stored".into()),
                 Some("env".into())
             ),
-            WebSearchConfig::Exa {
-                api_key: "stored".into()
+            WebSearchSelection {
+                local: WebSearchConfig::Exa {
+                    api_key: "stored".into()
+                },
+                allows_hosted: false,
             }
         );
         assert_eq!(
-            resolve_web_search_config(WebSearchProvider::Perplexity, None, Some("env".into())),
+            WebSearchSelection::resolve(WebSearchProvider::Perplexity, None, Some("env".into()))
+                .local,
             WebSearchConfig::Perplexity {
                 api_key: "env".into()
             }
@@ -198,20 +250,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_falls_back_to_duckduckgo() {
+    fn missing_key_turns_search_off() {
         assert_eq!(
-            resolve_web_search_config(WebSearchProvider::Exa, None, None),
-            WebSearchConfig::DuckDuckGo
+            WebSearchSelection::resolve(WebSearchProvider::Perplexity, None, None),
+            WebSearchSelection::off()
         );
     }
 
-    #[test]
-    fn hosted_search_only_in_auto_mode() {
-        assert!(allows_hosted_search(&WebSearchConfig::DuckDuckGo));
-        assert!(!allows_hosted_search(&WebSearchConfig::Disabled));
-        assert!(!allows_hosted_search(&WebSearchConfig::Exa {
-            api_key: "k".into()
-        }));
+    #[tokio::test]
+    async fn install_swaps_and_removes_the_client() {
+        let bridge = ToolBridge::for_test();
+        let perplexity =
+            WebSearchSelection::resolve(WebSearchProvider::Perplexity, Some("k".into()), None);
+        install_web_search_selection(&bridge, perplexity.clone()).await;
+        let client = bridge.read_resource::<WebSearchClient>().await.unwrap();
+        assert_eq!(client.provider_name(), "Perplexity");
+        assert_eq!(
+            bridge.read_resource::<WebSearchSelection>().await,
+            Some(perplexity)
+        );
+        install_web_search_selection(&bridge, WebSearchSelection::off()).await;
+        assert!(bridge.read_resource::<WebSearchClient>().await.is_none());
     }
 
     #[test]

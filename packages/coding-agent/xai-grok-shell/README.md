@@ -1859,7 +1859,7 @@ api_key = "sk-custom"
 2. Prefetched models from remote `/v1/models`
 3. Hardcoded defaults — lowest priority
 
-**Web search:** `[web_search] provider` (or `--web-search`, or `/web-search` in the TUI) picks `auto` (Codex native search on Codex models, DuckDuckGo otherwise), `off`, `exa`, or `perplexity`. Exa and Perplexity need a key saved with `/web-search <provider> <key>` or set in `EXA_API_KEY` / `PERPLEXITY_API_KEY`, and they apply only when selected explicitly.
+**Web search:** `[web_search] provider` (or `--web-search`, or `/web-search` in the TUI) picks `auto` (Codex native search on Codex models, no web search otherwise), `off`, `exa`, or `perplexity`. Exa and Perplexity need a key saved with `/web-search <provider> <key>` or set in `EXA_API_KEY` / `PERPLEXITY_API_KEY`, and they apply only when selected explicitly. A selected provider without a key turns web search off; it does not fall back. A `/web-search` change applies to running sessions at their next message.
 
 ### Examples
 

@@ -94,6 +94,9 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
     pub web_search_config: WebSearchConfig,
     pub backend_search: bool,
+    /// Register the local `web_search` tool so `/web-search` can turn it on
+    /// later. False under `--disable-web-search`.
+    pub web_search_switchable: bool,
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
     pub video_gen_config: VideoGenConfig,
@@ -201,6 +204,7 @@ impl AgentRebuildSpec {
             memory_backend,
             web_search_config,
             backend_search,
+            web_search_switchable,
             web_fetch_config,
             image_gen_config,
             video_gen_config,
@@ -262,6 +266,7 @@ impl AgentRebuildSpec {
         .with_state_path(bridge_state_path.clone())
         .with_web_search_config(web_search_config.clone())
         .with_backend_search(*backend_search)
+        .with_switchable_web_search(*web_search_switchable)
         .with_image_gen_config(image_gen_config.clone())
         .with_video_gen_config(video_gen_config.clone())
         .with_app_builder_deployer_config(app_builder_deployer_config.clone())
@@ -448,6 +453,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_backend: None,
         web_search_config: WebSearchConfig::default(),
         backend_search: false,
+        web_search_switchable: false,
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
         video_gen_config: VideoGenConfig::default(),
