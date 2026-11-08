@@ -380,7 +380,7 @@ Send an aside to the agent without interrupting the current task. In minimal mod
 
 ### `/subtask <task>`
 
-Hand a task to a subagent. The agent launches one subagent with your task and the context it needs, waits for it to finish, and then summarizes the result. The subagent's work stays out of the main conversation's context.
+Hand a task to a subagent. The agent starts one subagent in the background with your task and the context it needs, then frees up right away so you can keep working. When the subagent finishes, the agent summarizes the result. The subagent's work stays out of the main conversation's context.
 
 ```
 /subtask find every caller of parse_config and list them by file
