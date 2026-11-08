@@ -104,8 +104,14 @@ struct HitAreas {
 #[derive(Debug, Clone)]
 pub struct HubBrowserState {
     pub hub: store::Hub,
-    /// The handle of the person at the keyboard.
+    /// The name of the person at the keyboard, before it becomes a handle.
+    person_name: String,
+    /// The handle of the person at the keyboard. A reload checks it again,
+    /// because the person does not reserve it until the first post.
     pub person: String,
+    /// Read positions of a person who is not a member yet. A cursor file for a
+    /// free handle would pass to an agent that joins with that handle later.
+    unsaved_read: BTreeMap<String, usize>,
     /// The member whose view the browser shows.
     pub perspective: String,
     pub snapshot: HubSnapshot,
@@ -128,14 +134,17 @@ pub struct HubBrowserState {
 
 impl HubBrowserState {
     /// Purpose: Open the browser on a hub, as the person.
-    /// Input: The hub, the person handle, and an optional `#channel` to select.
+    /// Input: The hub, the person name, and an optional `#channel` to select.
     /// Output: The state, or an error when the hub files cannot be read.
-    pub fn open(hub: store::Hub, person: String, channel: Option<&str>) -> Result<Self> {
-        let snapshot = load_snapshot(&hub, &person, &person)?;
+    pub fn open(hub: store::Hub, person_name: &str, channel: Option<&str>) -> Result<Self> {
+        let person = agent_hub::person_handle_in(&hub.meta()?, person_name);
+        let snapshot = load_snapshot(&hub, &person, &person, &BTreeMap::new())?;
         let mut state = Self {
             hub,
+            person_name: person_name.to_string(),
             perspective: person.clone(),
             person,
+            unsaved_read: BTreeMap::new(),
             snapshot,
             feed: Vec::new(),
             first_unread: None,
@@ -174,7 +183,7 @@ impl HubBrowserState {
     /// Output: Ok, or the read error. A row that is gone selects a valid fallback.
     pub fn reload(&mut self) -> Result<()> {
         let selected_row = self.selected_row();
-        self.snapshot = load_snapshot(&self.hub, &self.perspective, &self.person)?;
+        self.reload_snapshot()?;
         let rows = self.rows();
         match rows
             .iter()
@@ -218,23 +227,62 @@ impl HubBrowserState {
 
     /// Purpose: Show the hub as another member sees it.
     /// Input: The member handle.
-    /// Output: The new view. The selected channel stays when it exists.
+    /// Output: The new view. The selected conversation stays when it exists.
     pub fn set_perspective(&mut self, handle: &str) -> Result<()> {
         self.picker = None;
         if handle == self.perspective {
             return Ok(());
         }
+        let kept_conv = self.selected_row().and_then(|row| row.conv());
         self.perspective = handle.to_string();
-        self.is_composing = false;
+        self.stop_compose();
         self.notice = None;
-        let kept_row = self.selected_row();
-        self.reload()?;
-        // A row index means nothing in another member's sidebar, so go to the top.
-        if self.selected_row() != kept_row {
-            self.selected = clamp_selection(&self.rows(), 0);
-        }
+        self.reload_snapshot()?;
+        // Keep the same conversation if this member has it. A row index means
+        // nothing in another sidebar, so the fallback is the top. Pick the row
+        // before the feed loads, so no other conversation is marked read.
+        let rows = self.rows();
+        self.selected = rows
+            .iter()
+            .position(|row| kept_conv.is_some() && row.conv() == kept_conv)
+            .unwrap_or_else(|| clamp_selection(&rows, 0));
+        self.feed_scroll = 0;
         // The unread marker belongs to the member whose view this is.
         self.load_feed(true)
+    }
+
+    /// Purpose: Read the hub files again, with no change to the selection.
+    /// Input: The browser state and the hub files.
+    /// Output: Ok, or the read error.
+    /// Note: If an agent took the person handle, the person gets the next free
+    ///     handle, so the browser never writes the read cursor of an agent.
+    fn reload_snapshot(&mut self) -> Result<()> {
+        let meta = self.hub.meta()?;
+        let person = agent_hub::person_handle_in(&meta, &self.person_name);
+        if person != self.person {
+            if self.is_person_view() {
+                self.perspective = person.clone();
+            }
+            self.person = person;
+        }
+        if is_person_member(&meta, &self.person) {
+            // The person posted since the last read, so the handle is safe to save.
+            for (conv, count) in std::mem::take(&mut self.unsaved_read) {
+                agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
+            }
+        }
+        let read_floor = if self.is_person_view() {
+            self.unsaved_read.clone()
+        } else {
+            BTreeMap::new()
+        };
+        self.snapshot = load_snapshot(&self.hub, &self.perspective, &self.person, &read_floor)?;
+        Ok(())
+    }
+
+    /// The person name that a post uses to find or reserve the person handle.
+    pub fn person_name(&self) -> &str {
+        &self.person_name
     }
 
     /// The members that the perspective picker lists: the person first.
@@ -327,7 +375,7 @@ impl HubBrowserState {
         if let Some(idx) = hit
             && self.rows().get(idx).is_some_and(Row::is_selectable)
         {
-            self.is_composing = false;
+            self.stop_compose();
             self.select(idx);
         }
     }
@@ -365,6 +413,14 @@ impl HubBrowserState {
         }
     }
 
+    /// Leave the post box. An empty draft releases its destination.
+    fn stop_compose(&mut self) {
+        self.is_composing = false;
+        if self.draft.is_empty() {
+            self.compose_target = None;
+        }
+    }
+
     fn start_compose(&mut self) {
         if let Some(target) = self.post_target() {
             self.compose_target = Some(target);
@@ -378,12 +434,7 @@ impl HubBrowserState {
     /// Output: The next browser action. An empty draft releases its target on exit.
     fn handle_compose_key(&mut self, key: &KeyEvent) -> HubKeyOutcome {
         match key.code {
-            KeyCode::Esc | KeyCode::Tab => {
-                self.is_composing = false;
-                if self.draft.is_empty() {
-                    self.compose_target = None;
-                }
-            }
+            KeyCode::Esc | KeyCode::Tab => self.stop_compose(),
             KeyCode::Backspace => {
                 self.draft.pop();
             }
@@ -447,7 +498,11 @@ impl HubBrowserState {
         }
         if self.is_person_view() {
             let count = self.feed.len() + skip;
-            agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
+            if is_person_member(&self.snapshot.meta, &self.person) {
+                agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
+            } else {
+                self.unsaved_read.insert(conv.clone(), count);
+            }
             self.snapshot.read.insert(conv.clone(), count);
             self.snapshot.unread_counts.insert(conv, 0);
         }
@@ -456,16 +511,26 @@ impl HubBrowserState {
 }
 
 /// Purpose: Read the hub as one member sees it.
-/// Input: The hub, the perspective handle, and the person handle.
+/// Input: The hub, the perspective handle, the person handle, and read
+///     positions that the cursor file does not have yet.
 /// Output: A snapshot with a count for every channel and every DM row.
 /// Note: The person sees every member as a DM row. Another member sees only
 ///     the DMs that it is in.
-pub fn load_snapshot(hub: &store::Hub, perspective: &str, person: &str) -> Result<HubSnapshot> {
+pub fn load_snapshot(
+    hub: &store::Hub,
+    perspective: &str,
+    person: &str,
+    read_floor: &BTreeMap<String, usize>,
+) -> Result<HubSnapshot> {
     let mut meta = hub.meta()?;
     for member in &mut meta.members {
         member.active = member.is_live();
     }
-    let read = hub.cursors(perspective)?.read;
+    let mut read = hub.cursors(perspective)?.read;
+    for (conv, count) in read_floor {
+        let position = read.entry(conv.clone()).or_default();
+        *position = (*position).max(*count);
+    }
     let mut convs: Vec<String> = meta
         .channels
         .iter()
@@ -535,6 +600,12 @@ pub fn post_target(row: &Row) -> Option<String> {
         Row::Channel(name) => Some(format!("#{name}")),
         Row::Dm { peer, .. } => Some(format!("@{peer}")),
     }
+}
+
+/// True when `handle` belongs to a person member, so its cursors are safe to save.
+fn is_person_member(meta: &store::HubMeta, handle: &str) -> bool {
+    meta.member(handle)
+        .is_some_and(|member| member.kind == MemberKind::Person)
 }
 
 fn clamp_selection(rows: &[Row], selected: usize) -> usize {
@@ -1549,25 +1620,30 @@ mod tests {
         }
     }
 
+    fn member(handle: &str, kind: MemberKind) -> store::Member {
+        store::Member {
+            handle: handle.to_string(),
+            label: "main".to_string(),
+            kind,
+            session_id: None,
+            active: true,
+            disconnected: false,
+            joined_ms: 0,
+            pid: None,
+        }
+    }
+
     fn hub_with_dms() -> (tempfile::TempDir, store::Hub) {
         let root = tempfile::tempdir().unwrap();
         let hub = store::Hub::create(root.path(), "demo").unwrap();
         hub.update_meta(|meta| {
             for handle in ["front", "back", "me"] {
-                meta.members.push(store::Member {
-                    handle: handle.to_string(),
-                    label: "main".to_string(),
-                    kind: if handle == "me" {
-                        MemberKind::Person
-                    } else {
-                        MemberKind::Agent
-                    },
-                    session_id: None,
-                    active: true,
-                    disconnected: false,
-                    joined_ms: 0,
-                    pid: None,
-                });
+                let kind = if handle == "me" {
+                    MemberKind::Person
+                } else {
+                    MemberKind::Agent
+                };
+                meta.members.push(member(handle, kind));
             }
         })
         .unwrap();
@@ -1584,7 +1660,7 @@ mod tests {
     }
 
     fn open(hub: store::Hub) -> HubBrowserState {
-        HubBrowserState::open(hub, "me".to_string(), None).unwrap()
+        HubBrowserState::open(hub, "me", None).unwrap()
     }
 
     fn dm(peer: &str, perspective: &str) -> Row {
@@ -1707,7 +1783,7 @@ mod tests {
     #[test]
     fn compose_posts_to_the_selected_target() {
         let (_root, hub) = hub_with_dms();
-        let mut state = HubBrowserState::open(hub, "me".to_string(), Some("#general")).unwrap();
+        let mut state = HubBrowserState::open(hub, "me", Some("#general")).unwrap();
         assert_eq!(state.handle_key(&key(KeyCode::Tab)), HubKeyOutcome::Changed);
         assert!(state.is_composing);
         for c in "hi all".chars() {
@@ -1819,6 +1895,87 @@ mod tests {
         state.finish_post("#general", Ok("message-id".to_string()));
         state.handle_key(&key(KeyCode::Esc));
         assert_eq!(state.post_target().as_deref(), Some("@front"));
+    }
+
+    #[test]
+    fn a_row_click_after_a_post_releases_the_old_destination() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("hi");
+        assert!(matches!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post { .. }
+        ));
+        state.finish_post("#general", Ok("message-id".to_string()));
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let (y, _) = *state
+            .hits
+            .rows
+            .iter()
+            .find(|(_, idx)| state.rows()[*idx] == dm("front", "me"))
+            .unwrap();
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), 3, y);
+        assert!(!state.is_composing);
+        assert_eq!(state.post_target().as_deref(), Some("@front"));
+    }
+
+    #[test]
+    fn switching_back_to_the_person_marks_only_the_shown_conversation_read() {
+        let (_root, hub) = hub_with_dms();
+        let back_dm = store::dm_conv("back", "me");
+        hub.append(&message("back", back_dm.clone(), "unread", store::now_ms()))
+            .unwrap();
+        let mut state = open(hub.clone());
+        state.set_perspective("front").unwrap();
+        let front_dm = store::dm_conv("front", "me");
+        let idx = state
+            .rows()
+            .iter()
+            .position(|row| row.conv().as_deref() == Some(front_dm.as_str()))
+            .unwrap();
+        state.select(idx);
+
+        state.set_perspective("me").unwrap();
+
+        assert_eq!(
+            state.selected_row().and_then(|row| row.conv()),
+            Some(front_dm)
+        );
+        assert_eq!(hub.cursors("me").unwrap().read.get(&back_dm), None);
+        assert_eq!(state.snapshot.unread(&back_dm), 1);
+    }
+
+    #[test]
+    fn an_agent_that_takes_the_person_handle_keeps_its_cursors() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "tony", None).unwrap();
+        assert_eq!(state.person, "tony");
+        hub.update_meta(|meta| meta.members.push(member("tony", MemberKind::Agent)))
+            .unwrap();
+
+        state.reload().unwrap();
+
+        assert_eq!(state.person, "tony-2");
+        assert!(state.is_person_view());
+        assert!(hub.cursors("tony").unwrap().read.is_empty());
+        assert!(
+            hub.cursors("tony-2").unwrap().read.is_empty(),
+            "not reserved yet"
+        );
+        assert_eq!(state.snapshot.unread("#general"), 0, "kept in memory");
+
+        // The first post reserves the person handle this way.
+        agent_hub::ensure_person(&hub, state.person_name()).unwrap();
+        state.reload().unwrap();
+
+        assert_eq!(state.person, "tony-2");
+        assert_eq!(
+            hub.cursors("tony-2").unwrap().read.get("#general"),
+            Some(&1)
+        );
     }
 
     #[test]

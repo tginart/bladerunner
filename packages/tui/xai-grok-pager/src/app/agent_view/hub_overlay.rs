@@ -58,11 +58,12 @@ impl AgentView {
             HubKeyOutcome::Changed => {}
             HubKeyOutcome::Post { to, text } => {
                 let result =
-                    agent_hub::post_as_person(&browser.hub, &browser.person, &to, &text, &[]);
-                browser.finish_post(&to, result);
+                    agent_hub::post_as_person(&browser.hub, browser.person_name(), &to, &text, &[]);
+                // The post can reserve a new person handle, so read it before the notice.
                 if let Err(error) = browser.reload() {
                     tracing::warn!(%error, "hub browser: reload failed");
                 }
+                browser.finish_post(&to, result);
             }
         }
         Some(InputOutcome::Changed)
@@ -79,8 +80,7 @@ impl AgentView {
             None => self.session_hub_name(&root)?,
         };
         let hub = open_named_hub(&root, &name)?;
-        let person = agent_hub::person_handle_in(&hub.meta()?, &store::person_handle());
-        HubBrowserState::open(hub, person, channel)
+        HubBrowserState::open(hub, &store::person_handle(), channel)
     }
 
     fn session_hub_name(&self, root: &std::path::Path) -> anyhow::Result<String> {
@@ -118,9 +118,8 @@ mod tests {
         let bus = AgentBus::new(root.path().to_path_buf(), "root").unwrap();
         bus.register(MAIN_PEER_ID, "main", None);
         bus.join("team", Some("worker"), "unused", true).unwrap();
-        let person = agent_hub::person_handle_in(&bus.hub().meta().unwrap(), "me");
         let mut view = crate::test_util::make_agent_view(None, "/tmp");
-        view.hub_browser = Some(HubBrowserState::open(bus.hub(), person, None).unwrap());
+        view.hub_browser = Some(HubBrowserState::open(bus.hub(), "me", None).unwrap());
         (root, view, bus)
     }
 
