@@ -5,7 +5,8 @@
 //! Method:
 //!     1. Wrap the task text in a fixed instruction for the agent.
 //!     2. Inject the instruction as a structured prompt (like `/loop`).
-//!     3. The agent calls its subagent tool once and relays the result.
+//!     3. The agent starts one background subagent and ends its turn.
+//!     4. The completion notice wakes the agent, and it relays the result.
 //! Note: The command does not gate on the subagent tool name. Toolsets use
 //! different wire names for it (`task`, `Task`, `spawn_subagent`), and
 //! `required_tools()` matches names exactly.
@@ -73,15 +74,19 @@ fn subtask_instruction(task: &str) -> String {
          Do not do the task yourself.\n\
          \n\
          1. Call your subagent tool (the tool that launches a subagent) exactly \
-         once, in the foreground (run_in_background: false).\n\
+         once, in the background (run_in_background: true).\n\
          2. Use the general-purpose subagent type unless the task clearly fits a \
          more specific type listed in the tool description.\n\
          3. Set the prompt to the task text exactly as written. The subagent \
          does not see this conversation, so after the task text add only the \
          context it needs (file paths, decisions, constraints already set here).\n\
          4. Set the description to a 3-5 word summary of the task.\n\
-         5. When the subagent finishes, give the user a short summary of its \
-         result. Say plainly if it failed or did not finish.\n\
+         5. After the subagent starts, tell the user in one line that it is \
+         running, then end your turn. Do not wait for it or poll it, and do \
+         not start the task yourself, even if the tool result says to continue \
+         parent work. You will be notified when it completes.\n\
+         6. When the completion notice arrives, give the user a short summary \
+         of the result. Say plainly if it failed or did not finish.\n\
          \n\
          If you have no subagent tool, tell the user that /subtask is not \
          available in this session and stop.\n\
@@ -138,6 +143,8 @@ mod tests {
                     panic!("expected one text block, got {prompt_blocks:?}");
                 };
                 assert!(text.text.contains("subagent tool"));
+                assert!(text.text.contains("run_in_background: true"));
+                assert!(text.text.contains("end your turn"));
                 assert!(
                     text.text
                         .ends_with("<task>\nrefactor the auth flow\n</task>"),
