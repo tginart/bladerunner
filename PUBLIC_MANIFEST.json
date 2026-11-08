@@ -35,7 +35,7 @@
     {
       "path": "Cargo.lock",
       "bytes": 411403,
-      "sha256": "b3f336fd7230b704530d05316b4d9c7220ac55a9c52d6bfcf0bbd4907d5e26fc",
+      "sha256": "d57c2c6cec81b87e6c31c21d05c1c4925b5dd59f8de9a943efb692b342ce806c",
       "mode": "0644"
     },
     {
@@ -83,7 +83,7 @@
     {
       "path": "VERSION",
       "bytes": 7,
-      "sha256": "3d901930de0e241026725466cc51b31b51951b7c18e55360047c8dcb459d9332",
+      "sha256": "88804ba15933968c7cdea26762dc0a9a6d938a2a816b48b5c270931c7fc9e982",
       "mode": "0644"
     },
     {
@@ -3407,7 +3407,7 @@
     {
       "path": "packages/coding-agent/xai-grok-pager-bin/Cargo.toml",
       "bytes": 4451,
-      "sha256": "8214918c519e1073af08b2ccab2d14e7f1fb185b1b2fcb0790965e24c8214e02",
+      "sha256": "8babe211157d6db3bc5081cf9b751eb63677be45a444db805ef47c214c430d0e",
       "mode": "0644"
     },
     {
@@ -3575,7 +3575,7 @@
     {
       "path": "packages/coding-agent/xai-grok-shell/Cargo.toml",
       "bytes": 10709,
-      "sha256": "b647c5c5dc4e538ecf7f7ab904123f9c29b428738d82145dd12725e82a635ada",
+      "sha256": "4802cf58e80407a90df82ba9774f958204533a5f998c3fe037c5b7137bb0b596",
       "mode": "0644"
     },
     {
@@ -8717,7 +8717,7 @@
     {
       "path": "packages/platform/xai-grok-version/Cargo.toml",
       "bytes": 221,
-      "sha256": "6416708869b1e9ab027f9ba39455e6216827543a4afc1923b55781a34ac8bcc6",
+      "sha256": "8d42dc4adc94daad83d6a52b6e491b0c752b8256476b8487b61a3d0774ba2ae3",
       "mode": "0644"
     },
     {
@@ -13481,7 +13481,7 @@
     {
       "path": "packages/tui/xai-grok-pager/Cargo.toml",
       "bytes": 11509,
-      "sha256": "0aa0dfdbba43c7060a6b78e2b37b21bf6974c8eb13dd4f8e64a242ae6c085e6a",
+      "sha256": "da5a3245faa0e46fccc3317c54f9fbb33116ab299d8fa2d7a62fc7c601da3374",
       "mode": "0644"
     },
     {
@@ -14986,8 +14986,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/event_loop.rs",
-      "bytes": 258512,
-      "sha256": "a330487baa181c5ffadb1a79137d5f8f3e330a659760a3cd9a4b5ce7cc415ac8",
+      "bytes": 258902,
+      "sha256": "d3b84492a43aceab9232aa050025afa6a8c4915c1e8ef23691c871604c65d2c9",
       "mode": "0644"
     },
     {
@@ -15034,8 +15034,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/mod.rs",
-      "bytes": 102637,
-      "sha256": "cd1fc670fdc49a3cacdbad9da25aaba2a935100aa4bcd5003a20a7ad7f781f2a",
+      "bytes": 103648,
+      "sha256": "492b633f0464913a853fc702b2bb138e7b5d02ed45530064e0c2f445ca5a0ce7",
       "mode": "0644"
     },
     {
@@ -18219,6 +18219,12 @@
       "mode": "0644"
     },
     {
+      "path": "packages/tui/xai-grok-pager/tests/pty_e2e/mouse_tracking_stays_on.rs",
+      "bytes": 3908,
+      "sha256": "7455288e65d83959af9eb0e231cf6d92967025cebb6746dece4c3d52dafd1d0a",
+      "mode": "0644"
+    },
+    {
       "path": "packages/tui/xai-grok-pager/tests/pty_e2e/nested_quote_drag_copy_excludes_bars_pty.rs",
       "bytes": 4331,
       "sha256": "999db2a05e0e397062bc5d44cc7e49dfca76bf973d092db03f73d4019ff82d03",
@@ -18754,8 +18760,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/tests/pty_e2e_smoke.rs",
-      "bytes": 3236,
-      "sha256": "a25b19391b713b77470a56cb7817e061c5d72e43d59cd200b89171f0295f8f40",
+      "bytes": 3312,
+      "sha256": "0f358326d265309fb6e767ede1c9e2af6706c7eec9113ca63cbee686140fb369",
       "mode": "0644"
     },
     {
@@ -19120,14 +19126,14 @@
     },
     {
       "path": "packages/tui/xai-ratatui-inline/src/terminal.rs",
-      "bytes": 58949,
-      "sha256": "28aaedf673410532f73fbe88f386c0198f2b2af09218e8e752848f8d1789fc87",
+      "bytes": 60487,
+      "sha256": "0b43c284748bb47df01b2a1dc0600a6d610fc64e5b6eeb5d0cbb4e44582e3ebc",
       "mode": "0644"
     },
     {
       "path": "packages/tui/xai-ratatui-inline/src/tests.rs",
-      "bytes": 16995,
-      "sha256": "591ca825cf40258cbb47c0994268c34b7dbb7d8083cae9a52027ed07c1ef5f15",
+      "bytes": 19338,
+      "sha256": "6fd0d44c1576f69e3cfc2bf7d55bc2c43106d8662315e45a249d4831c17769a0",
       "mode": "0644"
     },
     {
