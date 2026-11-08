@@ -55,6 +55,15 @@ pub(super) fn push_turn_terminal_marker(
         }
     };
 
+    // A `/hub` command turn ends in its card; a "Worked for 0.0s" line adds nothing.
+    let ends_in_hub_card = agent.scrollback.last().is_some_and(|entry| {
+        matches!(
+            entry.block,
+            crate::scrollback::block::RenderBlock::HubCard(_)
+        )
+    });
+    let event = event
+        .filter(|event| !(ends_in_hub_card && matches!(event, SessionEvent::TurnCompleted { .. })));
     match event {
         Some(event) => {
             agent.push_end_marker_block(event, groups, ending_prompt_id.map(str::to_string));

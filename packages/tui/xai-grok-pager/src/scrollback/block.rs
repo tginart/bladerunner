@@ -15,10 +15,10 @@ use crate::prompt_images::{InlineMediaInfo, ScrollbackImageRef, ScrollbackVideoR
 use super::blocks::mermaid_content::DiagramAffordance;
 use super::blocks::{
     AgentMessageBlock, BgTaskBlock, BtwBlock, ContextInfoBlock, CreditLimitBlock,
-    EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
-    ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock,
-    SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock,
-    UserPromptBlock, WorkflowBlock,
+    EditToolCallBlock, ExecuteToolCallBlock, HubCardBlock, LineRange, ListDirToolCallBlock,
+    OtherToolCallBlock, ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent,
+    SessionEventBlock, SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock,
+    ToolCallBlock, UserPromptBlock, WorkflowBlock,
 };
 use super::types::{
     AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
@@ -394,6 +394,8 @@ pub enum RenderBlock {
     ContextInfo(ContextInfoBlock),
     /// Credit-limit card for max-tier users (red accent, single action).
     CreditLimit(CreditLimitBlock),
+    /// Agent hub card: a `/hub` reply or a wake with hub messages.
+    HubCard(HubCardBlock),
 }
 
 /// Delegate a method call to the inner block variant.
@@ -413,6 +415,7 @@ macro_rules! delegate_block {
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
+            RenderBlock::HubCard(b) => b.$method($($arg),*),
         }
     };
 }
@@ -771,6 +774,11 @@ impl RenderBlock {
         RenderBlock::System(SystemMessageBlock::new(text))
     }
 
+    /// Create a hub card for the reply to a `/hub` command.
+    pub fn hub_command_card(title: impl Into<String>, markdown: impl Into<String>) -> Self {
+        RenderBlock::HubCard(HubCardBlock::command(title, markdown))
+    }
+
     /// Create a `/context` snapshot block.
     ///
     /// The block stores the raw `ContextInfo` snapshot + model name and
@@ -973,6 +981,7 @@ impl RenderBlock {
             RenderBlock::AgentMessage(b) => b.content().evict_wrap_cache(),
             RenderBlock::Thinking(b) => b.content().evict_wrap_cache(),
             RenderBlock::Btw(b) => b.content().evict_wrap_cache(),
+            RenderBlock::HubCard(b) => b.content().evict_wrap_cache(),
             _ => {}
         }
     }
@@ -1030,6 +1039,7 @@ impl RenderBlock {
             | RenderBlock::ContextInfo(_)
             | RenderBlock::CreditLimit(_) => None,
             RenderBlock::Btw(_) => Some(theme.accent_plan),
+            RenderBlock::HubCard(_) => Some(theme.accent_verify),
             RenderBlock::Stub(block) => Some(block.accent_color),
         }
     }
@@ -1178,6 +1188,10 @@ impl RenderBlock {
             RenderBlock::CreditLimit(b) => {
                 join_searchable([Some(b.heading.clone()), Some(b.url.clone())])
             }
+            RenderBlock::HubCard(b) => join_searchable([
+                Some(b.title.clone()),
+                Some(b.content().rendered_plain_text()),
+            ]),
             RenderBlock::ToolCall(tc) => tc.searchable_text(),
         }
     }
@@ -1211,6 +1225,7 @@ impl RenderBlock {
             RenderBlock::AgentMessage(b) => b.content().with_hyperlinks(f),
             RenderBlock::Thinking(b) => b.content().with_hyperlinks(f),
             RenderBlock::Btw(b) => b.content().with_hyperlinks(f),
+            RenderBlock::HubCard(b) => b.content().with_hyperlinks(f),
             _ => f(&[]),
         }
     }

@@ -1038,6 +1038,7 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             RenderBlock::Btw(_) => return "Btw".to_string(),
             RenderBlock::ContextInfo(_) => return "Context".to_string(),
             RenderBlock::CreditLimit(_) => return "Credit limit".to_string(),
+            RenderBlock::HubCard(_) => return "Hub".to_string(),
             // The user's latest input marks the turn boundary — there's
             // no agent response after it yet.
             RenderBlock::UserPrompt(_) => break,
@@ -1167,6 +1168,7 @@ fn block_short_text(block: &crate::scrollback::block::RenderBlock) -> Option<Str
         RenderBlock::Btw(_) => Some("(btw)".to_string()),
         RenderBlock::ContextInfo(_) => Some("(context info)".to_string()),
         RenderBlock::CreditLimit(_) => Some("(credit limit)".to_string()),
+        RenderBlock::HubCard(b) => Some(format!("(hub) {}", b.title)),
         RenderBlock::Stub(_) => None,
     }
 }

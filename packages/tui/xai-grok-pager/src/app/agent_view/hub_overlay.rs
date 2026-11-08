@@ -1,7 +1,7 @@
-//! Controller for the hub browser overlay (`/hub open`): open, input, refresh.
+//! Controller for the hub browser overlay (`/hub open [name] [#channel]`).
 
 use anyhow::Context;
-use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use xai_grok_tools::implementations::grok_build::agent_hub::{self, store};
 
 use super::AgentView;
@@ -9,16 +9,12 @@ use crate::app::app_view::InputOutcome;
 use crate::key;
 use crate::scrollback::block::RenderBlock;
 use crate::views::hub_browser::{HubBrowserState, HubKeyOutcome};
-use crate::views::modal_window::{ModalWindowOutcome, handle_modal_mouse};
-
-/// Feed lines that one mouse wheel step scrolls.
-const WHEEL_LINES: usize = 3;
 
 impl AgentView {
-    /// Open the browser on this session's hub. When the session is in no
-    /// named hub, say so in the scrollback instead.
-    pub(crate) fn open_hub_browser(&mut self, channel: Option<&str>) {
-        match self.load_hub_browser(channel) {
+    /// Open the browser on a hub: the named hub, or this session's hub when
+    /// `hub` is `None`. On failure, say why in the scrollback instead.
+    pub(crate) fn open_hub_browser(&mut self, hub: Option<&str>, channel: Option<&str>) {
+        match self.load_hub_browser(hub, channel) {
             Ok(browser) => {
                 self.hub_browser = Some(browser);
                 self.show_goal_detail = false;
@@ -44,55 +40,70 @@ impl AgentView {
 
     pub(super) fn handle_hub_browser_input(&mut self, ev: &Event) -> Option<InputOutcome> {
         let browser = self.hub_browser.as_mut()?;
-        match ev {
-            Event::Key(key) if key.kind == KeyEventKind::Release => {}
+        let outcome = match ev {
+            Event::Key(key) if key.kind == KeyEventKind::Release => HubKeyOutcome::Changed,
             Event::Key(key) if key!('q', CONTROL).matches(key) => {
                 return Some(InputOutcome::Unchanged);
             }
-            Event::Key(key) => match browser.handle_key(key) {
-                HubKeyOutcome::Close => self.hub_browser = None,
-                HubKeyOutcome::Changed => {}
-                HubKeyOutcome::Post { to, text } => {
-                    let result =
-                        agent_hub::post_as_person(&browser.hub, &browser.person, &to, &text, &[]);
-                    browser.finish_post(&to, result);
-                    if let Err(error) = browser.reload() {
-                        tracing::warn!(%error, "hub browser: reload failed");
-                    }
-                }
-            },
-            Event::Paste(text) => browser.handle_paste(text),
-            Event::Mouse(mouse) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => browser.feed_scroll += WHEEL_LINES,
-                    MouseEventKind::ScrollDown => {
-                        browser.feed_scroll = browser.feed_scroll.saturating_sub(WHEEL_LINES);
-                    }
-                    _ => {}
-                }
-                let outcome =
-                    handle_modal_mouse(&mut browser.window, mouse.kind, mouse.column, mouse.row);
-                if outcome == ModalWindowOutcome::CloseRequested {
-                    self.hub_browser = None;
-                }
+            Event::Key(key) => browser.handle_key(key),
+            Event::Paste(text) => {
+                browser.handle_paste(text);
+                HubKeyOutcome::Changed
             }
-            _ => {}
+            Event::Mouse(mouse) => browser.handle_mouse(mouse.kind, mouse.column, mouse.row),
+            _ => HubKeyOutcome::Changed,
+        };
+        match outcome {
+            HubKeyOutcome::Close => self.hub_browser = None,
+            HubKeyOutcome::Changed => {}
+            HubKeyOutcome::Post { to, text } => {
+                let result =
+                    agent_hub::post_as_person(&browser.hub, browser.person_name(), &to, &text, &[]);
+                // The post can reserve a new person handle, so read it before the notice.
+                if let Err(error) = browser.reload() {
+                    tracing::warn!(%error, "hub browser: reload failed");
+                }
+                browser.finish_post(&to, result);
+            }
         }
         Some(InputOutcome::Changed)
     }
 
-    fn load_hub_browser(&self, channel: Option<&str>) -> anyhow::Result<HubBrowserState> {
+    fn load_hub_browser(
+        &self,
+        hub: Option<&str>,
+        channel: Option<&str>,
+    ) -> anyhow::Result<HubBrowserState> {
+        let root = xai_grok_shell::session::hub::hubs_root();
+        let name = match hub {
+            Some(name) => name.to_string(),
+            None => self.session_hub_name(&root)?,
+        };
+        let hub = open_named_hub(&root, &name)?;
+        HubBrowserState::open(hub, &store::person_handle(), channel)
+    }
+
+    fn session_hub_name(&self, root: &std::path::Path) -> anyhow::Result<String> {
         let session_id = self
             .session
             .session_id
             .as_ref()
             .context("the session has not started yet")?;
-        let root = xai_grok_shell::session::hub::hubs_root();
-        let (name, _handle) = store::find_membership(&root, &session_id.0)
-            .context("this session is in no hub. Use /hub join <name> or /hub new <name>.")?;
-        let hub = store::Hub::open(&root, &name)?;
-        let person = agent_hub::ensure_person(&hub, &store::person_handle())?;
-        HubBrowserState::open(hub, person, channel)
+        let (name, _handle) = store::find_membership(root, &session_id.0).context(
+            "this session is in no hub. Use /hub open <name>, /hub join <name>, or /hub new <name>.",
+        )?;
+        Ok(name)
+    }
+}
+
+/// Open a hub by name, with a suggestion when the name does not exist.
+fn open_named_hub(root: &std::path::Path, name: &str) -> anyhow::Result<store::Hub> {
+    if let Ok(hub) = store::Hub::open(root, name) {
+        return Ok(hub);
+    }
+    match store::suggest_hub_name(root, name) {
+        Some(suggestion) => anyhow::bail!("no hub named {name}. Did you mean {suggestion}?"),
+        None => anyhow::bail!("no hub named {name}. Use /hub list to see the hubs."),
     }
 }
 
@@ -107,9 +118,8 @@ mod tests {
         let bus = AgentBus::new(root.path().to_path_buf(), "root").unwrap();
         bus.register(MAIN_PEER_ID, "main", None);
         bus.join("team", Some("worker"), "unused", true).unwrap();
-        let person = agent_hub::ensure_person(&bus.hub(), "me").unwrap();
         let mut view = crate::test_util::make_agent_view(None, "/tmp");
-        view.hub_browser = Some(HubBrowserState::open(bus.hub(), person, None).unwrap());
+        view.hub_browser = Some(HubBrowserState::open(bus.hub(), "me", None).unwrap());
         (root, view, bus)
     }
 
@@ -143,6 +153,10 @@ mod tests {
     fn post_to_a_gone_recipient_keeps_the_draft_and_destination() {
         let (_root, mut view, bus) = browser_with_agent();
         view.handle_hub_browser_input(&key_event(KeyCode::Down));
+        assert_eq!(
+            view.hub_browser.as_ref().unwrap().post_target().as_deref(),
+            Some("@worker")
+        );
         view.handle_hub_browser_input(&key_event(KeyCode::Tab));
         view.handle_hub_browser_input(&Event::Paste("please check".to_string()));
         bus.mark_gone(MAIN_PEER_ID);

@@ -59,6 +59,22 @@ pub fn render_blocks_to_markdown<'a>(blocks: impl IntoIterator<Item = &'a Render
                 out.push('\n');
                 last_was_agent = false;
             }
+            // Hub traffic is conversation: a wake carries the message that the
+            // agent answers next, so it stays in the export.
+            RenderBlock::HubCard(h) => {
+                if in_tools_section {
+                    out.push('\n');
+                    in_tools_section = false;
+                }
+                out.push_str(&format!("## Hub · {}", h.title));
+                if let Some(detail) = &h.detail {
+                    out.push_str(&format!(" ({detail})"));
+                }
+                out.push_str("\n\n");
+                out.push_str(&h.content().text());
+                out.push_str("\n\n");
+                last_was_agent = false;
+            }
             // Skip all non-conversation chrome: Thinking, System, SessionEvent, BgTask,
             // Subagent, Btw, CreditLimit, Stub, etc. Thinking blocks are
             // treated as intra-Assistant glue (no new header).
@@ -108,5 +124,34 @@ mod tests {
     fn empty_blocks_yield_empty_string() {
         let out = render_blocks_to_markdown(std::iter::empty::<&RenderBlock>());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hub_cards_stay_in_the_export() {
+        use xai_grok_tools::implementations::grok_build::agent_hub::{DeliveredMessage, Delivery};
+        let delivery = Delivery {
+            hub: Some("team".to_string()),
+            messages: vec![DeliveredMessage {
+                place: "#general".to_string(),
+                from: "me".to_string(),
+                is_person: true,
+                text: "please fix the build".to_string(),
+                image_count: 0,
+            }],
+        };
+        let blocks = [
+            RenderBlock::HubCard(crate::scrollback::blocks::HubCardBlock::delivery(&delivery)),
+            RenderBlock::hub_command_card("hubs", "- [team](</hub open team>)"),
+        ];
+        let out = render_blocks_to_markdown(blocks.iter());
+        assert!(
+            out.starts_with("## Hub · team (1 new message)\n\n"),
+            "{out}"
+        );
+        assert!(out.contains("please fix the build"), "{out}");
+        assert!(
+            out.contains("## Hub · hubs\n\n- [team](</hub open team>)"),
+            "{out}"
+        );
     }
 }

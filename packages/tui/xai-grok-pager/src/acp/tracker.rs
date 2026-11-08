@@ -935,6 +935,18 @@ impl AcpUpdateTracker {
             );
             return false;
         }
+        if let Some(title) = hub_card_title(&chunk) {
+            if let Some(agent_id) = self.current_agent_msg.take() {
+                scrollback.finish_running(agent_id);
+            }
+            let entry_id = scrollback.push_block(RenderBlock::hub_command_card(title, text));
+            if let Some(ts_ms) = meta.agent_timestamp_ms
+                && let Some(entry) = scrollback.get_by_id_mut(entry_id)
+            {
+                entry.created_at = Some(utc_ms_to_local(ts_ms));
+            }
+            return true;
+        }
         let is_new = self.current_agent_msg.is_none();
         let id = *self.current_agent_msg.get_or_insert_with(|| {
             let entry_id = scrollback.start_streaming_agent();
@@ -1256,6 +1268,16 @@ impl AcpUpdateTracker {
                 scrollback.finish_running(entry_id);
             }
         }
+        if let Some(card) = hub_delivery_card(&text) {
+            let entry_id = scrollback.push_block(card);
+            let ts_ms = meta.turn_start_ms.or(meta.agent_timestamp_ms);
+            if let Some(ms) = ts_ms
+                && let Some(entry) = scrollback.get_by_id_mut(entry_id)
+            {
+                entry.created_at = Some(utc_ms_to_local(ms));
+            }
+            return true;
+        }
         if self.skip_next_user_echo {
             self.skip_next_user_echo = false;
             if text.contains("<command-name>") {
@@ -1436,6 +1458,24 @@ fn extract_skill_header_command(text: &str) -> Option<String> {
     }
     Some(cmd_name.to_string())
 }
+/// The card title of a `/hub` reply chunk, or `None` for other agent text.
+fn hub_card_title(chunk: &acp::ContentChunk) -> Option<String> {
+    chunk
+        .meta
+        .as_ref()?
+        .get(xai_grok_shell::session::hub::HUB_CARD_META_KEY)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// A hub card for a user turn that is a hub wake, or `None` for other text.
+pub(crate) fn hub_delivery_card(text: &str) -> Option<RenderBlock> {
+    let delivery = xai_grok_tools::implementations::grok_build::agent_hub::parse_delivery(text)?;
+    Some(RenderBlock::HubCard(
+        crate::scrollback::blocks::HubCardBlock::delivery(&delivery),
+    ))
+}
+
 /// Whether a `UserMessageChunk` must stay out of scrollback.
 ///
 /// Type-driven (preferred):

@@ -26,8 +26,18 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::Hub { args } => {
-                let message = self.run_hub_command(args).await;
-                self.send_host_turn_slash_command_output(&message).await;
+                let reply = self.run_hub_command(args).await;
+                let mut chunk_meta = serde_json::Map::new();
+                chunk_meta.insert(
+                    crate::session::storage::HOST_TURN_META_KEY.into(),
+                    serde_json::json!(true),
+                );
+                chunk_meta.insert(
+                    crate::session::hub::HUB_CARD_META_KEY.into(),
+                    serde_json::json!(reply.title),
+                );
+                self.send_slash_command_output_with_meta(&reply.markdown, Some(chunk_meta))
+                    .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::Compact { user_context } => {
@@ -1091,9 +1101,12 @@ impl SessionActor {
     }
 
     /// Run `/hub` for the person. Hub calls touch disk, so they run off the actor.
-    async fn run_hub_command(self: &Arc<Self>, args: String) -> String {
+    async fn run_hub_command(self: &Arc<Self>, args: String) -> crate::session::hub::HubReply {
         let Some(bus) = self.rebuild_spec.agent_bus.as_ref() else {
-            return "/hub: hubs are not available in this session.".to_string();
+            return crate::session::hub::HubReply {
+                title: "hub".to_string(),
+                markdown: "/hub: hubs are not available in this session.".to_string(),
+            };
         };
         let bus = bus.bus().clone();
         let cwd_name = std::path::Path::new(&self.session_info.cwd)
@@ -1105,6 +1118,9 @@ impl SessionActor {
             crate::session::hub::run_command(&bus, &args, &default_handle)
         })
         .await
-        .unwrap_or_else(|e| format!("/hub: {e}"))
+        .unwrap_or_else(|e| crate::session::hub::HubReply {
+            title: "hub".to_string(),
+            markdown: format!("/hub: {e}"),
+        })
     }
 }

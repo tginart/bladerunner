@@ -1098,8 +1098,12 @@ pub enum Action {
     ToggleWorkflows,
     /// Open the side-by-side columns of the latest n-shot run.
     OpenShots,
-    /// Open the hub browser, optionally on a `#channel`.
-    OpenHubBrowser(Option<String>),
+    /// Open the hub browser on a named hub (or this session's hub), optionally
+    /// on a `#channel`.
+    OpenHubBrowser {
+        hub: Option<String>,
+        channel: Option<String>,
+    },
     /// Switch to the focused shot of the open n-shot columns view.
     NShotColumnsAttach,
     /// Open the columns view of the active agent's n-shot group with this label.

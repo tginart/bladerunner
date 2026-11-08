@@ -144,7 +144,14 @@ impl AgentView {
             }
             PlanApprovalFocus::Preview => {
                 vec![
-                    HintItem::new(key!('y'), format!("{} {}", rust_i18n::t!("hints.copy"), rust_i18n::t!("hints.plan"))),
+                    HintItem::new(
+                        key!('y'),
+                        format!(
+                            "{} {}",
+                            rust_i18n::t!("hints.copy"),
+                            rust_i18n::t!("hints.plan")
+                        ),
+                    ),
                     HintItem::new(key!(Tab), "prompt"),
                 ]
             }
@@ -194,7 +201,10 @@ impl AgentView {
             QuestionFocus::InputMode if qv.is_feedback() => {
                 vec![HintItem::new(key!(Enter), rust_i18n::t!("hints.send")), esc]
             }
-            QuestionFocus::InputMode => vec![HintItem::new(key!(Enter), rust_i18n::t!("hints.submit")), esc],
+            QuestionFocus::InputMode => vec![
+                HintItem::new(key!(Enter), rust_i18n::t!("hints.submit")),
+                esc,
+            ],
             QuestionFocus::Navigation => {
                 vec![
                     // Upstream changed Tab from leaving the card to cycling
@@ -1661,11 +1671,17 @@ impl AgentView {
             .session_id
             .as_ref()
             .and_then(|sid| crate::hub_status::hub_label_lazy(&sid.0));
+        let hub_offset = path_offset;
+        let mut hub_width: u16 = 0;
         if let Some(label) = hub_label {
-            let hub_text = format!("{label} ");
-            let hub_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
-            path_offset += hub_text.width() as u16;
-            parts.push(Span::styled(hub_text, hub_style));
+            let mut hub_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
+            if self.hit_hub_label.hovered {
+                hub_style = hub_style.add_modifier(ratatui::style::Modifier::UNDERLINED);
+            }
+            hub_width = label.width() as u16;
+            path_offset += hub_width + 1;
+            parts.push(Span::styled(label, hub_style));
+            parts.push(Span::styled(" ", Style::default().bg(theme.bg_base)));
         }
         if let Some(git_text) = git_text {
             let git_style = Style::default()
@@ -1736,6 +1752,13 @@ impl AgentView {
             x: layout.status_bar.x,
             y: layout.status_bar.y,
             width: visible_shot_width,
+            height: 1,
+        });
+        let visible_hub_width = hub_width.min(cwd_width.saturating_sub(hub_offset));
+        self.hit_hub_label.rect = (visible_hub_width > 0).then_some(Rect {
+            x: layout.status_bar.x + hub_offset,
+            y: layout.status_bar.y,
+            width: visible_hub_width,
             height: 1,
         });
         let path_x = layout.status_bar.x + path_offset;
@@ -3645,14 +3668,28 @@ impl AgentView {
                 } else {
                     h.push(HintItem::new(key!('a'), "approve"));
                 }
-                h.push(HintItem::new(key!('y'), format!("{} {}", rust_i18n::t!("hints.copy"), rust_i18n::t!("hints.plan"))));
+                h.push(HintItem::new(
+                    key!('y'),
+                    format!(
+                        "{} {}",
+                        rust_i18n::t!("hints.copy"),
+                        rust_i18n::t!("hints.plan")
+                    ),
+                ));
                 h.push(HintItem::new(key!('q'), "quit plan"));
                 h.push(HintItem::new(key!(Tab), "prompt"));
                 h
             } else if in_plan_approval {
                 let mut h = vec![
                     HintItem::new(key!('c'), "comment"),
-                    HintItem::new(key!('y'), format!("{} {}", rust_i18n::t!("hints.copy"), rust_i18n::t!("hints.plan"))),
+                    HintItem::new(
+                        key!('y'),
+                        format!(
+                            "{} {}",
+                            rust_i18n::t!("hints.copy"),
+                            rust_i18n::t!("hints.plan")
+                        ),
+                    ),
                 ];
                 if approval_has_comments {
                     h.push(HintItem::new(key!('s'), "send"));
@@ -3679,12 +3716,26 @@ impl AgentView {
                     vec![
                         HintItem::new(key!(Enter), "edit"),
                         HintItem::new(key!('x'), "delete"),
-                        HintItem::new(key!('y'), format!("{} {}", rust_i18n::t!("hints.copy"), rust_i18n::t!("hints.plan"))),
+                        HintItem::new(
+                            key!('y'),
+                            format!(
+                                "{} {}",
+                                rust_i18n::t!("hints.copy"),
+                                rust_i18n::t!("hints.plan")
+                            ),
+                        ),
                     ]
                 } else {
                     vec![
                         HintItem::new(key!('c'), "comment"),
-                        HintItem::new(key!('y'), format!("{} {}", rust_i18n::t!("hints.copy"), rust_i18n::t!("hints.plan"))),
+                        HintItem::new(
+                            key!('y'),
+                            format!(
+                                "{} {}",
+                                rust_i18n::t!("hints.copy"),
+                                rust_i18n::t!("hints.plan")
+                            ),
+                        ),
                     ]
                 };
                 if has_plan_comments {
@@ -4502,10 +4553,9 @@ impl AgentView {
             self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
         }
-        if let Some(browser) = self.hub_browser.as_mut()
-            && let Some(popup) = crate::views::hub_browser::render_hub_browser(buf, area, browser)
-        {
-            self.frame_occluder_rects.push(popup);
+        if let Some(browser) = self.hub_browser.as_mut() {
+            let covered = crate::views::hub_browser::render_hub_browser(buf, area, browser);
+            self.frame_occluder_rects.push(covered);
         }
         if self.show_workflows {
             // List navigation and later notifications can reveal deferred children too.
@@ -4614,7 +4664,10 @@ impl AgentView {
                 }
             }
         }
-        let cursor = if self.inline_edit.is_some() {
+        let cursor = if self.hub_browser.is_some() {
+            // The hub browser covers the prompt and draws its own cursor.
+            None
+        } else if self.inline_edit.is_some() {
             inline_edit_cursor
         } else {
             prompt_cursor_pos

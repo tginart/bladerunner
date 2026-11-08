@@ -1038,6 +1038,114 @@ pub fn ensure_person(hub: &Hub, person: &str) -> Result<String> {
     })
 }
 
+/// Purpose: Find the handle that [`ensure_person`] gives, without a write.
+/// Input: The hub metadata and the person's preferred handle.
+/// Output: The person's member handle, or the free handle that a first post takes.
+/// Note: The result is never the handle of an agent.
+pub fn person_handle_in(meta: &HubMeta, person: &str) -> String {
+    for n in 1.. {
+        let handle = if n == 1 {
+            store::handle_candidate(person, "")
+        } else {
+            store::handle_candidate(person, &format!("-{n}"))
+        };
+        if handle == HERE_MENTION {
+            continue;
+        }
+        match meta.member(&handle) {
+            Some(member) if member.kind != MemberKind::Person => continue,
+            _ => return handle,
+        }
+    }
+    unreachable!("an unused person handle exists")
+}
+
+/// Purpose: Move a member's read cursor forward in one conversation.
+/// Input: The hub, the member handle, the conversation key, and the message count read.
+/// Output: Ok when the cursor is saved. A cursor never moves back.
+pub fn mark_read(hub: &Hub, handle: &str, conv: &str, count: usize) -> Result<()> {
+    let _lock = hub.lock_cursors(handle)?;
+    let mut cursors = hub.cursors(handle)?;
+    let read = cursors.read.entry(conv.to_string()).or_default();
+    if *read >= count {
+        return Ok(());
+    }
+    *read = count;
+    hub.save_cursors(handle, &cursors)
+}
+
+/// One message of a wake, as [`format_messages`] wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredMessage {
+    /// `#channel`, or `DM`.
+    pub place: String,
+    pub from: String,
+    pub is_person: bool,
+    pub text: String,
+    pub image_count: usize,
+}
+
+/// A wake text, parsed back for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    /// The named hub, or `None` for the private session hub.
+    pub hub: Option<String>,
+    pub messages: Vec<DeliveredMessage>,
+}
+
+/// Purpose: Parse a wake text that [`format_messages`] made.
+/// Input: The text of a user turn.
+/// Output: The hub and its messages, or `None` when the text is not a wake.
+/// Note: The model still sees the original text. Only a UI uses this.
+pub fn parse_delivery(text: &str) -> Option<Delivery> {
+    let header = text.lines().next()?;
+    let place = header.strip_prefix('[')?.split_once(']')?.0;
+    let hub = match place.strip_prefix(AGENT_HUB_MODEL_NAME)? {
+        "" => None,
+        rest => Some(rest.strip_prefix(" · hub ")?.to_string()),
+    };
+    let mut messages: Vec<DeliveredMessage> = Vec::new();
+    for line in text.lines().skip(1) {
+        if let Some(message) = parse_delivery_section(line) {
+            messages.push(message);
+            continue;
+        }
+        let Some(current) = messages.last_mut() else {
+            return None;
+        };
+        if line.starts_with("[image: ") && line.ends_with(']') {
+            current.image_count += 1;
+            continue;
+        }
+        if !current.text.is_empty() {
+            current.text.push('\n');
+        }
+        current.text.push_str(line);
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    Some(Delivery { hub, messages })
+}
+
+/// Parse a `--- <place> · from @<handle>[ (person)] · id=<id> ---` line.
+fn parse_delivery_section(line: &str) -> Option<DeliveredMessage> {
+    let inner = line.strip_prefix("--- ")?.strip_suffix(" ---")?;
+    let (place, rest) = inner.split_once(" · from @")?;
+    let (from, _id) = rest.rsplit_once(" · id=")?;
+    let (from, is_person) = match from.strip_suffix(" (person)") {
+        Some(from) => (from, true),
+        None => (from, false),
+    };
+    Some(DeliveredMessage {
+        place: place.to_string(),
+        from: from.to_string(),
+        is_person,
+        text: String::new(),
+        image_count: 0,
+    })
+}
+
 fn set_active(meta: &mut HubMeta, handle: &str, active: bool) {
     if let Some(member) = meta.members.iter_mut().find(|m| m.handle == handle) {
         member.active = active;
@@ -1074,6 +1182,70 @@ mod tests {
 
     fn texts(messages: &[Message]) -> Vec<&str> {
         messages.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn parse_delivery_reads_back_format_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        let person = ensure_person(&hub, "me").unwrap();
+        let mut messages = Vec::new();
+        for (from, conv, text) in [
+            (
+                "front",
+                "#general".to_string(),
+                "build is green\nsecond line",
+            ),
+            (
+                person.as_str(),
+                store::dm_conv("me", "front"),
+                "--- not a header",
+            ),
+        ] {
+            messages.push(Message {
+                id: format!("id-{from}"),
+                conv,
+                from: from.to_string(),
+                text: text.to_string(),
+                reply_to: None,
+                mentions: Vec::new(),
+                images: vec!["a.png".to_string()],
+                ts_unix_ms: 0,
+            });
+        }
+        let meta = hub.meta().unwrap();
+        let delivery = parse_delivery(&format_messages(&hub, &meta, &messages)).unwrap();
+        assert_eq!(delivery.hub.as_deref(), Some("team"));
+        assert_eq!(
+            delivery.messages,
+            vec![
+                DeliveredMessage {
+                    place: "#general".to_string(),
+                    from: "front".to_string(),
+                    is_person: false,
+                    text: "build is green\nsecond line".to_string(),
+                    image_count: 1,
+                },
+                DeliveredMessage {
+                    place: "DM".to_string(),
+                    from: "me".to_string(),
+                    is_person: true,
+                    text: "--- not a header".to_string(),
+                    image_count: 1,
+                },
+            ]
+        );
+        assert_eq!(parse_delivery("hello"), None);
+        assert_eq!(parse_delivery("[message_agents] 0 message(s)."), None);
+    }
+
+    #[test]
+    fn mark_read_only_moves_forward() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        mark_read(&hub, "me", "#general", 3).unwrap();
+        mark_read(&hub, "me", "#general", 1).unwrap();
+        assert_eq!(hub.cursors("me").unwrap().read["#general"], 3);
     }
 
     #[test]
@@ -1391,6 +1563,8 @@ mod tests {
         assert_eq!(messages[0].from, "tony-3");
         assert_eq!(messages[0].mentions, vec![HERE_MENTION]);
         assert!(format_messages(&hub, &meta, &messages).contains("from @tony-3 (person)"));
+        assert_eq!(person_handle_in(&meta, "tony"), "tony-3");
+        assert_eq!(person_handle_in(&meta, "nobody"), "nobody");
         bus.mark_gone(MAIN_PEER_ID);
         assert_eq!(ensure_person(&hub, "tony").unwrap(), "tony-3");
     }

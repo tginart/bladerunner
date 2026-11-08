@@ -67,7 +67,7 @@ async fn hub_startup_completes_before_the_headless_task_and_reports_errors() {
                     request: acp::SessionNotification::new(
                         session_id.clone(),
                         acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                            acp::ContentBlock::Text(acp::TextContent::new(output)),
+                            acp::ContentBlock::Text(acp::TextContent::new(output.markdown)),
                         )),
                     ),
                     response_tx,

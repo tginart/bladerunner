@@ -852,9 +852,9 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
         }
     }
 
-    agent
-        .scrollback
-        .push_block(RenderBlock::interjection_prompt(text));
+    let block = crate::acp::tracker::hub_delivery_card(text)
+        .unwrap_or_else(|| RenderBlock::interjection_prompt(text));
+    agent.scrollback.push_block(block);
     is_active
 }
 
