@@ -266,6 +266,14 @@ impl AgentView {
                 {
                     return InputOutcome::Action(Action::OpenNShotParent);
                 }
+                if self.hit_hub_label.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(Action::OpenHubBrowser {
+                        hub: None,
+                        channel: None,
+                    });
+                }
                 if self.hit_cwd.contains(mouse.column, mouse.row) {
                     let path = self.session.cwd.display().to_string();
                     self.copy_to_clipboard(&path);
@@ -1143,6 +1151,7 @@ impl AgentView {
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_n_shot_label.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_hub_label.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_upgrade_cta.update_hover(mouse.column, mouse.row);
                 {
                     let new_kill = self

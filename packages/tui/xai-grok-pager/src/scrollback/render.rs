@@ -604,6 +604,7 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
         if !is_group_header || verb_expanded_slot {
             let content_line_offset = match &entry.block {
                 RenderBlock::Btw(_) if ctx.mode != DisplayMode::Collapsed => 2,
+                RenderBlock::HubCard(_) => crate::scrollback::blocks::HUB_CARD_HEADER_LINES,
                 RenderBlock::Thinking(_)
                     if ctx.mode != DisplayMode::Collapsed
                         && appearance.scrollback.blocks.thinking.header =>

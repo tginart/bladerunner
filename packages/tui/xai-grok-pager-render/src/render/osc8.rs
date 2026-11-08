@@ -19,6 +19,13 @@ use unicode_width::UnicodeWidthStr;
 /// command. Each entry must be safe to run on a single click.
 const RUNNABLE_LINK_COMMANDS: &[&str] = &["/computer-use install"];
 
+/// Prefix of the one runnable command family with an argument: `/hub open <name>`.
+/// It only shows a hub, so a click is safe for any valid hub name.
+const HUB_OPEN_LINK_PREFIX: &str = "/hub open ";
+
+/// Longest hub name, in characters (as in the hub store).
+const MAX_HUB_NAME_CHARS: usize = 64;
+
 /// Semantic destination of a pager link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkTarget {
@@ -95,11 +102,22 @@ pub fn resolve_link_target_for_context(
 
 /// Map a markdown link destination to a runnable slash command target.
 ///
-/// Returns `None` unless the destination is exactly an allowlisted command.
+/// Returns `None` unless the destination is exactly an allowlisted command,
+/// or `/hub open <name>` with a valid hub name.
 pub fn slash_command_link_target(dest: &str) -> Option<LinkTarget> {
-    RUNNABLE_LINK_COMMANDS
-        .contains(&dest)
-        .then(|| LinkTarget::SlashCommand(Arc::from(dest)))
+    let is_runnable = RUNNABLE_LINK_COMMANDS.contains(&dest)
+        || dest
+            .strip_prefix(HUB_OPEN_LINK_PREFIX)
+            .is_some_and(is_hub_name);
+    is_runnable.then(|| LinkTarget::SlashCommand(Arc::from(dest)))
+}
+
+fn is_hub_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_HUB_NAME_CHARS
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
 }
 
 /// Resolve the target for app-owned activation.
@@ -855,9 +873,17 @@ mod tests {
             "/computer-use install now",
             "/always-approve",
             "/quit",
+            "/hub open ",
+            "/hub open team; /quit",
+            "/hub open Team",
+            "/hub join team",
         ] {
             assert!(slash_command_link_target(dest).is_none(), "{dest}");
         }
+        assert_eq!(
+            slash_command_link_target("/hub open team-2"),
+            Some(LinkTarget::SlashCommand(Arc::from("/hub open team-2")))
+        );
 
         let file = LinkTarget::File(Arc::from(Path::new("/tmp/a b.rs")));
         assert_eq!(

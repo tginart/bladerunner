@@ -13,7 +13,9 @@ use xai_grok_tools::implementations::grok_build::agent_hub::{
 
 use crate::util::grok_home::grok_home;
 
-const USAGE: &str = "Usage: /hub [list | new <name> [as @handle] | join <name> [as @handle] | leave | open [#channel] | channel <#name> [purpose] | post <#channel|@handle> <text> [--image <path>]... | archive <name>]";
+const USAGE: &str = "Usage: /hub [list | new <name> [as @handle] | join <name> [as @handle] | leave | open [name] [#channel] | channel <#name> [purpose] | post <#channel|@handle> <text> [--image <path>]... | archive <name>]";
+/// Content-chunk meta key that marks a `/hub` reply. Its value is the card title.
+pub const HUB_CARD_META_KEY: &str = "hubCard";
 /// Messages that `/hub open` shows.
 const FEED_MESSAGES: usize = 30;
 
@@ -106,14 +108,33 @@ fn inherit_membership_in(
     Ok(Some((hub_name, handle)))
 }
 
+/// The reply to one `/hub` command, shown as a hub card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubReply {
+    /// The card title: the hub name, `hubs`, or `hub`.
+    pub title: String,
+    /// The card body, in markdown.
+    pub markdown: String,
+}
+
 /// Purpose: Run one `/hub` command for the person at the keyboard.
 /// Input: The session's bus, the command arguments, and the default handle.
-/// Output: The text to show the person.
-pub fn run_command(bus: &AgentBus, args: &str, default_handle: &str) -> String {
-    match dispatch(bus, args.trim(), default_handle) {
+/// Output: The reply to show the person.
+pub fn run_command(bus: &AgentBus, args: &str, default_handle: &str) -> HubReply {
+    let args = args.trim();
+    let markdown = match dispatch(bus, args, default_handle) {
         Ok(text) => text,
         Err(e) => format!("/hub: {e}"),
-    }
+    };
+    let command = args.split_whitespace().next().unwrap_or("");
+    let title = if matches!(command, "list" | "ls") {
+        "hubs".to_string()
+    } else if bus.is_session_hub() {
+        "hub".to_string()
+    } else {
+        bus.hub_name()
+    };
+    HubReply { title, markdown }
 }
 
 /// Purpose: Build the status-bar label of a session's hub.
@@ -222,8 +243,11 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
                 (false, _) => "Hub already exists. Joined",
             };
             Ok(format!(
-                "{verb} hub {} as @{}. Subagents of this session join as @{}/<type>. Agents here can now reach each other with the message_agents tool.",
-                outcome.hub, outcome.handle, outcome.handle
+                "{verb} hub {} as @{}. Subagents of this session join as `@{}/<type>`, and agents here can reach each other with the `message_agents` tool.\n\n{}",
+                outcome.hub,
+                outcome.handle,
+                outcome.handle,
+                open_link(&outcome.hub, "Open the hub")
             ))
         }
         "leave" => {
@@ -237,7 +261,7 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
             }
             require_named_hub(bus)?;
             let name = bus.create_channel(channel, purpose)?;
-            Ok(format!("Created #{name}."))
+            Ok(format!("Created **#{name}**."))
         }
         "open" => feed(bus, rest),
         "post" => {
@@ -252,9 +276,7 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
                 .post_as_person(&person, target, &text, &images)
                 .into_result()
             {
-                Ok(id) => Ok(format!(
-                    "Posted to {target} as @{person} (person), id={id}."
-                )),
+                Ok(_id) => Ok(format!("Posted to **{target}** as @{person} (person).")),
                 Err(reason) => bail!("{reason}"),
             }
         }
@@ -265,7 +287,7 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
             let hub = store::Hub::open(&bus.hubs_root(), rest)?;
             hub.update_meta(|meta| meta.archived = true)?;
             Ok(format!(
-                "Archived hub {rest}. It is now read-only and hidden from /hub list."
+                "Archived hub **{rest}**. It is now read-only and hidden from `/hub list`."
             ))
         }
         _ => bail!("{USAGE}"),
@@ -276,7 +298,7 @@ fn status(bus: &AgentBus) -> Result<String> {
     if bus.is_session_hub() {
         let hubs = list(&bus.hubs_root(), false)?;
         return Ok(format!(
-            "Not in a hub. Main and its subagents share a private hub.\n{hubs}\nUse /hub join <name> or /hub new <name>."
+            "Not in a hub. Main and its subagents share a private hub.\n\n{hubs}\n\nUse `/hub join <name>` or `/hub new <name>`."
         ));
     }
     Ok(format_view(&bus.view(
@@ -285,32 +307,41 @@ fn status(bus: &AgentBus) -> Result<String> {
 }
 
 fn format_view(view: &HubView) -> String {
-    let mut out = format!("Hub {} · you are @{}", view.hub, view.handle);
-    let members: Vec<String> = view
-        .members
-        .iter()
-        .map(|m| {
-            let kind = match m.kind {
-                MemberKind::Person => "person".to_string(),
-                MemberKind::Agent => m.label.clone(),
-            };
-            let gone = if m.is_live() { "" } else { ", gone" };
-            format!("@{} ({kind}{gone})", m.handle)
-        })
-        .collect();
-    out.push_str(&format!("\n\nMembers: {}", members.join(", ")));
-    out.push_str("\n\nChannels:\n");
+    let mut out = format!(
+        "You are **@{}** · {} · {}",
+        view.handle,
+        plural(view.members.len(), "member"),
+        plural(view.channels.len(), "channel"),
+    );
+    out.push_str("\n\n**Members**\n");
+    for m in &view.members {
+        let kind = match m.kind {
+            MemberKind::Person => "person".to_string(),
+            MemberKind::Agent => m.label.clone(),
+        };
+        let state = if m.is_live() { "" } else { " · gone" };
+        out.push_str(&format!("\n- **@{}** · {kind}{state}", m.handle));
+    }
+    out.push_str("\n\n**Channels**\n");
     let mut total_tokens = view.dm_tokens;
     for c in &view.channels {
         total_tokens += c.tokens;
+        let purpose = if c.purpose.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", c.purpose)
+        };
         out.push_str(&format!(
-            "\n- #{}: {} messages, {} unread, ~{} tokens. {}",
-            c.name, c.messages, c.unread, c.tokens, c.purpose
+            "\n- **#{}** · {}, {} unread{purpose}",
+            c.name,
+            plural(c.messages, "message"),
+            c.unread,
         ));
     }
     out.push_str(&format!(
-        "\n\nTokens put into agents' context: ~{total_tokens} (DMs ~{}).",
-        view.dm_tokens
+        "\n\n~{total_tokens} tokens put into agents' context (DMs ~{}). {}",
+        view.dm_tokens,
+        open_link(&view.hub, "Open the hub")
     ));
     if view.paused {
         out.push_str(
@@ -320,38 +351,65 @@ fn format_view(view: &HubView) -> String {
     out
 }
 
-/// Purpose: Show the latest messages of the hub, or of one channel.
-/// Input: The bus and an optional `#channel`.
-/// Output: Up to FEED_MESSAGES lines, oldest first. Read cursors do not move.
-fn feed(bus: &AgentBus, channel: &str) -> Result<String> {
-    let hub = bus.hub();
-    let meta = hub.meta()?;
-    let filter = (!channel.is_empty()).then_some(channel);
-    let messages = store::recent_messages(&hub, filter, FEED_MESSAGES)?;
-    let title = if channel.is_empty() {
-        format!("Hub {}", meta.name)
+/// A markdown link that opens a hub in the hub browser when clicked.
+fn open_link(hub: &str, label: &str) -> String {
+    format!("[{label}](</hub open {hub}>)")
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
     } else {
-        format!("Hub {} #{}", meta.name, channel.trim_start_matches('#'))
+        format!("{count} {noun}s")
+    }
+}
+
+/// Purpose: Show the latest messages of a hub, or of one of its channels.
+/// Input: The bus and the arguments: an optional hub name and an optional `#channel`.
+/// Output: Up to FEED_MESSAGES lines, oldest first. Read cursors do not move.
+fn feed(bus: &AgentBus, args: &str) -> Result<String> {
+    let mut name = None;
+    let mut channel = None;
+    for word in args.split_whitespace() {
+        if word.starts_with('#') {
+            channel.get_or_insert(word);
+        } else {
+            name.get_or_insert(word);
+        }
+    }
+    let hub = match name {
+        Some(name) => store::Hub::open(&bus.hubs_root(), name)?,
+        None => bus.hub(),
+    };
+    let meta = hub.meta()?;
+    let messages = store::recent_messages(&hub, channel, FEED_MESSAGES)?;
+    let place = match channel {
+        Some(channel) => format!("**#{}**", channel.trim_start_matches('#')),
+        None => format!("hub **{}**", meta.name),
     };
     if messages.is_empty() {
-        return Ok(format!("{title}: no messages yet."));
+        return Ok(format!("No messages yet in {place}."));
     }
-    let mut out = format!("{title}, latest {} message(s):\n", messages.len());
+    let mut out = format!("Latest {} in {place}:\n", plural(messages.len(), "message"));
     for m in &messages {
         let place = match store::split_dm_conv(&m.conv) {
             Some((a, b)) => format!("DM @{a}/@{b}"),
             None => m.conv.clone(),
         };
         let time = chrono::DateTime::from_timestamp_millis(m.ts_unix_ms as i64)
-            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%-I:%M %p")
+                    .to_string()
+            })
             .unwrap_or_default();
-        let images = if m.images.is_empty() {
-            String::new()
-        } else {
-            format!(" [{} image(s)]", m.images.len())
+        let images = match m.images.len() {
+            0 => String::new(),
+            1 => " · 1 image".to_string(),
+            n => format!(" · {n} images"),
         };
         out.push_str(&format!(
-            "\n- {time} {place} @{}: {}{images}",
+            "\n- **@{}** in {place} · {time}{images}  \n  {}",
             m.from, m.text
         ));
     }
@@ -386,18 +444,20 @@ fn expand_home(path: &str) -> PathBuf {
 fn list(root: &std::path::Path, include_archived: bool) -> Result<String> {
     let hubs = store::list_hubs(root, include_archived)?;
     if hubs.is_empty() {
-        return Ok("No hubs yet.".to_string());
+        return Ok("No hubs yet. Use `/hub new <name>` to make one.".to_string());
     }
-    let mut out = String::from("Hubs:\n");
+    let mut out = String::new();
     for meta in hubs {
-        let active = meta.members.iter().filter(|m| m.is_live()).count();
-        let archived = if meta.archived { ", archived" } else { "" };
+        let live = meta.members.iter().filter(|m| m.is_live()).count();
+        let archived = if meta.archived { " · archived" } else { "" };
         out.push_str(&format!(
-            "\n- {}: {active} active member(s), {} channel(s){archived}",
-            meta.name,
-            meta.channels.len()
+            "- {} · {live} live of {} · {}{archived}\n",
+            open_link(&meta.name, &meta.name),
+            plural(meta.members.len(), "member"),
+            plural(meta.channels.len(), "channel"),
         ));
     }
+    out.push_str("\nClick a hub to open it.");
     Ok(out)
 }
 
@@ -448,9 +508,10 @@ mod tests {
             "{out}"
         );
         let out = dispatch(&bus, "channel #tasks hand-offs", "x").unwrap();
-        assert_eq!(out, "Created #tasks.");
+        assert_eq!(out, "Created **#tasks**.");
         let out = dispatch(&bus, "", "x").unwrap();
-        assert!(out.contains("Hub api · you are @backend"), "{out}");
+        assert!(out.contains("You are **@backend**"), "{out}");
+        assert!(out.contains("(</hub open api>)"), "{out}");
         assert!(out.contains("#tasks"), "{out}");
         assert!(dispatch(&bus, "join api as @a b", "x").is_err());
         let other = bus_in(root.path(), "s2");
@@ -642,16 +703,22 @@ mod tests {
         assert!(
             dispatch(&bus, "open", "x")
                 .unwrap()
-                .contains("no messages yet")
+                .contains("No messages yet")
         );
         let png = root.path().join("ui.png");
         std::fs::write(&png, b"png").unwrap();
         let post = format!("post #general look at this --image {}", png.display());
         dispatch(&bus, &post, "x").unwrap();
         let feed = dispatch(&bus, "open #general", "x").unwrap();
-        assert!(feed.contains("#general @"), "{feed}");
-        assert!(feed.contains(": look at this [1 image(s)]"), "{feed}");
+        assert!(feed.contains("in #general"), "{feed}");
+        assert!(feed.contains("· 1 image"), "{feed}");
+        assert!(feed.contains("look at this"), "{feed}");
         assert!(dispatch(&bus, "open #nope", "x").is_err());
+        let other = dispatch(&bus, "open team #general", "x").unwrap();
+        assert_eq!(other, feed, "a named hub opens the same feed");
+        assert!(dispatch(&bus, "open nope", "x").is_err());
+        let list = list(root.path(), false).unwrap();
+        assert!(list.contains("[team](</hub open team>)"), "{list}");
         assert!(dispatch(&bus, "post #general hi --image", "x").is_err());
     }
 
