@@ -219,3 +219,25 @@ async fn subagent_spawn_context_inherits_parent_process_scope() {
         "the child sees the owner enrolled through the parent scope"
     );
 }
+
+/// A subagent inherits the parent's agent hub bus, so `message_agents` works in
+/// the child and the child joins the same hub as the parent.
+#[tokio::test]
+async fn subagent_spawn_context_inherits_parent_agent_bus() {
+    use xai_grok_tools::implementations::grok_build::{AgentBus, AgentBusResource};
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("parent-agent-bus");
+    let hubs_root = tempfile::tempdir().expect("tempdir");
+    let bus = AgentBus::new(hubs_root.path().to_path_buf(), sid.0.as_ref()).expect("bus");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.tool_context.agent_bus = Some(AgentBusResource(bus.clone()));
+    agent.insert_resident(&sid, handle);
+
+    let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+    let inherited = ctx
+        .agent_bus
+        .expect("subagent context must inherit the parent's agent hub bus");
+
+    assert_eq!(inherited.bus().hub_name(), bus.hub_name());
+}

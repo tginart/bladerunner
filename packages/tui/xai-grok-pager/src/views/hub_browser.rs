@@ -20,6 +20,7 @@ use unicode_width::UnicodeWidthStr;
 use xai_grok_tools::implementations::grok_build::agent_hub::{self, MemberKind, store};
 
 use crate::render::SafeBuf;
+use crate::render::scrollbar::{ScrollbarClickResult, render_scrollbar, scrollbar_click_to_offset};
 use crate::theme::Theme;
 
 /// Messages that one feed shows.
@@ -99,6 +100,10 @@ struct HitAreas {
     chip: Rect,
     picker: Vec<(Rect, String)>,
     compose: Rect,
+    /// The feed scrollbar column. It is empty when the feed fits.
+    feed_scrollbar: Rect,
+    /// Lines of the feed in the last frame.
+    feed_line_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +134,8 @@ pub struct HubBrowserState {
     pub notice: Option<String>,
     /// The highlighted index of the open perspective picker.
     pub picker: Option<usize>,
+    /// A left press on the feed scrollbar holds it until the button is up.
+    is_dragging_scrollbar: bool,
     hits: HitAreas,
 }
 
@@ -155,6 +162,7 @@ impl HubBrowserState {
             feed_scroll: 0,
             notice: None,
             picker: None,
+            is_dragging_scrollbar: false,
             hits: HitAreas::default(),
         };
         let rows = state.rows();
@@ -335,10 +343,34 @@ impl HubBrowserState {
         match kind {
             MouseEventKind::ScrollUp => self.feed_scroll = self.feed_scroll.saturating_add(3),
             MouseEventKind::ScrollDown => self.feed_scroll = self.feed_scroll.saturating_sub(3),
-            MouseEventKind::Down(MouseButton::Left) => self.click(col, row),
+            MouseEventKind::Down(MouseButton::Left)
+                if self.picker.is_none() && contains(self.hits.feed_scrollbar, col, row) =>
+            {
+                self.is_dragging_scrollbar = true;
+                self.drag_feed_scrollbar(row);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.is_dragging_scrollbar = false;
+                self.click(col, row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.is_dragging_scrollbar => {
+                self.drag_feed_scrollbar(row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.is_dragging_scrollbar = false,
             _ => {}
         }
         HubKeyOutcome::Changed
+    }
+
+    /// Move the feed so that the scrollbar thumb sits at the screen row. A
+    /// row above or below the track counts as the first or last track cell.
+    fn drag_feed_scrollbar(&mut self, row: u16) {
+        let bar = self.hits.feed_scrollbar;
+        if bar.height == 0 {
+            return;
+        }
+        let cell = row.clamp(bar.y, bar.bottom() - 1) - bar.y;
+        self.feed_scroll = feed_scroll_for_cell(cell, bar.height, self.hits.feed_line_count);
     }
 
     fn click(&mut self, col: u16, row: u16) {
@@ -614,6 +646,23 @@ fn clamp_selection(rows: &[Row], selected: usize) -> usize {
         return idx;
     }
     rows.iter().position(Row::is_selectable).unwrap_or(0)
+}
+
+/// Purpose: Find the feed scroll for a press on one scrollbar cell.
+/// Input: The cell index in the track, the track height (also the feed
+///     height), and the count of feed lines.
+/// Output: The feed scroll, in lines up from the newest line.
+/// Note: The scrollbar counts its offset down from the top. The feed counts
+///     its scroll up from the bottom.
+fn feed_scroll_for_cell(cell: u16, track: u16, line_count: usize) -> usize {
+    let max_scroll = line_count.saturating_sub(track as usize);
+    let total = u16::try_from(line_count).unwrap_or(u16::MAX);
+    let offset = match scrollbar_click_to_offset(cell, track, total, track) {
+        ScrollbarClickResult::Top => 0,
+        ScrollbarClickResult::Bottom => max_scroll,
+        ScrollbarClickResult::Offset(offset) => offset.min(max_scroll),
+    };
+    max_scroll - offset
 }
 
 fn contains(rect: Rect, col: u16, row: u16) -> bool {
@@ -1107,7 +1156,14 @@ fn render_main(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, theme:
         height: compose_y.saturating_sub(inner.y + 4),
         ..inner
     };
-    render_feed(buf, feed, &row, state, theme);
+    // The scrollbar sits in the right margin, so the feed text does not wrap
+    // again when the feed starts to overflow.
+    let scrollbar = Rect {
+        x: area.right().saturating_sub(1),
+        width: 1,
+        ..feed
+    };
+    render_feed(buf, feed, scrollbar, &row, state, theme);
     if let Some(notice) = &state.notice {
         let style = if notice.starts_with("Not posted") {
             Style::default().fg(theme.accent_error)
@@ -1195,6 +1251,7 @@ fn render_conversation_header(
 fn render_feed(
     buf: &mut Buffer,
     area: Rect,
+    scrollbar: Rect,
     row: &Row,
     state: &mut HubBrowserState,
     theme: &Theme,
@@ -1254,6 +1311,21 @@ fn render_feed(
         for (text, part) in line {
             x = span_at(buf, x, y, text, part_style(*part, theme), area.right());
         }
+    }
+    if max_scroll > 0 {
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let offset = u16::try_from(max_scroll - state.feed_scroll).unwrap_or(u16::MAX);
+        let is_following = state.feed_scroll == 0;
+        render_scrollbar(
+            buf,
+            Some(scrollbar),
+            total,
+            area.height,
+            offset,
+            is_following,
+        );
+        state.hits.feed_scrollbar = scrollbar;
+        state.hits.feed_line_count = lines.len();
     }
     if state.feed_scroll > 0 {
         let hint = format!(" ↓ {} more lines ", state.feed_scroll);
@@ -1409,14 +1481,14 @@ fn render_footer(buf: &mut Buffer, bar: Rect, state: &HubBrowserState, theme: &T
             ("Tab", "write"),
             ("p", "perspective"),
             ("PgUp/PgDn", "scroll"),
-            ("Esc", "close"),
+            ("Esc", "close hub"),
         ]
     } else {
         &[
             ("↑↓", "conversations"),
             ("p", "perspective"),
             ("PgUp/PgDn", "scroll"),
-            ("Esc", "close"),
+            ("Esc", "close hub"),
         ]
     };
     let mut x = bar.x + 2;
@@ -2024,6 +2096,79 @@ mod tests {
     }
 
     #[test]
+    fn feed_scroll_for_cell_maps_track_ends_to_oldest_and_newest() {
+        // 100 lines in a 10-row feed: the scroll runs from 0 (newest) to 90.
+        assert_eq!(feed_scroll_for_cell(0, 10, 100), 90);
+        assert_eq!(feed_scroll_for_cell(9, 10, 100), 0);
+        let middle = feed_scroll_for_cell(5, 10, 100);
+        assert!(middle > 0 && middle < 90, "{middle}");
+        // A feed that fits has no scroll.
+        assert_eq!(feed_scroll_for_cell(0, 10, 4), 0);
+    }
+
+    #[test]
+    fn feed_scrollbar_drag_scrolls_a_long_thread() {
+        let (_root, hub) = hub_with_dms();
+        let start_ms = store::now_ms();
+        for i in 0..80 {
+            let text = format!("line {i}");
+            hub.append(&message("me", "#general".to_string(), &text, start_ms + i))
+                .unwrap();
+        }
+        let mut state = open(hub);
+        assert_eq!(
+            state.selected_row(),
+            Some(Row::Channel("general".to_string()))
+        );
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let bar = state.hits.feed_scrollbar;
+        assert_eq!(bar.width, 1, "a long thread shows a scrollbar");
+        assert_eq!(
+            bar.x,
+            area.right() - 1,
+            "the scrollbar is at the right edge"
+        );
+
+        // Press the bottom cell, then drag above the track: the feed goes to the top.
+        state.handle_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar.x,
+            bar.bottom() - 1,
+        );
+        assert_eq!(state.feed_scroll, 0);
+        state.handle_mouse(MouseEventKind::Drag(MouseButton::Left), bar.x - 5, 0);
+        let max_scroll = state.hits.feed_line_count - bar.height as usize;
+        assert_eq!(state.feed_scroll, max_scroll);
+        render_hub_browser(&mut buf, area, &mut state);
+        assert!(
+            buffer_text(&buf).contains("line 0"),
+            "{}",
+            buffer_text(&buf)
+        );
+
+        // After release, a drag does not move the feed.
+        state.handle_mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y);
+        state.handle_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            bar.x,
+            bar.bottom() - 1,
+        );
+        assert_eq!(state.feed_scroll, max_scroll);
+    }
+
+    #[test]
+    fn a_short_thread_has_no_scrollbar() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        assert_eq!(state.hits.feed_scrollbar, Rect::default());
+    }
+
+    #[test]
     fn render_shows_the_slack_layout_and_the_perspective_chip() {
         let (_root, hub) = hub_with_dms();
         let mut state = open(hub);
@@ -2041,6 +2186,7 @@ mod tests {
             "@me",
             "hello",
             "Message #general",
+            "close hub",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in\n{text}");
         }
