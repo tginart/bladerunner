@@ -1465,6 +1465,73 @@ async fn loop_tracking_covers_pending_active_and_nested_reparenting() {
     harness.actor.abort();
 }
 
+/// A loop worker's nested spawn is re-keyed to the root session, but the
+/// worker must still find the child by ID through its own session-bound
+/// backend (regression: "Task <id> not found" after a successful spawn).
+#[tokio::test]
+async fn reparented_nested_child_stays_visible_to_its_spawner() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let mut outer_request = request("outer", true);
+    outer_request.runtime_overrides.loop_task_id = Some("loop-task".to_owned());
+    let outer_spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(outer_request).await }
+    });
+    assert_eq!(harness.requests.recv().await.unwrap().id, "outer");
+    assert_eq!(harness.started.recv().await.as_deref(), Some("outer"));
+
+    let worker_backend = ChannelBackend::for_session(harness.backend.sender(), "outer");
+    let mut nested_request = request("nested", true);
+    nested_request.parent_session_id = "outer".to_owned();
+    let nested_spawn = tokio::spawn({
+        let backend = worker_backend.clone();
+        async move { backend.spawn(nested_request).await }
+    });
+    let observed_nested = harness.requests.recv().await.unwrap();
+    assert_eq!(observed_nested.parent_session_id, "parent");
+    assert_eq!(
+        observed_nested.runtime_overrides.spawner_session_id.as_deref(),
+        Some("outer")
+    );
+    assert_eq!(harness.started.recv().await.as_deref(), Some("nested"));
+
+    assert!(
+        worker_backend.query("nested", false, None).await.is_some(),
+        "spawner must see its running nested child"
+    );
+    assert!(
+        parent_backend(&harness)
+            .query("nested", false, None)
+            .await
+            .is_some(),
+        "root parent must still see the reparented child"
+    );
+    assert!(
+        ChannelBackend::for_session(harness.backend.sender(), "stranger")
+            .query("nested", false, None)
+            .await
+            .is_none(),
+        "unrelated sessions must not see the child"
+    );
+
+    let _ = harness.finish.send(());
+    assert!(outer_spawn.await.unwrap().unwrap().success);
+    assert!(nested_spawn.await.unwrap().unwrap().success);
+    let snapshot = worker_backend
+        .query("nested", true, Some(1_000))
+        .await
+        .expect("spawner must read its completed nested child");
+    assert!(matches!(
+        snapshot.status,
+        SubagentSnapshotStatus::Completed { .. }
+    ));
+    assert!(matches!(
+        worker_backend.cancel("nested").await,
+        SubagentCancelOutcome::AlreadyFinished { .. }
+    ));
+    harness.actor.abort();
+}
+
 #[tokio::test]
 async fn completion_buffer_caps_summary_without_mutating_result() {
     let mut harness = harness_with_config(

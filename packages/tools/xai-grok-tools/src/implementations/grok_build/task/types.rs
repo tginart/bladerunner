@@ -201,6 +201,10 @@ pub struct SubagentRuntimeOverrides {
     pub output_token_budget: Option<u64>,
     pub output_schema: Option<serde_json::Value>,
     pub loop_task_id: Option<String>,
+    /// Session that issued a nested spawn before the coordinator re-keyed
+    /// `parent_session_id` to the root. Set only by the coordinator. It lets
+    /// the spawner still query, wait on and cancel its own child.
+    pub spawner_session_id: Option<String>,
 }
 
 /// Re-export of [`xai_tool_types::is_not_sentinel`] for existing call sites.
