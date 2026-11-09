@@ -135,7 +135,8 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 true,
             ));
         }
-        request.parent_session_id = root_parent;
+        let spawner = std::mem::replace(&mut request.parent_session_id, root_parent);
+        request.runtime_overrides.spawner_session_id = Some(spawner);
         request.surface_completion = false;
         // Nested children keep workflow lineage after reparent so
         // ParentSession Stop does not kill in-flight workflow work.

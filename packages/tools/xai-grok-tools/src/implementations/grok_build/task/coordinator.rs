@@ -1114,8 +1114,17 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     }
 }
 
+/// Purpose: This function decides if a session can see and control a child.
+/// Input: The child request. The session ID of the caller, or `None` for an
+/// unscoped caller.
+/// Output: `true` if the caller is the root parent or the original spawner.
+/// Note: A nested spawn is re-keyed to the root session. The spawner must
+/// still find the child by ID, or `get_command_or_subagent_output` fails.
 fn belongs_to_session(request: &SubagentRequest, parent_session_id: Option<&str>) -> bool {
-    parent_session_id.is_none_or(|id| request.parent_session_id == id)
+    parent_session_id.is_none_or(|id| {
+        request.parent_session_id == id
+            || request.runtime_overrides.spawner_session_id.as_deref() == Some(id)
+    })
 }
 
 impl<R: ChildRunner> Drop for SubagentCoordinator<R> {
