@@ -646,7 +646,7 @@ pub(crate) async fn spawn_session_actor(
             goal_loop_active: tool_context.goal_loop_active_gate.clone(),
         },
     );
-    let tool_context_for_handle = tool_context.clone();
+    let mut tool_context_for_handle = tool_context.clone();
     let cursor_harness = false;
     let terminal_backend_kind = select_terminal_backend_kind(
         startup_hints.is_subagent,
@@ -960,6 +960,10 @@ pub(crate) async fn spawn_session_actor(
             bus_res.bus().register(peer_id, label, Some(wake));
         }
     }
+    // The handle snapshot predates the hub connect above. Subagent spawns read
+    // the bus from the handle, so copy it in or children get no hub.
+    tool_context_for_handle.agent_bus = tool_context.agent_bus.clone();
+    tool_context_for_handle.agent_self_id = tool_context.agent_self_id.clone();
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         terminal_backend: terminal_backend.clone(),
