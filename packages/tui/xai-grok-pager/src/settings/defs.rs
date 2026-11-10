@@ -1306,6 +1306,23 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        // SHARED: `[ui].hooks_muted` + process-wide cache. Same value as
+        // `/hooks mute` / `/hooks unmute`. Default OFF.
+        SettingMeta {
+            key: "hooks_muted",
+            category: SettingCategory::Appearance,
+            owner: SettingOwner::Shared,
+            label: "Mute hooks",
+            description: "Hide hook results in the transcript: no [hooks: N] badges, \
+                          stop-hook summaries, or hook messages. Hooks still run and \
+                          can still block tool calls.",
+            keywords: &["hooks", "hook", "mute", "silent", "quiet", "badge", "hide"],
+            kind: SettingKind::Bool {
+                default: ui_default.hooks_muted.unwrap_or(false),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned: `[ui.display_refresh].auto_cadence_enabled`. Restart-
         // required (cadence pinned at startup); hidden in minimal.
         SettingMeta {

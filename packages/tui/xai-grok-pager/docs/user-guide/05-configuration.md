@@ -51,6 +51,8 @@ collapsed_edit_blocks = false          # show edits as one-line +N/-M diffstat s
                                        # back-to-back same-file edits into one row, expand for the
                                        # diffs (default: false; pager.toml [scrollback.blocks.edit]
                                        # expanded_by_default/line_summary override its fold shape)
+hooks_muted = false                    # hide hook results in the transcript; hooks still run and
+                                       # can still block (default: false; /hooks mute, /settings)
 page_flip_on_send = true               # pin a just-sent prompt at the top of the viewport so the
                                        # response starts on a fresh page (default: true); set false
                                        # so sending never moves the scroll position

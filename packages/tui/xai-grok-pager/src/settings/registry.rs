@@ -605,6 +605,10 @@ pub fn current_value_for(
         "combine_queued_prompts" => Some(SettingValue::Bool(
             crate::appearance::cache::load_combine_queued_prompts(),
         )),
+        // Cache is the notification-gate source of truth (also set by `/hooks mute`).
+        "hooks_muted" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_hooks_muted(),
+        )),
         "confirm_before_rewind" => Some(SettingValue::Bool(ui.confirm_before_rewind_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
@@ -976,6 +980,13 @@ mod tests {
                         *default,
                         ui.combine_queued_prompts.unwrap_or(false),
                         "combine_queued_prompts default drifts from UiConfig::default()"
+                    );
+                }
+                ("hooks_muted", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.hooks_muted.unwrap_or(false),
+                        "hooks_muted default drifts from UiConfig::default()"
                     );
                 }
                 ("simple_mode", SettingKind::Bool { default }) => {

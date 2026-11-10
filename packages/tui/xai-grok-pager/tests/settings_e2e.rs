@@ -63,6 +63,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "prompt_suggestions",
     "group_tool_verbs",
     "collapsed_edit_blocks",
+    "hooks_muted",
     "respect_manual_folds",
     "hunk_tracker_mode",
     "voice_keybind_enabled",
@@ -292,6 +293,9 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 b, expected,
                 "SetCollapsedEditBlocks value differs from expected"
             )
+        }
+        ("hooks_muted", Action::SetHooksMuted(b)) => {
+            assert_eq!(b, expected, "SetHooksMuted value differs from expected")
         }
         ("invert_scroll", Action::SetInvertScroll(b)) => {
             assert_eq!(b, expected, "SetInvertScroll value differs from expected")
@@ -1823,6 +1827,7 @@ fn registry_kind_membership_through_pr_14() {
             "compact_mode",
             "group_tool_verbs",
             "collapsed_edit_blocks",
+            "hooks_muted",
             "invert_scroll",
             "display_refresh_auto_cadence",
             "multiline_mode",
@@ -1974,6 +1979,7 @@ fn defaults_round_trip_through_registry() {
     xai_grok_pager::appearance::cache::set_group_tool_verbs(true);
     xai_grok_pager::appearance::cache::set_page_flip_on_send(true);
     xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
+    xai_grok_pager::appearance::cache::set_hooks_muted(false);
     xai_grok_pager::appearance::cache::set_scroll_mode(
         xai_grok_pager::appearance::ScrollMode::Auto,
     );
@@ -2024,6 +2030,7 @@ fn defaults_round_trip_through_registry() {
             "prompt_suggestions" => SettingValue::Bool(true),
             "group_tool_verbs" => SettingValue::Bool(true),
             "collapsed_edit_blocks" => SettingValue::Bool(false),
+            "hooks_muted" => SettingValue::Bool(false),
             "respect_manual_folds" => SettingValue::Bool(false),
             // Per-tip contextual-hint children default ON (inherit → true).
             "contextual_hints.undo" => SettingValue::Bool(true),
@@ -2105,6 +2112,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetPromptSuggestions(_))
             | SettingsKeyOutcome::Action(Action::SetGroupToolVerbs(_))
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
+            | SettingsKeyOutcome::Action(Action::SetHooksMuted(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
             | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
             | SettingsKeyOutcome::Action(Action::SetVoiceKeybindEnabled(_)) => {}
@@ -7975,6 +7983,84 @@ fn collapsed_edit_blocks_renders_under_appearance_category_shell_owned() {
         group_idx + 1,
         collapsed_idx,
         "collapsed_edit_blocks must be immediately below group_tool_verbs; \
+         Appearance order: {keys:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// hooks_muted — SHARED Bool (Appearance, default false; same value as /hooks mute)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hooks_muted_space_dispatches_typed_setter() {
+    // Seed the live cache so a host [ui] override can't flip the direction.
+    xai_grok_pager::appearance::cache::set_hooks_muted(false);
+    let mut s = make_state();
+    navigate_to(&mut s, "hooks_muted");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "hooks_muted", true);
+}
+
+#[test]
+fn hooks_muted_mouse_click_two_stage_toggles() {
+    xai_grok_pager::appearance::cache::set_hooks_muted(false);
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "hooks_muted") as u16;
+    let click = MouseEventKind::Down(crossterm::event::MouseButton::Left);
+
+    let outcome = handle_settings_mouse(&mut s, click, 10, row_y);
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "first click on a different row body should only select, got: {outcome:?}"
+    );
+    assert_eq!(s.selected, row_y as usize);
+
+    let outcome = handle_settings_mouse(&mut s, click, 10, row_y);
+    assert_set_bool_action(outcome, "hooks_muted", true);
+}
+
+#[test]
+fn hooks_muted_cache_on_dispatches_off() {
+    // `/hooks mute` writes the same cache, so the row must reflect it.
+    xai_grok_pager::appearance::cache::set_hooks_muted(true);
+    let mut s = make_state();
+    navigate_to(&mut s, "hooks_muted");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "hooks_muted", false);
+    xai_grok_pager::appearance::cache::set_hooks_muted(false);
+}
+
+#[test]
+fn hooks_muted_renders_under_appearance_below_collapsed_edit_blocks() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg
+        .find("hooks_muted")
+        .expect("hooks_muted must be registered");
+    assert_eq!(meta.category, SettingCategory::Appearance);
+    assert_eq!(meta.owner, SettingOwner::Shared);
+    match &meta.kind {
+        SettingKind::Bool { default } => assert!(!*default, "default must be false"),
+        other => panic!("expected Bool kind for hooks_muted, got {other:?}"),
+    }
+    let keys: Vec<&str> = reg
+        .all()
+        .iter()
+        .filter(|m| m.category == SettingCategory::Appearance)
+        .map(|m| m.key)
+        .collect();
+    let collapsed_idx = keys
+        .iter()
+        .position(|k| *k == "collapsed_edit_blocks")
+        .expect("collapsed_edit_blocks in Appearance");
+    let muted_idx = keys
+        .iter()
+        .position(|k| *k == "hooks_muted")
+        .expect("hooks_muted in Appearance");
+    assert_eq!(
+        collapsed_idx + 1,
+        muted_idx,
+        "hooks_muted must be immediately below collapsed_edit_blocks; \
          Appearance order: {keys:?}"
     );
 }

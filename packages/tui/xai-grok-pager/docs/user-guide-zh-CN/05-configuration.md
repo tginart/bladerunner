@@ -54,6 +54,8 @@ collapsed_edit_blocks = false          # 将编辑显示为单行 +N/-M diffstat
                                        # 同一文件的连续编辑为一行，展开查看
                                        # diffs（默认：false；pager.toml [scrollback.blocks.edit]
                                        # 的 expanded_by_default/line_summary 覆盖折叠形状）
+hooks_muted = false                    # 在对话记录中隐藏钩子结果；钩子仍会运行并可阻止
+                                       # 工具调用（默认：false；/hooks mute、/settings）
 page_flip_on_send = true               # 刚发送的提示钉在视口顶部，使
                                        # 回复从新页开始（默认：true）；设为 false
                                        # 则发送时从不移动滚动位置
