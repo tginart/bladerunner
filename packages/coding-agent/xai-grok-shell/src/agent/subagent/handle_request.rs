@@ -1,6 +1,54 @@
 use super::*;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
+/// Bounds each wait on the parent session in the child completion path.
+/// The parent's select polls its event channels before `cmd_rx`, so a busy
+/// parent turn can starve `cmd_rx`. An unbounded wait then parks the
+/// finished child forever, with its session thread, fs watchers and fds.
+pub(super) const PARENT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bounds each read of the child session's own actors (chat state, signals,
+/// session commands) in the completion path. These actors share the child's
+/// current-thread runtime, so a tool that blocks that thread freezes them
+/// too. The child `Shutdown` must still be reached.
+pub(super) const CHILD_ACTOR_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Purpose: Wait for a parent ack for at most [`PARENT_ACK_TIMEOUT`].
+/// Input: A short name for the log, and the ack future.
+/// Output: The ack value, or `None` when the parent did not answer in time.
+pub(super) async fn await_parent_ack<T>(
+    what: &'static str,
+    ack: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match tokio::time::timeout(PARENT_ACK_TIMEOUT, ack).await {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(
+                ack = what,
+                "parent did not ack in time; continuing teardown"
+            );
+            None
+        }
+    }
+}
+/// Purpose: Run one query against a child-session actor for at most
+/// [`CHILD_ACTOR_ACK_TIMEOUT`].
+/// Input: A short name for the log, the query, and a fallback value.
+/// Output: The query result, or `fallback` when the actor did not answer.
+pub(super) async fn child_actor_query<T>(
+    what: &'static str,
+    query: impl std::future::Future<Output = T>,
+    fallback: T,
+) -> T {
+    match tokio::time::timeout(CHILD_ACTOR_ACK_TIMEOUT, query).await {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(
+                query = what,
+                "child actor did not answer in time; using fallback"
+            );
+            fallback
+        }
+    }
+}
 pub(super) fn canonical_total_tokens(totals: &xai_chat_state::UsageTotals) -> u64 {
     totals.total_tokens()
 }
@@ -37,9 +85,106 @@ pub(super) async fn record_subagent_usage(
             {
                 return false;
             }
-            ack.await.is_ok()
+            matches!(
+                await_parent_ack("RecordSubagentUsage", ack).await,
+                Some(Ok(()))
+            )
         }
     }
+}
+/// Purpose: Mark the parent bill incomplete when the usage fold missed.
+/// Input: The parent command channel, the coordinator channel, the parent
+/// session id and the parent prompt id.
+/// Method:
+///     1. Ask the parent session to mark the bill. Wait at most
+///        [`PARENT_ACK_TIMEOUT`] for its ack.
+///     2. If the parent did not ack, mark the coordinator report directly.
+/// Note: A slow parent can apply both the queued fold and this mark later.
+/// Both are idempotent, so the worst case is a conservative incomplete flag.
+pub(super) async fn mark_child_usage_not_applied_with_fallback(
+    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+    subagent_event_tx: &mpsc::UnboundedSender<SubagentEvent>,
+    parent_session_id: &str,
+    parent_prompt_id: Option<String>,
+) {
+    let marked_by_parent = match parent_cmd_tx {
+        Some(cmd_tx) => {
+            let (respond_to, ack) = oneshot::channel();
+            let sent = cmd_tx
+                .send(SessionCommand::MarkSubagentUsageNotApplied {
+                    parent_prompt_id: parent_prompt_id.clone(),
+                    respond_to,
+                })
+                .is_ok();
+            sent && matches!(
+                await_parent_ack("MarkSubagentUsageNotApplied", ack).await,
+                Some(Ok(()))
+            )
+        }
+        None => false,
+    };
+    let Some(prompt_id) = parent_prompt_id.filter(|_| !marked_by_parent) else {
+        return;
+    };
+    let (respond_to, ack) = oneshot::channel();
+    let request = SubagentMarkUsageNotAppliedRequest {
+        parent_session_id: parent_session_id.to_string(),
+        prompt_id,
+        respond_to,
+    };
+    // The coordinator actor is not the starved parent session, so this
+    // ack stays unbounded, as before.
+    if subagent_event_tx
+        .send(SubagentEvent::MarkUsageNotApplied(request))
+        .is_ok()
+    {
+        let _ = ack.await;
+    }
+}
+/// Purpose: Hand the child's surviving background tasks to the parent.
+/// Input: The parent terminal backend and notification handle, the parent
+/// command channel, both session ids, and `surface_completion`.
+/// Method:
+///     1. If the completion is not surfaced, record the child's open task
+///        ids as goal-turn tasks of the parent.
+///     2. Move the child's task notifications to the parent.
+/// Note: Both awaits use the parent terminal actor and wait at most
+/// [`PARENT_ACK_TIMEOUT`], so the child `Shutdown` stays reachable.
+pub(super) async fn reparent_surviving_child_tasks(
+    parent_tb: &std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
+    parent_notif_handle: &xai_grok_tools::notification::types::ToolNotificationHandle,
+    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+    child_session_id: &str,
+    parent_session_id: &str,
+    surface_completion: bool,
+) {
+    if !surface_completion
+        && let Some(tasks) = await_parent_ack("list_tasks", parent_tb.list_tasks()).await
+    {
+        let reparented_task_ids: Vec<String> = tasks
+            .into_iter()
+            .filter(|t| !t.completed && t.owner_session_id.as_deref() == Some(child_session_id))
+            .map(|t| t.task_id)
+            .collect();
+        if !reparented_task_ids.is_empty()
+            && let Some(cmd_tx) = parent_cmd_tx
+        {
+            let _ = cmd_tx.send(SessionCommand::RecordGoalTurnTaskIds {
+                task_ids: reparented_task_ids,
+            });
+        }
+    }
+    let parent_backend_weak = std::sync::Arc::downgrade(parent_tb);
+    let _ = await_parent_ack(
+        "reparent_notifications",
+        parent_tb.reparent_notifications(
+            child_session_id,
+            parent_session_id,
+            parent_notif_handle.clone(),
+            parent_backend_weak,
+        ),
+    )
+    .await;
 }
 pub(super) fn task_model_override_error(
     requested: Option<&str>,
@@ -1538,12 +1683,19 @@ pub(crate) async fn run_shell_child(
                 }
                 _ => signals_snapshot_counts(&child_handle).await,
             };
-            let final_text = child_handle
-                .chat_state_handle
-                .get_last_assistant_text()
-                .await
-                .unwrap_or_default();
-            let result_tokens = child_handle.chat_state_handle.get_total_tokens().await;
+            let final_text = child_actor_query(
+                "GetLastAssistantText",
+                child_handle.chat_state_handle.get_last_assistant_text(),
+                None,
+            )
+            .await
+            .unwrap_or_default();
+            let result_tokens = child_actor_query(
+                "GetTotalTokens",
+                child_handle.chat_state_handle.get_total_tokens(),
+                0,
+            )
+            .await;
             match *turn_result {
                 Ok(Ok(crate::session::commands::PromptTurnOk {
                     completion_kind: PromptCompletionKind::Cancelled { category, context },
@@ -1729,16 +1881,23 @@ pub(crate) async fn run_shell_child(
                 .send(SessionCommand::TakeTurnMessages { respond_to: tx })
                 .is_ok()
             {
-                rx.await.ok().flatten()
+                child_actor_query("TakeTurnMessages", rx, Ok(None))
+                    .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             }
         };
-        let streaming_partial = crate::upload::turn::take_streaming_partial(
-            &child_handle.cmd_tx,
-            child_prompt_id.clone(),
-            result.success,
-            gcs_upload_ctx.model_id.clone(),
+        let streaming_partial = child_actor_query(
+            "TakeStreamingCapture",
+            crate::upload::turn::take_streaming_partial(
+                &child_handle.cmd_tx,
+                child_prompt_id.clone(),
+                result.success,
+                gcs_upload_ctx.model_id.clone(),
+            ),
+            None,
         )
         .await
         .map(|mut cap| {
@@ -1824,11 +1983,14 @@ pub(crate) async fn run_shell_child(
             sandbox: local_sandbox_telemetry(),
         };
         upload_metadata(&trace_ctx, metadata).await;
-        let resolved_model = child_handle
-            .get_model_metadata()
-            .await
-            .resolved_model_id
-            .or_else(|| gcs_upload_ctx.model_id.clone());
+        let resolved_model = child_actor_query(
+            "GetModelMetadata",
+            child_handle.get_model_metadata(),
+            Default::default(),
+        )
+        .await
+        .resolved_model_id
+        .or_else(|| gcs_upload_ctx.model_id.clone());
         let turn_result_meta = TurnResultMetadata {
             schema_version: "1",
             request_id: child_prompt_id,
@@ -1884,14 +2046,25 @@ pub(crate) async fn run_shell_child(
     let final_status = result.status().to_string();
     let snapshot_dispose_enabled = ctx.should_snapshot_subagent_worktree(&request);
     let telemetry_tokens = if result.tool_calls > 0 || result.success {
-        child_handle.chat_state_handle.get_total_tokens().await
+        child_actor_query(
+            "GetTotalTokens",
+            child_handle.chat_state_handle.get_total_tokens(),
+            0,
+        )
+        .await
     } else {
         0
     };
     completion_data.telemetry_tokens = telemetry_tokens;
     let task_budget_usage = task_output_budget.as_ref().map(|budget| budget.usage());
     let (subagent_usage_by_model, subagent_usage_incomplete, output_tokens_used, total_tokens_used) =
-        match child_handle.chat_state_handle.try_get_session_usage().await {
+        match child_actor_query(
+            "GetSessionUsage",
+            child_handle.chat_state_handle.try_get_session_usage(),
+            Err(()),
+        )
+        .await
+        {
             Ok(u) => {
                 let output_tokens = u.totals.output_tokens;
                 let total_tokens = canonical_total_tokens(&u.totals);
@@ -1933,41 +2106,13 @@ pub(crate) async fn run_shell_child(
             parent_prompt_id = ?request.parent_prompt_id,
             "subagent usage not applied; parent bill marked incomplete"
         );
-        let sticky_prompt = request.parent_prompt_id.clone();
-        let marked_by_parent = if let Some(cmd_tx) = ctx.parent_cmd_tx.as_ref() {
-            let (respond_to, ack) = tokio::sync::oneshot::channel();
-            if cmd_tx
-                .send(
-                    crate::session::commands::SessionCommand::MarkSubagentUsageNotApplied {
-                        parent_prompt_id: sticky_prompt.clone(),
-                        respond_to,
-                    },
-                )
-                .is_ok()
-            {
-                ack.await.is_ok()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !marked_by_parent && let Some(pid) = sticky_prompt {
-            let (respond_to, ack) = tokio::sync::oneshot::channel();
-            if ctx
-                .subagent_event_tx
-                .send(SubagentEvent::MarkUsageNotApplied(
-                    SubagentMarkUsageNotAppliedRequest {
-                        parent_session_id: ctx.parent_session_id.clone(),
-                        prompt_id: pid,
-                        respond_to,
-                    },
-                ))
-                .is_ok()
-            {
-                let _ = ack.await;
-            }
-        }
+        mark_child_usage_not_applied_with_fallback(
+            ctx.parent_cmd_tx.as_ref(),
+            &ctx.subagent_event_tx,
+            &ctx.parent_session_id,
+            request.parent_prompt_id.clone(),
+        )
+        .await;
     }
     let outcome = if result.success {
         xai_grok_telemetry::events::Outcome::Completed
@@ -1995,33 +2140,15 @@ pub(crate) async fn run_shell_child(
         &ctx.parent_notification_handle,
     ) {
         (Some(parent_tb), Some(parent_notif_handle)) => {
-            if !request.surface_completion {
-                let reparented_task_ids: Vec<String> = parent_tb
-                    .list_tasks()
-                    .await
-                    .into_iter()
-                    .filter(|t| {
-                        !t.completed && t.owner_session_id.as_deref() == Some(&*child_session_id.0)
-                    })
-                    .map(|t| t.task_id)
-                    .collect();
-                if !reparented_task_ids.is_empty()
-                    && let Some(cmd_tx) = ctx.parent_cmd_tx.as_ref()
-                {
-                    let _ = cmd_tx.send(SessionCommand::RecordGoalTurnTaskIds {
-                        task_ids: reparented_task_ids,
-                    });
-                }
-            }
-            let parent_backend_weak = std::sync::Arc::downgrade(parent_tb);
-            parent_tb
-                .reparent_notifications(
-                    &child_session_id.0,
-                    &ctx.parent_session_id,
-                    parent_notif_handle.clone(),
-                    parent_backend_weak,
-                )
-                .await;
+            reparent_surviving_child_tasks(
+                parent_tb,
+                parent_notif_handle,
+                ctx.parent_cmd_tx.as_ref(),
+                &child_session_id.0,
+                &ctx.parent_session_id,
+                request.surface_completion,
+            )
+            .await;
         }
         (Some(_), None) | (None, Some(_)) => {
             tracing::warn!(

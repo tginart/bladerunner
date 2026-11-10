@@ -3285,12 +3285,14 @@ async fn await_subagent_turn_or_cancellation(
 }
 /// Fallback for cancelled/errored paths where TurnDeltaSnapshot is unavailable.
 async fn signals_snapshot_counts(child_handle: &SessionHandle) -> (u32, u32) {
-    child_handle
-        .signals_handle
-        .snapshot()
-        .await
-        .map(|s| (s.tool_call_count, s.turn_count))
-        .unwrap_or((0, 0))
+    handle_request::child_actor_query(
+        "SignalsSnapshot",
+        child_handle.signals_handle.snapshot(),
+        None,
+    )
+    .await
+    .map(|s| (s.tool_call_count, s.turn_count))
+    .unwrap_or((0, 0))
 }
 fn cancellation_error_message(
     category: Option<xai_file_utils::events::types::CancellationCategory>,
