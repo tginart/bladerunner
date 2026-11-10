@@ -305,7 +305,15 @@ fn codex_terminal_error(data: &str) -> Option<SamplingError> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
         if reason == "max_output_tokens" {
-            return Some(SamplingError::MaxTokensTruncation);
+            // A parseable envelope flows on as `ResponseIncomplete`, so the
+            // response completes with a `Length` stop and the request's
+            // `LengthPolicy` decides. Without an id it cannot parse.
+            let has_response_id = event
+                .response
+                .as_ref()
+                .and_then(|response| response.get("id"))
+                .is_some_and(serde_json::Value::is_string);
+            return (!has_response_id).then_some(SamplingError::MaxTokensTruncation);
         }
         return Some(SamplingError::Api {
             status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
@@ -4415,6 +4423,7 @@ impl SamplingClient {
         let system_sha256 = evidence.system.as_ref().map(|(sha, _)| sha.as_str());
         let sent_effort = self.request_sent_effort(&request);
         let hosted_tools = self.request_hosted_tools(&request);
+        let length_policy = request.length_policy;
         let request_id = crate::types::RequestId::random();
         let idle_timeout = std::time::Duration::from_secs(300);
         let result = match self.api_backend() {
@@ -4462,18 +4471,48 @@ impl SamplingClient {
                 crate::stream::collect_response(events).await
             }
         };
-        result
-            .map(|(mut response, _metrics)| {
-                for item in &mut response.items {
-                    if let xai_grok_sampling_types::ConversationItem::Assistant(assistant) = item {
-                        assistant.reasoning_model_identity = reasoning_model_identity.clone();
-                        assistant.hosted_tools = Some(hosted_tools.clone());
-                        assistant.record_request(Some(&tools_sha256), system_sha256, sent_effort);
-                    }
-                }
-                response
-            })
-            .map_err(stream_collect_error)
+        let mut response = result
+            .map(|(response, _metrics)| response)
+            .map_err(stream_collect_error)?;
+        for item in &mut response.items {
+            if let xai_grok_sampling_types::ConversationItem::Assistant(assistant) = item {
+                assistant.reasoning_model_identity = reasoning_model_identity.clone();
+                assistant.hosted_tools = Some(hosted_tools.clone());
+                assistant.record_request(Some(&tools_sha256), system_sha256, sent_effort);
+            }
+        }
+        apply_length_policy(length_policy, response)
+    }
+}
+
+/// Apply the request's [`xai_grok_sampling_types::LengthPolicy`] to a
+/// completed response: fail a `Length` stop the policy rejects, and log a
+/// breadcrumb for a salvaged one. The one gate shared by `drive_l2` and the
+/// direct-collect path, so the two cannot drift.
+pub(crate) fn apply_length_policy(
+    policy: xai_grok_sampling_types::LengthPolicy,
+    response: xai_grok_sampling_types::ConversationResponse,
+) -> Result<xai_grok_sampling_types::ConversationResponse> {
+    use xai_grok_sampling_types::LengthVerdict;
+    match policy.verdict(&response) {
+        LengthVerdict::Pass => Ok(response),
+        LengthVerdict::Fail => Err(SamplingError::MaxTokensTruncation),
+        LengthVerdict::Salvage => {
+            tracing::info!(
+                content_len = response.assistant().map_or(0, |a| a.content.len()),
+                completion_tokens = response.usage.as_ref().map(|u| u.completion_tokens),
+                "salvaging Length-truncated response per LengthPolicy::CompletePartial"
+            );
+            Ok(response)
+        }
+        LengthVerdict::SalvageToolCalls => {
+            tracing::info!(
+                tool_calls = response.tool_calls().len(),
+                completion_tokens = response.usage.as_ref().map(|u| u.completion_tokens),
+                "completing Length-truncated response with complete tool calls"
+            );
+            Ok(response)
+        }
     }
 }
 
@@ -4490,6 +4529,52 @@ fn stream_collect_error(info: SamplingErrorInfo) -> SamplingError {
         retry_after_secs: info.retry_after_secs,
         should_retry: info.should_retry,
         error_code: info.error_code,
+    }
+}
+
+#[cfg(test)]
+mod length_policy_tests {
+    use super::*;
+    use xai_grok_sampling_types::{ConversationItem, LengthPolicy, StopReason, ToolCall};
+
+    fn length_response(item: ConversationItem) -> xai_grok_sampling_types::ConversationResponse {
+        xai_grok_sampling_types::ConversationResponse {
+            items: vec![item],
+            stop_reason: Some(StopReason::Length),
+            usage: None,
+            cost_usd_ticks: None,
+            message_chunks_emitted: 0,
+            doom_loop_signals: Vec::new(),
+            stop_message: None,
+            message_id: None,
+            raw_stop_reason: None,
+            stop_sequence: None,
+        }
+    }
+
+    #[test]
+    fn complete_truncated_tool_calls_run_by_default() {
+        let response = length_response(ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        }]));
+        let kept = apply_length_policy(LengthPolicy::default(), response)
+            .expect("complete tool calls must run");
+        assert_eq!(kept.tool_calls().len(), 1);
+        assert_eq!(kept.stop_reason, Some(StopReason::Length));
+    }
+
+    #[test]
+    fn text_truncation_fails_by_default_and_continues_with_complete_partial() {
+        let text = || length_response(ConversationItem::assistant("half an ans"));
+        assert!(matches!(
+            apply_length_policy(LengthPolicy::default(), text()),
+            Err(SamplingError::MaxTokensTruncation)
+        ));
+        let kept = apply_length_policy(LengthPolicy::CompletePartial, text())
+            .expect("partial text is delivered for continuation");
+        assert_eq!(kept.assistant_text(), "half an ans");
     }
 }
 
@@ -7127,6 +7212,17 @@ mod tests {
             codex_terminal_error(max_tokens),
             Some(SamplingError::MaxTokensTruncation)
         ));
+        // With an id the envelope parses, so the LengthPolicy decides.
+        let with_id = r#"{"type":"response.incomplete","response":{"id":"resp1","incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        assert!(codex_terminal_error(with_id).is_none());
+        let decoded = decode_responses_sse_frame("", with_id, ResponsesWireDialect::Codex)
+            .expect("a Codex incomplete envelope with an id parses");
+        let ResponsesStreamItem::Event(rs::ResponseStreamEvent::ResponseIncomplete(event)) =
+            decoded
+        else {
+            panic!("expected ResponseIncomplete");
+        };
+        assert_eq!(event.response.status, rs::Status::Incomplete);
 
         let other = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#;
         assert_codex_terminal_api_error(

@@ -2296,6 +2296,10 @@ impl SessionActor {
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
+        let mut salvage = super::length_salvage::LengthSalvage::new(
+            self.length_salvage_budget(json_schema.is_some()),
+        );
+        let mut length_salvage_streak = super::length_salvage::LengthSalvageStreak::default();
         // Validator is large; keep it on the heap for the whole turn.
         let structured_output_validator = std::sync::Arc::new(json_schema.as_ref().map(|schema| {
             jsonschema::validator_for(schema).map_err(|e| format!("invalid output schema: {e}"))
@@ -2505,6 +2509,9 @@ impl SessionActor {
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
                 .map_err(|message| acp::Error::internal_error().data(message))?;
+            if salvage.enabled() {
+                request.length_policy = xai_grok_sampling_types::LengthPolicy::CompletePartial;
+            }
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2787,6 +2794,27 @@ impl SessionActor {
                 stop_reason == Some(xai_grok_sampling_types::StopReason::ContentFilter);
             let refusal_explanation = response.stop_message.clone();
             let final_answer_text = json_schema.is_some().then(|| response.assistant_text());
+            let is_length_stop = stop_reason == Some(xai_grok_sampling_types::StopReason::Length);
+            match length_salvage_streak.on_sample(is_length_stop && !tool_calls.is_empty()) {
+                super::length_salvage::LengthSalvageAction::Exhausted => {
+                    tracing::error!(
+                        session_id = %self.session_info.id,
+                        max = super::length_salvage::MAX_OUTPUT_TOKEN_LIMIT_RETRIES,
+                        "consecutive Length-salvaged tool-call samples hit the cap; failing the turn"
+                    );
+                    return Err(self.fail_turn_length_salvage_exhausted().await);
+                }
+                super::length_salvage::LengthSalvageAction::Proceed { inject_reminder } => {
+                    // Before the assistant item, so the model sees the cut
+                    // before its own salvaged calls and their results.
+                    if inject_reminder {
+                        self.push_system_reminder(
+                            super::length_salvage::OUTPUT_TOKEN_LIMIT_REMINDER,
+                        );
+                    }
+                }
+                super::length_salvage::LengthSalvageAction::NotSalvage => {}
+            }
             for item in response.items {
                 match item {
                     xai_grok_sampling_types::ConversationItem::Assistant(_) => {
@@ -2831,9 +2859,56 @@ impl SessionActor {
                 .await;
             }
             self.send_buffered_xai_update(response_completed).await;
+            if is_length_stop && tool_calls.is_empty() {
+                match salvage.on_length_stop() {
+                    super::length_salvage::SalvageStep::Continue { inject_reminder } => {
+                        if inject_reminder {
+                            self.push_system_reminder(
+                                super::length_salvage::LENGTH_CONTINUE_REMINDER_BODY,
+                            );
+                        }
+                        tracing::warn!(
+                            session_id = %self.session_info.id,
+                            retry = salvage.continues(),
+                            max = salvage.budget(),
+                            "output token limit hit; asking the model to continue"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.length_truncation_continue",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "continue_attempts": salvage.continues(),
+                                "continue_budget": salvage.budget(),
+                            })),
+                        );
+                        continue;
+                    }
+                    super::length_salvage::SalvageStep::Exhaust => {
+                        tracing::error!(
+                            session_id = %self.session_info.id,
+                            retries = salvage.continues(),
+                            "output token limit continues exhausted; completing the turn truncated"
+                        );
+                        xai_grok_telemetry::unified_log::warn(
+                            "shell.turn.length_truncation_exhausted",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({
+                                "continue_attempts": salvage.continues(),
+                                "continue_budget": salvage.budget(),
+                            })),
+                        );
+                    }
+                    super::length_salvage::SalvageStep::None => {}
+                }
+            }
+            if !tool_calls.is_empty() {
+                salvage.step_boundary();
+            }
             if tool_calls.is_empty() {
+                // A cut-off answer is not a turn end the TodoGate should judge.
                 if !schema_ok
                     && !turn_refused
+                    && !salvage.is_truncated()
                     && let Some(gate_cfg) = self.todo_gate_policy()
                 {
                     let collected = self.collect_todo_gate_input(req_id).await;

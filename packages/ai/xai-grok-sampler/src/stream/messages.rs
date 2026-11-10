@@ -534,13 +534,8 @@ pub fn stream_messages<'a>(
             }
         }
 
-        if final_stop_reason == Some(StopReason::Length) {
-            yield SamplingEvent::Failed {
-                request_id: request_id.clone(),
-                error: SamplingErrorInfo::from(&SamplingError::MaxTokensTruncation),
-            };
-            return;
-        }
+        // A `Length` stop is not failed here: the response completes with
+        // `stop_reason=Length` and the request's `LengthPolicy` decides.
 
         // ── Build the final response ─────────────────────────────────
         let model_id = final_model.unwrap_or_default();
@@ -561,7 +556,12 @@ pub fn stream_messages<'a>(
             None
         };
 
-        let stop_reason = if !assistant_tool_calls.is_empty() {
+        let stop_reason = if final_stop_reason == Some(StopReason::Length) {
+            // Length wins even over closed tool_use blocks: the provider
+            // closes a block it cut mid-stream, so the last call's arguments
+            // may be truncated. The `LengthPolicy` gate checks them.
+            final_stop_reason
+        } else if !assistant_tool_calls.is_empty() {
             // Completed tool_use blocks win even over Refusal: the calls are
             // real model output the agent loop must resolve.
             Some(StopReason::ToolCalls)

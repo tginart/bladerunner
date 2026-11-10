@@ -554,37 +554,51 @@ async fn pause_turn_and_unknown_stop_reasons_complete_as_stop() {
 }
 
 /// Pins the model_context_window_exceeded decision: it stays in the
-/// max_tokens truncation class (fatal, non-retryable), not the
-/// context-length Api class.
+/// max_tokens truncation class, not the context-length Api class. The
+/// stream completes with a `Length` stop; the request's `LengthPolicy`
+/// (in `apply_length_policy`) decides whether it fails.
 #[tokio::test]
-async fn model_context_window_exceeded_fails_as_max_tokens_truncation() {
-    let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
-        Ok(message_start()),
-        Ok(text_block_start(0)),
-        Ok(text_delta(0, "truncated answ")),
-        Ok(block_stop(0)),
-        Ok(message_delta_with_stop(
-            messages::StopReason::ModelContextWindowExceeded,
-        )),
-        Ok(MessageStreamEvent::MessageStop),
-    ];
+async fn model_context_window_exceeded_completes_with_length_stop() {
+    for stop in [
+        messages::StopReason::ModelContextWindowExceeded,
+        messages::StopReason::MaxTokens,
+    ] {
+        let events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![
+            Ok(message_start()),
+            Ok(text_block_start(0)),
+            Ok(text_delta(0, "truncated answ")),
+            Ok(block_stop(0)),
+            Ok(message_delta_with_stop(stop.clone())),
+            Ok(MessageStreamEvent::MessageStop),
+        ];
+        let raw = stream::iter(events).boxed();
+        let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+        match evs.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length), "{stop:?}");
+                assert_eq!(response.assistant_text(), "truncated answ");
+            }
+            other => panic!("{stop:?}: expected Completed(Length), got {other:?}"),
+        }
+    }
+}
+
+/// A `max_tokens` stop after closed tool_use blocks keeps `Length`: the
+/// provider closes a block it cut, so the policy gate must check the args.
+#[tokio::test]
+async fn max_tokens_after_tool_use_blocks_keeps_length_stop_reason() {
+    let mut events: Vec<Result<MessageStreamEvent, SamplingError>> = vec![Ok(message_start())];
+    events.extend(tool_use_block(0, "call_cut"));
+    events.push(Ok(message_delta_with_stop(messages::StopReason::MaxTokens)));
+    events.push(Ok(MessageStreamEvent::MessageStop));
     let raw = stream::iter(events).boxed();
     let evs = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
-
-    assert!(
-        !evs.iter()
-            .any(|e| matches!(e, SamplingEvent::Completed { .. })),
-        "context-window truncation must not complete: {evs:?}"
-    );
     match evs.last().unwrap() {
-        SamplingEvent::Failed { error, .. } => {
-            assert_eq!(
-                error.kind,
-                crate::events::SamplingErrorKind::MaxTokensTruncation
-            );
-            assert!(!error.is_retryable, "truncation is deterministic");
+        SamplingEvent::Completed { response, .. } => {
+            assert_eq!(response.tool_calls().len(), 1);
+            assert_eq!(response.stop_reason, Some(StopReason::Length));
         }
-        other => panic!("expected Failed(MaxTokensTruncation), got {other:?}"),
+        other => panic!("expected Completed(Length), got {other:?}"),
     }
 }
 
