@@ -413,6 +413,75 @@ fn paint_committed(
     }
 }
 
+/// Like [`insert_committed`], but a block taller than `max_rows` keeps its
+/// newest rows instead of its oldest. The history reprint uses it for the
+/// block at the edge of its row budget, so the output the user saw last stays.
+pub(crate) fn insert_committed_tail(
+    terminal: &mut PagerTerminal,
+    renderer: EntryRenderer<'_>,
+    width: u16,
+    max_rows: u16,
+    footer_style: Style,
+) -> std::io::Result<()> {
+    let full_h = renderer.desired_height(width);
+    if full_h == 0 {
+        return Ok(());
+    }
+    let commit_h = full_h.min(max_rows);
+    terminal.insert_before(commit_h, move |buf| {
+        paint_committed_tail(buf, renderer, width, full_h, footer_style);
+    })?;
+    insert_gap(terminal);
+    Ok(())
+}
+
+/*
+Purpose: This function paints the newest rows of a committed block into buf.
+Input: A buffer of commit_h rows. The renderer. The width. The full block
+    height full_h. The note style.
+Output: None. The function writes into buf.
+Method:
+    1. If the block fits in buf, paint it with paint_committed.
+    2. If not, the first row is a note that tells how many earlier lines are
+       left out.
+    3. Paint the last commit_h - 1 rows of the block below the note.
+*/
+fn paint_committed_tail(
+    buf: &mut ratatui::buffer::Buffer,
+    renderer: EntryRenderer<'_>,
+    width: u16,
+    full_h: u16,
+    footer_style: Style,
+) {
+    let commit_h = buf.area.height;
+    if commit_h >= full_h {
+        paint_committed(buf, renderer, width, full_h, footer_style);
+        return;
+    }
+    assert!(
+        commit_h >= 2,
+        "a tail clip needs a note row and a content row"
+    );
+    let hidden = full_h - (commit_h - 1);
+    let style = footer_style.bg(Color::Reset);
+    let note_row = Rect {
+        x: buf.area.x,
+        y: buf.area.y,
+        width,
+        height: 1,
+    };
+    buf.set_style(note_row, style);
+    let text = format!("\u{2026} {hidden} earlier lines \u{2014} /transcript to view");
+    buf.set_span(buf.area.x, buf.area.y, &Span::styled(text, style), width);
+    let area = Rect {
+        x: buf.area.x,
+        y: buf.area.y + 1,
+        width,
+        height: commit_h - 1,
+    };
+    renderer.with_skip_rows(hidden).render(area, buf);
+}
+
 /// Commit the active agent's newly-finalized blocks into native scrollback.
 ///
 /// For each entry in the leading committable run: stamp its print-once display
