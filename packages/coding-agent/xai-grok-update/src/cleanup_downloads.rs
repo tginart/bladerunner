@@ -337,7 +337,11 @@ fn macos_list_pids() -> std::io::Result<Vec<i32>> {
 fn linux_running_executable_paths() -> std::io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
+        // One unreadable entry must not fail the whole scan: on Linux a
+        // failed scan means "not in use".
+        let Ok(entry) = entry else {
+            continue;
+        };
         let is_pid = entry
             .file_name()
             .to_str()
