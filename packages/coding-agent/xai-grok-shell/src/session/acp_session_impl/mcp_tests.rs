@@ -41,6 +41,57 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
 "#;
 
+/// A streamable-HTTP MCP server on `127.0.0.1:<argv[1]>` that lists one
+/// tool, `proof`. It answers every POST with plain JSON and has no SSE
+/// stream (GET and DELETE get 405).
+const HTTP_SERVER_SCRIPT: &str = r#"
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(405)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    do_DELETE = do_GET
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        request = json.loads(body)
+        if 'id' not in request:
+            self.send_response(202)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        method = request['method']
+        if method == 'initialize':
+            result = {
+                'protocolVersion': request['params']['protocolVersion'],
+                'capabilities': {'tools': {}},
+                'serverInfo': {'name': 'fixture', 'version': '1'},
+            }
+        elif method == 'tools/list':
+            result = {'tools': [{
+                'name': 'proof', 'description': 'Synthetic proof tool',
+                'inputSchema': {'type': 'object', 'properties': {}},
+            }]}
+        else:
+            result = {}
+        data = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
+"#;
+
 /// Purpose: Create an actor whose fixture files stay inside a temporary directory.
 /// Input: The fixture directory.
 /// Output: An actor with no initial MCP configuration.
@@ -132,6 +183,117 @@ async fn long_qualified_mcp_name_is_kept_and_dispatches() {
             );
         })
         .await;
+}
+
+/// Purpose: Verify that a server that was down at startup gets its tools
+///     once it comes up and the retry cooldown is over.
+/// Input: An HTTP server config on a free port with no listener, then the
+///     HTTP fixture started on that port.
+/// Output: The server first waits for a retry, then is ready with its tool.
+#[tokio::test(flavor = "current_thread")]
+async fn unreachable_server_is_retried_and_becomes_available() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            let port = free_local_port();
+            let url = format!("http://127.0.0.1:{port}/mcp");
+            actor.mcp_state.lock().await.configs =
+                vec![acp::McpServer::Http(acp::McpServerHttp::new("flaky", &url))];
+            actor.ensure_mcp_tools_initialized().await;
+            wait_until(&actor, |state| {
+                !state.is_server_handshaking("flaky") && state.init_failed.contains_key("flaky")
+            })
+            .await;
+            assert!(
+                actor
+                    .mcp_state
+                    .lock()
+                    .await
+                    .is_unreachable_retry_pending("flaky"),
+                "a refused connection must be retryable"
+            );
+
+            // A retry inside the cooldown does nothing.
+            actor
+                .retry_unreachable_servers_at(std::time::Instant::now())
+                .await;
+            assert!(actor.mcp_state.lock().await.init_failed.contains_key("flaky"));
+
+            let _server = HttpFixture::start(root.path(), port);
+            let after_cooldown = std::time::Instant::now()
+                + crate::session::mcp_servers::McpState::UNREACHABLE_RETRY_COOLDOWN;
+            actor.retry_unreachable_servers_at(after_cooldown).await;
+            {
+                let state = actor.mcp_state.lock().await;
+                assert!(!state.init_failed.contains_key("flaky"));
+                assert!(!state.is_unreachable_retry_pending("flaky"));
+                assert!(state.get_client("flaky").is_some());
+            }
+            wait_for_registered_tool(&actor, "flaky__proof").await;
+        })
+        .await;
+}
+
+/// Purpose: Find a TCP port on 127.0.0.1 that nothing listens on now.
+/// Input: None.
+/// Output: The port number.
+fn free_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Purpose: Wait until the MCP state satisfies a condition.
+/// Input: An actor and the condition.
+/// Output: None, or a bounded assertion failure.
+async fn wait_until(
+    actor: &SessionActor,
+    condition: impl Fn(&crate::session::mcp_servers::McpState) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !condition(&*actor.mcp_state.lock().await) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("MCP state must reach the condition");
+}
+
+/// The HTTP fixture process. It is killed on drop.
+struct HttpFixture(std::process::Child);
+
+impl HttpFixture {
+    /// Purpose: Start the HTTP fixture and wait until it accepts connections.
+    /// Input: The fixture directory and the port.
+    /// Output: The running fixture.
+    fn start(root: &Path, port: u16) -> Self {
+        let script = root.join("http_server.py");
+        std::fs::write(&script, HTTP_SERVER_SCRIPT).unwrap();
+        #[allow(clippy::disallowed_methods)] // killed and waited on in Drop
+        let child = std::process::Command::new("/usr/bin/env")
+            .args(["python3", "-u"])
+            .arg(&script)
+            .arg(port.to_string())
+            .spawn()
+            .unwrap();
+        let fixture = Self(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the HTTP fixture must start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fixture
+    }
+}
+
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Purpose: Verify that the shared spawn OAuth map carries a plugin's client ID.

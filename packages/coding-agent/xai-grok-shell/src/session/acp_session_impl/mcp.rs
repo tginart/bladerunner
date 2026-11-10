@@ -389,6 +389,193 @@ impl SessionActor {
             self.emit_mcp_tools_changed_notifications(all_ui_tools);
         }
     }
+    /// Respawn MCP servers whose last connect failed because the endpoint was
+    /// unreachable, once their cooldown is over. A network blip during
+    /// startup must not remove a server's tools for the rest of the session.
+    pub(super) async fn retry_unreachable_servers(&self) {
+        self.retry_unreachable_servers_at(std::time::Instant::now())
+            .await;
+    }
+    /// [`Self::retry_unreachable_servers`] with an explicit clock, so tests
+    /// can step past the cooldown.
+    ///
+    /// Each claimed server holds an attempt token. Two triggers therefore
+    /// never spawn the same server, and an attempt that a config change made
+    /// stale cannot install its client or rewrite the failure records.
+    pub(super) async fn retry_unreachable_servers_at(&self, now: std::time::Instant) {
+        let (attempts, meta_config_map, configs) = {
+            let mut state = self.mcp_state.lock().await;
+            let attempts: std::collections::HashMap<String, u64> = state
+                .take_unreachable_retry_candidates(now)
+                .into_iter()
+                .collect();
+            let configs: Vec<acp::McpServer> = state
+                .configs
+                .iter()
+                .filter(|c| attempts.contains_key(mcp_server_name(c)))
+                .cloned()
+                .collect();
+            (attempts, state.meta_config_map.clone(), configs)
+        };
+        if attempts.is_empty() {
+            return;
+        }
+        tracing::info!(
+            servers = ?attempts.keys().collect::<Vec<_>>(),
+            "Retrying spawn of unreachable MCP servers"
+        );
+        let cwd = std::path::Path::new(&self.session_info.cwd);
+        let oauth_config_map = self.spawn_oauth_config_map(cwd);
+        let spawn_writer = self.events.writer();
+        let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
+            self.session_info.id.0.as_ref(),
+            &spawn_writer,
+            OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
+            self.tool_context.process_scope.as_ref(),
+        );
+        let results = crate::session::mcp_servers::start_mcp_servers(
+            configs,
+            Some(cwd),
+            &meta_config_map,
+            &oauth_config_map,
+            &ctx,
+        )
+        .await;
+        let mut unsettled = attempts;
+        let mut recovered = false;
+        let mut all_ui_tools: std::collections::HashMap<
+            String,
+            Vec<crate::extensions::mcp::McpToolEntry>,
+        > = std::collections::HashMap::new();
+        for result in results {
+            let (server_name, outcome) = match result {
+                Ok(client) => {
+                    let name = client.server_name().to_string();
+                    (name, Ok(client))
+                }
+                Err(e) => match e.server_name() {
+                    Some(name) => (name.to_string(), Err(e)),
+                    None => continue,
+                },
+            };
+            let Some(token) = unsettled.remove(&server_name) else {
+                continue;
+            };
+            match outcome {
+                Ok(client) => {
+                    if let Some(ui_tools) = self
+                        .install_retried_client(&server_name, token, client)
+                        .await
+                    {
+                        recovered = true;
+                        all_ui_tools.extend(ui_tools);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(server = server_name.as_str(), %e, "retry_unreachable: spawn still failing");
+                    self.settle_failed_unreachable_attempt(&server_name, token, &e, None)
+                        .await;
+                }
+            }
+        }
+        for (name, token) in unsettled {
+            self.mcp_state
+                .lock()
+                .await
+                .settle_unreachable_attempt_failed(
+                    &name,
+                    token,
+                    "respawn attempt produced no result".to_string(),
+                );
+        }
+        if recovered {
+            self.refresh_mcp_snapshot_and_schedule_reminder().await;
+            self.emit_mcp_tools_changed_notifications(all_ui_tools);
+        }
+    }
+    /// Handshake a respawned client and, if the attempt still owns the
+    /// server, install it and register its tools. Returns the UI-tool
+    /// entries for the `tools_changed` notification, or `None` when the
+    /// attempt did not recover the server.
+    async fn install_retried_client(
+        &self,
+        server_name: &str,
+        token: u64,
+        client: crate::session::mcp_servers::McpClient,
+    ) -> Option<std::collections::HashMap<String, Vec<crate::extensions::mcp::McpToolEntry>>> {
+        if let Some(tx) = self.mcp_state.lock().await.client_event_tx() {
+            client.set_event_tx(Some(tx));
+        }
+        let client = std::sync::Arc::new(client);
+        let registrations = match client.get_tool_registrations(self.mcp_state.clone()).await {
+            Ok(registrations) => registrations,
+            Err(e) => {
+                tracing::debug!(server = server_name, %e, "retry_unreachable: handshake still failing");
+                self.settle_failed_unreachable_attempt(server_name, token, &e, Some(client))
+                    .await;
+                return None;
+            }
+        };
+        let _ = client
+            .arm_liveness_watcher(xai_grok_mcp::liveness::DEFAULT_POLL_INTERVAL)
+            .await;
+        let mut mcp_state = self.mcp_state.lock().await;
+        if !mcp_state.finish_unreachable_attempt(server_name, token) {
+            drop(mcp_state);
+            tracing::info!(
+                server = server_name,
+                "retry_unreachable: attempt token stale; discarding client"
+            );
+            client.shutdown().await;
+            return None;
+        }
+        mcp_state
+            .owned_clients
+            .insert(server_name.to_string(), client);
+        let mut ui_tools = std::collections::HashMap::new();
+        for reg in registrations {
+            self.register_mcp_tool(server_name, reg, &mut mcp_state, &mut ui_tools)
+                .await;
+        }
+        drop(mcp_state);
+        tracing::info!(
+            server = server_name,
+            "MCP server recovered via retry_unreachable (respawn succeeded)"
+        );
+        Some(ui_tools)
+    }
+    /// Settle a failed respawn attempt by error class. An auth rejection
+    /// hands the server to the auth-required flow and keeps the new client
+    /// (when there is one) for its recovery paths. A connectivity failure
+    /// waits for the next cooldown. Anything else is a terminal init failure.
+    async fn settle_failed_unreachable_attempt(
+        &self,
+        server_name: &str,
+        token: u64,
+        error: &crate::session::mcp_servers::McpError,
+        client_for_auth: Option<std::sync::Arc<crate::session::mcp_servers::McpClient>>,
+    ) {
+        let detail =
+            || xai_grok_tools::util::truncate_str_with_marker(&error.to_string(), 200).into_owned();
+        let mut state = self.mcp_state.lock().await;
+        if error.is_auth_rejection() || client_for_auth.as_ref().is_some_and(|c| c.has_auth()) {
+            if !state.settle_unreachable_attempt_unretryable(server_name, token) {
+                return;
+            }
+            if let Some(client) = client_for_auth {
+                state.owned_clients.insert(server_name.to_string(), client);
+            }
+            state.clear_init_failed(server_name);
+            state.record_init_failure(server_name, true, None);
+        } else if error.is_transient_connectivity() {
+            state.settle_unreachable_attempt_failed(server_name, token, detail());
+        } else {
+            if !state.settle_unreachable_attempt_unretryable(server_name, token) {
+                return;
+            }
+            state.record_init_failure(server_name, false, Some(detail()));
+        }
+    }
     /// Refresh the MCP tool/search snapshot from current tool bridge state.
     /// Called after MCP init and after auth_trigger/retry recovers new servers.
     ///
@@ -1060,6 +1247,7 @@ impl SessionActor {
         .await;
         tokio::task::yield_now().await;
         let mut spawn_auth_failures: Vec<String> = Vec::new();
+        let mut spawn_unreachable_failures: Vec<(String, String)> = Vec::new();
         let mcp_clients: Vec<_> = mcp_results
             .into_iter()
             .filter_map(|result| match result {
@@ -1072,6 +1260,8 @@ impl SessionActor {
                     let sname = e.server_name().unwrap_or("unknown").to_string();
                     if e.is_auth_rejection() && sname != "unknown" {
                         spawn_auth_failures.push(sname.clone());
+                    } else if e.is_unreachable() && sname != "unknown" {
+                        spawn_unreachable_failures.push((sname.clone(), e.to_string()));
                     }
                     let cfg = mcp_server_configs
                         .iter()
@@ -1116,6 +1306,10 @@ impl SessionActor {
                 );
                 if spawn_auth_failures.iter().any(|n| n == name) {
                     mcp_state.record_init_failure(name, true, None);
+                } else if let Some((_, detail)) =
+                    spawn_unreachable_failures.iter().find(|(n, _)| n == name)
+                {
+                    mcp_state.record_unreachable_failure(name, detail.clone());
                 }
                 mcp_state.mark_server_ready(name);
             }
@@ -1468,7 +1662,16 @@ impl SessionActor {
                             xai_grok_tools::util::truncate_str_with_marker(&e.to_string(), 200)
                                 .into_owned()
                         });
-                        mcp_state.record_init_failure(&server_name, needs_auth, detail);
+                        // A server that was never reached is retried later; any
+                        // other failure stays until the config changes.
+                        if !needs_auth && e.is_connect_failure() {
+                            mcp_state.record_unreachable_failure(
+                                &server_name,
+                                detail.unwrap_or_default(),
+                            );
+                        } else {
+                            mcp_state.record_init_failure(&server_name, needs_auth, detail);
+                        }
                         mcp_state.mark_server_ready(&server_name);
                     }
                 }

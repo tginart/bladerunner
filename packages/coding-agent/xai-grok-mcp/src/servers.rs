@@ -324,6 +324,22 @@ struct AcpMcpRegistry {
     invoker: Arc<dyn crate::acp_transport::AcpReverseInvoker>,
 }
 
+/// Retry state of a server whose last connect failed because the endpoint
+/// was unreachable. `Cooling` waits out the backoff. `InFlight` marks a
+/// running respawn and holds the token that the attempt must show to settle,
+/// so two triggers never spawn the same server and a config change makes a
+/// stale attempt's result unusable.
+#[derive(Debug, Clone, Copy)]
+enum UnreachableRetry {
+    Cooling {
+        retry_at: std::time::Instant,
+    },
+    InFlight {
+        token: u64,
+        started_at: std::time::Instant,
+    },
+}
+
 /// Consolidated MCP state behind a single lock. Generation counter detects stale inits.
 pub struct McpState {
     pub configs: Vec<acp::McpServer>,
@@ -358,6 +374,14 @@ pub struct McpState {
     /// `tools/list` and registered zero tools — does not misleadingly show
     /// as `Ready`. Cleared when the server begins a fresh init attempt.
     pub init_failed: std::collections::HashMap<McpServerName, String>,
+    /// Servers whose last connect failed because the endpoint was
+    /// unreachable. Its keys are a subset of [`Self::init_failed`] and are
+    /// cleared with it. Drives the session's unreachable-server retry, so a
+    /// network blip at startup does not remove the server's tools for the
+    /// rest of the session.
+    unreachable_retry: HashMap<McpServerName, UnreachableRetry>,
+    /// Source of [`UnreachableRetry::InFlight`] attempt tokens.
+    unreachable_attempt_counter: u64,
     /// Per-server set of unqualified tool names that the user has disabled.
     /// Persisted to `~/.grok/config.toml` under `[mcp_servers.<name>].disabled_tools`.
     pub disabled_tools: HashMap<McpServerName, std::collections::HashSet<ToolName>>,
@@ -409,6 +433,8 @@ impl McpState {
             mcp_tool_meta: HashMap::new(),
             auth_required: std::collections::HashSet::new(),
             init_failed: HashMap::new(),
+            unreachable_retry: HashMap::new(),
+            unreachable_attempt_counter: 0,
             disabled_tools: HashMap::new(),
             disabled_tool_registrations: HashMap::new(),
             event_writer: xai_file_utils::events::EventWriter::noop(),
@@ -551,6 +577,7 @@ impl McpState {
         self.init_progress.cancel();
         self.auth_required.clear();
         self.init_failed.clear();
+        self.unreachable_retry.clear();
         self.generation = self.generation.wrapping_add(1);
         true
     }
@@ -619,6 +646,7 @@ impl McpState {
         for name in &removed {
             self.owned_clients.remove(name);
             self.auth_required.remove(name);
+            self.unreachable_retry.remove(name);
             self.init_progress.mark_handshake_complete(name);
             let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
             self.mcp_tool_meta.retain(|k, _| !k.starts_with(&prefix));
@@ -730,6 +758,7 @@ impl McpState {
         // a server that recovers on retry stops showing as `Unavailable`.
         for name in &names {
             self.init_failed.remove(name);
+            self.unreachable_retry.remove(name);
         }
         self.init_progress.mark_handshaking(names);
     }
@@ -768,6 +797,122 @@ impl McpState {
     /// with a stale non-auth `detail`.
     pub fn clear_init_failed(&mut self, name: &str) {
         self.init_failed.remove(name);
+        self.unreachable_retry.remove(name);
+    }
+
+    /// Minimum wait between connect attempts for an unreachable server, so
+    /// retry triggers (tool batches, `/mcps` refreshes) cannot pile up
+    /// attempts while the server is down.
+    pub const UNREACHABLE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// How long an attempt keeps the server to itself. Far above any bounded
+    /// connect, so it only expires for an attempt whose future was dropped
+    /// and can never settle.
+    pub const UNREACHABLE_ATTEMPT_LEASE: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Record a connect failure caused by an unreachable endpoint. The server
+    /// shows as `Unavailable` and becomes a retry candidate after the
+    /// cooldown. An in-flight attempt is not demoted: its settle call owns
+    /// the next transition.
+    pub fn record_unreachable_failure(&mut self, name: &str, detail: String) {
+        self.init_failed.insert(name.to_string(), detail);
+        if let Some(UnreachableRetry::InFlight { .. }) = self.unreachable_retry.get(name) {
+            return;
+        }
+        let retry_at = std::time::Instant::now() + Self::UNREACHABLE_RETRY_COOLDOWN;
+        self.unreachable_retry
+            .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
+    }
+
+    /// True when `name` waits for (or runs) an unreachable-server retry.
+    pub fn is_unreachable_retry_pending(&self, name: &str) -> bool {
+        self.unreachable_retry.contains_key(name)
+    }
+
+    /// Claim the servers due for a retry at `now`: the cooldown is over (or
+    /// an earlier attempt's lease expired) and the server is still
+    /// configured. Each claimed server moves to `InFlight` with a new token,
+    /// so a concurrent caller does not get it again.
+    pub fn take_unreachable_retry_candidates(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<(McpServerName, u64)> {
+        let configured: std::collections::HashSet<&str> =
+            self.configs.iter().map(mcp_server_name).collect();
+        let due: Vec<McpServerName> = self
+            .unreachable_retry
+            .iter()
+            .filter(|(name, state)| {
+                configured.contains(name.as_str()) && Self::is_retry_due(state, now)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut claimed = Vec::with_capacity(due.len());
+        for name in due {
+            self.unreachable_attempt_counter += 1;
+            let token = self.unreachable_attempt_counter;
+            self.unreachable_retry.insert(
+                name.clone(),
+                UnreachableRetry::InFlight {
+                    token,
+                    started_at: now,
+                },
+            );
+            claimed.push((name, token));
+        }
+        claimed
+    }
+
+    /// Settle an attempt as recovered. Returns `false` when a config change
+    /// removed the server during the attempt; the caller must then discard
+    /// its new client.
+    pub fn finish_unreachable_attempt(&mut self, name: &str, token: u64) -> bool {
+        if !self.owns_unreachable_attempt(name, token) {
+            return false;
+        }
+        self.unreachable_retry.remove(name);
+        self.init_failed.remove(name);
+        true
+    }
+
+    /// Settle an attempt that still could not connect: restart the cooldown
+    /// from now and refresh the failure detail. No-op for a stale token.
+    pub fn settle_unreachable_attempt_failed(&mut self, name: &str, token: u64, detail: String) {
+        if !self.owns_unreachable_attempt(name, token) {
+            return;
+        }
+        self.init_failed.insert(name.to_string(), detail);
+        let retry_at = std::time::Instant::now() + Self::UNREACHABLE_RETRY_COOLDOWN;
+        self.unreachable_retry
+            .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
+    }
+
+    /// Settle an attempt and stop retrying (a failure that is not about
+    /// connectivity, or a handoff to the auth flow). Returns whether the
+    /// attempt still owned the server. The `init_failed` entry is left to
+    /// the caller.
+    pub fn settle_unreachable_attempt_unretryable(&mut self, name: &str, token: u64) -> bool {
+        if !self.owns_unreachable_attempt(name, token) {
+            return false;
+        }
+        self.unreachable_retry.remove(name);
+        true
+    }
+
+    fn is_retry_due(state: &UnreachableRetry, now: std::time::Instant) -> bool {
+        match state {
+            UnreachableRetry::Cooling { retry_at } => *retry_at <= now,
+            UnreachableRetry::InFlight { started_at, .. } => {
+                now.saturating_duration_since(*started_at) > Self::UNREACHABLE_ATTEMPT_LEASE
+            }
+        }
+    }
+
+    fn owns_unreachable_attempt(&self, name: &str, token: u64) -> bool {
+        matches!(
+            self.unreachable_retry.get(name),
+            Some(UnreachableRetry::InFlight { token: t, .. }) if *t == token
+        )
     }
 
     /// Clear the entire handshaking set in one shot. Used by the
@@ -1066,6 +1211,12 @@ pub enum McpError {
     )]
     AuthRequired { server: String },
 
+    /// Pre-spawn gate: neither OAuth discovery nor the anonymous-access probe
+    /// could reach the server. A connectivity failure, not an auth verdict,
+    /// so the session retries it.
+    #[error("MCP server '{server}': unreachable during startup (connection failed; will retry)")]
+    Unreachable { server: String },
+
     #[error("MCP service error: {0}")]
     ServiceError(#[from] ServiceError),
 }
@@ -1089,6 +1240,7 @@ impl McpError {
             Self::Timeout { .. } => McpErrorCategory::Timeout,
             Self::HandshakeFailed { .. } => McpErrorCategory::HandshakeFailed,
             Self::AuthRequired { .. } => McpErrorCategory::AuthRequired,
+            Self::Unreachable { .. } => McpErrorCategory::SpawnFailed,
             Self::ClientError(_) | Self::ServiceError(_) => McpErrorCategory::ClientError,
         }
     }
@@ -1098,7 +1250,8 @@ impl McpError {
             Self::SpawnFailed { server, .. }
             | Self::Timeout { server, .. }
             | Self::HandshakeFailed { server, .. }
-            | Self::AuthRequired { server } => Some(server),
+            | Self::AuthRequired { server }
+            | Self::Unreachable { server } => Some(server),
             Self::ClientError(_) | Self::ServiceError(_) => None,
         }
     }
@@ -1112,10 +1265,107 @@ impl McpError {
             Self::HandshakeFailed { source, .. } => is_auth_rejection_message(&source.to_string()),
             Self::ServiceError(e) => is_auth_rejection_message(&e.to_string()),
             Self::ClientError(s) => is_auth_rejection_message(s),
-            Self::Timeout { .. } | Self::SpawnFailed { .. } => false,
+            Self::Timeout { .. } | Self::SpawnFailed { .. } | Self::Unreachable { .. } => false,
+        }
+    }
+
+    /// True for the pre-spawn [`Self::Unreachable`] verdict.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable { .. })
+    }
+
+    /// True for failures that say nothing about the server itself, only
+    /// about the path to it, so another connect attempt can help. Protocol
+    /// rejections and malformed responses are not transient.
+    pub fn is_transient_connectivity(&self) -> bool {
+        match self {
+            Self::Unreachable { .. } | Self::Timeout { .. } => true,
+            Self::HandshakeFailed { source, .. } => {
+                is_transport_error_message(&error_chain_text(source.as_ref()))
+            }
+            Self::ClientError(s) => is_transport_error_message(s),
+            Self::ServiceError(e) => is_transport_error_message(&error_chain_text(e)),
+            Self::SpawnFailed { .. } | Self::AuthRequired { .. } => false,
+        }
+    }
+
+    /// The never-connected subset of [`Self::is_transient_connectivity`]: the
+    /// client did not reach the server at all.
+    pub fn is_connect_failure(&self) -> bool {
+        match self {
+            Self::Unreachable { .. } => true,
+            Self::HandshakeFailed { source, .. } => {
+                init_error_is_connect_phase(source)
+                    || is_connect_failure_message(&error_chain_text(source.as_ref()))
+            }
+            Self::ClientError(s) => is_connect_failure_message(s),
+            Self::ServiceError(e) => is_connect_failure_message(&error_chain_text(e)),
+            Self::Timeout { .. } | Self::SpawnFailed { .. } | Self::AuthRequired { .. } => false,
         }
     }
 }
+
+/// True when the handshake failed because reqwest could not open a
+/// connection to the streamable-HTTP endpoint.
+fn init_error_is_connect_phase(err: &ClientInitializeError) -> bool {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    let ClientInitializeError::TransportError { error, .. } = err else {
+        return false;
+    };
+    matches!(
+        error
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest::Error>>(),
+        Some(StreamableHttpError::Client(e)) if e.is_connect()
+    )
+}
+
+/// `Display` of an error and all its sources. reqwest keeps the OS cause
+/// ("connection refused") in the source chain, not in its own message.
+fn error_chain_text(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// Connect-level subset of [`is_transport_error_message`].
+fn is_connect_failure_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "connection refused",
+        "dns error",
+        "network unreachable",
+        "host unreachable",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Detect transport-level failures from the error text, for error types
+/// that carry no typed connectivity verdict.
+fn is_transport_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "error sending request",
+        "network unreachable",
+        "host unreachable",
+        "timed out",
+        "transport closed",
+        "dns error",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 
 /// True when a failed refresh-token grant was a **network-level** failure
 /// that never reached the IdP (RT validity unknown, presumed good); IdP
@@ -1735,18 +1985,173 @@ enum HttpOauthPrep {
     ManagerReady(Arc<tokio::sync::Mutex<rmcp::transport::auth::AuthorizationManager>>),
     /// OAuth is required but cannot complete in non-interactive mode — do not start unauthenticated.
     NeedsInteractiveLogin,
+    /// Non-interactive only: discovery gave no verdict (manager-create
+    /// error, discovery error, or timeout). The anonymous-access probe
+    /// decides.
+    Inconclusive,
+    /// Neither discovery nor the anonymous-access probe reached the server.
+    Unreachable,
 }
 
 impl HttpOauthPrep {
     /// Inconclusive OAuth probe (manager-create error, discovery error, or timeout):
-    /// interactive proceeds as plain HTTP; non-interactive fails closed to avoid rmcp
-    /// auth-worker stderr noise.
+    /// interactive proceeds as plain HTTP. Non-interactive must not start an
+    /// unauthenticated worker that fatals on an OAuth challenge, so it asks
+    /// the anonymous-access probe first.
     fn on_probe_failure(mode: OauthInteractivity) -> Self {
         match mode {
             OauthInteractivity::Interactive => Self::NoOauthSupport,
-            OauthInteractivity::NonInteractive => Self::NeedsInteractiveLogin,
+            OauthInteractivity::NonInteractive => Self::Inconclusive,
         }
     }
+}
+
+/// Bound on the anonymous-access probe request.
+const ANONYMOUS_ACCESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether an MCP server answers a request that carries no credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnonymousAccess {
+    Accepted,
+    AuthChallenged,
+    Unreachable,
+}
+
+/// Decide how to connect to an HTTP/SSE server that has no configured
+/// credential: OAuth discovery first, then, when discovery is inconclusive
+/// in a non-interactive session, one anonymous request.
+async fn decide_http_auth(
+    server_name: &str,
+    url: &str,
+    headers: &[(String, String)],
+    ctx: &McpSpawnCtx<'_>,
+    discovery_timeout: std::time::Duration,
+) -> HttpOauthPrep {
+    let prep = {
+        let _auth_discovery_timer =
+            xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
+        match tokio::time::timeout(
+            discovery_timeout,
+            discover_and_prepare_auth(server_name, url, ctx.mode),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    server = %server_name,
+                    url = %url,
+                    mode = ?ctx.mode,
+                    timeout_secs = discovery_timeout.as_secs(),
+                    "OAuth discovery timed out"
+                );
+                ctx.event_writer
+                    .emit(xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
+                        server_name: server_name.to_string(),
+                        url: url.to_string(),
+                    });
+                HttpOauthPrep::on_probe_failure(ctx.mode)
+            }
+        }
+    };
+    let HttpOauthPrep::Inconclusive = prep else {
+        return prep;
+    };
+    match probe_anonymous_access(server_name, url, headers).await {
+        AnonymousAccess::Accepted => {
+            tracing::info!(
+                server = server_name,
+                "OAuth discovery was inconclusive but the server accepts unauthenticated requests; connecting without auth"
+            );
+            HttpOauthPrep::NoOauthSupport
+        }
+        AnonymousAccess::AuthChallenged => {
+            tracing::warn!(
+                server = server_name,
+                "OAuth discovery was inconclusive and the server challenges unauthenticated requests; authenticate in TUI or set an Authorization header"
+            );
+            HttpOauthPrep::NeedsInteractiveLogin
+        }
+        AnonymousAccess::Unreachable => {
+            tracing::warn!(
+                server = server_name,
+                "OAuth discovery was inconclusive and the anonymous-access probe could not reach the server; will retry"
+            );
+            HttpOauthPrep::Unreachable
+        }
+    }
+}
+
+/// One POST to the MCP endpoint without credentials, judged by status class.
+/// A POST, not a GET: a streamable-HTTP server may answer GET with an SSE
+/// stream that never ends.
+async fn probe_anonymous_access(
+    server_name: &str,
+    url: &str,
+    headers: &[(String, String)],
+) -> AnonymousAccess {
+    // Redirects are not followed: a gateway that redirects an anonymous POST
+    // to a login page challenges the request, it does not accept it.
+    let client = match with_extra_root_certificates(reqwest::Client::builder())
+        .timeout(ANONYMOUS_ACCESS_PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(server = server_name, error = %e, "anonymous-access probe: building HTTP client failed");
+            return AnonymousAccess::Unreachable;
+        }
+    };
+    // The real transport sends the configured headers (e.g. `X-Api-Key`), so
+    // the probe must too, or a header-authenticated server looks closed.
+    let mut probe_headers = reqwest::header::HeaderMap::new();
+    for (key, value) in headers {
+        match (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            value.parse::<reqwest::header::HeaderValue>(),
+        ) {
+            (Ok(name), Ok(value)) => {
+                probe_headers.insert(name, value);
+            }
+            _ => tracing::warn!("Skipping invalid MCP HTTP header: {key}"),
+        }
+    }
+    probe_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    probe_headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    ensure_figma_user_agent(&mut probe_headers, server_name, url);
+    match client.post(url).headers(probe_headers).body("{}").send().await {
+        Ok(response) => classify_anonymous_response(response.status()),
+        Err(e) => {
+            tracing::warn!(server = server_name, error = %e, "anonymous-access probe failed");
+            AnonymousAccess::Unreachable
+        }
+    }
+}
+
+fn classify_anonymous_response(status: reqwest::StatusCode) -> AnonymousAccess {
+    // 407 asks for proxy credentials, which a headless session cannot
+    // supply either.
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        || status.is_redirection()
+    {
+        return AnonymousAccess::AuthChallenged;
+    }
+    // A 5xx is often an ingress or proxy blip that says nothing about auth.
+    if status.is_server_error() {
+        return AnonymousAccess::Unreachable;
+    }
+    // Any other answer, even a 4xx about the `{}` body, shows that the
+    // server serves unauthenticated requests.
+    AnonymousAccess::Accepted
 }
 
 /// Proactive OAuth discovery per RFC 8414 + 9728.
@@ -4305,32 +4710,14 @@ pub async fn start_mcp_server(
                 );
                 HttpOauthPrep::NoOauthSupport
             } else {
-                let _auth_discovery_timer =
-                    xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
-                match tokio::time::timeout(
+                decide_http_auth(
+                    &name,
+                    &url,
+                    &http_config.headers,
+                    ctx,
                     OAUTH_DISCOVERY_TIMEOUT,
-                    discover_and_prepare_auth(&name, &url, ctx.mode),
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            server = %name,
-                            url = %url,
-                            mode = ?ctx.mode,
-                            timeout_secs = OAUTH_DISCOVERY_TIMEOUT.as_secs(),
-                            "OAuth discovery timed out"
-                        );
-                        ctx.event_writer.emit(
-                            xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
-                                server_name: name.clone(),
-                                url: url.clone(),
-                            },
-                        );
-                        HttpOauthPrep::on_probe_failure(ctx.mode)
-                    }
-                }
             };
             match auth_prep {
                 HttpOauthPrep::ManagerReady(auth_mgr) => Ok(McpClient::new_http_auth(
@@ -4351,6 +4738,11 @@ pub async fn start_mcp_server(
                 HttpOauthPrep::NeedsInteractiveLogin => Err(McpError::AuthRequired {
                     server: name.clone(),
                 }),
+                HttpOauthPrep::Unreachable => Err(McpError::Unreachable {
+                    server: name.clone(),
+                }),
+                // `decide_http_auth` resolves an inconclusive discovery itself.
+                HttpOauthPrep::Inconclusive => unreachable!("decide_http_auth resolves Inconclusive"),
             }
         }
         // TODO(acp-0.10): `McpServer` is #[non_exhaustive]; reject unknown transports.
@@ -5097,6 +5489,190 @@ mod tests {
         assert!(!state.init_failed.contains_key("dead-srv"));
         // Idempotent: clearing an absent entry is a no-op.
         state.clear_init_failed("never-seen");
+    }
+
+    #[test]
+    fn unreachable_server_becomes_a_candidate_after_the_cooldown() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        let now = std::time::Instant::now();
+        state.record_unreachable_failure("down", "connection refused".to_string());
+        assert_eq!(
+            state.init_failed.get("down").map(String::as_str),
+            Some("connection refused")
+        );
+        assert!(state.take_unreachable_retry_candidates(now).is_empty());
+
+        let later = now + McpState::UNREACHABLE_RETRY_COOLDOWN + std::time::Duration::from_secs(1);
+        let claimed = state.take_unreachable_retry_candidates(later);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, "down");
+        // An in-flight server is not handed to a second trigger.
+        assert!(state.take_unreachable_retry_candidates(later).is_empty());
+
+        assert!(state.finish_unreachable_attempt("down", claimed[0].1));
+        assert!(!state.init_failed.contains_key("down"));
+        assert!(!state.is_unreachable_retry_pending("down"));
+    }
+
+    #[test]
+    fn stale_unreachable_attempt_cannot_settle() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        state.record_unreachable_failure("down", String::new());
+        let later = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        let (_, token) = state.take_unreachable_retry_candidates(later).remove(0);
+
+        // A config change tears the server down during the attempt.
+        assert!(state.update_configs(vec![make_http_server("down", "http://127.0.0.1:2/mcp")]));
+        assert!(!state.finish_unreachable_attempt("down", token));
+        state.settle_unreachable_attempt_failed("down", token, "late".to_string());
+        assert!(!state.init_failed.contains_key("down"));
+        assert!(!state.is_unreachable_retry_pending("down"));
+    }
+
+    #[test]
+    fn failed_unreachable_attempt_restarts_the_cooldown() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        state.record_unreachable_failure("down", String::new());
+        let later = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        let (_, token) = state.take_unreachable_retry_candidates(later).remove(0);
+        state.settle_unreachable_attempt_failed("down", token, "still down".to_string());
+        assert!(state.is_unreachable_retry_pending("down"));
+        assert!(state.take_unreachable_retry_candidates(later).is_empty());
+        assert_eq!(
+            state.init_failed.get("down").map(String::as_str),
+            Some("still down")
+        );
+    }
+
+    #[test]
+    fn unconfigured_unreachable_server_is_not_retried() {
+        let mut state = McpState::new(vec![]);
+        state.record_unreachable_failure("gone", String::new());
+        let later = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        assert!(state.take_unreachable_retry_candidates(later).is_empty());
+    }
+
+    #[test]
+    fn connect_failures_are_classified_as_unreachable() {
+        let unreachable = McpError::Unreachable {
+            server: "s".to_string(),
+        };
+        assert!(unreachable.is_unreachable());
+        assert!(unreachable.is_connect_failure());
+        assert!(!unreachable.is_auth_rejection());
+        let refused = McpError::ClientError("tcp connect error: Connection refused".to_string());
+        assert!(refused.is_connect_failure());
+        assert!(refused.is_transient_connectivity());
+        let reset = McpError::ClientError("connection reset by peer".to_string());
+        assert!(!reset.is_connect_failure());
+        assert!(reset.is_transient_connectivity());
+        let protocol = McpError::ClientError("invalid params".to_string());
+        assert!(!protocol.is_connect_failure());
+        assert!(!protocol.is_transient_connectivity());
+    }
+
+    /// Purpose: Serve canned HTTP answers on 127.0.0.1 for the auth probes.
+    /// Input: The status line for a POST. A GET never gets an answer, like
+    ///     a never-ending SSE stream, so OAuth discovery times out.
+    /// Output: The base URL of the server. The server thread lives until the
+    ///     test process exits.
+    fn spawn_probe_server(post_status: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if !buf[..n].starts_with(b"POST") {
+                        // Hold the connection open with no answer.
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        return;
+                    }
+                    let body = "{}";
+                    let response = format!(
+                        "HTTP/1.1 {post_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn anonymous_probe_status_classes() {
+        use reqwest::StatusCode;
+        for (status, expected) in [
+            (StatusCode::OK, AnonymousAccess::Accepted),
+            (StatusCode::BAD_REQUEST, AnonymousAccess::Accepted),
+            (StatusCode::METHOD_NOT_ALLOWED, AnonymousAccess::Accepted),
+            (StatusCode::UNAUTHORIZED, AnonymousAccess::AuthChallenged),
+            (StatusCode::FORBIDDEN, AnonymousAccess::AuthChallenged),
+            (
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                AnonymousAccess::AuthChallenged,
+            ),
+            (StatusCode::FOUND, AnonymousAccess::AuthChallenged),
+            (StatusCode::BAD_GATEWAY, AnonymousAccess::Unreachable),
+        ] {
+            assert_eq!(classify_anonymous_response(status), expected, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_reaches_the_endpoint() {
+        let open = spawn_probe_server("200 OK");
+        assert_eq!(
+            probe_anonymous_access("open", &open, &[]).await,
+            AnonymousAccess::Accepted
+        );
+        let locked = spawn_probe_server("401 Unauthorized");
+        assert_eq!(
+            probe_anonymous_access("locked", &locked, &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/mcp", listener.local_addr().unwrap())
+        };
+        assert_eq!(
+            probe_anonymous_access("closed", &closed, &[]).await,
+            AnonymousAccess::Unreachable
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_keeps_a_tokenless_server_when_discovery_is_inconclusive() {
+        let ew = xai_file_utils::events::EventWriter::noop();
+        let ctx = McpSpawnCtx::for_session("s", &ew, OauthInteractivity::NonInteractive, None);
+        let timeout = std::time::Duration::from_millis(300);
+
+        let open = spawn_probe_server("200 OK");
+        assert!(matches!(
+            decide_http_auth("open", &open, &[], &ctx, timeout).await,
+            HttpOauthPrep::NoOauthSupport
+        ));
+        let locked = spawn_probe_server("401 Unauthorized");
+        assert!(matches!(
+            decide_http_auth("locked", &locked, &[], &ctx, timeout).await,
+            HttpOauthPrep::NeedsInteractiveLogin
+        ));
+        let flaky = spawn_probe_server("503 Service Unavailable");
+        assert!(matches!(
+            decide_http_auth("flaky", &flaky, &[], &ctx, timeout).await,
+            HttpOauthPrep::Unreachable
+        ));
+
+        // An interactive session still connects without asking the probe.
+        let ctx = McpSpawnCtx::for_session("s", &ew, OauthInteractivity::Interactive, None);
+        assert!(matches!(
+            decide_http_auth("locked", &locked, &[], &ctx, timeout).await,
+            HttpOauthPrep::NoOauthSupport
+        ));
     }
 
     #[test]
