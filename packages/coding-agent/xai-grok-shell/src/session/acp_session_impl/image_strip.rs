@@ -21,7 +21,8 @@ impl SessionActor {
     /// Method:
     ///     1. Find the one image to blame. If there is none, keep the strip
     ///        local to the request.
-    ///     2. Remove that image from the chat state and its stored history.
+    ///     2. Remove that image from the chat state. The chat state also queues a
+    ///        rewrite of the stored history.
     ///     3. Send a notice that matches the result.
     pub(crate) async fn handle_images_stripped(&self, stripped_urls: Vec<Arc<str>>) {
         let stripped = stripped_urls.len();
@@ -38,7 +39,7 @@ impl SessionActor {
             .await;
             return;
         };
-        let persisted = self
+        let removed = self
             .chat_state_handle
             .strip_conversation_images(vec![blamed])
             .await
@@ -46,12 +47,14 @@ impl SessionActor {
         tracing::warn!(
             session_id = %self.session_info.id.0,
             stripped,
-            persisted,
+            removed,
             "server-rejected image strip"
         );
-        let notice = if persisted > 0 {
-            "The server could not process an image, so it was removed from the \
-             conversation. Re-attach it if it is still needed."
+        // The history rewrite is queued, not acknowledged, so the notice
+        // claims only what is sure: later requests leave the image out.
+        let notice = if removed > 0 {
+            "The server could not process an image, so later requests in this session \
+             leave it out. Re-attach it if it is still needed."
         } else {
             "The server could not process an image, so it was left out of this request."
         };
