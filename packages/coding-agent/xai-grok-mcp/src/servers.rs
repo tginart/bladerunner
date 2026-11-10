@@ -2121,11 +2121,9 @@ async fn probe_anonymous_access(
     url: &str,
     headers: &[(String, String)],
 ) -> AnonymousAccess {
-    // Redirects are not followed: a gateway that redirects an anonymous POST
-    // to a login page challenges the request, it does not accept it.
     let client = match with_extra_root_certificates(reqwest::Client::builder())
         .timeout(ANONYMOUS_ACCESS_PROBE_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(anonymous_probe_redirect_policy())
         .build()
     {
         Ok(client) => client,
@@ -2170,6 +2168,31 @@ async fn probe_anonymous_access(
             AnonymousAccess::Unreachable
         }
     }
+}
+
+/// The probe follows one redirect, and only a same-origin 307 or 308 (such as
+/// Starlette's `/mcp` -> `/mcp/`). A redirect to another origin, a second
+/// redirect, or one that changes the POST to a GET stops the probe, and the
+/// 3xx counts as an auth challenge: a gateway that sends an anonymous POST
+/// to a login page challenges it. The configured headers therefore never go
+/// to an origin other than the configured one.
+fn anonymous_probe_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let is_first_redirect = attempt.previous().len() == 1;
+        let is_same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        let keeps_method = matches!(
+            attempt.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+        );
+        if is_first_redirect && is_same_origin && keeps_method {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 fn classify_anonymous_response(status: reqwest::StatusCode) -> AnonymousAccess {
@@ -5742,6 +5765,117 @@ mod tests {
         assert_eq!(
             probe_anonymous_access("closed", &closed, &[]).await,
             AnonymousAccess::Unreachable
+        );
+    }
+
+    /// Purpose: Serve one canned POST answer per path on 127.0.0.1, and
+    ///     record every request head it gets.
+    /// Input: Pairs of a path and the full response head for a POST to it.
+    ///     Any other request gets 404.
+    /// Output: The base URL (`http://host:port`) and the recorded heads.
+    fn spawn_routed_probe_server(
+        routes: Vec<(&'static str, String)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                seen_by_server.lock().unwrap().push(head);
+                let response = routes
+                    .iter()
+                    .find(|(path, _)| request_line == format!("POST {path} HTTP/1.1"))
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(|| "HTTP/1.1 404 Not Found".to_string());
+                let _ = stream.write_all(
+                    format!("{response}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_follows_only_a_same_origin_method_preserving_redirect() {
+        // Starlette and FastMCP answer `/mcp` with `307 -> /mcp/`.
+        let (open, _) = spawn_routed_probe_server(vec![
+            (
+                "/mcp",
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: /mcp/".to_string(),
+            ),
+            ("/mcp/", "HTTP/1.1 200 OK".to_string()),
+        ]);
+        assert_eq!(
+            probe_anonymous_access("open", &format!("{open}/mcp"), &[]).await,
+            AnonymousAccess::Accepted
+        );
+
+        // A same-origin redirect to a login page that challenges.
+        let (locked, _) = spawn_routed_probe_server(vec![
+            (
+                "/mcp",
+                "HTTP/1.1 308 Permanent Redirect\r\nlocation: /mcp/".to_string(),
+            ),
+            ("/mcp/", "HTTP/1.1 401 Unauthorized".to_string()),
+        ]);
+        assert_eq!(
+            probe_anonymous_access("locked", &format!("{locked}/mcp"), &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+
+        // A 302 turns the POST into a GET, so it is not followed.
+        let (login, _) = spawn_routed_probe_server(vec![(
+            "/mcp",
+            "HTTP/1.1 302 Found\r\nlocation: /login".to_string(),
+        )]);
+        assert_eq!(
+            probe_anonymous_access("login", &format!("{login}/mcp"), &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+
+        // A second redirect is not followed.
+        let (chain, chain_seen) = spawn_routed_probe_server(vec![
+            (
+                "/mcp",
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: /a".to_string(),
+            ),
+            (
+                "/a",
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: /b".to_string(),
+            ),
+            ("/b", "HTTP/1.1 200 OK".to_string()),
+        ]);
+        assert_eq!(
+            probe_anonymous_access("chain", &format!("{chain}/mcp"), &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+        assert_eq!(chain_seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_never_sends_headers_to_another_origin() {
+        let (other, other_seen) =
+            spawn_routed_probe_server(vec![("/mcp", "HTTP/1.1 200 OK".to_string())]);
+        let (origin, _) = spawn_routed_probe_server(vec![(
+            "/mcp",
+            format!("HTTP/1.1 307 Temporary Redirect\r\nlocation: {other}/mcp"),
+        )]);
+        let headers = vec![("X-Api-Key".to_string(), "secret-value".to_string())];
+        assert_eq!(
+            probe_anonymous_access("cross", &format!("{origin}/mcp"), &headers).await,
+            AnonymousAccess::AuthChallenged
+        );
+        assert!(
+            other_seen.lock().unwrap().is_empty(),
+            "the probe must not follow a redirect to another origin"
         );
     }
 
