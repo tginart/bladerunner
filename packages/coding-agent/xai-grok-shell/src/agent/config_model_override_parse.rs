@@ -516,6 +516,21 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_reasoning_effort_is_accepted() {
+        let cfg = parse_cfg(
+            r#"
+            [model."grok-4.5"]
+            model = "grok-4.5"
+            env_key = "ANTHROPIC_AUTH_TOKEN"
+            reasoning_effort = "xHigh"
+            "#,
+        );
+        let model = cfg.config_models.get("grok-4.5").unwrap();
+        assert_eq!(model.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        assert!(cfg.config_warnings.is_empty());
+    }
+
+    #[test]
     fn invalid_reasoning_effort_skips_field_keeps_model() {
         let cfg = parse_cfg(
             r#"
