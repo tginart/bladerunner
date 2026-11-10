@@ -4203,10 +4203,18 @@ pub(crate) fn mark_session_live(session_dir: &Path) {
 
 /// Delete regular files older than `ttl_days` from a live session's
 /// [`SWEPT_BLOB_DIRS`]. The directories stay: a writer may sit between its
-/// `create_dir_all` and its write.
+/// `create_dir_all` and its write. A media dir that is a symlink is skipped,
+/// so the sweep never deletes files outside the session dir.
 fn prune_blob_dirs(session_dir: &Path, ttl_days: u32, stats: &mut CleanupStats) {
     for dir_name in SWEPT_BLOB_DIRS {
-        let Ok(entries) = std::fs::read_dir(session_dir.join(dir_name)) else {
+        let blob_dir = session_dir.join(dir_name);
+        // `read_dir` follows a symlink, so check the dir itself first.
+        let is_real_dir = std::fs::symlink_metadata(&blob_dir)
+            .is_ok_and(|metadata| metadata.file_type().is_dir());
+        if !is_real_dir {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&blob_dir) else {
             continue;
         };
         for entry_result in entries {
@@ -4323,6 +4331,27 @@ mod cleanup_stale_sessions_tests {
             "the bump changes only the mtime"
         );
         assert!(!idle.join("updates.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_does_not_follow_a_symlinked_media_dir() {
+        let home = TempDir::new().unwrap();
+        let dir = make_session(&home.path().join("sessions"), "live-session", 1);
+        let outside = home.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("keep.png");
+        fs::write(&outside_file, "png").unwrap();
+        age_file(&outside_file, 90);
+        fs::remove_dir_all(dir.join("images")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("images")).unwrap();
+
+        sweep(home.path());
+
+        assert!(
+            outside_file.is_file(),
+            "the sweep must not delete files behind a symlinked media dir"
+        );
     }
 
     #[test]
