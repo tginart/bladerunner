@@ -532,90 +532,22 @@ impl SessionActor {
             model: Some(model),
             temperature: Some(0.1),
             max_output_tokens: Some(50),
+            // A suggestion cut at the 50-token cap must not become ghost text.
+            length_policy: xai_grok_sampling_types::LengthPolicy::Fail,
             ..Default::default()
         };
 
-        let request_id = xai_grok_sampler::RequestId::random();
-        let idle_timeout = std::time::Duration::from_secs(5);
-
-        let result = match sampling_client.api_backend() {
-            crate::sampling::ApiBackend::ChatCompletions => {
-                let (raw, meta) = sampling_client.conversation_stream(request).await.ok()?;
-                let events =
-                    xai_grok_sampler::stream_chat_completions(raw, meta, request_id, idle_timeout);
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::Responses
-            | crate::sampling::ApiBackend::CodexResponses => {
-                let (raw, meta, doom_loop) = sampling_client
-                    .conversation_stream_responses(request)
-                    .await
-                    .ok()?;
-                let events = xai_grok_sampler::stream_responses(
-                    raw,
-                    meta,
-                    request_id,
-                    idle_timeout,
-                    doom_loop,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::Messages => {
-                let (raw, meta) = sampling_client
-                    .conversation_stream_messages(request)
-                    .await
-                    .ok()?;
-                let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::GoogleGenerateContent => {
-                let (raw, identity) = sampling_client
-                    .conversation_stream_google(request)
-                    .await
-                    .ok()?;
-                let events = xai_grok_sampler::google::stream_google_generate_content(
-                    raw,
-                    request_id,
-                    identity,
-                    idle_timeout,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::BedrockConverseStream => {
-                let (raw, identity) = sampling_client
-                    .conversation_stream_bedrock(request)
-                    .await
-                    .ok()?;
-                let events = xai_grok_sampler::bedrock::stream_bedrock_converse(
-                    raw,
-                    request_id,
-                    identity,
-                    idle_timeout,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::PiMessages => {
-                let (raw, identity) = sampling_client
-                    .conversation_stream_pi_messages(request)
-                    .await
-                    .ok()?;
-                let events = xai_grok_sampler::pi_messages::stream_pi_messages(
-                    raw,
-                    request_id,
-                    identity,
-                    idle_timeout,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-        };
-
-        match result {
-            Ok((response, _metrics)) => {
+        // Collect via the client so the `LengthPolicy` gate applies.
+        match sampling_client
+            .conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(response) => {
                 let text = response.assistant_text();
                 if text.is_empty() { None } else { Some(text) }
             }
             Err(e) => {
-                tracing::debug!(error = %e.message, "AI suggest inference failed");
+                tracing::debug!(error = %e, "AI suggest inference failed");
                 None
             }
         }

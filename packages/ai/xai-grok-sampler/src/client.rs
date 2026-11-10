@@ -4414,7 +4414,19 @@ impl SamplingClient {
     /// Backend-aware streaming call that collects the full response.
     pub async fn conversation_collect(
         &self,
+        request: ConversationRequest,
+    ) -> Result<ConversationResponse> {
+        self.conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(300))
+            .await
+    }
+
+    /// Backend-aware streaming call that collects the full response, with a
+    /// caller-chosen idle timeout between stream events. The request's
+    /// `LengthPolicy` gates a `Length` stop before the response returns.
+    pub async fn conversation_collect_with_idle_timeout(
+        &self,
         mut request: ConversationRequest,
+        idle_timeout: std::time::Duration,
     ) -> Result<ConversationResponse> {
         self.apply_conversation_defaults(&mut request)?;
         let reasoning_model_identity = request.reasoning_model_identity.clone();
@@ -4425,7 +4437,6 @@ impl SamplingClient {
         let hosted_tools = self.request_hosted_tools(&request);
         let length_policy = request.length_policy;
         let request_id = crate::types::RequestId::random();
-        let idle_timeout = std::time::Duration::from_secs(300);
         let result = match self.api_backend() {
             ApiBackend::ChatCompletions => {
                 let (raw, meta) = self.conversation_stream(request).await?;
@@ -4489,7 +4500,7 @@ impl SamplingClient {
 /// completed response: fail a `Length` stop the policy rejects, and log a
 /// breadcrumb for a salvaged one. The one gate shared by `drive_l2` and the
 /// direct-collect path, so the two cannot drift.
-pub(crate) fn apply_length_policy(
+pub fn apply_length_policy(
     policy: xai_grok_sampling_types::LengthPolicy,
     response: xai_grok_sampling_types::ConversationResponse,
 ) -> Result<xai_grok_sampling_types::ConversationResponse> {

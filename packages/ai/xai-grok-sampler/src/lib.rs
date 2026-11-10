@@ -41,7 +41,7 @@ pub use adapter::BackendAdapter;
 pub use attribution::{
     Auth401AttributionCallback, BEARER_SUFFIX_LEN, SamplingConsumer, SharedAttributionCallback,
 };
-pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
+pub use client::{ApiBackend, SamplingClient, apply_length_policy, user_agent_string_for};
 pub use config::{
     AuthScheme, BearerResolution, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy,
     SamplerConfig, SharedBearerResolver, SharedHeaderInjector,
