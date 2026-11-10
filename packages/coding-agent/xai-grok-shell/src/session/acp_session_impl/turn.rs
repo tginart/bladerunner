@@ -584,6 +584,7 @@ impl SessionActor {
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
+        self.begin_prompt_transient_retry();
         let yolo_mode = self.permissions.is_yolo_mode();
         let msg_count = self.chat_state_handle.get_conversation_len().await;
         let redirect_kind = if matches!(
@@ -2531,6 +2532,16 @@ impl SessionActor {
                 }
                 Ok(SamplerTurnOutcome::CompactAndResubmit) => {
                     auth_retry_schedule.reset_on_success();
+                    self.transient_retry_on_compaction();
+                    continue;
+                }
+                Ok(SamplerTurnOutcome::RetryTransient {
+                    kind,
+                    status_code,
+                    grant,
+                }) => {
+                    self.back_off_transient_retry(kind, status_code, grant, loop_index)
+                        .await;
                     continue;
                 }
                 Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
@@ -2662,6 +2673,7 @@ impl SessionActor {
                 }
             };
             auth_retry_schedule.reset_on_success();
+            self.transient_retry_on_response();
             let model_elapsed_ms = model_timer.elapsed().as_millis() as u64;
             let usage = response.usage.as_ref();
             let prompt_tokens = usage.map(|u| u.prompt_tokens);

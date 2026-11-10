@@ -150,6 +150,9 @@ use session_mode::*;
 #[path = "acp_session_impl/sampler_turn.rs"]
 mod sampler_turn;
 use sampler_turn::*;
+#[path = "acp_session_impl/transient_retry.rs"]
+mod transient_retry;
+use transient_retry::*;
 #[path = "acp_session_impl/tool_dispatch.rs"]
 mod tool_dispatch;
 use tool_dispatch::*;
@@ -1021,6 +1024,9 @@ pub(crate) struct SessionActor {
     /// increment).  Used by `ToolCallStarted` bridge emissions so they
     /// report the same turn number as `TurnStarted` / `TurnEnded`.
     pub(crate) current_turn_number: std::cell::Cell<u64>,
+    /// Turn-level transient retry budget for the current prompt (see
+    /// `transient_retry.rs`).
+    pub(crate) transient_retry: std::cell::Cell<TransientRetryState>,
     /// Recap rate-limit watermark (`main_turns` of last finished recap; `0` = none).
     pub(crate) last_recap_main_turn: std::cell::Cell<usize>,
     /// True while a recap model call is in flight (auto or manual). Prevents
