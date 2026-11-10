@@ -13,6 +13,7 @@ pub mod install_resolve;
 pub mod installer;
 pub mod matcher;
 pub mod scanner;
+pub mod source_identity;
 pub mod types;
 
 pub use config::{

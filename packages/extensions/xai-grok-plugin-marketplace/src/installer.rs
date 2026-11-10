@@ -12,6 +12,7 @@ use xai_grok_agent::plugins::install_registry::{
 };
 use xai_grok_agent::plugins::manifest::{ManifestLoadResult, load_manifest, name_from_dirname};
 
+use crate::source_identity::is_same_source_identity;
 use crate::types::{MarketplaceEntry, MarketplaceRelativePath};
 
 /// Result of a marketplace install attempt.
@@ -245,7 +246,7 @@ pub fn update_from_marketplace_entry_transactional(
         .into_iter()
         .find_map(|(key, repo)| {
             repo.marketplace.as_ref().and_then(|mp| {
-                if mp.source_url_or_path == provenance.source_url_or_path
+                if is_same_source_identity(&mp.source_url_or_path, &provenance.source_url_or_path)
                     && mp.plugin_subdir == provenance.plugin_subdir
                 {
                     Some((key.to_string(), repo.clone()))
@@ -439,7 +440,7 @@ pub fn update_from_marketplace_entry_transactional(
 
 /// Check if a plugin from a specific marketplace source is already installed.
 ///
-/// Matches by `source_url_or_path + plugin_subdir` (stable identity).
+/// Matches by source identity ([`is_same_source_identity`]) and `plugin_subdir`.
 pub fn find_installed_marketplace_plugin(
     registry: &InstallRegistry,
     source_url_or_path: &str,
@@ -447,7 +448,7 @@ pub fn find_installed_marketplace_plugin(
 ) -> Option<(String, String)> {
     for (key, repo) in registry.list() {
         if let Some(ref mp) = repo.marketplace
-            && mp.source_url_or_path == source_url_or_path
+            && is_same_source_identity(&mp.source_url_or_path, source_url_or_path)
             && mp.plugin_subdir == plugin_subdir
         {
             let version = repo
@@ -1019,6 +1020,41 @@ mod tests {
             let result =
                 find_installed_marketplace_plugin(registry, "https://example.com", "plugins/test");
             assert!(result.is_none());
+        });
+    }
+
+    /// A source recorded as `https://Example.com/market.git` is the same
+    /// source as `https://example.com/market`, so auto-update finds it.
+    #[test]
+    fn find_installed_matches_source_with_git_suffix_and_host_case_drift() {
+        with_test_registry(|registry| {
+            let marketplace = tempfile::tempdir().unwrap();
+            write_plugin(marketplace.path(), "demo", "1.0.0", "old");
+            let provenance = MarketplaceProvenance {
+                source_url_or_path: "https://Example.com/team/market.git".into(),
+                source_display_name: "Test".into(),
+                plugin_subdir: "plugins/demo".into(),
+            };
+            install_from_marketplace(marketplace.path(), "plugins/demo", provenance, registry)
+                .unwrap();
+
+            for source in [
+                "https://example.com/team/market",
+                "https://example.com/team/market.git",
+                "HTTPS://EXAMPLE.COM/team/market",
+            ] {
+                let found = find_installed_marketplace_plugin(registry, source, "plugins/demo");
+                assert_eq!(found.map(|(_, v)| v).as_deref(), Some("1.0.0"), "{source}");
+            }
+            assert!(
+                find_installed_marketplace_plugin(
+                    registry,
+                    "https://example.com/Team/market",
+                    "plugins/demo"
+                )
+                .is_none(),
+                "path case still names a different repo"
+            );
         });
     }
 
