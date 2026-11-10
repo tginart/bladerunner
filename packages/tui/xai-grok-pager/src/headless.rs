@@ -26,7 +26,7 @@ use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::{AgentShutdownGuard, spawn_grok_shell};
 use crate::client_identity::{HEADLESS_CLIENT_TYPE, PAGER_CLIENT_VERSION};
 use crate::headless::reducer::{
-    Lifecycle, McpServer, Reducer, SessionContext, StreamEvent, TurnEnd, map_session_update,
+    Lifecycle, Reducer, SessionContext, StreamEvent, TurnEnd, map_session_update,
     reducer_for,
 };
 
@@ -40,6 +40,7 @@ mod reducer;
 use ext_protocol::{ExtEvent, handle_ext_notification, reply_headless_ext_method};
 
 mod cli;
+mod mcp_init;
 pub use cli::{HeadlessPrompt, OutputFormat, parse_json_schema, parse_permission_rules_lenient};
 pub(crate) use cli::{ResolvedAgent, resolve_agent_arg};
 use cli::{apply_agent_flag, parse_cli_agents, parse_comma_list, parse_permission_rules_strict};
@@ -406,27 +407,6 @@ fn stop_reason_wire(reason: acp::StopReason) -> String {
         }
     }
     .to_string()
-}
-
-/// Configured MCP servers for the `init` line; all report `"connected"` (status is not resolved here).
-fn mcp_server_names(cwd: &Path) -> Vec<McpServer> {
-    let servers =
-        cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
-    servers
-        .iter()
-        .filter_map(|s| {
-            let name = match s {
-                acp::McpServer::Http(h) => h.name.clone(),
-                acp::McpServer::Sse(h) => h.name.clone(),
-                acp::McpServer::Stdio(h) => h.name.clone(),
-                _ => return None,
-            };
-            Some(McpServer {
-                name,
-                status: "connected".to_string(),
-            })
-        })
-        .collect()
 }
 
 fn auto_respond_to_permissions(
@@ -1083,6 +1063,13 @@ pub async fn run_single_turn(
 
     // Seed the reducer's session context BEFORE applying model/effort so a later failure carries it.
     {
+        // Only the Messages `init` line lists MCP servers, so the other
+        // formats skip the status read.
+        let mcp_servers = if options.output_format == OutputFormat::StreamingMessagesJson {
+            mcp_init::resolve_mcp_servers_for_init(&acp_tx, &session_id, &session_cwd).await
+        } else {
+            Vec::new()
+        };
         let model = options
             .model
             .clone()
@@ -1096,7 +1083,7 @@ pub async fn run_single_turn(
             model,
             cwd: session_cwd.to_string_lossy().to_string(),
             permission_mode,
-            mcp_servers: mcp_server_names(&session_cwd),
+            mcp_servers,
             include_partial_messages: options.include_partial_messages,
             api_key_auth: is_api_key_auth,
             context_window: session_models.get_context_window(),
