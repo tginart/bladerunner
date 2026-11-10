@@ -2547,7 +2547,8 @@ impl SessionActor {
                     status_code,
                     grant,
                 }) => {
-                    self.back_off_transient_retry(kind, status_code, grant, loop_index)
+                    // Boxed: the turn future is near the test-thread stack limit.
+                    Box::pin(self.back_off_transient_retry(kind, status_code, grant, loop_index))
                         .await;
                     continue;
                 }
@@ -2795,25 +2796,12 @@ impl SessionActor {
             let refusal_explanation = response.stop_message.clone();
             let final_answer_text = json_schema.is_some().then(|| response.assistant_text());
             let is_length_stop = stop_reason == Some(xai_grok_sampling_types::StopReason::Length);
-            match length_salvage_streak.on_sample(is_length_stop && !tool_calls.is_empty()) {
-                super::length_salvage::LengthSalvageAction::Exhausted => {
-                    tracing::error!(
-                        session_id = %self.session_info.id,
-                        max = super::length_salvage::MAX_OUTPUT_TOKEN_LIMIT_RETRIES,
-                        "consecutive Length-salvaged tool-call samples hit the cap; failing the turn"
-                    );
-                    return Err(self.fail_turn_length_salvage_exhausted().await);
-                }
-                super::length_salvage::LengthSalvageAction::Proceed { inject_reminder } => {
-                    // Before the assistant item, so the model sees the cut
-                    // before its own salvaged calls and their results.
-                    if inject_reminder {
-                        self.push_system_reminder(
-                            super::length_salvage::OUTPUT_TOKEN_LIMIT_REMINDER,
-                        );
-                    }
-                }
-                super::length_salvage::LengthSalvageAction::NotSalvage => {}
+            let is_salvage_streak_exhausted = self.observe_length_salvage_streak(
+                &mut length_salvage_streak,
+                is_length_stop && !tool_calls.is_empty(),
+            );
+            if is_salvage_streak_exhausted {
+                return Err(Box::pin(self.fail_turn_length_salvage_exhausted()).await);
             }
             for item in response.items {
                 match item {
@@ -2859,47 +2847,9 @@ impl SessionActor {
                 .await;
             }
             self.send_buffered_xai_update(response_completed).await;
-            if is_length_stop && tool_calls.is_empty() {
-                match salvage.on_length_stop() {
-                    super::length_salvage::SalvageStep::Continue { inject_reminder } => {
-                        if inject_reminder {
-                            self.push_system_reminder(
-                                super::length_salvage::LENGTH_CONTINUE_REMINDER_BODY,
-                            );
-                        }
-                        tracing::warn!(
-                            session_id = %self.session_info.id,
-                            retry = salvage.continues(),
-                            max = salvage.budget(),
-                            "output token limit hit; asking the model to continue"
-                        );
-                        xai_grok_telemetry::unified_log::warn(
-                            "shell.turn.length_truncation_continue",
-                            Some(self.session_info.id.0.as_ref()),
-                            Some(serde_json::json!({
-                                "continue_attempts": salvage.continues(),
-                                "continue_budget": salvage.budget(),
-                            })),
-                        );
-                        continue;
-                    }
-                    super::length_salvage::SalvageStep::Exhaust => {
-                        tracing::error!(
-                            session_id = %self.session_info.id,
-                            retries = salvage.continues(),
-                            "output token limit continues exhausted; completing the turn truncated"
-                        );
-                        xai_grok_telemetry::unified_log::warn(
-                            "shell.turn.length_truncation_exhausted",
-                            Some(self.session_info.id.0.as_ref()),
-                            Some(serde_json::json!({
-                                "continue_attempts": salvage.continues(),
-                                "continue_budget": salvage.budget(),
-                            })),
-                        );
-                    }
-                    super::length_salvage::SalvageStep::None => {}
-                }
+            if is_length_stop && tool_calls.is_empty() && self.advance_length_salvage(&mut salvage)
+            {
+                continue;
             }
             if !tool_calls.is_empty() {
                 salvage.step_boundary();

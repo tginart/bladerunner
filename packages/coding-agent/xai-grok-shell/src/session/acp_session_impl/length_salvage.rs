@@ -56,6 +56,86 @@ impl SessionActor {
         )
     }
 
+    /// Purpose: Advance the tool-call salvage streak for one completed sample.
+    /// Input: The streak. Whether the sample is a `Length` stop with tool calls.
+    /// Output: True when the streak passed its cap and the turn must fail.
+    /// Note: On the first salvage of a streak, this pushes the reminder. The
+    /// caller runs it before it records the assistant item, so the model sees
+    /// the cut before its own salvaged calls. Kept out of line so the turn
+    /// loop's poll frame does not grow.
+    #[inline(never)]
+    pub(super) fn observe_length_salvage_streak(
+        &self,
+        streak: &mut LengthSalvageStreak,
+        is_length_with_tool_calls: bool,
+    ) -> bool {
+        match streak.on_sample(is_length_with_tool_calls) {
+            LengthSalvageAction::Exhausted => {
+                tracing::error!(
+                    session_id = %self.session_info.id,
+                    max = MAX_OUTPUT_TOKEN_LIMIT_RETRIES,
+                    "consecutive Length-salvaged tool-call samples hit the cap; failing the turn"
+                );
+                true
+            }
+            LengthSalvageAction::Proceed { inject_reminder } => {
+                if inject_reminder {
+                    self.push_system_reminder(OUTPUT_TOKEN_LIMIT_REMINDER);
+                }
+                false
+            }
+            LengthSalvageAction::NotSalvage => false,
+        }
+    }
+
+    /// Purpose: Apply the salvage state machine to a text-only `Length` stop.
+    /// Input: The per-prompt salvage state.
+    /// Output: True when the turn must sample again (a continue). False when
+    /// the turn completes with the truncated answer.
+    /// Note: A continue pushes the reminder once per run. Kept out of line so
+    /// the turn loop's poll frame does not grow.
+    #[inline(never)]
+    pub(super) fn advance_length_salvage(&self, salvage: &mut LengthSalvage) -> bool {
+        let step = salvage.on_length_stop();
+        let details = Some(serde_json::json!({
+            "continue_attempts": salvage.continues(),
+            "continue_budget": salvage.budget(),
+        }));
+        match step {
+            SalvageStep::Continue { inject_reminder } => {
+                if inject_reminder {
+                    self.push_system_reminder(LENGTH_CONTINUE_REMINDER_BODY);
+                }
+                tracing::warn!(
+                    session_id = %self.session_info.id,
+                    retry = salvage.continues(),
+                    max = salvage.budget(),
+                    "output token limit hit; asking the model to continue"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "shell.turn.length_truncation_continue",
+                    Some(self.session_info.id.0.as_ref()),
+                    details,
+                );
+                true
+            }
+            SalvageStep::Exhaust => {
+                tracing::error!(
+                    session_id = %self.session_info.id,
+                    retries = salvage.continues(),
+                    "output token limit continues exhausted; completing the turn truncated"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "shell.turn.length_truncation_exhausted",
+                    Some(self.session_info.id.0.as_ref()),
+                    details,
+                );
+                false
+            }
+            SalvageStep::None => false,
+        }
+    }
+
     /// Terminal failure when the tool-call salvage streak passes its cap:
     /// running more calls does not converge, so surface the old
     /// `MaxTokensTruncation` failure. The sampler emitted only `Completed`
