@@ -924,20 +924,57 @@ async fn compaction_reseed_without_provider_count_matches_plain_estimate() {
 }
 
 #[tokio::test]
-async fn non_compaction_replace_does_not_carry_overhead() {
+async fn non_compaction_replace_carries_confirmed_total() {
+    // The estimate runs high against the provider count, so a rewind or mode
+    // switch replace scales from the confirmed count, not the raw estimate.
     let h = TestHarness::new();
     h.handle
         .push_user_message(ConversationItem::user("x".repeat(4000)));
-    h.handle.record_token_usage(51_000);
+    h.handle.record_token_usage(500);
+    // Estimate at last response = 1_000, confirmed = 500, so the ratio is 0.5.
 
     h.handle
         .replace_conversation(vec![ConversationItem::user("q".repeat(4000))]);
 
     let total = h.handle.get_total_tokens().await;
     assert_eq!(
-        total, 1_000,
-        "non-compaction replace (e.g. rewind) keeps the plain estimate"
+        total, 500,
+        "same-size replace carries the provider-confirmed count"
     );
+}
+
+#[tokio::test]
+async fn replace_never_increases_total_tokens() {
+    // A growing replace is capped at the confirmed total; the brief
+    // under-count heals on the next usage report.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.record_token_usage(1_500);
+
+    h.handle
+        .replace_conversation(vec![ConversationItem::user("q".repeat(40_000))]);
+
+    assert_eq!(h.handle.get_total_tokens().await, 1_500);
+}
+
+#[tokio::test]
+async fn truncate_scales_from_confirmed_total() {
+    // Rewind uses the same carry as `replace_conversation`.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.increment_prompt_index();
+    h.handle
+        .push_user_message(ConversationItem::user("y".repeat(4000)));
+    h.handle.increment_prompt_index();
+    h.handle.record_token_usage(1_000);
+    // Estimate at last response = 2_000, confirmed = 1_000, so the ratio is 0.5.
+
+    h.handle.truncate_to_prompt_index(1).await;
+
+    // Keeps the first user item (raw estimate 1_000), scaled to 500.
+    assert_eq!(h.handle.get_total_tokens().await, 500);
 }
 
 #[tokio::test]
