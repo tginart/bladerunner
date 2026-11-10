@@ -212,6 +212,15 @@ pub enum SamplingError {
 /// both non-stream error bodies and mid-stream SSE error events.
 pub const INVALID_IMAGE_ERROR_CODE: &str = "invalid_image";
 
+/// Content path that Anthropic-style providers (Claude through AIP) put in a
+/// codeless image rejection, for example
+/// `messages.3.content.1.image.source.base64.data: image dimensions exceed
+/// max allowed size for many-image requests: 2000 pixels`. These arrive as
+/// `invalid_request_error` with no `error.code`, so [`INVALID_IMAGE_ERROR_CODE`]
+/// misses them. The path appears only when the request carried an image, so
+/// image recovery is safe.
+const IMAGE_CONTENT_PATH_MARKER: &str = ".image.source.";
+
 /// A wire `error.code`, parsed once at the boundary so classification
 /// compares variants instead of strings. `#[non_exhaustive]`: the next
 /// semantic code is a new variant, not another const and `||` chain.
@@ -397,6 +406,7 @@ impl SamplingError {
             } if matches!(status.as_u16(), 400 | 500) => {
                 *error_code == Some(ApiErrorCode::InvalidImage)
                     || message.contains("Could not process image")
+                    || message.contains(IMAGE_CONTENT_PATH_MARKER)
             }
             SamplingError::StreamError { code, .. } => *code == Some(ApiErrorCode::InvalidImage),
             // Explicit like `is_retryable`: a new variant must state its
@@ -938,6 +948,31 @@ mod tests {
             error_code: None,
         };
         assert!(!not_vetoed.is_retry_vetoed());
+    }
+
+    #[test]
+    fn codeless_image_content_path_rejection_is_an_image_error() {
+        let api = |status: u16, message: &str| SamplingError::Api {
+            status: StatusCode::from_u16(status).unwrap(),
+            message: message.into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        let many_images = "invalid_request_error: messages.3.content.1.image.source.base64.data: \
+                           image dimensions exceed max allowed size for many-image requests: \
+                           2000 pixels";
+        assert!(api(400, many_images).is_image_processing_error());
+        // Unexpected statuses fail closed: recovery destroys request images.
+        assert!(!api(422, many_images).is_image_processing_error());
+        assert!(
+            !api(
+                400,
+                "invalid_request_error: messages.3.content.0.text: empty"
+            )
+            .is_image_processing_error()
+        );
     }
 
     #[test]
