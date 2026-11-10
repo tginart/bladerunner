@@ -396,6 +396,22 @@ impl SessionActor {
         self.retry_unreachable_servers_at(std::time::Instant::now())
             .await;
     }
+    /// Start an unreachable-server retry in the background when one is due.
+    /// A turn start calls this. When every server failed at startup, the
+    /// index holds no MCP tools and the model never sees `search_tool` or
+    /// `use_tool`, so a tool-call trigger alone can never fire. The task is
+    /// detached: it does not delay the turn, and a turn cancel does not stop
+    /// it. The cooldown still applies, because only due servers are claimed.
+    pub(super) async fn spawn_due_unreachable_retry(self: &Arc<Self>) {
+        let now = std::time::Instant::now();
+        if !self.mcp_state.lock().await.has_due_unreachable_retry(now) {
+            return;
+        }
+        let actor = Arc::clone(self);
+        tokio::task::spawn_local(async move {
+            actor.retry_unreachable_servers().await;
+        });
+    }
     /// [`Self::retry_unreachable_servers`] with an explicit clock, so tests
     /// can step past the cooldown.
     ///
@@ -433,6 +449,12 @@ impl SessionActor {
             OauthInteractivity::from_non_interactive(self.attach_non_interactive.get()),
             self.tool_context.process_scope.as_ref(),
         );
+        // From here on, a dropped future (a cancelled turn) releases the
+        // attempts it did not settle, so they do not wait for the lease.
+        let mut unsettled = UnsettledUnreachableAttempts {
+            mcp_state: self.mcp_state.clone(),
+            attempts,
+        };
         let results = crate::session::mcp_servers::start_mcp_servers(
             configs,
             Some(cwd),
@@ -441,7 +463,6 @@ impl SessionActor {
             &ctx,
         )
         .await;
-        let mut unsettled = attempts;
         let mut recovered = false;
         let mut all_ui_tools: std::collections::HashMap<
             String,
@@ -458,7 +479,7 @@ impl SessionActor {
                     None => continue,
                 },
             };
-            let Some(token) = unsettled.remove(&server_name) else {
+            let Some(token) = unsettled.attempts.get(&server_name).copied() else {
                 continue;
             };
             match outcome {
@@ -477,8 +498,9 @@ impl SessionActor {
                         .await;
                 }
             }
+            unsettled.attempts.remove(&server_name);
         }
-        for (name, token) in unsettled {
+        for (name, token) in std::mem::take(&mut unsettled.attempts) {
             self.mcp_state
                 .lock()
                 .await
@@ -1930,6 +1952,45 @@ pub(super) fn format_mcp_connecting_reminder(
         ));
     }
     text
+}
+
+/// The unreachable-server attempts that a retry pass claimed and did not
+/// settle yet. On drop, it releases them, so a cancelled pass does not keep
+/// the servers for the full attempt lease.
+struct UnsettledUnreachableAttempts {
+    mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,
+    attempts: std::collections::HashMap<String, u64>,
+}
+
+impl Drop for UnsettledUnreachableAttempts {
+    fn drop(&mut self) {
+        if self.attempts.is_empty() {
+            return;
+        }
+        let attempts = std::mem::take(&mut self.attempts);
+        if let Ok(mut state) = self.mcp_state.try_lock() {
+            release_unreachable_attempts(&mut state, attempts);
+            return;
+        }
+        // The lock is busy: release from a task. Without a runtime the
+        // attempt lease is the fallback.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mcp_state = self.mcp_state.clone();
+        runtime.spawn(async move {
+            release_unreachable_attempts(&mut *mcp_state.lock().await, attempts);
+        });
+    }
+}
+
+fn release_unreachable_attempts(
+    state: &mut crate::session::mcp_servers::McpState,
+    attempts: std::collections::HashMap<String, u64>,
+) {
+    for (name, token) in attempts {
+        state.release_unreachable_attempt(&name, token);
+    }
 }
 
 #[cfg(all(test, unix))]

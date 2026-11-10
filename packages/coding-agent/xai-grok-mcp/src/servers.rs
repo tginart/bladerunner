@@ -381,6 +381,9 @@ pub struct McpState {
     unreachable_retry: HashMap<McpServerName, UnreachableRetry>,
     /// Source of [`UnreachableRetry::InFlight`] attempt tokens.
     unreachable_attempt_counter: u64,
+    /// Wait between connect attempts for an unreachable server. It is
+    /// [`Self::UNREACHABLE_RETRY_COOLDOWN`]; tests shorten it.
+    pub unreachable_retry_cooldown: std::time::Duration,
     /// Per-server set of unqualified tool names that the user has disabled.
     /// Persisted to `~/.grok/config.toml` under `[mcp_servers.<name>].disabled_tools`.
     pub disabled_tools: HashMap<McpServerName, std::collections::HashSet<ToolName>>,
@@ -434,6 +437,7 @@ impl McpState {
             init_failed: HashMap::new(),
             unreachable_retry: HashMap::new(),
             unreachable_attempt_counter: 0,
+            unreachable_retry_cooldown: Self::UNREACHABLE_RETRY_COOLDOWN,
             disabled_tools: HashMap::new(),
             disabled_tool_registrations: HashMap::new(),
             event_writer: xai_file_utils::events::EventWriter::noop(),
@@ -818,7 +822,7 @@ impl McpState {
         if let Some(UnreachableRetry::InFlight { .. }) = self.unreachable_retry.get(name) {
             return;
         }
-        let retry_at = std::time::Instant::now() + Self::UNREACHABLE_RETRY_COOLDOWN;
+        let retry_at = std::time::Instant::now() + self.unreachable_retry_cooldown;
         self.unreachable_retry
             .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
     }
@@ -826,6 +830,12 @@ impl McpState {
     /// True when `name` waits for (or runs) an unreachable-server retry.
     pub fn is_unreachable_retry_pending(&self, name: &str) -> bool {
         self.unreachable_retry.contains_key(name)
+    }
+
+    /// True when at least one server is due for a retry at `now`. It does
+    /// not claim the servers.
+    pub fn has_due_unreachable_retry(&self, now: std::time::Instant) -> bool {
+        !self.due_unreachable_servers(now).is_empty()
     }
 
     /// Claim the servers due for a retry at `now`: the cooldown is over (or
@@ -836,16 +846,7 @@ impl McpState {
         &mut self,
         now: std::time::Instant,
     ) -> Vec<(McpServerName, u64)> {
-        let configured: std::collections::HashSet<&str> =
-            self.configs.iter().map(mcp_server_name).collect();
-        let due: Vec<McpServerName> = self
-            .unreachable_retry
-            .iter()
-            .filter(|(name, state)| {
-                configured.contains(name.as_str()) && Self::is_retry_due(state, now)
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
+        let due = self.due_unreachable_servers(now);
         let mut claimed = Vec::with_capacity(due.len());
         for name in due {
             self.unreachable_attempt_counter += 1;
@@ -881,7 +882,27 @@ impl McpState {
             return;
         }
         self.init_failed.insert(name.to_string(), detail);
-        let retry_at = std::time::Instant::now() + Self::UNREACHABLE_RETRY_COOLDOWN;
+        let retry_at = std::time::Instant::now() + self.unreachable_retry_cooldown;
+        self.unreachable_retry
+            .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
+    }
+
+    /// Give back the claim of an attempt that stopped before it settled
+    /// (its future was dropped, e.g. by a turn cancel). The server becomes
+    /// due one cooldown after the attempt started, so the cooldown still
+    /// holds. No-op for a stale token.
+    pub fn release_unreachable_attempt(&mut self, name: &str, token: u64) {
+        let Some(UnreachableRetry::InFlight {
+            token: t,
+            started_at,
+        }) = self.unreachable_retry.get(name).copied()
+        else {
+            return;
+        };
+        if t != token {
+            return;
+        }
+        let retry_at = started_at + self.unreachable_retry_cooldown;
         self.unreachable_retry
             .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
     }
@@ -896,6 +917,18 @@ impl McpState {
         }
         self.unreachable_retry.remove(name);
         true
+    }
+
+    fn due_unreachable_servers(&self, now: std::time::Instant) -> Vec<McpServerName> {
+        let configured: std::collections::HashSet<&str> =
+            self.configs.iter().map(mcp_server_name).collect();
+        self.unreachable_retry
+            .iter()
+            .filter(|(name, state)| {
+                configured.contains(name.as_str()) && Self::is_retry_due(state, now)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     fn is_retry_due(state: &UnreachableRetry, now: std::time::Instant) -> bool {
@@ -5547,6 +5580,33 @@ mod tests {
         assert_eq!(
             state.init_failed.get("down").map(String::as_str),
             Some("still down")
+        );
+    }
+
+    #[test]
+    fn released_unreachable_attempt_is_due_one_cooldown_after_it_started() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        state.record_unreachable_failure("down", String::new());
+        let started = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        assert!(state.has_due_unreachable_retry(started));
+        let (_, token) = state.take_unreachable_retry_candidates(started).remove(0);
+        assert!(!state.has_due_unreachable_retry(started));
+
+        // A stale token does not release the claim.
+        state.release_unreachable_attempt("down", token + 1);
+        let after_cooldown = started + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        assert!(!state.has_due_unreachable_retry(after_cooldown));
+
+        // The dropped attempt gives the server back without the 600 s lease,
+        // and the cooldown still counts from the attempt start.
+        state.release_unreachable_attempt("down", token);
+        assert!(!state.has_due_unreachable_retry(started));
+        assert!(state.has_due_unreachable_retry(after_cooldown));
+        assert_eq!(
+            state
+                .take_unreachable_retry_candidates(after_cooldown)
+                .len(),
+            1
         );
     }
 
