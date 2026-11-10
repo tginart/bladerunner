@@ -177,7 +177,9 @@ async fn long_qualified_mcp_name_is_kept_and_dispatches() {
                 .await
                 .expect("long qualified name must dispatch");
             assert!(
-                result.prompt_text.contains(&format!("called {tool} with ok")),
+                result
+                    .prompt_text
+                    .contains(&format!("called {tool} with ok")),
                 "the server must get the raw tool name: {}",
                 result.prompt_text
             );
@@ -218,7 +220,14 @@ async fn unreachable_server_is_retried_and_becomes_available() {
             actor
                 .retry_unreachable_servers_at(std::time::Instant::now())
                 .await;
-            assert!(actor.mcp_state.lock().await.init_failed.contains_key("flaky"));
+            assert!(
+                actor
+                    .mcp_state
+                    .lock()
+                    .await
+                    .init_failed
+                    .contains_key("flaky")
+            );
 
             let _server = HttpFixture::start(root.path(), port);
             let after_cooldown = std::time::Instant::now()

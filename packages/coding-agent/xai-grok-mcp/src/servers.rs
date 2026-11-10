@@ -1365,7 +1365,6 @@ fn is_transport_error_message(message: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-
 /// True when a failed refresh-token grant was a **network-level** failure
 /// that never reached the IdP (RT validity unknown, presumed good); IdP
 /// rejections and missing credentials stay terminal (escalate to browser).
@@ -2125,7 +2124,13 @@ async fn probe_anonymous_access(
         reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
     );
     ensure_figma_user_agent(&mut probe_headers, server_name, url);
-    match client.post(url).headers(probe_headers).body("{}").send().await {
+    match client
+        .post(url)
+        .headers(probe_headers)
+        .body("{}")
+        .send()
+        .await
+    {
         Ok(response) => classify_anonymous_response(response.status()),
         Err(e) => {
             tracing::warn!(server = server_name, error = %e, "anonymous-access probe failed");
@@ -4741,7 +4746,9 @@ pub async fn start_mcp_server(
                     server: name.clone(),
                 }),
                 // `decide_http_auth` resolves an inconclusive discovery itself.
-                HttpOauthPrep::Inconclusive => unreachable!("decide_http_auth resolves Inconclusive"),
+                HttpOauthPrep::Inconclusive => {
+                    unreachable!("decide_http_auth resolves Inconclusive")
+                }
             }
         }
         // TODO(acp-0.10): `McpServer` is #[non_exhaustive]; reject unknown transports.
