@@ -89,7 +89,16 @@ use xai_grok_pager::app::app_view::AppView;
 /// `BeginSynchronizedUpdate` is redundant-but-harmless (DEC 2026 is a mode,
 /// not a counter — the first End closes it).
 pub fn draw(app: &mut AppView, terminal: &mut PagerTerminal) {
-    let _ = terminal.backend_mut().queue(BeginSynchronizedUpdate);
+///
+/// Under tmux neither marker is sent (see
+/// [`xai_grok_pager::terminal::should_emit_synchronized_output`]). The opening
+/// marker here and the closing marker in `draw_frame` use the same policy on
+/// the same terminal context, so they always come as a pair.
+    if xai_grok_pager::terminal::should_emit_synchronized_output(
+        xai_grok_pager::terminal::terminal_context(),
+    ) {
+        let _ = terminal.backend_mut().queue(BeginSynchronizedUpdate);
+    }
     let _ = terminal.autoresize();
     // Pending permission/question marks are synced ONCE, up front, so the
     // viewport sizing (`sync_viewport` / `tail_height` / `will_commit`) and the

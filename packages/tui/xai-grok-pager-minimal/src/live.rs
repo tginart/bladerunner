@@ -138,7 +138,8 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
     {
         clear_btw_geometry(agent);
     }
-    xai_grok_pager::render::draw::draw_frame(terminal, cursor, |frame, _link_spans| {
+    let ctx = xai_grok_pager::terminal::terminal_context();
+    xai_grok_pager::render::draw::draw_frame(terminal, cursor, ctx, |frame, _link_spans| {
         let area = frame.area();
         if area.height == 0 || area.width < 4 {
             return (None, None);
