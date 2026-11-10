@@ -251,7 +251,7 @@ The default (`inherit = "all"`, `ignore_default_excludes = true`) leaves the env
 
 ## Event Logging
 
-Sandbox events are logged to `~/.bladerunner/sandbox-events.jsonl` for debugging. Events include:
+Sandbox events are logged to `~/.bladerunner/sessions/sandbox-events.jsonl` for debugging. Events include:
 
 - Profile applied (which profile, timestamp)
 - Violations (attempted access to denied paths)
