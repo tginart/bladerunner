@@ -6,7 +6,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use futures::StreamExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::{ChildStderr, Command},
@@ -4769,17 +4768,17 @@ pub async fn start_mcp_servers(
         );
     }
 
-    futures::stream::iter(mcp_servers)
-        .map(|server| {
-            let server_name = mcp_server_name(&server);
-            let overrides = overrides_map.get(server_name);
-            let mc = meta_config_map.get(server_name);
-            let byo = oauth_config_map.get(server_name);
-            start_mcp_server(server, overrides, mc, byo, ctx)
-        })
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await
+    // One future per server, no cap: the count is bounded by config, the
+    // work is I/O-bound, and any cap is a slot that waits behind a stalled
+    // server (an OAuth discovery can take its full 5 s timeout).
+    futures::future::join_all(mcp_servers.into_iter().map(|server| {
+        let server_name = mcp_server_name(&server);
+        let overrides = overrides_map.get(server_name);
+        let mc = meta_config_map.get(server_name);
+        let byo = oauth_config_map.get(server_name);
+        start_mcp_server(server, overrides, mc, byo, ctx)
+    }))
+    .await
 }
 
 /// Extract the name from an MCP server enum variant.
@@ -5601,6 +5600,34 @@ mod tests {
             }
         });
         url
+    }
+
+    #[tokio::test]
+    async fn start_mcp_servers_does_not_queue_behind_stalled_discovery() {
+        // Every discovery hangs until its timeout. With a fixed batch of 8,
+        // the ninth server waited for a free slot: two timeouts in a row.
+        let url = spawn_probe_server("200 OK");
+        let servers: Vec<acp::McpServer> = (0..9)
+            .map(|i| make_http_server(&format!("srv{i}"), &url))
+            .collect();
+        let ew = xai_file_utils::events::EventWriter::noop();
+        let ctx = McpSpawnCtx::for_session("s", &ew, OauthInteractivity::Interactive, None);
+        let started = std::time::Instant::now();
+        let results = start_mcp_servers(
+            servers,
+            &HashMap::new(),
+            &McpMetaConfigMap::new(),
+            &crate::oauth_config::McpOAuthConfigMap::new(),
+            &ctx,
+        )
+        .await;
+        assert_eq!(results.len(), 9);
+        assert!(results.iter().all(Result::is_ok));
+        assert!(
+            started.elapsed() < OAUTH_DISCOVERY_TIMEOUT * 2,
+            "servers must start concurrently, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
