@@ -62,7 +62,8 @@ pub use managed_cache::{
     bump_rollback_floor_with_now, confirmed_team_switch, confirmed_team_switch_at,
     fail_closed_policy_armed_at, is_managed_config_hard_stale_for, is_managed_config_stale_for,
     managed_config_identity_changed_at, managed_deployment_id, managed_policy_compromised_for,
-    mark_managed_config_synced, mark_managed_config_synced_at, normalize_identity,
+    managed_sync_marker_present_at, mark_managed_config_synced, mark_managed_config_synced_at,
+    normalize_identity,
 };
 pub use paths::{
     BLADERUNNER_HOME_ENV, claude_managed_settings_path, claude_managed_settings_probe_path,
