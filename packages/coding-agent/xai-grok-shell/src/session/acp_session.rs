@@ -1929,6 +1929,9 @@ mod auth_error_no_retry_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn/auth_retry_budget_tests.rs"]
 mod auth_retry_budget_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/turn/turn_recovery_loop_tests.rs"]
+mod turn_recovery_loop_tests;
 /// Regression coverage for the auto-wake suppression sweep + shutdown
 /// drain. These exercise the helpers added to fix the trailing
 /// `<system-reminder>` chat history bug.
