@@ -131,12 +131,72 @@ pub const DEFAULT_STOP_GATE_TIMEOUT_SECS: u64 = 600;
 
 pub const DEFAULT_STOP_GATE_TIMEOUT_MS: u64 = DEFAULT_STOP_GATE_TIMEOUT_SECS * 1000;
 
-fn default_timeout_ms(event: crate::event::HookEventName) -> u64 {
+/// SessionEnd hooks run one after another while the session closes, and the
+/// process-exit flush gives every session a fixed grace. A short default per
+/// hook keeps one slow hook from using the grace of all the others.
+pub const SESSION_END_HOOK_BUDGET_DEFAULT_MS: u64 = 1_500;
+
+/// Upper bound for an explicit SessionEnd `timeout`, so a typo cannot hold
+/// the exit for hours.
+pub const SESSION_END_HOOK_BUDGET_MAX_MS: u64 = 60_000;
+
+/// Environment variable that overrides [`SESSION_END_HOOK_BUDGET_DEFAULT_MS`].
+pub const SESSION_END_HOOK_BUDGET_ENV: &str = "GROK_SESSION_END_HOOKS_TIMEOUT_MS";
+
+fn default_timeout_ms(event: HookEventName) -> u64 {
+    if event == HookEventName::SessionEnd {
+        return session_end_default_timeout_ms();
+    }
     if event.traits().gate == crate::event::GateKind::Stop {
         DEFAULT_STOP_GATE_TIMEOUT_MS
     } else {
         DEFAULT_TIMEOUT_MS
     }
+}
+
+/// The SessionEnd default, read once from the environment.
+fn session_end_default_timeout_ms() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let value = std::env::var(SESSION_END_HOOK_BUDGET_ENV).ok();
+        resolve_session_end_default(value.as_deref())
+    })
+}
+
+/// Parse the SessionEnd default override. A missing value gives the default.
+/// A value that is not a positive integer gives the default and a warning.
+/// A large value is capped at [`SESSION_END_HOOK_BUDGET_MAX_MS`].
+fn resolve_session_end_default(value: Option<&str>) -> u64 {
+    let Some(value) = value else {
+        return SESSION_END_HOOK_BUDGET_DEFAULT_MS;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(ms) if ms > 0 => ms.min(SESSION_END_HOOK_BUDGET_MAX_MS),
+        _ => {
+            tracing::warn!(
+                value,
+                "{SESSION_END_HOOK_BUDGET_ENV} must be a positive integer; using \
+                 default {SESSION_END_HOOK_BUDGET_DEFAULT_MS}ms"
+            );
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        }
+    }
+}
+
+/// Resolve a handler's `timeout` (seconds) to milliseconds. A missing or zero
+/// value gives the event default, because a 0 ms budget kills the hook before
+/// it starts.
+fn handler_timeout_ms(timeout_secs: Option<u64>, event: HookEventName) -> u64 {
+    let Some(secs) = timeout_secs.filter(|&secs| secs > 0) else {
+        return default_timeout_ms(event);
+    };
+    // Untrusted config value: saturate rather than overflow (debug panic /
+    // release wrap) on an absurd timeout.
+    let ms = secs.saturating_mul(1000);
+    if event == HookEventName::SessionEnd {
+        return ms.min(SESSION_END_HOOK_BUDGET_MAX_MS);
+    }
+    ms
 }
 
 /// The validated handler kind.
@@ -523,12 +583,7 @@ fn build_one_spec(
     compiled_matcher: Option<HookMatcher>,
     ctx: &SpecContext<'_>,
 ) -> Result<HookSpec, HookError> {
-    let timeout_ms = handler
-        .timeout
-        // Untrusted config value: saturate rather than overflow (debug panic /
-        // release wrap) on an absurd timeout.
-        .map(|secs| secs.saturating_mul(1000))
-        .unwrap_or(default_timeout_ms(event));
+    let timeout_ms = handler_timeout_ms(handler.timeout, event);
 
     let mut extra_env: HashMap<String, String> = handler.env;
     strip_reserved_env_keys(&mut extra_env, &name, ctx.error_path);
@@ -777,10 +832,61 @@ mod tests {
         for spec in &specs {
             let expected = match spec.event {
                 HookEventName::Stop | HookEventName::SubagentStop => DEFAULT_STOP_GATE_TIMEOUT_MS,
+                HookEventName::SessionEnd => SESSION_END_HOOK_BUDGET_DEFAULT_MS,
                 _ => DEFAULT_TIMEOUT_MS,
             };
             assert_eq!(spec.timeout_ms, expected, "event {}", spec.event);
         }
+    }
+
+    #[test]
+    fn session_end_timeout_resolution() {
+        fn timeout_ms(handler_timeout: Option<u64>) -> u64 {
+            let handler = match handler_timeout {
+                Some(secs) => {
+                    format!(r#"{{ "type": "command", "command": "end.sh", "timeout": {secs} }}"#)
+                }
+                None => r#"{ "type": "command", "command": "end.sh" }"#.to_string(),
+            };
+            let json =
+                format!(r#"{{ "hooks": {{ "SessionEnd": [{{ "hooks": [{handler}] }}] }} }}"#);
+            let (specs, errors) = parse_hook_file(&json, Path::new("/tmp/test.json"));
+            assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+            specs[0].timeout_ms
+        }
+        assert_eq!(timeout_ms(None), SESSION_END_HOOK_BUDGET_DEFAULT_MS);
+        assert_eq!(timeout_ms(Some(10)), 10_000);
+        assert_eq!(timeout_ms(Some(120)), SESSION_END_HOOK_BUDGET_MAX_MS);
+        assert_eq!(timeout_ms(Some(0)), SESSION_END_HOOK_BUDGET_DEFAULT_MS);
+    }
+
+    #[test]
+    fn zero_timeout_uses_the_event_default() {
+        let json = r#"{ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "s.sh", "timeout": 0 }] }] } }"#;
+        let (specs, errors) = parse_hook_file(json, Path::new("/tmp/test.json"));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(specs[0].timeout_ms, DEFAULT_STOP_GATE_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn resolve_session_end_default_parses_env_value() {
+        assert_eq!(
+            resolve_session_end_default(None),
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        assert_eq!(resolve_session_end_default(Some(" 2000 ")), 2000);
+        assert_eq!(
+            resolve_session_end_default(Some("0")),
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        assert_eq!(
+            resolve_session_end_default(Some("nope")),
+            SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        assert_eq!(
+            resolve_session_end_default(Some("600000")),
+            SESSION_END_HOOK_BUDGET_MAX_MS
+        );
     }
 
     #[test]
