@@ -411,8 +411,14 @@ async fn apply_retry_decision(
         }
         RetryDecision::RetryWithImageStrip => {
             let stripped_urls = xai_grok_sampling_types::collect_image_urls(&request.items);
-            let stripped =
-                xai_grok_sampling_types::strip_images_by_url(&mut request.items, &stripped_urls);
+            // A 413 says the request is too large, not that an image is bad,
+            // so it keeps the size placeholder and never heals history.
+            let is_oversize = err.is_payload_too_large();
+            let stripped = if is_oversize {
+                request.strip_images()
+            } else {
+                xai_grok_sampling_types::strip_images_by_url(&mut request.items, &stripped_urls)
+            };
             if stripped == 0 {
                 // Nothing left to strip; upgrade to fatal.
                 emit_failed(event_tx, request_id, err);
@@ -424,7 +430,7 @@ async fn apply_retry_decision(
                 error = %err,
                 "stripped {stripped} image(s) after server rejection; retrying without them"
             );
-            if is_coded_image_rejection(err) {
+            if !is_oversize && is_coded_image_rejection(err) {
                 let _ = event_tx.send(SamplingEvent::ImagesStripped {
                     request_id: request_id.clone(),
                     stripped_urls,
