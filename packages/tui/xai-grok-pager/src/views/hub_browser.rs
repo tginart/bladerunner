@@ -967,11 +967,16 @@ fn render_top_bar(buf: &mut Buffer, bar: Rect, state: &mut HubBrowserState, them
         Style::default().fg(theme.accent_verify).bg(bar_bg),
         bar.right(),
     );
+    let title = if meta.is_session_hub() {
+        "this session (private)"
+    } else {
+        meta.name.as_str()
+    };
     x = span_at(
         buf,
         x,
         bar.y,
-        &meta.name,
+        title,
         Style::default()
             .fg(theme.text_primary)
             .bg(bar_bg)

@@ -139,24 +139,43 @@ pub fn run_command(bus: &AgentBus, args: &str, default_handle: &str) -> HubReply
 
 /// Purpose: Build the status-bar label of a session's hub.
 /// Input: The session id.
-/// Output: `hub <name> · @<handle>`, plus ` · N unread` when there are unread
-///     messages, or `None` when the session is in no named hub.
+/// Output: `hub <name> · @<handle>` for a named hub, or `hub · private` for
+///     the session hub, plus ` · N unread` when there are unread messages.
+///     `None` when the session is in no named hub and its session hub holds
+///     no message.
+/// Note: The label of the session hub lets the person open the hub where
+///     main and its subagents talk.
 pub fn status_label(session_id: &str) -> Option<String> {
     status_label_in(&hubs_root(), session_id)
 }
 
 fn status_label_in(root: &Path, session_id: &str) -> Option<String> {
-    let (name, handle) = store::find_membership(root, session_id)?;
+    let Some((name, handle)) = store::find_membership(root, session_id) else {
+        return session_hub_label(root, session_id);
+    };
     let hub = store::Hub::open(root, &name).ok()?;
     let unread = unread_count(&hub, &handle).ok()?;
-    let mut label = format!("hub {name} \u{b7} @{handle}");
+    Some(with_unread(format!("hub {name} \u{b7} @{handle}"), unread))
+}
+
+fn session_hub_label(root: &Path, session_id: &str) -> Option<String> {
+    let hub = store::Hub::open_existing_session_hub(root, session_id).ok()?;
+    if !hub.has_messages() {
+        return None;
+    }
+    let unread = unread_count(&hub, &store::person_handle()).ok()?;
+    Some(with_unread("hub \u{b7} private".to_string(), unread))
+}
+
+fn with_unread(mut label: String, unread: usize) -> String {
     if unread > 0 {
         label.push_str(&format!(" \u{b7} {unread} unread"));
     }
-    Some(label)
+    label
 }
 
 /// Messages after the member's read cursor, over all channels and its DMs.
+/// The member's own messages do not count.
 fn unread_count(hub: &store::Hub, handle: &str) -> Result<usize> {
     let meta = hub.meta()?;
     let cursors = hub.cursors(handle)?;
@@ -169,7 +188,8 @@ fn unread_count(hub: &store::Hub, handle: &str) -> Result<usize> {
     let mut unread = 0;
     for conv in convs {
         let read = cursors.read.get(&conv).copied().unwrap_or(0);
-        unread += hub.messages(&conv, read)?.len();
+        let messages = hub.messages(&conv, read)?;
+        unread += messages.iter().filter(|m| m.from != handle).count();
     }
     Ok(unread)
 }
@@ -259,7 +279,6 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
             if channel.is_empty() {
                 bail!("{USAGE}");
             }
-            require_named_hub(bus)?;
             let name = bus.create_channel(channel, purpose)?;
             Ok(format!("Created **#{name}**."))
         }
@@ -270,7 +289,6 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
             if target.is_empty() || text.trim().is_empty() {
                 bail!("{USAGE}");
             }
-            require_named_hub(bus)?;
             let person = ensure_person(&bus.hub(), &store::person_handle())?;
             match bus
                 .post_as_person(&person, target, &text, &images)
@@ -298,7 +316,7 @@ fn status(bus: &AgentBus) -> Result<String> {
     if bus.is_session_hub() {
         let hubs = list(&bus.hubs_root(), false)?;
         return Ok(format!(
-            "Not in a hub. Main and its subagents share a private hub.\n\n{hubs}\n\nUse `/hub join <name>` or `/hub new <name>`."
+            "Not in a named hub. Main and its subagents share a private hub: `/hub open` shows it, and `/hub channel` and `/hub post` work in it.\n\n{hubs}\n\nUse `/hub join <name>` or `/hub new <name>`."
         ));
     }
     Ok(format_view(&bus.view(
@@ -385,6 +403,7 @@ fn feed(bus: &AgentBus, args: &str) -> Result<String> {
     let messages = store::recent_messages(&hub, channel, FEED_MESSAGES)?;
     let place = match channel {
         Some(channel) => format!("**#{}**", channel.trim_start_matches('#')),
+        None if meta.is_session_hub() => "this session's private hub".to_string(),
         None => format!("hub **{}**", meta.name),
     };
     if messages.is_empty() {
@@ -470,13 +489,6 @@ fn parse_name_and_handle(rest: &str) -> Result<(String, Option<String>)> {
     }
 }
 
-fn require_named_hub(bus: &AgentBus) -> Result<()> {
-    if bus.is_session_hub() {
-        bail!("not in a hub; use /hub join <name> or /hub new <name>");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +545,23 @@ mod tests {
         );
         let out = dispatch(&bus, "leave", "x").unwrap();
         assert!(out.contains("Left hub api"), "{out}");
-        assert!(dispatch(&bus, "post #general hi", "x").is_err());
+        let out = dispatch(&bus, "", "x").unwrap();
+        assert!(out.contains("`/hub open` shows it"), "{out}");
+    }
+
+    #[test]
+    fn person_can_add_channels_and_post_in_the_session_hub() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "s1");
+        assert!(bus.is_session_hub());
+        let out = dispatch(&bus, "channel #plan who does what", "x").unwrap();
+        assert_eq!(out, "Created **#plan**.");
+        let out = dispatch(&bus, "post #plan @Main split the work", "x").unwrap();
+        assert!(out.contains("(person)"), "{out}");
+        let inbox = bus.inbox(MAIN_PEER_ID).unwrap();
+        assert_eq!(inbox.len(), 1);
+        let out = dispatch(&bus, "open", "x").unwrap();
+        assert!(out.contains("this session's private hub"), "{out}");
     }
 
     /// Purpose: Check that concurrent new commands join the same hub without loss of members.
@@ -737,6 +765,26 @@ mod tests {
             status_label_in(root.path(), "s1").as_deref(),
             Some("hub api \u{b7} @backend \u{b7} 1 unread")
         );
+    }
+
+    #[test]
+    fn status_label_shows_the_session_hub_once_it_has_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "s1");
+        assert_eq!(status_label_in(root.path(), "s1"), None);
+        dispatch(&bus, "post #general hi", "x").unwrap();
+        assert_eq!(
+            status_label_in(root.path(), "s1").as_deref(),
+            Some("hub \u{b7} private")
+        );
+        bus.send(MAIN_PEER_ID, "#general", "status", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            status_label_in(root.path(), "s1").as_deref(),
+            Some("hub \u{b7} private \u{b7} 1 unread")
+        );
+        assert_eq!(status_label_in(root.path(), "s2"), None);
     }
 
     #[test]
