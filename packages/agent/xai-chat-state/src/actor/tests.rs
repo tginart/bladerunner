@@ -944,9 +944,28 @@ async fn non_compaction_replace_carries_confirmed_total() {
 }
 
 #[tokio::test]
-async fn replace_never_increases_total_tokens() {
-    // A growing replace is capped at the confirmed total; the brief
-    // under-count heals on the next usage report.
+async fn shrinking_replace_never_increases_total_tokens() {
+    // The confirmed total is above the scaled estimate of the remaining
+    // history, which still fits under the cap.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.record_token_usage(1_500);
+    // History grows after the response (tool output), then a rewrite keeps
+    // more than the last-response estimate but less than the history.
+    h.handle
+        .push_user_message(ConversationItem::user("y".repeat(8000)));
+
+    h.handle
+        .replace_conversation(vec![ConversationItem::user("q".repeat(6000))]);
+
+    assert_eq!(h.handle.get_total_tokens().await, 1_500);
+}
+
+#[tokio::test]
+async fn growing_replace_uses_the_new_estimate() {
+    // A bigger system prompt or an AGENTS.md insert grows the history; a cap
+    // at the old total would under-count it.
     let h = TestHarness::new();
     h.handle
         .push_user_message(ConversationItem::user("x".repeat(4000)));
@@ -955,7 +974,8 @@ async fn replace_never_increases_total_tokens() {
     h.handle
         .replace_conversation(vec![ConversationItem::user("q".repeat(40_000))]);
 
-    assert_eq!(h.handle.get_total_tokens().await, 1_500);
+    // Raw estimate 10_000 scaled by the confirmed ratio 1_500 / 1_000.
+    assert_eq!(h.handle.get_total_tokens().await, 15_000);
 }
 
 #[tokio::test]

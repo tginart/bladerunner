@@ -425,23 +425,32 @@ impl ChatStateActor {
         });
     }
 
-    /// Reseed `total_tokens` after any conversation rewrite (compaction,
-    /// rewind, mode switch). Scales `base_estimate` by the ratio of the
-    /// provider-confirmed total to the estimate at that response, and caps the
-    /// result at the pre-rewrite total.
-    ///
-    /// The estimate runs high or low against the provider count (for example,
-    /// retained reasoning never reaches the wire), so a raw estimate would make
-    /// the context bar jump and could fire an early compaction.
-    pub(super) fn reseed_total_tokens(&self, base_estimate: u64) -> u64 {
+    /// Purpose: Reseed `total_tokens` after a conversation rewrite
+    /// (compaction, rewind, mode switch, system-prompt swap).
+    /// Input: The estimate of the new history. The estimate of the history
+    /// before the rewrite.
+    /// Output: The new total.
+    /// Method:
+    ///     1. Scale `base_estimate` by the ratio of the provider-confirmed
+    ///        total to the estimate at that response.
+    ///     2. If the rewrite shrinks the history, cap the result at the
+    ///        pre-rewrite total.
+    ///     3. If the rewrite grows the history (a bigger system prompt, an
+    ///        AGENTS.md insert), keep the scaled value uncapped.
+    /// Note: The estimate runs high or low against the provider count (for
+    /// example, retained reasoning never reaches the wire), so a raw estimate
+    /// would make the context bar jump and could fire an early compaction.
+    /// A cap on a growing rewrite would under-count and delay a needed one.
+    pub(super) fn reseed_total_tokens(&self, base_estimate: u64, pre_rewrite_estimate: u64) -> u64 {
         let pre_rewrite_total = self.state.total_tokens;
         if pre_rewrite_total == 0 || self.state.estimate_at_last_response == 0 {
             return base_estimate;
         }
         let ratio = pre_rewrite_total as f64 / self.state.estimate_at_last_response as f64;
         let scaled = (base_estimate as f64 * ratio).round() as u64;
-        // An over-count fires an early compaction; an under-count heals on
-        // the next model response.
+        if base_estimate > pre_rewrite_estimate {
+            return scaled;
+        }
         scaled.min(pre_rewrite_total)
     }
 
@@ -466,7 +475,9 @@ impl ChatStateActor {
         // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
         self.persistence.replace_history(&items);
         let base_estimate = super::state::estimate_conversation_tokens(&items);
-        let estimated_tokens = self.reseed_total_tokens(base_estimate);
+        let pre_rewrite_estimate =
+            super::state::estimate_conversation_tokens(&self.state.conversation);
+        let estimated_tokens = self.reseed_total_tokens(base_estimate, pre_rewrite_estimate);
         self.state.conversation = items;
         self.state.estimated_tokens_since_model = 0;
         self.state.total_tokens = estimated_tokens;
