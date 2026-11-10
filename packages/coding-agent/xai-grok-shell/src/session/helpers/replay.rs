@@ -579,7 +579,10 @@ fn read_checkpoint_file(path: &Path) -> io::Result<CompactionCheckpointFile> {
     if file.schema_version > 1 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("unsupported checkpoint schema version {}", file.schema_version),
+            format!(
+                "unsupported checkpoint schema version {}",
+                file.schema_version
+            ),
         ));
     }
     Ok(file)
@@ -827,7 +830,10 @@ mod tests {
     }
 
     fn summary_history(summary: &str) -> Vec<ConversationItem> {
-        vec![ConversationItem::system("sys"), ConversationItem::user(summary)]
+        vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user(summary),
+        ]
     }
 
     /// The 30-day sweep can delete an older checkpoint. A rewind whose base
@@ -864,7 +870,10 @@ mod tests {
             message.starts_with("checkpoint for prompts #3 onward is missing."),
             "{message}"
         );
-        assert!(message.contains("compaction_checkpoints/ckpt2.json"), "{message}");
+        assert!(
+            message.contains("compaction_checkpoints/ckpt2.json"),
+            "{message}"
+        );
     }
 
     #[test]

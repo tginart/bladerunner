@@ -1188,7 +1188,8 @@ mod tests {
                 .await;
 
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(crate::config::DEFAULT_TIMEOUT_MS - 1_000),
+            started.elapsed()
+                < std::time::Duration::from_millis(crate::config::DEFAULT_TIMEOUT_MS - 1_000),
             "the slow hook must not hold the close, took {:?}",
             started.elapsed()
         );

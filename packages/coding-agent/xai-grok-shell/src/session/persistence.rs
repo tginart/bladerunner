@@ -4189,7 +4189,9 @@ fn prune_blob_dirs(session_dir: &Path, ttl_days: u32, stats: &mut CleanupStats) 
                 continue;
             };
             let is_stale_file = metadata.file_type().is_file()
-                && metadata.modified().is_ok_and(|mtime| is_stale(mtime, ttl_days));
+                && metadata
+                    .modified()
+                    .is_ok_and(|mtime| is_stale(mtime, ttl_days));
             if !is_stale_file {
                 continue;
             }

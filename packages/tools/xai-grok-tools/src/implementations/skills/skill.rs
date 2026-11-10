@@ -8,8 +8,7 @@ use crate::implementations::skills::types::SkillInfo;
 use crate::util::truncate::{estimate_tokens, floor_char_boundary};
 
 /// Byte budget that matches the `MAX_NUM_TOKENS` read cap.
-const SKILL_BODY_MAX_BYTES: usize =
-    MAX_NUM_TOKENS * xai_token_estimation::BYTES_PER_TOKEN as usize;
+const SKILL_BODY_MAX_BYTES: usize = MAX_NUM_TOKENS * xai_token_estimation::BYTES_PER_TOKEN as usize;
 
 /// Input for the Skill tool
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]

@@ -212,10 +212,7 @@ impl ChatStateHandle {
     /// Remove server-rejected images from the conversation and its stored
     /// history; see [`ChatStateCommand::StripConversationImages`]. Returns
     /// the number of removed image parts, or `None` if the actor is dead.
-    pub async fn strip_conversation_images(
-        &self,
-        urls: Vec<std::sync::Arc<str>>,
-    ) -> Option<usize> {
+    pub async fn strip_conversation_images(&self, urls: Vec<std::sync::Arc<str>>) -> Option<usize> {
         self.query("StripConversationImages", |reply| {
             ChatStateCommand::StripConversationImages { urls, reply }
         })

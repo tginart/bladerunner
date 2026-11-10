@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::{
-    ApiErrorCode, ConversationItem, ConversationRequest, ConversationResponse, EmptyResponseContext,
-    ReasoningModelIdentity, SamplingError, SentCredential, error::Result as SamplingResult,
+    ApiErrorCode, ConversationItem, ConversationRequest, ConversationResponse,
+    EmptyResponseContext, ReasoningModelIdentity, SamplingError, SentCredential,
+    error::Result as SamplingResult,
 };
 
 use crate::client::{ApiBackend, SamplingClient};

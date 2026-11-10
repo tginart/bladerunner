@@ -81,8 +81,13 @@ mod tests {
         let (mock, persistence_rx) = MockChatPersistence::new();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let token = tokio_util::sync::CancellationToken::new();
-        let handle =
-            ChatStateActor::spawn(items, test_config(), Box::new(mock), event_tx, token.clone());
+        let handle = ChatStateActor::spawn(
+            items,
+            test_config(),
+            Box::new(mock),
+            event_tx,
+            token.clone(),
+        );
         (handle, persistence_rx, token)
     }
 
@@ -139,8 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn strip_without_a_match_does_not_rewrite_history() {
-        let (handle, mut persistence_rx, _token) =
-            spawn_with(vec![user_with_images(&[GOOD])]);
+        let (handle, mut persistence_rx, _token) = spawn_with(vec![user_with_images(&[GOOD])]);
 
         let stripped = handle
             .strip_conversation_images(vec![Arc::<str>::from(BAD)])
