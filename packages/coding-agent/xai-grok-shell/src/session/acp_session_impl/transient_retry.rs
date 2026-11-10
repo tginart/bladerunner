@@ -46,14 +46,6 @@ const TRANSIENT_RETRY_ENV: &str = "GROK_TURN_TRANSIENT_RETRY";
 /// broke after it started (connection reset mid-body).
 const MID_STREAM_TRANSPORT_PREFIX: &str = "reqwest error stream:";
 
-/// In-stream Anthropic error events, which the Messages stream reports as a
-/// synthesized 500 with the event type in front of the message. An HTTP 5xx
-/// response renders its body differently, so these markers do not match it.
-const MID_STREAM_SERVER_ERROR_MARKERS: [&str; 2] = [
-    "(status 500): overloaded_error:",
-    "(status 500): api_error:",
-];
-
 /// Transport failures that fail the same way on every attempt.
 const DETERMINISTIC_TRANSPORT_MARKERS: [&str; 9] = [
     "builder error",
@@ -217,15 +209,10 @@ pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorIn
             error.message.starts_with(MID_STREAM_TRANSPORT_PREFIX)
                 && !is_deterministic_transport_error(&error.message)
         }
-        // Status-less: a server error event inside the stream. A status
-        // means an HTTP response the sampler classified (and retried) itself,
-        // except the in-stream events the Messages stream maps to a 500.
-        SamplingErrorKind::Api => match error.status_code {
-            None => error.is_retryable,
-            Some(_) => MID_STREAM_SERVER_ERROR_MARKERS
-                .iter()
-                .any(|marker| error.message.contains(marker)),
-        },
+        // Status-less: a server error event inside the stream (a
+        // `StreamError`, on every backend). A status means an HTTP response
+        // that the sampler classified, and retried, itself.
+        SamplingErrorKind::Api => error.status_code.is_none() && error.is_retryable,
         SamplingErrorKind::Auth
         | SamplingErrorKind::Serialization
         | SamplingErrorKind::RateLimited
@@ -545,22 +532,18 @@ mod tests {
 
     #[test]
     fn a_mid_stream_server_error_event_is_eligible() {
-        // Status-less: a StreamError decoded from an SSE error frame.
-        let stream_error = error_with(
-            SamplingErrorKind::Api,
-            None,
-            "stream error (overloaded_error): Overloaded",
-            true,
+        // An in-stream `error` frame (Messages included) decodes to a
+        // status-less `StreamError` via `try_parse_stream_error`.
+        let stream_error = xai_grok_sampler::SamplingErrorInfo::from(
+            &xai_grok_sampling_types::SamplingError::StreamError {
+                error_type: "overloaded_error".into(),
+                message: "Overloaded".into(),
+                code: None,
+            },
         );
+        assert_eq!(stream_error.kind, SamplingErrorKind::Api);
+        assert_eq!(stream_error.status_code, None);
         assert!(transient_retry_eligible(&stream_error));
-        // The Messages stream maps an in-stream `error` event to a 500.
-        let messages_event = error_with(
-            SamplingErrorKind::Api,
-            Some(500),
-            "API error (status 500): overloaded_error: Overloaded",
-            true,
-        );
-        assert!(transient_retry_eligible(&messages_event));
         // A status-less error that is not retryable is a config problem.
         let config = error_with(SamplingErrorKind::Api, None, "missing project", false);
         assert!(!transient_retry_eligible(&config));
