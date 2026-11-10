@@ -5033,8 +5033,7 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.supports_reasoning_effort {
             entry.info.supports_reasoning_effort = v;
-        } else if !entry.info.supports_reasoning_effort
-            && matches!(entry.info.api_backend, ApiBackend::Messages)
+        } else if !entry.info.supports_reasoning_effort && entry.info.api_backend.is_messages_wire()
         {
             entry.info.supports_reasoning_effort = true;
         }
@@ -6289,8 +6288,12 @@ pub(crate) fn sampling_config_for_model(
     let api_backend = info.api_backend.clone();
     // Custom `api_backend = "codex_responses"` forces the Codex adapter even
     // when the catalog id is not `openai-codex/*` (BYOK reverse proxies).
+    // Custom `api_backend = "vertex_messages"` likewise forces the Vertex
+    // Anthropic adapter for any provider prefix.
     let adapter_kind = if api_backend.uses_codex_dialect() {
         xai_grok_models::AdapterKind::OpenAiCodex
+    } else if api_backend == ApiBackend::VertexMessages {
+        xai_grok_models::AdapterKind::VertexAnthropic
     } else {
         adapter_kind_for_model(model)
     };

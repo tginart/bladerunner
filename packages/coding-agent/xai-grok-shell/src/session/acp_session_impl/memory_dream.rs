@@ -814,7 +814,7 @@ impl SessionActor {
                 );
                 xai_grok_sampler::collect_response(events).await
             }
-            crate::sampling::ApiBackend::Messages => {
+            crate::sampling::ApiBackend::Messages | crate::sampling::ApiBackend::VertexMessages => {
                 let (raw, meta) = sampling_client
                     .conversation_stream_messages(request)
                     .await

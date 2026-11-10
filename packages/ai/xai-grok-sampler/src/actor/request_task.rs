@@ -664,7 +664,7 @@ async fn run_one_attempt(
             )
             .await
         }
-        ApiBackend::Messages => {
+        ApiBackend::Messages | ApiBackend::VertexMessages => {
             let (raw, metadata) = match client.conversation_stream_messages(request).await {
                 Ok(pair) => pair,
                 Err(e) => return AttemptOutcome::InitFailed { error: e },

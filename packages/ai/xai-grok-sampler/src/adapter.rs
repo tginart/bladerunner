@@ -25,6 +25,7 @@ pub enum BackendAdapter {
     GitHubCopilot(ApiBackend),
     GoogleGenerateContent,
     BedrockConverseStream,
+    VertexAnthropic,
 }
 
 impl Default for BackendAdapter {
@@ -39,6 +40,9 @@ impl BackendAdapter {
     pub fn from_route(kind: AdapterKind, backend: ApiBackend) -> Result<Self> {
         match kind {
             AdapterKind::Standard if backend == ApiBackend::CodexResponses => Ok(Self::OpenAiCodex),
+            AdapterKind::Standard if backend == ApiBackend::VertexMessages => {
+                Ok(Self::VertexAnthropic)
+            }
             AdapterKind::Standard => Ok(Self::Standard(backend)),
             AdapterKind::KimiCoding
                 if matches!(backend, ApiBackend::ChatCompletions | ApiBackend::Messages) =>
@@ -82,6 +86,10 @@ impl BackendAdapter {
             AdapterKind::BedrockConverseStream => Err(SamplingError::InvalidConfiguration(
                 "Bedrock ConverseStream adapter requires the Bedrock ConverseStream backend",
             )),
+            AdapterKind::VertexAnthropic if backend.is_messages_wire() => Ok(Self::VertexAnthropic),
+            AdapterKind::VertexAnthropic => Err(SamplingError::InvalidConfiguration(
+                "Vertex Anthropic adapter requires the Messages or VertexMessages backend",
+            )),
         }
     }
 
@@ -96,6 +104,7 @@ impl BackendAdapter {
             Self::GitHubCopilot(_) => AdapterKind::GitHubCopilot,
             Self::GoogleGenerateContent => AdapterKind::GoogleGenerateContent,
             Self::BedrockConverseStream => AdapterKind::BedrockConverseStream,
+            Self::VertexAnthropic => AdapterKind::VertexAnthropic,
         }
     }
 
@@ -108,7 +117,7 @@ impl BackendAdapter {
             | Self::Nexus(backend)
             | Self::GitHubCopilot(backend) => Some(backend),
             Self::OpenAiCodex => Some(&ApiBackend::Responses),
-            Self::AnthropicClaude => Some(&ApiBackend::Messages),
+            Self::AnthropicClaude | Self::VertexAnthropic => Some(&ApiBackend::Messages),
             Self::MistralConversations => Some(&ApiBackend::ChatCompletions),
             Self::GoogleGenerateContent => Some(&ApiBackend::GoogleGenerateContent),
             Self::BedrockConverseStream => Some(&ApiBackend::BedrockConverseStream),
@@ -135,6 +144,10 @@ impl BackendAdapter {
 
     pub fn uses_github_copilot_dialect(&self) -> bool {
         matches!(self, Self::GitHubCopilot(_))
+    }
+
+    pub fn uses_vertex_anthropic_dialect(&self) -> bool {
+        matches!(self, Self::VertexAnthropic)
     }
 
     pub fn ensure_implemented(&self) -> Result<()> {

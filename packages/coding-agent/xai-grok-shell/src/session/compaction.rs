@@ -314,7 +314,7 @@ impl SessionActor {
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await;
         let strips = sampling_cfg
             .as_ref()
-            .map(|c| c.api_backend == ApiBackend::Messages)
+            .map(|c| c.api_backend.is_messages_wire())
             .unwrap_or(false);
         let model_slug = sampling_cfg
             .as_ref()
@@ -1043,7 +1043,7 @@ impl SessionActor {
         }
         let summary_strips_reasoning = sampling_config
             .as_ref()
-            .map(|c| c.api_backend == ApiBackend::Messages)
+            .map(|c| c.api_backend.is_messages_wire())
             .unwrap_or(false);
         let model_id = sampling_config.map(|c| c.model).unwrap_or_default();
         let compaction = xai_grok_telemetry::events::CompactionScope::begin(

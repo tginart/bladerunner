@@ -726,7 +726,7 @@ pub(crate) async fn generate_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
-        ApiBackend::Messages => {
+        ApiBackend::Messages | ApiBackend::VertexMessages => {
             let request = ConversationRequest {
                 items: chat_history,
                 tools,

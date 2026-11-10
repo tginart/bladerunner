@@ -55,7 +55,7 @@ default = "grok-build"
 
 ## 支持的 API 后端
 
-Grok 支持四种 API 后端。在 `[model.*]` 配置中设置 `api_backend`，以选择模型使用的协议：
+Grok 支持五种 API 后端。在 `[model.*]` 配置中设置 `api_backend`，以选择模型使用的协议：
 
 | 值 | API | 默认 |
 |-------|-----|---------|
@@ -63,6 +63,7 @@ Grok 支持四种 API 后端。在 `[model.*]` 配置中设置 `api_backend`，�
 | `"responses"` | OpenAI Responses（`/v1/responses`） | |
 | `"codex_responses"` | OpenAI Codex 兼容 Responses（`/v1/responses`） | |
 | `"messages"` | Anthropic Messages（`/v1/messages`） | |
+| `"vertex_messages"` | Google Vertex AI 上的 Anthropic Messages（`:streamRawPredict`，使用 ADC 认证） | |
 
 省略 `api_backend` 时，Grok 使用 `chat_completions`。
 

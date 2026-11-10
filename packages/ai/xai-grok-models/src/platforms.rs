@@ -404,6 +404,9 @@ pub enum AdapterKind {
     GitHubCopilot,
     GoogleGenerateContent,
     BedrockConverseStream,
+    /// Anthropic Messages wire on Google-managed Vertex AI (rawPredict
+    /// envelope, ADC bearer auth).
+    VertexAnthropic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -355,7 +355,7 @@ async fn drive_sampler_stream(
             let stream = stream_responses(raw, meta, request_id, idle, doom);
             forward_recorded_sampling_events(stream, tx, Some(recording), response_observer).await
         }
-        ApiBackend::Messages => {
+        ApiBackend::Messages | ApiBackend::VertexMessages => {
             let (raw, meta) = client
                 .conversation_stream_messages(request)
                 .await
@@ -869,6 +869,7 @@ fn parse_api_backend(raw: &str) -> ApiBackend {
         "responses" => ApiBackend::Responses,
         "codex_responses" | "codex-responses" => ApiBackend::CodexResponses,
         "messages" => ApiBackend::Messages,
+        "vertex_messages" | "vertex-messages" => ApiBackend::VertexMessages,
         _ => ApiBackend::ChatCompletions,
     }
 }
