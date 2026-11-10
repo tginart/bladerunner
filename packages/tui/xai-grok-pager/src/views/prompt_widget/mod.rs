@@ -2231,6 +2231,18 @@ impl PromptWidget {
     /// ALL mouse events (not just those in the prompt area) because TextArea
     /// tracks drag state internally and handles drag-beyond-edge.
     pub fn handle_mouse(&mut self, mouse: &crossterm::event::MouseEvent) -> PromptEvent {
+        self.handle_mouse_inner(mouse).0
+    }
+
+    /// Handle a wheel event. Returns `true` only if the textarea scrolled.
+    ///
+    /// A prompt with no overflow, or one already at the edge, does not
+    /// scroll. The caller then sends the wheel to the history instead.
+    pub fn handle_mouse_scroll(&mut self, mouse: &crossterm::event::MouseEvent) -> bool {
+        self.handle_mouse_inner(mouse).1
+    }
+
+    fn handle_mouse_inner(&mut self, mouse: &crossterm::event::MouseEvent) -> (PromptEvent, bool) {
         use xai_ratatui_textarea::{MouseAction, TextElementEventKind};
 
         self.post_insert_image_preview = None;
@@ -2259,7 +2271,8 @@ impl PromptWidget {
             }
         }
 
-        match action {
+        let did_scroll = matches!(action, MouseAction::Scrolled);
+        let event = match action {
             MouseAction::CursorPlaced
             | MouseAction::SelectionUpdated
             | MouseAction::SelectionFinished
@@ -2270,7 +2283,8 @@ impl PromptWidget {
                 PromptEvent::Edited
             }
             MouseAction::Nothing => PromptEvent::Edited,
-        }
+        };
+        (event, did_scroll)
     }
 
     /// Handle a paste event.

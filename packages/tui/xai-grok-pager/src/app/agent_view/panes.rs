@@ -686,7 +686,17 @@ impl AgentView {
                     row,
                     modifiers: KeyModifiers::NONE,
                 };
-                self.prompt.handle_mouse(&event);
+                // A one-line prompt (or one at its scroll edge) has nothing
+                // to scroll, so the wheel moves the history instead of
+                // doing nothing.
+                if self.prompt.handle_mouse_scroll(&event) {
+                    return;
+                }
+                if lines > 0 {
+                    self.scrollback.scroll_down(lines as u16);
+                } else {
+                    self.scrollback.scroll_up((-lines) as u16);
+                }
             }
         }
     }
@@ -793,6 +803,54 @@ mod scroll_granularity_tests {
             before,
             "wheel must not leak through the goal detail overlay"
         );
+    }
+    /// A one-line prompt has nothing to scroll, so the wheel over it must
+    /// scroll the history instead of being dropped.
+    #[test]
+    fn wheel_over_one_line_prompt_scrolls_history() {
+        let mut agent = make_agent();
+        for i in 0..60 {
+            agent
+                .scrollback
+                .push_block(crate::scrollback::block::RenderBlock::agent_message(
+                    format!("line {i}"),
+                ));
+        }
+        agent.prompt.set_text("hi");
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let mut scratch = crate::scrollback::render::ScratchBuffer::new();
+        agent.last_terminal_size = (80, 30);
+        agent.draw(
+            area,
+            &mut buf,
+            &crate::actions::ActionRegistry::defaults(),
+            &mut scratch,
+            None,
+            false,
+            crate::app::agent_view::BannerSlotParams::none(),
+            &crate::app::bundle::BundleState::default(),
+            false,
+            false,
+            &mut Vec::new(),
+            crate::app::agent_view::AppRenderParams::default(),
+        );
+        let prompt = agent.pane_areas.prompt;
+        assert!(prompt.area() > 0, "setup: the prompt pane was laid out");
+        let (col, row) = (prompt.x + 4, prompt.y + prompt.height / 2);
+        assert_eq!(
+            agent.pane_areas.hit_test(col, row),
+            Some(crate::views::agent::ActivePane::Prompt),
+            "setup: the pointer is over the prompt"
+        );
+        let before = agent.scrollback.scroll_info().0;
+        agent.handle_scroll(-3, col, row);
+        assert_ne!(
+            agent.scrollback.scroll_info().0,
+            before,
+            "wheel up over a one-line prompt must scroll the history"
+        );
+        assert_eq!(agent.prompt.text(), "hi", "the prompt text is unchanged");
     }
 }
 #[cfg(test)]
