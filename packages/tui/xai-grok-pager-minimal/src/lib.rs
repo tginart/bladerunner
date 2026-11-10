@@ -32,6 +32,7 @@ pub mod live;
 pub mod overlay;
 pub mod panel;
 pub mod plan;
+pub mod reprint;
 pub mod todo;
 pub mod welcome;
 
@@ -88,12 +89,12 @@ use xai_grok_pager::app::app_view::AppView;
 /// every path through this function reaches; its own inner
 /// `BeginSynchronizedUpdate` is redundant-but-harmless (DEC 2026 is a mode,
 /// not a counter — the first End closes it).
-pub fn draw(app: &mut AppView, terminal: &mut PagerTerminal) {
 ///
 /// Under tmux neither marker is sent (see
 /// [`xai_grok_pager::terminal::should_emit_synchronized_output`]). The opening
 /// marker here and the closing marker in `draw_frame` use the same policy on
 /// the same terminal context, so they always come as a pair.
+pub fn draw(app: &mut AppView, terminal: &mut PagerTerminal) {
     if xai_grok_pager::terminal::should_emit_synchronized_output(
         xai_grok_pager::terminal::terminal_context(),
     ) {
@@ -105,6 +106,9 @@ pub fn draw(app: &mut AppView, terminal: &mut PagerTerminal) {
     // commit pass judge committability against the same state (see
     // `commit::sync_pending_marks`).
     commit::sync_pending_marks(app);
+    // Before this frame's commits, so that they land below the reprinted
+    // history and not above it.
+    reprint::maybe_reprint(app, terminal);
     // Advance any in-progress /transcript build by one time-budgeted slice
     // (arms `pending_pager_path` when done; see `full_view::pump_transcript`).
     full_view::pump_transcript(app);

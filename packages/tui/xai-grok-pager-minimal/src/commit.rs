@@ -15,6 +15,7 @@ use xai_grok_pager::app::PagerTerminal;
 use xai_grok_pager::app::app_view::{ActiveView, AppView};
 use xai_grok_pager::appearance::AppearanceConfig;
 use xai_grok_pager::minimal_api;
+use xai_grok_pager::minimal_reprint;
 use xai_grok_pager::render::Renderable;
 use xai_grok_pager::scrollback::block::RenderBlock;
 use xai_grok_pager::scrollback::blocks::ToolCallBlock;
@@ -336,7 +337,7 @@ pub(crate) fn minimal_renderer<'a>(
 /// **full** `desired_height` so wrapping is byte-identical to an uncapped commit
 /// (K5); the `insert_before` buffer is only `commit_h` rows tall, so any content
 /// past it is clipped — bounding the allocation to the cap.
-fn insert_committed(
+pub(crate) fn insert_committed(
     terminal: &mut PagerTerminal,
     renderer: EntryRenderer<'_>,
     width: u16,
@@ -468,7 +469,7 @@ pub fn commit_active(app: &mut AppView, terminal: &mut PagerTerminal) {
     // Drive the ONE frontier walk (`commit_leading_run` — also what the unit
     // tests exercise) with the production per-entry work: finalize, stamp the
     // print-once display mode, print, then remember folded blocks for Ctrl+E.
-    commit_leading_run(sb, turn_running, |sb, i| {
+    let committed = commit_leading_run(sb, turn_running, |sb, i| {
         // If the turn is idle but this entry still carries a stale
         // `is_running` flag, finalize it first so it renders in its
         // finished form (e.g. "Thought for Xs", not an animated "Thinking…").
@@ -521,6 +522,9 @@ pub fn commit_active(app: &mut AppView, terminal: &mut PagerTerminal) {
         e.set_display_mode(mode);
         j += 1;
     }
+    if committed > 0 {
+        minimal_reprint::record_minimal_rows_printed(app, width);
+    }
 }
 
 /// Re-print the entries queued by `Ctrl+E` / `/expand` into native scrollback,
@@ -566,6 +570,7 @@ pub fn expand_pending(app: &mut AppView, terminal: &mut PagerTerminal) {
     // /expand request.
     let ids = minimal_api::take_minimal_pending_expand(app);
     let mut requeue: Vec<EntryId> = Vec::new();
+    let mut is_printed = false;
     {
         let Some(agent) = app.agents.get_mut(&id) else {
             // Can't happen (existence checked just above, nothing in between
@@ -593,11 +598,15 @@ pub fn expand_pending(app: &mut AppView, terminal: &mut PagerTerminal) {
                     requeue.extend(iter);
                     break;
                 }
+                is_printed = true;
             }
         }
     }
     if !requeue.is_empty() {
         minimal_api::requeue_minimal_pending_expand(app, requeue);
+    }
+    if is_printed {
+        minimal_reprint::record_minimal_rows_printed(app, width);
     }
 }
 

@@ -5714,7 +5714,7 @@ impl AppView {
     /// or when new tracing entries arrive via the channel.
     pub fn tick(&mut self) -> bool {
         let mut needs_redraw = false;
-        needs_redraw |= self.minimal_state.transcript.is_some();
+        needs_redraw |= self.minimal_state.needs_frames();
         needs_redraw |= self.poll_clipboard_focus_tip();
         #[cfg(feature = "codex-live")]
         if self.live_active() && self.live_runtime.visualizer.peak_decay > 0.0 {
@@ -6057,7 +6057,7 @@ impl AppView {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return TickDemand::Fast;
         }
         if self
