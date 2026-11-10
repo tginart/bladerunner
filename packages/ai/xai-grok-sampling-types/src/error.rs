@@ -456,8 +456,18 @@ impl SamplingError {
 
     /// True when this error is a context-window/size overflow — deterministic,
     /// so retrying the same payload can't help. See [`is_context_length_error`].
+    ///
+    /// A 429 with `Retry-After` never classifies: a TPM rate limit reads
+    /// "Request too large for model ... tokens per min", but the server
+    /// promises capacity later, so retry loops must back off instead of
+    /// failing fast.
     pub fn is_context_length_error(&self) -> bool {
         match self {
+            SamplingError::Api {
+                status,
+                retry_after_secs: Some(_),
+                ..
+            } if *status == StatusCode::TOO_MANY_REQUESTS => false,
             SamplingError::Api { message, .. } | SamplingError::StreamError { message, .. } => {
                 is_context_length_error(message)
             }
@@ -731,18 +741,8 @@ pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
     })
 }
 
-/// True when an error message indicates a context-window overflow. Backends report
-/// this inconsistently with no stable error code, so we match the message text; it's
-/// deterministic (re-sending the same payload always fails), so callers must not retry.
-pub fn is_context_length_error(message: &str) -> bool {
-    let m = message.to_ascii_lowercase();
-    m.contains("too long for this model")
-        || m.contains("prompt is too long")
-        || m.contains("maximum prompt length")
-        || m.contains("maximum context length")
-        || m.contains("context_length_exceeded")
-        || (m.contains("current message") && m.contains("exceeds budget"))
-}
+/// One size detector for the turn path and compaction, so the two cannot drift.
+pub use xai_grok_compaction::is_context_length_error;
 
 /// Whether an HTTP status is worth retrying: the same 429 + any 5xx rule CCP
 /// publishes in `x-should-retry`, minus Cloudflare's origin-TLS 525/526
@@ -938,6 +938,26 @@ mod tests {
             error_code: None,
         };
         assert!(!not_vetoed.is_retry_vetoed());
+    }
+
+    #[test]
+    fn tpm_429_with_retry_after_escapes_the_size_text_veto() {
+        let tpm = |retry_after_secs: Option<u64>| SamplingError::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "Request too large for model: Limit 30000, Requested 50000 \
+                      tokens per min"
+                .into(),
+            model_metadata: None,
+            retry_after_secs,
+            should_retry: None,
+            error_code: None,
+        };
+        // Retry-After promises capacity later: back off, do not fail fast.
+        assert!(!tpm(Some(7)).is_context_length_error());
+        assert!(!tpm(Some(7)).is_retry_vetoed());
+        // Without Retry-After the request exceeds the cap outright.
+        assert!(tpm(None).is_context_length_error());
+        assert!(tpm(None).is_retry_vetoed());
     }
 
     #[test]

@@ -770,6 +770,7 @@ impl SessionActor {
         reason: SuppressReason,
         estimated_tokens: u64,
         context_window: u64,
+        detail: &str,
     ) {
         let new_state = reason.suppress_state();
         if self
@@ -796,26 +797,59 @@ impl SessionActor {
                     context_window,
                 },
             );
-            let message = match reason {
-                SuppressReason::CreditBlock => {
-                    "out of credits or over your spending limit. Add credits and retry."
-                }
-                SuppressReason::Auth => {
-                    "authentication problem — re-authenticate using /login and retry."
-                }
-                SuppressReason::Size => "this conversation is too large to compact.",
-                SuppressReason::Schema => "this conversation can't be summarized.",
-                SuppressReason::Other => {
-                    "it'll retry on the next turn, or start a new session using /new."
-                }
-            };
             self.send_xai_notification(
                 crate::extensions::notification::SessionUpdate::AutoCompactFailed {
-                    error: message.to_string(),
+                    error: Self::suppress_notification_message(reason, detail),
                 },
             )
             .await;
         }
+    }
+    /// Text for the suppression notification. Known reasons get fixed text;
+    /// `Other` carries the real error so the user can act on it.
+    fn suppress_notification_message(reason: SuppressReason, detail: &str) -> String {
+        match reason {
+            SuppressReason::CreditBlock => {
+                "out of credits or over your spending limit. Add credits and retry.".to_string()
+            }
+            SuppressReason::Auth => {
+                "authentication problem — re-authenticate using /login and retry.".to_string()
+            }
+            SuppressReason::Size => "this conversation is too large to compact.".to_string(),
+            SuppressReason::Schema => "this conversation can't be summarized.".to_string(),
+            SuppressReason::Other => Self::failure_with_retry_guidance(detail),
+        }
+    }
+    /// Retry guidance, then the real error on its own line. Both the `Other`
+    /// suppression and a transient failure retry on the next turn.
+    fn failure_with_retry_guidance(detail: &str) -> String {
+        const RETRY_GUIDANCE: &str =
+            "it'll retry on the next turn, or start a new session using /new.";
+        let detail = Self::user_facing_compact_error(detail);
+        if detail.is_empty() {
+            RETRY_GUIDANCE.to_string()
+        } else {
+            format!("{RETRY_GUIDANCE}\n{detail}")
+        }
+    }
+    /// Strip the internal wrapper prefixes (they nest), fold the text to one
+    /// line and cap its length, so the notification shows the provider error.
+    fn user_facing_compact_error(raw: &str) -> String {
+        const MAX_DETAIL_BYTES: usize = 300;
+        const INTERNAL_PREFIXES: &[&str] = &[
+            crate::session::helpers::session_compact::COMPACT_FAILED_PREFIX,
+            xai_grok_compaction::SAMPLER_BUILD_FAILED_PREFIX,
+            xai_grok_compaction::SAMPLER_START_FAILED_PREFIX,
+        ];
+        let mut rest = raw.trim();
+        while let Some(prefix) = INTERNAL_PREFIXES.iter().find(|p| {
+            rest.get(..p.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(p))
+        }) {
+            rest = rest[prefix.len()..].trim_start();
+        }
+        let single_line = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+        xai_grok_tools::util::truncate_str_with_marker(&single_line, MAX_DETAIL_BYTES).into_owned()
     }
     /// Map a deterministic failure's error text to a fixed, content-free
     /// [`SuppressReason`] (drives telemetry + sticky-vs-per-turn scope).
@@ -1493,6 +1527,7 @@ impl SessionActor {
                                 SuppressReason::Size,
                                 estimated_input_tokens,
                                 context_window,
+                                &message,
                             )
                             .await;
                         }
@@ -1507,6 +1542,7 @@ impl SessionActor {
                                 reason,
                                 estimated_input_tokens,
                                 context_window,
+                                &message,
                             )
                             .await;
                         }
@@ -2452,8 +2488,9 @@ impl SessionActor {
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == SUPPRESS_NONE
                 {
+                    let detail = Self::acp_error_message(&e);
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
-                        error: String::new(),
+                        error: Self::failure_with_retry_guidance(&detail),
                     })
                     .await;
                 }
@@ -3048,7 +3085,7 @@ mod inline_auto_compact_flow_tests {
                 assert!(actor.check_auto_compact_needed().await.is_some());
                 assert!(actor.should_compact_on_error(&err).await);
                 actor
-                    .suppress_auto_compaction(SuppressReason::Other, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Other, 1_000, 200_000, "")
                     .await;
                 assert!(actor.check_auto_compact_needed().await.is_none());
                 assert!(!actor.should_compact_on_error(&err).await);
@@ -3060,7 +3097,7 @@ mod inline_auto_compact_flow_tests {
                 );
                 assert!(actor.check_auto_compact_needed().await.is_some());
                 actor
-                    .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000, "")
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3086,7 +3123,7 @@ mod inline_auto_compact_flow_tests {
                 );
                 assert!(actor.check_auto_compact_needed().await.is_some());
                 actor
-                    .suppress_auto_compaction(SuppressReason::Size, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Size, 1_000, 200_000, "")
                     .await;
                 assert!(actor.check_auto_compact_needed().await.is_none());
                 let _ = actor.compaction.auto_compact_suppressed.compare_exchange(
@@ -3124,7 +3161,9 @@ mod inline_auto_compact_flow_tests {
                     create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await,
                 );
                 for reason in [SuppressReason::Size, SuppressReason::Other] {
-                    actor.suppress_auto_compaction(reason, 1_000, 200_000).await;
+                    actor
+                        .suppress_auto_compaction(reason, 1_000, 200_000, "")
+                        .await;
                     assert_ne!(
                         actor.compaction.auto_compact_suppressed.load(Relaxed),
                         SUPPRESS_NONE,
@@ -3166,7 +3205,9 @@ mod inline_auto_compact_flow_tests {
                     (SuppressReason::CreditBlock, SUPPRESS_UNTIL_SUCCESS),
                     (SuppressReason::Auth, SUPPRESS_AUTH),
                 ] {
-                    actor.suppress_auto_compaction(reason, 1_000, 200_000).await;
+                    actor
+                        .suppress_auto_compaction(reason, 1_000, 200_000, "")
+                        .await;
                     assert_eq!(
                         actor.compaction.auto_compact_suppressed.load(Relaxed),
                         expected,
@@ -3206,7 +3247,7 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     create_test_actor(184_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 actor
-                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000, "")
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3235,7 +3276,7 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 actor
-                    .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000, "")
                     .await;
                 actor.clear_auth_compact_suppression();
                 assert_eq!(
@@ -3260,7 +3301,7 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     create_test_actor(184_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 actor
-                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000, "")
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3346,7 +3387,7 @@ mod inline_auto_compact_flow_tests {
                             persistence_tx,
                         )
                         .await;
-                    actor.suppress_auto_compaction(reason, 1_000, 200_000).await;
+                    actor.suppress_auto_compaction(reason, 1_000, 200_000, "").await;
                     let mut text = None;
                     while let Ok(msg) = persistence_rx.try_recv() {
                         if let PersistenceMsg::Update(
@@ -3371,6 +3412,10 @@ mod inline_auto_compact_flow_tests {
                 assert!(schema.contains("can't be summarized"), "schema: {schema}");
                 let other = notification_for(SuppressReason::Other).await;
                 assert!(other.contains("/new"), "other: {other}");
+                assert_eq!(
+                    other, "it'll retry on the next turn, or start a new session using /new.",
+                    "no detail means guidance only"
+                );
             })
             .await;
     }
@@ -3626,7 +3671,7 @@ mod inline_auto_compact_flow_tests {
                     create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await,
                 );
                 actor
-                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
+                    .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000, "")
                     .await;
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -3861,6 +3906,48 @@ mod inline_auto_compact_flow_tests {
                 );
             })
             .await;
+    }
+    /// The user sees the provider error, without the internal wrappers.
+    #[test]
+    fn user_facing_compact_error_strips_prefixes_single_lines_and_caps() {
+        let user_facing = SessionActor::user_facing_compact_error;
+        assert_eq!(
+            user_facing("compact failed: API error\n  detail  line\t2"),
+            "API error detail line 2"
+        );
+        let nested = xai_grok_compaction::CompactionSampleError::Build(
+            "compact failed: API error (status 400 Bad Request): invalid_image: too big".into(),
+        )
+        .to_string();
+        assert_eq!(
+            user_facing(&nested),
+            "API error (status 400 Bad Request): invalid_image: too big"
+        );
+        assert_eq!(
+            user_facing("COMPACT FAILED: Compaction Sampler Start Failed: connection refused"),
+            "connection refused",
+            "prefixes strip case-insensitively and in any order"
+        );
+        assert_eq!(user_facing("  no prefix here  "), "no prefix here");
+        let long = format!("compact failed: {}", "x".repeat(2_000));
+        assert!(user_facing(&long).len() < 400, "detail is capped");
+    }
+    #[test]
+    fn other_suppression_and_transient_failure_carry_the_real_error() {
+        let message = SessionActor::suppress_notification_message(
+            SuppressReason::Other,
+            "compact failed: API error (status 400 Bad Request): unsupported parameter",
+        );
+        assert_eq!(
+            message,
+            "it'll retry on the next turn, or start a new session using /new.\n\
+             API error (status 400 Bad Request): unsupported parameter"
+        );
+        // Known reasons keep their fixed, content-free text.
+        assert_eq!(
+            SessionActor::suppress_notification_message(SuppressReason::Size, "raw"),
+            "this conversation is too large to compact."
+        );
     }
     /// `classify_suppress_reason` maps each deterministic-failure shape to its
     /// fixed [`SuppressReason`].

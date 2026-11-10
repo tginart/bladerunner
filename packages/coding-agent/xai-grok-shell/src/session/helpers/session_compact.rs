@@ -52,6 +52,9 @@ pub(crate) enum CompactFailure {
 }
 /// Stable error payload for a user-cancelled compact (pager + retry loop).
 pub(crate) const COMPACT_CANCELLED_MSG: &str = "compact cancelled";
+/// Prefix the classifiers put on every compact-failure detail; user-facing
+/// text strips it again.
+pub(crate) const COMPACT_FAILED_PREFIX: &str = "compact failed: ";
 impl CompactFailure {
     pub(crate) fn cancelled_error() -> acp::Error {
         acp::Error::internal_error().data(COMPACT_CANCELLED_MSG)
@@ -142,28 +145,32 @@ pub(crate) async fn verify_compaction_images(
 /// and stuck-model conditions all persist). 4xx API responses other than
 /// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
 /// transport errors, stream-level blips, and 5xx responses are transient.
+///
+/// A size overflow (HTTP 413, or size wording) is deterministic so the input
+/// ladder steps down. A 429 with `Retry-After` is not a size overflow even
+/// when it says "Request too large": that is a TPM rate limit, so it stays
+/// transient and the engine backs off.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
-    let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
-    let deterministic = match &err {
-        SamplingError::Auth { .. }
-        | SamplingError::InvalidConfiguration(_)
-        | SamplingError::Serialization(_)
-        | SamplingError::IdleTimeout { .. } => true,
-        SamplingError::Api {
-            status, message, ..
-        } => {
-            is_context_length_error(message)
-                || (status.is_client_error()
+    let acp_err = acp::Error::internal_error().data(format!("{COMPACT_FAILED_PREFIX}{err}"));
+    let size_overflow = err.is_payload_too_large() || err.is_context_length_error();
+    let deterministic = size_overflow
+        || match &err {
+            SamplingError::Auth { .. }
+            | SamplingError::InvalidConfiguration(_)
+            | SamplingError::Serialization(_)
+            | SamplingError::IdleTimeout { .. } => true,
+            SamplingError::Api { status, .. } => {
+                status.is_client_error()
                     && *status != StatusCode::REQUEST_TIMEOUT
-                    && *status != StatusCode::TOO_MANY_REQUESTS)
-        }
-        SamplingError::MaxTokensTruncation => true,
-        SamplingError::Http(_)
-        | SamplingError::EventStreamError(_)
-        | SamplingError::StreamError { .. }
-        | SamplingError::EmptyResponse { .. }
-        | SamplingError::DoomLoopDetected { .. } => false,
-    };
+                    && *status != StatusCode::TOO_MANY_REQUESTS
+            }
+            SamplingError::MaxTokensTruncation => true,
+            SamplingError::Http(_)
+            | SamplingError::EventStreamError(_)
+            | SamplingError::StreamError { .. }
+            | SamplingError::EmptyResponse { .. }
+            | SamplingError::DoomLoopDetected { .. } => false,
+        };
     if deterministic {
         CompactFailure::Deterministic(acp_err)
     } else {
@@ -183,8 +190,8 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
 /// the same payload).
 fn classify_response_event_error(code: Option<&str>, message: &str) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(match code {
-        Some(c) => format!("compact failed: {c}: {message}"),
-        None => format!("compact failed: {message}"),
+        Some(c) => format!("{COMPACT_FAILED_PREFIX}{c}: {message}"),
+        None => format!("{COMPACT_FAILED_PREFIX}{message}"),
     });
     if matches!(code, Some("invalid_request_error")) || message.contains("invalid_request_error") {
         return CompactFailure::Deterministic(acp_err);
@@ -1036,6 +1043,41 @@ mod classify_tests {
         assert!(is_det(&classify_sampling_error(
             SamplingError::Serialization(serde_err)
         )));
+    }
+    #[test]
+    fn tpm_429_with_retry_after_is_transient_not_overflow() {
+        let tpm = |retry_after_secs: Option<u64>| SamplingError::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "Request too large for model: Limit 30000, Requested 50000 \
+                      tokens per min"
+                .into(),
+            model_metadata: None,
+            retry_after_secs,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(matches!(
+            classify_sampling_error(tpm(Some(7))),
+            CompactFailure::Transient(_)
+        ));
+        // No Retry-After: the request exceeds the per-request cap outright.
+        assert!(is_det(&classify_sampling_error(tpm(None))));
+    }
+    #[test]
+    fn http_413_is_deterministic_with_size_text() {
+        let CompactFailure::Deterministic(err) = classify_sampling_error(SamplingError::Api {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "Request failed (HTTP 413).".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        }) else {
+            panic!("expected Deterministic for 413");
+        };
+        let data = err.data.as_ref().and_then(|d| d.as_str()).unwrap();
+        // The engine reads this text to flag the overflow for the input ladder.
+        assert!(is_context_length_error(data), "got: {data}");
     }
     #[test]
     fn classifier_preserves_acp_error_data() {
