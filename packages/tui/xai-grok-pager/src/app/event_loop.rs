@@ -2936,12 +2936,8 @@ pub(crate) async fn run(
 
                                 let mut loads = Vec::with_capacity(load_plans.len());
                                 for (agent_id, plan) in load_plans {
-                                    // Reconnect path — no resolved compat in scope; default
-                                    // (all-on) preserves existing behavior.
-                                    let mcp_servers = xai_grok_shell::util::config::load_mcp_servers(
-                                        &plan.cwd,
-                                        &xai_grok_tools::types::compat::CompatConfig::default(),
-                                    );
+                                    let mcp_servers =
+                                        effects::discover_mcp_servers(plan.cwd.clone()).await;
                                     let load_req = acp::LoadSessionRequest::new(plan.session_id, plan.cwd).mcp_servers(mcp_servers).meta(plan.meta.as_object().cloned());
                                     match acp_send(load_req, &acp_tx).await {
                                         Ok(resp) => {
