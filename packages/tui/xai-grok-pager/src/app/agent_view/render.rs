@@ -4679,7 +4679,8 @@ impl AgentView {
 /// hit area when hidden (`y: None`). The unconditional set-or-clear is the
 /// point: a hit rect must never outlive the frame that painted its arrow,
 /// or an invisible click target keeps firing under whatever covers it
-/// (e.g. an open block viewer).
+/// (e.g. an open block viewer). On hover, the full hit area becomes a
+/// highlighted pill with a bold accent arrow, so the arrow reads as a button.
 fn draw_scroll_arrow(
     buf: &mut Buffer,
     theme: &Theme,
@@ -4692,16 +4693,23 @@ fn draw_scroll_arrow(
         hit.clear();
         return;
     };
-    let style = Style::default().fg(if hit.hovered {
-        theme.gray_bright
-    } else {
-        theme.gray
-    });
+    let hit_rect = Rect::new(center_x.saturating_sub(1), y, 3, 1);
+    let mut style = Style::default().fg(theme.gray);
+    if hit.hovered {
+        style = Style::default()
+            .fg(theme.command)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+        for x in hit_rect.x..hit_rect.x + hit_rect.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(theme.bg_hover);
+            }
+        }
+    }
     if let Some(cell) = buf.cell_mut((center_x, y)) {
         cell.set_symbol(symbol);
         cell.set_style(style);
     }
-    hit.set(Some(Rect::new(center_x.saturating_sub(1), y, 3, 1)));
+    hit.set(Some(hit_rect));
 }
 /// Pad `msg` for the toast slot, truncating with a trailing ellipsis when it
 /// cannot fit in `avail_width` columns (long clipboard toasts embed backup
