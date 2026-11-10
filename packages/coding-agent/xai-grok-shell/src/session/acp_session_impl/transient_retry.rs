@@ -1,11 +1,15 @@
 //! Turn-level retry of transient sampler failures.
 //!
 //! Purpose: The sampler retries 429, 5xx and connection errors inside one
-//! request, but it never retries a stalled stream (`IdleTimeout`), and when
-//! its own budget runs out the turn used to end. This module resubmits the
-//! turn instead, with a slow backoff and two budgets: a few retries per
-//! sampling step and a cap for the whole prompt. It automates the manual
-//! "Continue" that revived a stalled session.
+//! request, but it never retries a stalled stream (`IdleTimeout`), and a
+//! stream that breaks after it started used to end the turn. This module
+//! resubmits the turn for those failures, with a slow backoff and two
+//! budgets: a few retries per sampling step and a cap for the whole prompt.
+//! It automates the manual "Continue" that revived a stalled session.
+//!
+//! Note: A failure class that the sampler already retried to exhaustion
+//! (HTTP 5xx, connection errors) is not retried again here. Stacking the two
+//! ladders would turn a hard outage into a ~17 minute wait.
 //!
 //! Note: Subagents and budgeted workflow children stay terminal. The early
 //! returns in `handle_sampling_failure` keep the workflow children out, and
@@ -37,6 +41,31 @@ const _: () = assert!(MAX_TRANSIENT_TURN_RETRIES as usize == TRANSIENT_TURN_RETR
 /// Env kill switch: `GROK_TURN_TRANSIENT_RETRY=0` restores the old
 /// fail-the-turn behavior for new sessions.
 const TRANSIENT_RETRY_ENV: &str = "GROK_TURN_TRANSIENT_RETRY";
+
+/// Display prefix of `SamplingError::EventStreamError`: the response stream
+/// broke after it started (connection reset mid-body).
+const MID_STREAM_TRANSPORT_PREFIX: &str = "reqwest error stream:";
+
+/// In-stream Anthropic error events, which the Messages stream reports as a
+/// synthesized 500 with the event type in front of the message. An HTTP 5xx
+/// response renders its body differently, so these markers do not match it.
+const MID_STREAM_SERVER_ERROR_MARKERS: [&str; 2] = [
+    "(status 500): overloaded_error:",
+    "(status 500): api_error:",
+];
+
+/// Transport failures that fail the same way on every attempt.
+const DETERMINISTIC_TRANSPORT_MARKERS: [&str; 9] = [
+    "builder error",
+    "relative url",
+    "invalid url",
+    "certificate",
+    "tls",
+    "dns error",
+    "failed to lookup address",
+    "no such host",
+    "nodename nor servname",
+];
 
 /// Transient-retry state for one prompt.
 ///
@@ -163,12 +192,15 @@ fn transient_display_ceiling(step_attempts: u32, prompt_attempts: u32) -> u32 {
             .min(MAX_TRANSIENT_RETRIES_PER_PROMPT.saturating_sub(prompt_attempts))
 }
 
-/// Whether a terminal sampler failure is worth a turn-level resubmit: a
-/// stream stall, a transport error, or a retryable 5xx.
-///
-/// The vetoes mirror `SamplingError::is_retry_vetoed`. 429 is excluded: it
-/// classifies as `RateLimited` and keeps its own handling. Other kinds keep
-/// their dedicated recovery or terminal path.
+/// Purpose: Decide whether a terminal sampler failure is worth a
+/// turn-level resubmit.
+/// Input: The sampler's error info.
+/// Output: True for a stream stall (`IdleTimeout`) or a stream that broke
+/// after it started. False for everything else.
+/// Note: The sampler already retried HTTP 5xx and connection errors to
+/// exhaustion, so they stay terminal here. 4xx, auth, and deterministic
+/// transport errors (bad URL, TLS, DNS) fail the same way again. The vetoes
+/// mirror `SamplingError::is_retry_vetoed`.
 pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorInfo) -> bool {
     use xai_grok_sampler::SamplingErrorKind;
     if error.should_retry == Some(false)
@@ -180,14 +212,20 @@ pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorIn
         return false;
     }
     match error.kind {
-        // `SamplingErrorInfo` loses reqwest's retryability, so every Http
-        // failure retries here (bounded).
-        SamplingErrorKind::IdleTimeout | SamplingErrorKind::Http => true,
-        SamplingErrorKind::Api => error.status_code.is_some_and(|status| {
-            status != 429
-                && reqwest::StatusCode::from_u16(status)
-                    .is_ok_and(xai_grok_sampling_types::is_retryable_api_status)
-        }),
+        SamplingErrorKind::IdleTimeout => true,
+        SamplingErrorKind::Http => {
+            error.message.starts_with(MID_STREAM_TRANSPORT_PREFIX)
+                && !is_deterministic_transport_error(&error.message)
+        }
+        // Status-less: a server error event inside the stream. A status
+        // means an HTTP response the sampler classified (and retried) itself,
+        // except the in-stream events the Messages stream maps to a 500.
+        SamplingErrorKind::Api => match error.status_code {
+            None => error.is_retryable,
+            Some(_) => MID_STREAM_SERVER_ERROR_MARKERS
+                .iter()
+                .any(|marker| error.message.contains(marker)),
+        },
         SamplingErrorKind::Auth
         | SamplingErrorKind::Serialization
         | SamplingErrorKind::RateLimited
@@ -195,6 +233,22 @@ pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorIn
         | SamplingErrorKind::MaxTokensTruncation
         | SamplingErrorKind::DoomLoopDetected => false,
     }
+}
+
+/// The transcript note sent before a resubmit.
+fn transient_retry_notice(cause: &str, grant: TransientRetryGrant) -> String {
+    format!(
+        "\n\n_{cause}. Retrying the request (attempt {} of {}); any partial output \
+         above is discarded._\n\n",
+        grant.attempt, grant.max_retries
+    )
+}
+
+fn is_deterministic_transport_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    DETERMINISTIC_TRANSPORT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 impl SessionActor {
@@ -272,6 +326,16 @@ impl SessionActor {
                 reason: format!("{cause}; retrying request"),
             },
         ))
+        .await;
+        // There is no way to retract the failed attempt's streamed text or
+        // pending tool cards from the client, so say that the output above
+        // is abandoned and the answer starts again.
+        self.send_update(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(transient_retry_notice(cause, grant)),
+            ))),
+            None,
+        )
         .await;
         tokio::time::sleep(delay).await;
     }
@@ -411,32 +475,108 @@ mod tests {
         );
     }
 
+    fn error_with(
+        kind: SamplingErrorKind,
+        status_code: Option<u16>,
+        message: &str,
+        is_retryable: bool,
+    ) -> xai_grok_sampler::SamplingErrorInfo {
+        xai_grok_sampler::SamplingErrorInfo {
+            message: message.into(),
+            is_retryable,
+            ..error(kind, status_code)
+        }
+    }
+
     #[test]
-    fn eligibility_covers_stalls_transport_and_retryable_5xx_only() {
+    fn stalls_are_eligible() {
         assert!(transient_retry_eligible(&error(
             SamplingErrorKind::IdleTimeout,
             None
         )));
-        assert!(transient_retry_eligible(&error(
+    }
+
+    #[test]
+    fn a_mid_stream_transport_break_is_eligible() {
+        let broken = error_with(
             SamplingErrorKind::Http,
-            None
-        )));
-        assert!(transient_retry_eligible(&error(
-            SamplingErrorKind::Api,
-            Some(503)
-        )));
-        assert!(!transient_retry_eligible(&error(
-            SamplingErrorKind::Api,
-            Some(400)
-        )));
-        assert!(!transient_retry_eligible(&error(
-            SamplingErrorKind::Api,
-            Some(429)
-        )));
-        assert!(
-            !transient_retry_eligible(&error(SamplingErrorKind::Api, None)),
-            "a status-less Api error fails closed"
+            None,
+            "reqwest error stream: error decoding response body: connection reset",
+            true,
         );
+        assert!(transient_retry_eligible(&broken));
+    }
+
+    /// The sampler already spent its ~5.5 minute ladder on these.
+    #[test]
+    fn errors_the_sampler_already_retried_are_not_eligible() {
+        let connect = error_with(
+            SamplingErrorKind::Http,
+            None,
+            "error sending request for url (https://api.example.com/v1/responses)",
+            true,
+        );
+        assert!(!transient_retry_eligible(&connect));
+        for status in [500, 502, 503, 529] {
+            let http_5xx = error_with(
+                SamplingErrorKind::Api,
+                Some(status),
+                &format!("API error (status {status}): upstream overloaded"),
+                true,
+            );
+            assert!(!transient_retry_eligible(&http_5xx), "{status}");
+        }
+        let rate_limited = error_with(SamplingErrorKind::RateLimited, Some(429), "slow down", true);
+        assert!(!transient_retry_eligible(&rate_limited));
+    }
+
+    #[test]
+    fn deterministic_transport_errors_are_not_eligible() {
+        for message in [
+            "reqwest error stream: builder error: relative URL without a base",
+            "reqwest error stream: invalid peer certificate: UnknownIssuer",
+            "reqwest error stream: dns error: failed to lookup address information",
+            "error sending request: tls handshake eof",
+        ] {
+            let err = error_with(SamplingErrorKind::Http, None, message, false);
+            assert!(!transient_retry_eligible(&err), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_mid_stream_server_error_event_is_eligible() {
+        // Status-less: a StreamError decoded from an SSE error frame.
+        let stream_error = error_with(
+            SamplingErrorKind::Api,
+            None,
+            "stream error (overloaded_error): Overloaded",
+            true,
+        );
+        assert!(transient_retry_eligible(&stream_error));
+        // The Messages stream maps an in-stream `error` event to a 500.
+        let messages_event = error_with(
+            SamplingErrorKind::Api,
+            Some(500),
+            "API error (status 500): overloaded_error: Overloaded",
+            true,
+        );
+        assert!(transient_retry_eligible(&messages_event));
+        // A status-less error that is not retryable is a config problem.
+        let config = error_with(SamplingErrorKind::Api, None, "missing project", false);
+        assert!(!transient_retry_eligible(&config));
+    }
+
+    #[test]
+    fn client_errors_and_other_kinds_are_not_eligible() {
+        for status in [400, 401, 403, 404, 422] {
+            let err = error_with(
+                SamplingErrorKind::Api,
+                Some(status),
+                &format!("API error (status {status}): bad request"),
+                false,
+            );
+            assert!(!transient_retry_eligible(&err), "{status}");
+        }
         for kind in [
             SamplingErrorKind::Auth,
             SamplingErrorKind::Serialization,
@@ -450,15 +590,31 @@ mod tests {
                 "{kind:?}"
             );
         }
-        let mut vetoed = error(SamplingErrorKind::Api, Some(500));
+        let mut vetoed = error(SamplingErrorKind::IdleTimeout, None);
         vetoed.should_retry = Some(false);
         assert!(!transient_retry_eligible(&vetoed));
-        let mut overflow = error(SamplingErrorKind::Api, Some(500));
-        overflow.message = "The prompt is too long for this model's context window.".into();
+        let overflow = error_with(
+            SamplingErrorKind::Api,
+            None,
+            "The prompt is too long for this model's context window.",
+            true,
+        );
         assert!(!transient_retry_eligible(&overflow));
-        let mut image = error(SamplingErrorKind::Api, Some(500));
+        let mut image = error_with(SamplingErrorKind::Api, None, "bad image", true);
         image.error_code = Some(xai_grok_sampling_types::ApiErrorCode::InvalidImage);
         assert!(!transient_retry_eligible(&image));
+    }
+
+    #[test]
+    fn the_retry_notice_names_the_attempt() {
+        let grant = TransientRetryGrant {
+            attempt: 2,
+            max_retries: 3,
+            delay: std::time::Duration::from_secs(10),
+        };
+        let notice = transient_retry_notice("Response stalled", grant);
+        assert!(notice.contains("Response stalled. Retrying the request (attempt 2 of 3)"));
+        assert!(notice.starts_with("\n\n") && notice.ends_with("\n\n"));
     }
 
     /// End to end through `handle_sampling_failure`: an idle timeout is
