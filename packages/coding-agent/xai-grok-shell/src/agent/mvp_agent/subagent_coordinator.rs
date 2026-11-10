@@ -555,6 +555,7 @@ impl MvpAgent {
             agent_bus: parent_handle
                 .as_ref()
                 .and_then(|h| h.tool_context.agent_bus.clone()),
+            subagent_sampling_gate: self.subagent_sampling_gate.clone(),
             parent_session_info: parent_handle.as_ref().map(|h| crate::session::info::Info {
                 id: parent_sid.clone(),
                 cwd: h.info.cwd.clone(),

@@ -205,6 +205,8 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_cmd_tx: Option<mpsc::UnboundedSender<SessionCommand>>,
     /// Root-parent peer bus for `agent_hub` (shared Arc with Main + siblings).
     pub agent_bus: Option<xai_grok_tools::implementations::grok_build::AgentBusResource>,
+    /// Process-wide gate on concurrent subagent model requests.
+    pub subagent_sampling_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// Parent session info — used to locate parent session directory.
     pub parent_session_info: Option<SessionInfo>,
     /// Subagent roles config for role-based config layering.

@@ -886,6 +886,9 @@ pub struct MvpAgent {
     >,
     /// Shell-only presentation state; lifecycle lives in the channel actor.
     subagent_presentation: RefCell<crate::agent::subagent::SubagentPresentation>,
+    /// Gate on concurrent model requests of all subagents in this process.
+    /// Shared so a wide fan-out queues here instead of a 429 burst.
+    subagent_sampling_gate: Arc<tokio::sync::Semaphore>,
     /// Shared buffer for mid-turn monitor event notifications.
     /// Pushed by the `InjectNotification` handler when a turn is active and the
     /// notification has `Next` priority. Drained by the session turn loop

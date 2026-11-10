@@ -943,6 +943,9 @@ pub(crate) async fn run_shell_child(
         .map(crate::tools::tool_context::TaskOutputTokenBudget::limited);
     tool_ctx.task_output_token_budget = task_output_budget.clone();
     tool_ctx.sampler_retry_only_before_output = task_output_budget.is_some();
+    tool_ctx.subagent_sampling = Some(crate::session::SubagentSampling::new(
+        ctx.subagent_sampling_gate.clone(),
+    ));
     tool_ctx.monitor_event_buffer = Some(MonitorEventBuffer::default());
     // Share the root parent agent hub bus; roster id is this subagent's id.
     tool_ctx.agent_bus = ctx.agent_bus.clone();
