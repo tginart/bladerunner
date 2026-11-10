@@ -259,8 +259,7 @@ impl SessionActor {
         };
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
-        let (_, oauth_config_map) =
-            crate::util::config::load_mcp_servers_with_oauth(cwd, &self.rebuild_spec.compat);
+        let oauth_config_map = self.spawn_oauth_config_map(cwd);
         let byo_config = oauth_config_map.get(server_name).cloned();
         let event_writer = self.events.writer();
         let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
@@ -301,6 +300,29 @@ impl SessionActor {
             "Rebuilt MCP HTTP client with OAuth manager for auth_trigger"
         );
         Ok(arc)
+    }
+    /// The OAuth config map that every spawn path must use: the config
+    /// file's own OAuth settings plus plugin-provided OAuth (client IDs,
+    /// callback ports) for plugin MCP servers. Init, the `/mcps` login
+    /// rebuild and the unreachable-server retry share it, so a plugin server
+    /// keeps its OAuth identity on every path.
+    pub(super) fn spawn_oauth_config_map(
+        &self,
+        cwd: &std::path::Path,
+    ) -> crate::util::config::McpOAuthConfigMap {
+        let (_, mut oauth_config_map) =
+            crate::util::config::load_mcp_servers_with_oauth(cwd, &self.rebuild_spec.compat);
+        let plugin_registry_snapshot = self.plugin_registry.borrow().clone();
+        let plugin_oauth = crate::session::managed_mcp::collect_plugin_oauth_configs(
+            plugin_registry_snapshot.as_deref(),
+        );
+        let toml_mcp_names = crate::util::config::all_toml_mcp_server_names(cwd);
+        crate::session::managed_mcp::merge_plugin_oauth_into(
+            &mut oauth_config_map,
+            plugin_oauth,
+            &toml_mcp_names,
+        );
+        oauth_config_map
     }
     /// Attempt to re-initialize MCP servers stuck in `auth_required`.
     ///
@@ -1019,18 +1041,7 @@ impl SessionActor {
         let session_id = self.session_info.id.0.as_ref();
         tokio::task::yield_now().await;
         let cwd = std::path::Path::new(&self.session_info.cwd);
-        let (_, mut oauth_config_map) =
-            crate::util::config::load_mcp_servers_with_oauth(cwd, &self.rebuild_spec.compat);
-        let plugin_registry_snapshot = self.plugin_registry.borrow().clone();
-        let plugin_oauth = crate::session::managed_mcp::collect_plugin_oauth_configs(
-            plugin_registry_snapshot.as_deref(),
-        );
-        let toml_mcp_names = crate::util::config::all_toml_mcp_server_names(cwd);
-        crate::session::managed_mcp::merge_plugin_oauth_into(
-            &mut oauth_config_map,
-            plugin_oauth,
-            &toml_mcp_names,
-        );
+        let oauth_config_map = self.spawn_oauth_config_map(cwd);
         let spawn_writer = self.events.writer();
         let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
             session_id,
@@ -1717,3 +1728,7 @@ pub(super) fn format_mcp_connecting_reminder(
     }
     text
 }
+
+#[cfg(all(test, unix))]
+#[path = "mcp_tests.rs"]
+mod tests;
