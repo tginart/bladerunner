@@ -4645,3 +4645,83 @@
             "without the remap the chip keeps its own background"
         );
     }
+
+    // ── Shift+arrow selection and its callers ──────────────────────
+
+    /// `hello` with `llo` selected by three Shift+Left presses.
+    fn widget_with_shift_selection() -> PromptWidget {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("hello");
+        for _ in 0..3 {
+            pw.handle_key(&key!(Left, SHIFT).to_key_event());
+        }
+        pw
+    }
+
+    /// The selection is drawn state: a key that changes only the selection
+    /// must report Edited, or no frame is drawn and a stale highlight stays.
+    #[test]
+    fn selection_only_change_reports_edited() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("hello");
+        for _ in 0..3 {
+            assert_eq!(
+                pw.handle_key(&key!(Left, SHIFT).to_key_event()),
+                PromptEvent::Edited,
+                "Shift+Left extends the selection"
+            );
+        }
+        assert_eq!(pw.textarea.selection_range(), Some(2..5));
+        assert_eq!(
+            pw.handle_key(&key!(Left).to_key_event()),
+            PromptEvent::Edited,
+            "Left collapses the selection, which must redraw"
+        );
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    #[test]
+    fn shift_enter_replaces_the_selection() {
+        let mut pw = widget_with_shift_selection();
+        assert_eq!(
+            pw.handle_key(&key!(Enter, SHIFT).to_key_event()),
+            PromptEvent::Edited
+        );
+        assert_eq!(pw.text(), "he\n");
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    #[test]
+    fn inline_paste_replaces_the_selection() {
+        crate::clipboard::set_clipboard_probe_hook(
+            crate::clipboard::ClipboardProbeHook::no_raster(Some("y")),
+        );
+        let mut pw = widget_with_shift_selection();
+        let event = pw.handle_key(&key!('v', CONTROL | SHIFT).to_key_event());
+        crate::clipboard::clear_clipboard_probe_hook();
+        assert_eq!(event, PromptEvent::Edited);
+        assert_eq!(pw.text(), "hey");
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    #[test]
+    fn accept_prompt_suggestion_clears_the_selection() {
+        let mut pw = widget_with_prompt_suggestion("run the tests");
+        pw.textarea.insert_str("run ");
+        pw.textarea.set_selection(0, 4);
+        assert!(pw.accept_prompt_suggestion());
+        assert_eq!(pw.text(), "run the tests");
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    /// Esc drops the highlight but is still declined, so it can cancel.
+    #[test]
+    fn esc_clears_the_selection_and_is_declined() {
+        let mut pw = widget_with_shift_selection();
+        assert_eq!(
+            pw.handle_key(&key!(Esc).to_key_event()),
+            PromptEvent::Ignored
+        );
+        assert_eq!(pw.textarea.selection_range(), None);
+        assert_eq!(pw.text(), "hello");
+    }
