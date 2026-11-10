@@ -334,6 +334,29 @@ fn turn_start_retries_an_unreachable_server_without_an_mcp_tool_call() {
     });
 }
 
+/// Purpose: Verify that a headless session keeps retrying a server whose
+///     OAuth discovery and anonymous probe both fail before the spawn.
+/// Input: A non-interactive session and a server that holds GETs open and
+///     answers POSTs with 503.
+/// Output: The server waits for an unreachable-server retry.
+#[tokio::test(flavor = "current_thread")]
+async fn headless_unreachable_before_spawn_is_retryable() {
+    if python3_is_missing() {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            actor.attach_non_interactive.set(true);
+            let server = HttpFixture::start(root.path(), "stall");
+            actor.mcp_state.lock().await.configs = vec![http_server("down", &server.url())];
+            actor.ensure_mcp_tools_initialized().await;
+            wait_for_unreachable_retry(&actor, "down").await;
+        })
+        .await;
+}
+
 /// Purpose: Verify that a cancelled retry pass gives its servers back
 ///     at once, not after the attempt lease.
 /// Input: A due retry against a server whose OAuth discovery hangs. The
@@ -367,6 +390,68 @@ async fn cancelled_retry_pass_releases_its_attempts() {
             assert!(
                 state.has_due_unreachable_retry(std::time::Instant::now()),
                 "a dropped pass must not hold the server for the attempt lease"
+            );
+        })
+        .await;
+}
+
+/// Purpose: Verify that a respawn whose attempt went stale does not
+///     install its client.
+/// Input: A claimed retry attempt, then a config change that drops the
+///     claim, then a working client for the old attempt.
+/// Output: No client and no tools for the server.
+#[tokio::test(flavor = "current_thread")]
+async fn stale_retry_attempt_discards_its_client() {
+    if python3_is_missing() {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            let server = HttpFixture::start(root.path(), "mcp");
+            let config = http_server("flaky", &server.url());
+            let token = {
+                let mut state = actor.mcp_state.lock().await;
+                state.configs = vec![config.clone()];
+                state.unreachable_retry_cooldown = Duration::ZERO;
+                state.record_unreachable_failure("flaky", "refused".to_string());
+                let (_, token) = state
+                    .take_unreachable_retry_candidates(std::time::Instant::now())
+                    .remove(0);
+                // The server is removed and added back during the attempt,
+                // so the token is stale.
+                assert!(state.update_configs(vec![]));
+                assert!(state.update_configs(vec![config.clone()]));
+                token
+            };
+            let ew = xai_file_utils::events::EventWriter::noop();
+            let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
+                "s",
+                &ew,
+                OauthInteractivity::Interactive,
+                None,
+            );
+            let client =
+                crate::session::mcp_servers::start_mcp_server(config, None, None, None, &ctx)
+                    .await
+                    .expect("the fixture is up");
+            assert!(
+                actor
+                    .install_retried_client("flaky", token, client)
+                    .await
+                    .is_none()
+            );
+            let state = actor.mcp_state.lock().await;
+            assert!(state.get_client("flaky").is_none());
+            drop(state);
+            let bridge = actor.agent.borrow().tool_bridge().clone();
+            assert!(
+                !bridge
+                    .tool_definitions()
+                    .await
+                    .iter()
+                    .any(|d| d.function.name == "flaky__proof")
             );
         })
         .await;
@@ -517,25 +602,33 @@ impl Drop for HttpFixture {
     }
 }
 
-/// Purpose: Verify that the shared spawn OAuth map carries a plugin's client ID.
-/// Input: A plugin whose `.mcp.json` declares an HTTP server with an OAuth client ID.
-/// Output: The client ID in the map that the `/mcps` login rebuild uses.
+/// Purpose: Verify that the `/mcps` login rebuild of an HTTP client keeps a
+///     plugin server's OAuth client ID.
+/// Input: A plugin whose `.mcp.json` declares an HTTP server with an OAuth
+///     client ID, and an HTTP fixture that serves OAuth metadata.
+/// Output: The rebuilt client carries the client ID.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_oauth_config_map_includes_plugin_client_id() {
+async fn oauth_rebuild_keeps_the_plugin_client_id() {
+    if python3_is_missing() {
+        return;
+    }
     tokio::task::LocalSet::new()
         .run_until(async {
             let root = tempfile::tempdir().unwrap();
             let actor = actor(root.path()).await;
-            let registry = plugin_registry_with_oauth(
-                root.path(),
-                "slack",
-                "https://mcp.example.invalid/mcp",
-                "slack-byo-client",
-            );
+            let server = HttpFixture::start(root.path(), "oauth");
+            let registry =
+                plugin_registry_with_oauth(root.path(), "slack", &server.url(), "slack-byo-client");
             *actor.plugin_registry.borrow_mut() = Some(Arc::new(registry));
-            let map = actor.spawn_oauth_config_map(root.path());
+            actor.mcp_state.lock().await.configs = vec![http_server("slack", &server.url())];
+            let client = actor
+                .recreate_http_client_with_oauth("slack")
+                .await
+                .expect("the fixture serves OAuth metadata");
             assert_eq!(
-                map.get("slack").and_then(|c| c.client_id.as_deref()),
+                client
+                    .byo_oauth_config()
+                    .and_then(|c| c.client_id.as_deref()),
                 Some("slack-byo-client")
             );
         })

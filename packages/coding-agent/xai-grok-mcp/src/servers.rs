@@ -3191,6 +3191,12 @@ impl McpClient {
         self.auth_manager.is_some()
     }
 
+    /// The user- or plugin-supplied OAuth client settings that the browser
+    /// login of this client uses.
+    pub fn byo_oauth_config(&self) -> Option<&McpOAuthConfig> {
+        self.byo_oauth_config.as_ref()
+    }
+
     /// Try to recover tokens from disk or via refresh — no browser flow.
     ///
     /// Returns true if valid tokens were found (from another session/process
