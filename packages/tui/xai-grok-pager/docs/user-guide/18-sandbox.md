@@ -15,7 +15,7 @@ bladerunner --sandbox workspace
 # Read-only mode (read everywhere, write only to ~/.bladerunner/ + temp dirs)
 bladerunner --sandbox read-only
 
-# Most restrictive profile (read CWD + system paths, write CWD + temp dirs + ~/.bladerunner/, no child network)
+# Most restrictive profile (read CWD + system paths, write CWD + temp dirs + ~/.bladerunner/sessions/, no child network)
 bladerunner --sandbox strict
 ```
 
@@ -29,7 +29,7 @@ bladerunner --sandbox strict
 | `workspace`           | Everywhere         | CWD + `~/.bladerunner/` + `/tmp` + `/var/tmp`         | Allowed       | Normal development                |
 | `devbox`              | Everywhere         | All top-level dirs except `/data`              | Allowed       | Disposable dev VMs                |
 | `read-only`           | Everywhere         | `~/.bladerunner/` + `/tmp` + `/var/tmp`               | Blocked¹      | Exploration, code review          |
-| `strict`              | CWD + system paths | CWD + `~/.bladerunner/` + `/tmp` + `/var/tmp`         | Blocked¹      | Untrusted code                    |
+| `strict`              | CWD + system paths | CWD + `~/.bladerunner/sessions/` + `/tmp` + `/var/tmp` | Blocked¹      | Untrusted code                    |
 
 ¹ Child-network blocking is enforced on **Linux only** (via seccomp). On macOS it is a no-op — these profiles do not restrict child-process network there.
 
@@ -43,7 +43,7 @@ To block specific files (e.g. `.env` or credential paths) on top of a profile, d
 
 **read-only** -- Use when you want the agent to analyze code without modifying your project files. The agent can read everything but can only write to `~/.bladerunner/` (needed for session persistence) and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
 
-**strict** -- The most restrictive profile, for reviewing untrusted code. The agent can only read files within the current working directory and essential system paths. Writes are limited to CWD, `~/.bladerunner/`, and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
+**strict** -- The most restrictive profile, for reviewing untrusted code. The agent can only read files within the current working directory and essential system paths. Writes are limited to CWD, `~/.bladerunner/sessions/`, and temp directories. The rest of `~/.bladerunner/` (config, hooks, auth, permission state) is read-only, so changes to it, including ones the agent itself makes, do not persist during a strict session. Child-process network access is blocked on Linux (no-op on macOS).
 
 ### Direct global hook write protection
 
