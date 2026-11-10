@@ -786,63 +786,63 @@ mod platform {
         Ok(output.stdout)
     }
 
-    fn attachments_probe_temp_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)
-    {
-        let temp_dir = std::env::temp_dir();
-        (
-            temp_dir.join("grok-clipboard-probe.png"),
-            temp_dir.join("grok-clipboard-probe.tiff"),
-            temp_dir.join("grok-clipboard-probe.jpg"),
-        )
+    /// Private 0700 scratch directory for one `osascript` raster hand-off. Drop
+    /// removes it, so every exit path cleans up. A fixed `$TMPDIR` path shared
+    /// by all processes let one session read or swap another session's pasted
+    /// image between the write and the read.
+    pub(super) struct ProbeTemps(tempfile::TempDir);
+
+    impl ProbeTemps {
+        pub(super) fn new() -> anyhow::Result<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+            tempfile::Builder::new()
+                .prefix("bladerunner-clipboard-probe-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .map(Self)
+                .map_err(|e| anyhow::anyhow!("failed to create clipboard probe dir: {e}"))
+        }
+
+        pub(super) fn png(&self) -> std::path::PathBuf {
+            self.0.path().join("probe.png")
+        }
+
+        pub(super) fn tiff(&self) -> std::path::PathBuf {
+            self.0.path().join("probe.tiff")
+        }
+
+        pub(super) fn jpg(&self) -> std::path::PathBuf {
+            self.0.path().join("probe.jpg")
+        }
     }
 
-    fn read_clipboard_image_from_class(
+    /// Quote `text` as an AppleScript string literal.
+    pub(super) fn applescript_string(text: &str) -> String {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    pub(super) fn read_clipboard_image_from_class(
         class: &str,
-        path_png: &std::path::Path,
-        path_tiff: &std::path::Path,
-        path_jpg: &std::path::Path,
+        temps: &ProbeTemps,
     ) -> anyhow::Result<Option<ImageData>> {
         let (temp_path, mime) = match class {
-            "PNGf" => (path_png, "image/png"),
-            "TIFF" => (path_tiff, "image/tiff"),
-            "JPEG" => (path_jpg, "image/jpeg"),
+            "PNGf" => (temps.png(), "image/png"),
+            "TIFF" => (temps.tiff(), "image/tiff"),
+            "JPEG" => (temps.jpg(), "image/jpeg"),
             _ => return Ok(None),
         };
-
-        let data = match std::fs::read(temp_path) {
-            Ok(bytes) if !bytes.is_empty() => bytes,
-            Ok(_) => {
-                let _ = std::fs::remove_file(temp_path);
-                return Ok(None);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(temp_path);
-                return Err(anyhow::anyhow!("failed to read clipboard temp file: {e}"));
-            }
-        };
-
-        let _ = std::fs::remove_file(temp_path);
+        let data = std::fs::read(temp_path)
+            .map_err(|e| anyhow::anyhow!("failed to read clipboard temp file: {e}"))?;
+        if data.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(ImageData {
             data,
             mime_type: mime.to_owned(),
         }))
     }
 
-    fn remove_attachment_probe_temps(
-        path_png: &std::path::Path,
-        path_tiff: &std::path::Path,
-        path_jpg: &std::path::Path,
-    ) {
-        let _ = std::fs::remove_file(path_png);
-        let _ = std::fs::remove_file(path_tiff);
-        let _ = std::fs::remove_file(path_jpg);
-    }
-
-    fn attachments_osascript(
-        path_png: &std::path::Path,
-        path_tiff: &std::path::Path,
-        path_jpg: &std::path::Path,
-    ) -> String {
+    pub(super) fn attachments_osascript(temps: &ProbeTemps) -> String {
         format!(
             "set furlOut to \"none\"\n\
              try\n\
@@ -874,7 +874,7 @@ mod platform {
              if furlOut is \"none\" then\n\
              try\n\
              set imgData to the clipboard as \u{00AB}class PNGf\u{00BB}\n\
-             set filePath to POSIX file \"{png}\" as text\n\
+             set filePath to POSIX file {png} as text\n\
              set fRef to open for access file filePath with write permission\n\
              set eof of fRef to 0\n\
              write imgData to fRef\n\
@@ -883,7 +883,7 @@ mod platform {
              on error\n\
              try\n\
              set imgData to the clipboard as \u{00AB}class TIFF\u{00BB}\n\
-             set filePath to POSIX file \"{tiff}\" as text\n\
+             set filePath to POSIX file {tiff} as text\n\
              set fRef to open for access file filePath with write permission\n\
              set eof of fRef to 0\n\
              write imgData to fRef\n\
@@ -892,7 +892,7 @@ mod platform {
              on error\n\
              try\n\
              set imgData to the clipboard as \u{00AB}class JPEG\u{00BB}\n\
-             set filePath to POSIX file \"{jpg}\" as text\n\
+             set filePath to POSIX file {jpg} as text\n\
              set fRef to open for access file filePath with write permission\n\
              set eof of fRef to 0\n\
              write imgData to fRef\n\
@@ -904,19 +904,16 @@ mod platform {
              end try\n\
              end if\n\
              return \"{furl_marker}\" & linefeed & furlOut & linefeed & \"{image_marker}\" & linefeed & \"IMAGE:\" & imageOut",
-            png = path_png.display(),
-            tiff = path_tiff.display(),
-            jpg = path_jpg.display(),
+            png = applescript_string(&temps.png().display().to_string()),
+            tiff = applescript_string(&temps.tiff().display().to_string()),
+            jpg = applescript_string(&temps.jpg().display().to_string()),
             furl_marker = FURL_MARKER,
             image_marker = IMAGE_MARKER,
         )
     }
 
-    fn run_attachments_osascript() -> anyhow::Result<String> {
-        let (path_png, path_tiff, path_jpg) = attachments_probe_temp_paths();
-        remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
-
-        let script = attachments_osascript(&path_png, &path_tiff, &path_jpg);
+    fn run_attachments_osascript(temps: &ProbeTemps) -> anyhow::Result<String> {
+        let script = attachments_osascript(temps);
 
         let mut cmd = Command::new("osascript");
         cmd.arg("-e")
@@ -925,13 +922,7 @@ mod platform {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         xai_grok_tools::util::detach_std_command(&mut cmd);
-        let stdout = match checked_command_stdout("osascript", cmd.output()) {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
-                return Err(error);
-            }
-        };
+        let stdout = checked_command_stdout("osascript", cmd.output())?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
@@ -950,26 +941,17 @@ mod platform {
                 image: Some(image),
             });
         }
-        let raw = run_attachments_osascript()?;
+        // Dropped on every return below, which removes the probe dir.
+        let temps = ProbeTemps::new()?;
+        let raw = run_attachments_osascript(&temps)?;
         if raw.trim().is_empty() {
             return Ok(ClipboardAttachments::default());
         }
 
-        let (path_png, path_tiff, path_jpg) = attachments_probe_temp_paths();
         let (file_urls, image_class) = parse_attachments_output(&raw);
-        let image = if file_urls.is_some() {
-            remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
-            None
-        } else {
-            match image_class {
-                Some(class) => {
-                    read_clipboard_image_from_class(class, &path_png, &path_tiff, &path_jpg)?
-                }
-                None => {
-                    remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
-                    None
-                }
-            }
+        let image = match (&file_urls, image_class) {
+            (None, Some(class)) => read_clipboard_image_from_class(class, &temps)?,
+            _ => None,
         };
         Ok(ClipboardAttachments { file_urls, image })
     }
@@ -1048,15 +1030,15 @@ mod platform {
             return Ok(Some(image));
         }
 
-        let (path_png, path_tiff, path_jpg) = attachments_probe_temp_paths();
-        remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
+        // Dropped on every return below, which removes the probe dir.
+        let temps = ProbeTemps::new()?;
 
         // Image-only AppleScript (ImageOnly paste route). Unicode guillemets
         // (\u{AB}/\u{BB}) are required for `«class …»` in `osascript -e`.
         let script = format!(
             "try\n\
              set imgData to the clipboard as \u{00AB}class PNGf\u{00BB}\n\
-             set filePath to POSIX file \"{png}\" as text\n\
+             set filePath to POSIX file {png} as text\n\
              set fRef to open for access file filePath with write permission\n\
              set eof of fRef to 0\n\
              write imgData to fRef\n\
@@ -1065,7 +1047,7 @@ mod platform {
              on error\n\
              try\n\
              set imgData to the clipboard as \u{00AB}class TIFF\u{00BB}\n\
-             set filePath to POSIX file \"{tiff}\" as text\n\
+             set filePath to POSIX file {tiff} as text\n\
              set fRef to open for access file filePath with write permission\n\
              set eof of fRef to 0\n\
              write imgData to fRef\n\
@@ -1074,7 +1056,7 @@ mod platform {
              on error\n\
              try\n\
              set imgData to the clipboard as \u{00AB}class JPEG\u{00BB}\n\
-             set filePath to POSIX file \"{jpg}\" as text\n\
+             set filePath to POSIX file {jpg} as text\n\
              set fRef to open for access file filePath with write permission\n\
              set eof of fRef to 0\n\
              write imgData to fRef\n\
@@ -1085,9 +1067,9 @@ mod platform {
              end try\n\
              end try\n\
              end try",
-            png = path_png.display(),
-            tiff = path_tiff.display(),
-            jpg = path_jpg.display(),
+            png = applescript_string(&temps.png().display().to_string()),
+            tiff = applescript_string(&temps.tiff().display().to_string()),
+            jpg = applescript_string(&temps.jpg().display().to_string()),
         );
 
         let mut cmd = Command::new("osascript");
@@ -1097,20 +1079,13 @@ mod platform {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         xai_grok_tools::util::detach_std_command(&mut cmd);
-        let stdout = match checked_command_stdout("osascript", cmd.output()) {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
-                return Err(error);
-            }
-        };
+        let stdout = checked_command_stdout("osascript", cmd.output())?;
         let class = String::from_utf8_lossy(&stdout);
         let class = class.trim();
         if class == "none" {
-            remove_attachment_probe_temps(&path_png, &path_tiff, &path_jpg);
             return Ok(None);
         }
-        read_clipboard_image_from_class(class, &path_png, &path_tiff, &path_jpg)
+        read_clipboard_image_from_class(class, &temps)
     }
 
     /// Read file URLs from the macOS pasteboard via `osascript`.
@@ -2751,6 +2726,77 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for #53: the osascript probe used fixed
+    /// `$TMPDIR/grok-clipboard-probe.*` paths shared by every session.
+    #[cfg(target_os = "macos")]
+    mod probe_temps_tests {
+        use super::super::platform::{
+            ProbeTemps, applescript_string, attachments_osascript, read_clipboard_image_from_class,
+        };
+
+        #[test]
+        fn each_probe_gets_a_private_dir_removed_on_drop() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let a = ProbeTemps::new().expect("probe temps");
+            let b = ProbeTemps::new().expect("probe temps");
+            assert_ne!(a.png().parent(), b.png().parent(), "probe dir shared");
+            let dir = a.png().parent().expect("probe dir").to_path_buf();
+            assert_eq!(a.tiff().parent(), Some(dir.as_path()));
+            assert_eq!(a.jpg().parent(), Some(dir.as_path()));
+            let mode = std::fs::metadata(&dir)
+                .expect("probe dir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "probe dir must be owner-only, got {mode:o}");
+
+            std::fs::write(a.png(), b"img").unwrap();
+            drop(a);
+            assert!(!dir.exists(), "dropping the probe must remove its dir");
+        }
+
+        #[test]
+        fn scripts_write_only_into_this_probe_dir() {
+            let temps = ProbeTemps::new().expect("probe temps");
+            let script = attachments_osascript(&temps);
+            assert!(!script.contains("grok-clipboard-probe."));
+            for path in [temps.png(), temps.tiff(), temps.jpg()] {
+                let quoted = applescript_string(&path.display().to_string());
+                assert!(script.contains(&format!("POSIX file {quoted} as text")));
+            }
+        }
+
+        #[test]
+        fn reads_the_reported_class_from_this_probe() {
+            let temps = ProbeTemps::new().expect("probe temps");
+            std::fs::write(temps.png(), b"png-bytes").unwrap();
+
+            let image = read_clipboard_image_from_class("PNGf", &temps)
+                .unwrap()
+                .expect("image");
+            assert_eq!(image.data, b"png-bytes");
+            assert_eq!(image.mime_type, "image/png");
+            assert!(
+                read_clipboard_image_from_class("BMPf", &temps)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(read_clipboard_image_from_class("TIFF", &temps).is_err());
+            std::fs::write(temps.jpg(), b"").unwrap();
+            assert!(
+                read_clipboard_image_from_class("JPEG", &temps)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn applescript_string_escapes_quotes_and_backslashes() {
+            assert_eq!(applescript_string(r#"/a"b\c"#), r#""/a\"b\\c""#);
+        }
+    }
 
     #[cfg(target_os = "macos")]
     mod mac_command_status {
