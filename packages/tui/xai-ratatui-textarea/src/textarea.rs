@@ -2693,7 +2693,7 @@ impl TextArea {
         self.elements
             .iter()
             .find(|e| e.id == id)
-            .map(|e| &self.text[e.range.clone()])
+            .and_then(|e| self.text.get(e.range.clone()))
     }
 
     /// Update the display for an existing element. Invalidates the wrap cache.
@@ -2714,11 +2714,18 @@ impl TextArea {
     /// describes one element whose text already occupies `range` in the
     /// buffer. No text is inserted — this only recreates the element
     /// metadata so the textarea renders chips instead of raw text.
+    ///
+    /// A range that is out of bounds or off a char boundary is skipped. A
+    /// stale range (after a rewind or a skill injection) would otherwise
+    /// panic in the next render or wrap.
     pub fn restore_elements(
         &mut self,
         elems: impl IntoIterator<Item = (Range<usize>, ElementKind, Option<Line<'static>>)>,
     ) {
         for (range, kind, display) in elems {
+            if self.text.get(range.clone()).is_none() {
+                continue;
+            }
             self.add_element(range, kind, display);
         }
         self.wrap_cache.replace(None);
@@ -4339,6 +4346,25 @@ mod tests {
             .collect::<String>();
         let rendered = rendered.trim_end();
         assert_eq!(rendered, "[Pasted]");
+    }
+
+    #[test]
+    fn restore_elements_skips_bad_ranges_so_render_does_not_panic() {
+        let mut t = TextArea::new();
+        t.set_text("é");
+        // 1..2 is inside the 2-byte "é"; 0..50 is out of bounds.
+        t.restore_elements([
+            (1..2, ElementKind(0), None),
+            (0..50, ElementKind(0), None),
+            (0..2, ElementKind(1), None),
+        ]);
+        assert_eq!(t.elements().len(), 1);
+        assert_eq!(t.elements()[0].range, 0..2);
+
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::WidgetRef::render_ref(&(&t), area, &mut buf);
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "é");
     }
 
     #[test]

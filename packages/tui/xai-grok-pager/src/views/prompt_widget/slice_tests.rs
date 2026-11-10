@@ -57,6 +57,16 @@ fn paste_chip_lookup_ignores_an_out_of_bounds_element() {
     let mut pw = PromptWidget::new();
     pw.set_text("ab");
     pw.restore_chip_elements(&[chip(0..50, KIND_PASTE)]);
-    let elem = pw.textarea.elements()[0].clone();
-    assert_eq!(pw.paste_text(&elem), None);
+    assert!(pw.textarea.elements().is_empty());
+    assert_eq!(pw.paste_element_at_cursor(), None);
+}
+
+#[test]
+fn render_after_restoring_an_off_boundary_chip_does_not_panic() {
+    let mut pw = PromptWidget::new();
+    pw.set_text("é");
+    pw.restore_chip_elements(&[chip(1..2, KIND_PASTE)]);
+    let area = ratatui::layout::Rect::new(0, 0, 20, 1);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::WidgetRef::render_ref(&(&pw.textarea), area, &mut buf);
 }
