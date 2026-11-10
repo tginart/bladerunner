@@ -6400,3 +6400,55 @@ async fn acp_effort_selector_applies_to_sessions_using_a_routing_alias() {
     assert_eq!(handle.model_id.0.as_ref(), "config-model");
     assert_eq!(handle.reasoning_effort, Some(ReasoningEffort::High));
 }
+/// A child session is not in the session registry, so `session/cancel` for a
+/// child id reaches no session and no coordinator. The pager stops a child in
+/// a subagent overlay with the parent-routed `x.ai/subagent/cancel`, which
+/// asks the coordinator to cancel that subagent.
+#[test]
+fn subagent_overlay_stop_reaches_the_coordinator_only_through_the_parent() {
+    use acp::Agent as _;
+    use xai_grok_tools::implementations::grok_build::task::types::{
+        SubagentCancelOutcome, SubagentCancelTarget, SubagentEvent,
+    };
+    run_local_for_bridge_test(|| async {
+        let mut agent = build_minimal_agent_for_tests();
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        agent.subagent_event_tx = tx;
+
+        agent
+            .cancel(acp::CancelNotification::new("child-sid"))
+            .await
+            .expect("cancel must succeed");
+        assert!(
+            events.try_recv().is_err(),
+            "session/cancel for a child id must not reach the coordinator"
+        );
+
+        let params = serde_json::json!({ "subagentId": "sa-1" });
+        let request = acp::ExtRequest::new(
+            "x.ai/subagent/cancel",
+            serde_json::value::to_raw_value(&params).unwrap().into(),
+        );
+        let coordinator = async {
+            let Some(SubagentEvent::Cancel(cancel)) = events.recv().await else {
+                panic!("expected a coordinator cancel");
+            };
+            assert!(matches!(
+                &cancel.target,
+                SubagentCancelTarget::SubagentId(id) if id == "sa-1"
+            ));
+            cancel
+                .respond_to
+                .send(SubagentCancelOutcome::Cancelled)
+                .unwrap();
+        };
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(agent.ext_method(request), coordinator)
+        })
+        .await
+        .expect("the cancel must not hang");
+        let body: serde_json::Value =
+            serde_json::from_str(response.expect("ext call").0.get()).unwrap();
+        assert_eq!(body["result"]["cancelled"], serde_json::json!(true), "{body}");
+    });
+}
