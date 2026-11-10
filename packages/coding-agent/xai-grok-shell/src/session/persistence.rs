@@ -4153,7 +4153,8 @@ fn is_stale(mtime: std::time::SystemTime, ttl_days: u32) -> bool {
 
 /// Newest mtime among the session dir's own regular files, or the mtime of
 /// the dir itself when it has none. `updates.jsonl` grows with every
-/// persisted update, so a session in use always has a recent file here.
+/// persisted update, and [`mark_session_live`] bumps `summary.json` on every
+/// attach. A load alone writes neither.
 fn session_last_activity(session_dir: &Path) -> io::Result<std::time::SystemTime> {
     let mut newest: Option<std::time::SystemTime> = None;
     for entry in std::fs::read_dir(session_dir)? {
@@ -4167,6 +4168,36 @@ fn session_last_activity(session_dir: &Path) -> io::Result<std::time::SystemTime
     match newest {
         Some(mtime) => Ok(mtime),
         None => std::fs::symlink_metadata(session_dir)?.modified(),
+    }
+}
+
+/// Purpose: Bump the mtime of `summary.json` so that a sweep sees the attach
+/// that is about to read this session dir.
+/// Input: The session dir.
+/// Output: None. A failure is only logged.
+/// Note: Call it synchronously before the sweep and the load. The sweep of
+/// another process sees only mtimes, and its skip covers only its own
+/// session. A dir without a summary has nothing to bump.
+pub(crate) fn mark_session_live(session_dir: &Path) {
+    let summary = session_dir.join("summary.json");
+    let Ok(metadata) = std::fs::symlink_metadata(&summary) else {
+        return;
+    };
+    if !metadata.file_type().is_file() {
+        return;
+    }
+    // Windows needs write access for `set_modified`. Nothing is written.
+    let touched = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&summary)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(
+            target: "xai_grok_shell::session::persistence",
+            file = %summary.display(),
+            %error,
+            "SESSION_MARK_LIVE_ERROR"
+        );
     }
 }
 
@@ -4268,6 +4299,30 @@ mod cleanup_stale_sessions_tests {
             "old media in a live session still ages out"
         );
         assert!(dir.join("images").is_dir(), "the media dir itself stays");
+    }
+
+    /// The sweep of another process sees only mtimes, so an attach must bump
+    /// one before it loads an idle session.
+    #[test]
+    fn mark_session_live_keeps_an_idle_session_out_of_a_foreign_sweep() {
+        let home = TempDir::new().unwrap();
+        let sessions_root = home.path().join("sessions");
+        let attaching = make_session(&sessions_root, "attaching", 40);
+        let summary_before = fs::read(attaching.join("summary.json")).unwrap();
+        let idle = make_session(&sessions_root, "idle", 40);
+
+        mark_session_live(&attaching);
+        mark_session_live(&sessions_root.join("not-created-yet"));
+        sweep(home.path());
+
+        assert!(attaching.join("updates.jsonl").is_file());
+        assert!(attaching.join("compaction_checkpoints/ckpt1.json").is_file());
+        assert_eq!(
+            fs::read(attaching.join("summary.json")).unwrap(),
+            summary_before,
+            "the bump changes only the mtime"
+        );
+        assert!(!idle.join("updates.jsonl").exists());
     }
 
     #[test]

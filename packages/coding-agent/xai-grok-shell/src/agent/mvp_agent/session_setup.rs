@@ -705,6 +705,9 @@ impl MvpAgent {
         }
         let session_info = begin_session(&session_id, &cwd);
         let current_session_dir = crate::session::persistence::session_dir(&session_info);
+        // Before the sweep and the load: the sweep of another process may judge
+        // this dir now, and it sees only mtimes.
+        crate::session::persistence::mark_session_live(&current_session_dir);
         tokio::task::spawn_blocking(move || {
             crate::session::persistence::cleanup_stale_sessions(Some(&current_session_dir));
         });
