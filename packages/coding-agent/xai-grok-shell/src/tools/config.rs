@@ -38,6 +38,19 @@ pub struct BashToolConfig {
 }
 
 impl BashToolConfig {
+    /// [`Self::to_bash_params_json`] with the fallbacks read from the remote
+    /// settings snapshot. The top-level session and its subagent children
+    /// both resolve through here, so their bash limits cannot drift apart.
+    pub(crate) fn to_bash_params_json_with_remote(
+        &self,
+        remote: Option<&crate::util::config::RemoteSettings>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        self.to_bash_params_json(
+            remote.and_then(|r| r.auto_background_on_timeout),
+            remote.and_then(|r| r.allow_background_operator),
+        )
+    }
+
     /// Build the JSON params map for the bash tool.
     ///
     /// `remote_auto_bg` is the remote settings fallback for `auto_background_on_timeout`

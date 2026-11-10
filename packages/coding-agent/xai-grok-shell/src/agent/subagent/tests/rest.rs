@@ -625,16 +625,61 @@ fn retained_worktree_overrides_snapshot_cleanup() {
     }
 }
 
-/// Subagent spawns carry concrete ask_user_question timeout params (the
-/// session-level config follows the child) while bash stays on tool
-/// defaults. Tier precedence itself is pinned by the resolver's own
-/// tests; asserting concrete values here would read the host's disk
-/// layers and flake on configured dev machines.
+/// A child resolves bash params from the parent's `[toolset.bash]` and
+/// remote settings, so it keeps the parent's timeout, auto-background and
+/// foreground ceiling instead of the tool-server defaults.
+#[test]
+fn subagent_tool_params_inherit_parent_bash_settings() {
+    let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
+    let mut cfg = crate::agent::config::Config::default();
+    cfg.toolset.bash.timeout_secs = Some(42.0);
+    cfg.toolset.bash.max_timeout_secs = Some(900.0);
+    cfg.toolset.bash.foreground_block_budget_ms = Some(0);
+    ctx.agent_config = Some(cfg);
+    ctx.remote_settings = Some(crate::util::config::RemoteSettings {
+        auto_background_on_timeout: Some(false),
+        ..Default::default()
+    });
+    let bash = ctx
+        .resolve_tool_params_json()
+        .bash
+        .expect("children must receive the parent's bash params");
+    assert_eq!(bash.get("timeout_secs"), Some(&serde_json::json!(42.0)));
+    assert_eq!(bash.get("max_timeout_secs"), Some(&serde_json::json!(900.0)));
+    assert_eq!(
+        bash.get("foreground_block_budget_ms"),
+        Some(&serde_json::json!(0))
+    );
+    assert_eq!(
+        bash.get("auto_background_on_timeout"),
+        Some(&serde_json::json!(false)),
+        "the remote auto-background fallback must reach the child"
+    );
+}
+
+/// Without a parent config, a child still gets the production bash ceiling,
+/// not the tool-server's 5 min default.
+#[test]
+fn subagent_tool_params_default_bash_uses_production_ceiling() {
+    let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
+    ctx.agent_config = None;
+    let bash = ctx.resolve_tool_params_json().bash.unwrap();
+    assert_eq!(
+        bash.get("max_timeout_secs"),
+        Some(&serde_json::json!(
+            crate::tools::config::PRODUCTION_MAX_TIMEOUT_SECS
+        ))
+    );
+}
+
+/// Subagent spawns carry concrete ask_user_question timeout params. Tier
+/// precedence itself is pinned by the resolver's own tests; asserting
+/// concrete values here would read the host's disk layers and flake on
+/// configured dev machines.
 #[test]
 fn subagent_tool_params_carry_ask_user_question_timeouts() {
     let ctx = ctx_with_toggle(std::collections::HashMap::new());
     let params = ctx.resolve_tool_params_json();
-    assert!(params.bash.is_none(), "bash must stay on tool defaults");
     let ask = params
         .ask_user_question
         .expect("subagents must receive resolved ask_user_question params");

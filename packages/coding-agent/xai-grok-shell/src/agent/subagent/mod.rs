@@ -429,20 +429,27 @@ impl SubagentSpawnContext {
         !request.runtime_overrides.retain_worktree
             && self.resolve_subagent_worktree_snapshot_enabled()
     }
-    /// Per-tool params for the child's spawn. The ask_user_question timeout is
-    /// session-level config, so it is resolved from the same tiers as the
-    /// parent (requirements/env/user/managed from disk; remote from the
-    /// parent's snapshot) and follows the session into subagents. Bash stays
-    /// on tool defaults, as before that knob existed.
+    /// Per-tool params for the child's spawn.
+    ///
+    /// Bash resolves from the parent's `[toolset.bash]` config and remote
+    /// settings, the same way the parent session does. Without this, a child
+    /// fell back to the tool-server defaults: a 5 min foreground ceiling and
+    /// the parent's timeout and auto-background choices ignored. The
+    /// ask_user_question timeout resolves from the same tiers as the parent.
     pub(crate) fn resolve_tool_params_json(
         &self,
     ) -> crate::session::agent_rebuild::ResolvedToolParamsJson {
-        let params = crate::util::config::resolve_ask_user_question_params_from_disk(
+        let bash_config = self
+            .agent_config
+            .as_ref()
+            .map(|cfg| cfg.toolset.bash.clone())
+            .unwrap_or_default();
+        let ask_params = crate::util::config::resolve_ask_user_question_params_from_disk(
             self.remote_settings.as_ref(),
         );
         crate::session::agent_rebuild::ResolvedToolParamsJson {
-            bash: None,
-            ask_user_question: match serde_json::to_value(params) {
+            bash: Some(bash_config.to_bash_params_json_with_remote(self.remote_settings.as_ref())),
+            ask_user_question: match serde_json::to_value(ask_params) {
                 Ok(serde_json::Value::Object(map)) => Some(map),
                 _ => None,
             },
