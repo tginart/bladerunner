@@ -3,11 +3,10 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use agent_client_protocol as acp;
 use futures::StreamExt;
-use regex::Regex;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::{ChildStderr, Command},
@@ -45,6 +44,11 @@ use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 /// for callers that historically imported it from this module.
 pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
 
+pub use crate::tool_name::{
+    MCP_QUALIFIED_NAME_MAX_CHARS, McpToolAdmissionError, PROVIDER_TOOL_NAME_MAX_CHARS,
+    parse_mcp_qualified_name, parse_mcp_tool_name, qualify_mcp_tool_name, validate_tool_name,
+};
+
 /// Reqwest 0.13 adapter over `xai_grok_extra_ca::extra_root_ders` (DER is version-neutral).
 fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     for der in xai_grok_extra_ca::extra_root_ders() {
@@ -65,37 +69,6 @@ fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest:
 /// lookup keys agree.
 fn normalize_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
-}
-
-/// Regex for strictest cross-provider tool name validation.
-///
-/// Requirements across providers:
-/// - Anthropic/OpenAI: `^[a-zA-Z0-9_-]{1,64}$` (allows starting with digit/hyphen)
-/// - Google Gemini: `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$` (must start with letter/underscore, allows dots)
-///
-/// Strictest common denominator: must start with letter/underscore, only alphanumeric/_/- allowed, max 64 chars.
-static TOOL_NAME_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$").unwrap());
-
-/// Validate that a tool name matches the strictest cross-provider LLM API requirements.
-///
-/// Pattern: `^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$`
-/// - Must start with a letter or underscore (Gemini requirement)
-/// - Only letters, digits, underscores, hyphens allowed (no dots — Anthropic/OpenAI requirement)
-/// - Maximum 64 characters
-///
-/// Returns `Ok(())` if valid, or `Err(reason)` if invalid.
-pub fn validate_tool_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("tool name cannot be empty".to_string());
-    }
-    if !TOOL_NAME_REGEX.is_match(name) {
-        return Err(format!(
-            "tool name '{}' is invalid — must match ^[a-zA-Z_][a-zA-Z0-9_-]{{0,63}}$ (start with letter/underscore, max 64 chars)",
-            name
-        ));
-    }
-    Ok(())
 }
 
 /// Sanitize an MCP server or tool name into a single safe path segment
@@ -1067,33 +1040,6 @@ pub fn parse_mcp_meta_config(
 /// here so existing call sites continue to work.
 pub use xai_grok_telemetry::enums::McpInitStrategy;
 
-/// Parse a non-empty `server__tool` ID with one overlap-aware delimiter and
-/// valid [`xai_tool_protocol::ToolId`] syntax.
-pub fn parse_mcp_qualified_name(name: &str) -> Option<(xai_tool_protocol::ToolId, &str, &str)> {
-    let delimiter = MCP_TOOL_NAME_DELIMITER.as_bytes();
-    // Byte windows preserve both overlapping `__` boundaries in `___`.
-    let mut boundaries = name
-        .as_bytes()
-        .windows(delimiter.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == delimiter).then_some(index));
-    let boundary = boundaries.next()?;
-    if boundaries.next().is_some() {
-        return None;
-    }
-    let (server, tool_with_delimiter) = name.split_at(boundary);
-    let tool = &tool_with_delimiter[MCP_TOOL_NAME_DELIMITER.len()..];
-    if server.is_empty() || tool.is_empty() {
-        return None;
-    }
-    Some((xai_tool_protocol::ToolId::new(name).ok()?, server, tool))
-}
-
-/// Parse an MCP tool name in `server__tool` format into owned segments.
-pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
-    parse_mcp_qualified_name(name).map(|(_, server, tool)| (server.to_owned(), tool.to_owned()))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP client error: {0}")]
@@ -1294,33 +1240,22 @@ impl McpTool {
 
     /// Convert into the data needed for `ToolBridge::register_erased()`.
     ///
-    /// Invalid or ambiguous qualified IDs and provider-invalid names are logged
-    /// and skipped; the upstream connector must provide non-empty `server` and
-    /// `tool` segments separated by exactly one `__` boundary.
+    /// Invalid or ambiguous qualified IDs are logged and skipped. A qualified
+    /// name longer than the 64-char provider limit is kept: it is a catalog
+    /// key for `search_tool` / `use_tool`, never a provider function name.
     pub fn into_registration(self) -> Option<McpToolRegistration> {
-        let qualified_name = format!(
-            "{}{}{}",
-            self.server_name, MCP_TOOL_NAME_DELIMITER, self.name
-        );
-
-        if parse_mcp_qualified_name(&qualified_name).is_none() {
-            tracing::error!(
-                server = %self.server_name,
-                tool = %self.name,
-                qualified = %qualified_name,
-                "Skipping MCP tool with invalid or ambiguous qualified name"
-            );
-            return None;
-        }
-        if let Err(reason) = validate_tool_name(&qualified_name) {
-            tracing::error!(
-                tool_name = %qualified_name,
-                server = %self.server_name,
-                reason = %reason,
-                "Skipping MCP tool with invalid name"
-            );
-            return None;
-        }
+        let qualified_name = match qualify_mcp_tool_name(&self.server_name, &self.name) {
+            Ok(name) => name,
+            Err(reason) => {
+                tracing::error!(
+                    server = %self.server_name,
+                    tool = %self.name,
+                    reason = %reason,
+                    "Skipping MCP tool with invalid name"
+                );
+                return None;
+            }
+        };
 
         let description = self.description.clone();
         let input_schema = self.schema.clone();
@@ -6013,43 +5948,6 @@ mod tests {
     }
 
     #[test]
-    fn qualified_mcp_name_parser_accepts_structurally_valid_tool_ids() {
-        for (name, expected) in [
-            ("linear__list_issues", ("linear", "list_issues")),
-            ("123__lookup", ("123", "lookup")),
-            ("server:scope__tool", ("server:scope", "tool")),
-        ] {
-            let (id, server, tool) = parse_mcp_qualified_name(name).expect("valid qualified ID");
-            assert_eq!(id.as_str(), name);
-            assert_eq!((server, tool), expected);
-            assert_eq!(
-                parse_mcp_tool_name(name),
-                Some((expected.0.to_owned(), expected.1.to_owned()))
-            );
-        }
-    }
-
-    #[test]
-    fn qualified_mcp_name_parser_rejects_malformed_names() {
-        for name in [
-            "server__part__tool",
-            "server__tool__part",
-            "foo___bar",
-            "foo____bar",
-            "__tool",
-            "server__",
-            "server",
-            "",
-            "server__bad.tool",
-        ] {
-            assert!(
-                parse_mcp_qualified_name(name).is_none(),
-                "unexpectedly accepted {name:?}"
-            );
-        }
-    }
-
-    #[test]
     fn into_registration_validates_qualified_name() {
         let registration = make_mcp_tool("linear", "list_issues")
             .into_registration()
@@ -6073,23 +5971,24 @@ mod tests {
     }
 
     #[test]
-    fn into_registration_preserves_provider_name_policy() {
+    fn into_registration_keeps_names_over_the_provider_limit() {
         for qualified in ["123__lookup", "server:scope__tool"] {
             assert!(parse_mcp_qualified_name(qualified).is_some());
             let (server, tool) = qualified.split_once("__").unwrap();
             assert!(make_mcp_tool(server, tool).into_registration().is_none());
         }
 
-        let server_61 = format!("a{}", "b".repeat(60));
-        let server_62 = format!("a{}", "b".repeat(61));
-        let valid_64 = format!("{server_61}__b");
-        let invalid_65 = format!("{server_62}__b");
-        assert_eq!(valid_64.len(), 64);
-        assert_eq!(invalid_65.len(), 65);
-        assert!(parse_mcp_qualified_name(&valid_64).is_some());
-        assert!(parse_mcp_qualified_name(&invalid_65).is_some());
-        assert!(make_mcp_tool(&server_61, "b").into_registration().is_some());
-        assert!(make_mcp_tool(&server_62, "b").into_registration().is_none());
+        // A long server prefix pushes the qualified name past 64 chars. Such
+        // a tool used to be dropped; it is a catalog key, so it is kept as is.
+        let server = format!("a{}", "b".repeat(61));
+        let registration = make_mcp_tool(&server, "b")
+            .into_registration()
+            .expect("long qualified name is admitted");
+        assert_eq!(registration.name, format!("{server}__b"));
+        assert_eq!(registration.name.len(), PROVIDER_TOOL_NAME_MAX_CHARS + 1);
+
+        let too_long = "t".repeat(MCP_QUALIFIED_NAME_MAX_CHARS);
+        assert!(make_mcp_tool("s", &too_long).into_registration().is_none());
     }
 
     // ── is_retriable_transport_error tests ───────────────────────────
