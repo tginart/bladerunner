@@ -880,6 +880,9 @@ pub(crate) async fn generate_session_compact(
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),
                 x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                // A summary cut at the output cap is still a usable summary;
+                // the other backends' stream readers keep it the same way.
+                length_policy: xai_grok_sampling_types::LengthPolicy::CompletePartial,
                 ..Default::default()
             };
             let response = client
@@ -889,7 +892,8 @@ pub(crate) async fn generate_session_compact(
             CompactOutput {
                 content: response.assistant_text(),
                 stop_reason: response.stop_reason.map(|reason| format!("{reason:?}")),
-                truncated: false,
+                truncated: response.stop_reason
+                    == Some(xai_grok_sampling_types::StopReason::Length),
                 ttft_ms: None,
                 stream_ms: None,
                 delta_count: response.message_chunks_emitted,
@@ -2205,6 +2209,66 @@ mod reasoning_compaction_regression_tests {
                 .to_string(),
             ),
         ]
+    }
+    /// A Google summary that stops at MAX_TOKENS: the direct-collect path
+    /// must keep the cut summary, not fail it as `MaxTokensTruncation`
+    /// (which would suppress auto-compaction until the context overflows).
+    #[tokio::test]
+    async fn google_compaction_keeps_a_summary_cut_at_the_output_cap() {
+        let app = Router::new().fallback(post(|| async {
+            let chunk = json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Summary of the work so f"}]},
+                    "finishReason": "MAX_TOKENS"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 50,
+                    "totalTokenCount": 150
+                }
+            });
+            let events = vec![Ok::<_, std::convert::Infallible>(
+                Event::default().data(chunk.to_string()),
+            )];
+            Sse::new(stream::iter(events)).keep_alive(KeepAlive::default())
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let mut config = test_config(&format!("http://{addr}/v1beta"));
+        config.api_backend = ApiBackend::GoogleGenerateContent;
+        let chat_history = vec![
+            ConversationItem::system("You are a helpful assistant."),
+            ConversationItem::user("<user_query>\nfix the bug\n</user_query>"),
+            ConversationItem::assistant("I fixed it."),
+            ConversationItem::user("Summarize the conversation so far."),
+        ];
+        let client = Client::new(config.clone()).unwrap();
+        let output = generate_session_compact(
+            chat_history,
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("test-session"),
+            &config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::Auto,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a summary cut at the cap must not fail compaction"));
+        assert_eq!(output.content, "Summary of the work so f");
+        assert!(output.truncated, "the cut is reported as truncated");
+        let _ = shutdown_tx.send(());
     }
     fn test_config_responses(base_url: &str) -> SamplerConfig {
         let mut config = test_config(base_url);

@@ -854,18 +854,20 @@ pub trait RequestEvidenceSink: Send + Sync + std::fmt::Debug {
 /// `Length` (max_tokens truncation). `Length` often arrives far below any
 /// client budget, because the output budget is the context window minus the
 /// prompt.
+///
+/// The default is `CompletePartial`, so side calls (compaction summaries,
+/// recaps, titles, classifiers) keep the cut text they always got from the
+/// direct-collect path. The main turn always sets its policy explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LengthPolicy {
     /// Fail the attempt with `MaxTokensTruncation`.
     Fail,
     /// Complete a response whose tool calls all carry complete JSON
     /// arguments, so they run. Text-only and empty `Length` stops still fail.
-    /// The default: a caller that does not choose never gets a silently
-    /// truncated text answer.
-    #[default]
     CompleteToolCalls,
-    /// Also complete with partial text, for callers that continue it. An
-    /// empty `Length` stop still fails.
+    /// Also complete with partial text, for callers that continue it or can
+    /// use it as is. An empty `Length` stop still fails.
+    #[default]
     CompletePartial,
 }
 
@@ -11210,7 +11212,7 @@ mod tests {
         ]));
         let stop = make_response(ConversationItem::assistant("done"));
 
-        assert_eq!(LengthPolicy::default(), LengthPolicy::CompleteToolCalls);
+        assert_eq!(LengthPolicy::default(), LengthPolicy::CompletePartial);
         use LengthPolicy::{CompletePartial, CompleteToolCalls, Fail};
         use LengthVerdict as V;
         for (policy, response, want) in [

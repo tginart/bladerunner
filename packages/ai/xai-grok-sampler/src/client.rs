@@ -4553,28 +4553,36 @@ mod length_policy_tests {
     }
 
     #[test]
-    fn complete_truncated_tool_calls_run_by_default() {
-        let response = length_response(ConversationItem::assistant_tool_calls(vec![ToolCall {
-            id: "tc1".into(),
-            name: "read_file".into(),
-            arguments: r#"{"path":"a.rs"}"#.into(),
-        }]));
-        let kept = apply_length_policy(LengthPolicy::default(), response)
-            .expect("complete tool calls must run");
-        assert_eq!(kept.tool_calls().len(), 1);
-        assert_eq!(kept.stop_reason, Some(StopReason::Length));
+    fn complete_truncated_tool_calls_run() {
+        for policy in [
+            LengthPolicy::CompleteToolCalls,
+            LengthPolicy::CompletePartial,
+        ] {
+            let response =
+                length_response(ConversationItem::assistant_tool_calls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                }]));
+            let kept = apply_length_policy(policy, response)
+                .unwrap_or_else(|e| panic!("{policy:?}: complete tool calls must run: {e}"));
+            assert_eq!(kept.tool_calls().len(), 1);
+            assert_eq!(kept.stop_reason, Some(StopReason::Length));
+        }
     }
 
+    /// Side callers use the default and keep the cut text, as they did before
+    /// the gate existed. Only an explicit `CompleteToolCalls` fails it.
     #[test]
-    fn text_truncation_fails_by_default_and_continues_with_complete_partial() {
+    fn text_truncation_passes_by_default_and_fails_under_complete_tool_calls() {
         let text = || length_response(ConversationItem::assistant("half an ans"));
+        let kept = apply_length_policy(LengthPolicy::default(), text())
+            .expect("side callers keep the partial text");
+        assert_eq!(kept.assistant_text(), "half an ans");
         assert!(matches!(
-            apply_length_policy(LengthPolicy::default(), text()),
+            apply_length_policy(LengthPolicy::CompleteToolCalls, text()),
             Err(SamplingError::MaxTokensTruncation)
         ));
-        let kept = apply_length_policy(LengthPolicy::CompletePartial, text())
-            .expect("partial text is delivered for continuation");
-        assert_eq!(kept.assistant_text(), "half an ans");
     }
 }
 
