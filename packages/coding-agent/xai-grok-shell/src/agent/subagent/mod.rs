@@ -45,6 +45,7 @@ use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod handle_request;
+mod resume_window;
 pub(crate) use handle_request::run_shell_child;
 /// How the child session's initial context was bootstrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1518,15 +1519,21 @@ async fn bootstrap_initial_context(
                     }
                 };
                 let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&conversation);
-                const SAFE_RESUME_PERCENT: u64 = 80;
-                let threshold = child_context_window * SAFE_RESUME_PERCENT / 100;
-                if estimated_tokens > threshold {
+                let window = resume_window::ResumeWindowPolicy {
+                    context_window: child_context_window,
+                    auto_compact_threshold_percent: ctx
+                        .resolve_auto_compact_threshold_percent(effective_model_id),
+                };
+                if !window.fits(estimated_tokens) {
                     return BootstrapInitialContext::ResumeAbort(format!(
                         "Cannot resume from subagent '{}': source transcript \
-                         (~{estimated_tokens} tokens) exceeds {SAFE_RESUME_PERCENT}% of \
-                         the model's context window ({child_context_window} tokens). \
-                         The source conversation is too large for the current model.",
+                         (~{estimated_tokens} tokens) exceeds the resume limit \
+                         ({} of {child_context_window} tokens, under the {}% \
+                         auto-compact threshold). Compact the source first, or \
+                         resume on a model with a larger context window.",
                         source.subagent_id,
+                        window.token_limit(),
+                        window.auto_compact_threshold_percent,
                     ));
                 }
                 tracing::info!(

@@ -1835,21 +1835,21 @@ fn resume_model_pinning_overrides_default_resolution() {
     let no_pin = source_model.as_deref() == Some(resolved_same);
     assert!(no_pin, "same model — no pinning needed");
 }
+/// Resume admits a transcript up to 95% of the window, under the
+/// auto-compact threshold. 210k of 256k (82%) was refused by the old 80%
+/// guard; it now resumes. A transcript past the threshold is still refused.
 #[test]
 fn resume_window_safety_rejects_instead_of_swapping() {
-    let estimated_tokens: u64 = 100_000;
-    let child_window: u64 = 256_000;
-    const SAFE_RESUME_PERCENT: u64 = 80;
-    let threshold = child_window * SAFE_RESUME_PERCENT / 100;
+    let window = super::super::resume_window::ResumeWindowPolicy {
+        context_window: 256_000,
+        auto_compact_threshold_percent: 90,
+    };
+    assert!(window.fits(100_000), "100k of 256k must resume");
+    assert!(window.fits(210_000), "210k of 256k (82%) must resume now");
     assert!(
-            estimated_tokens <= threshold,
-            "100k tokens should be within 80% of 256k window"
-        );
-    let large_transcript: u64 = 210_000;
-    assert!(
-            large_transcript > threshold,
-            "210k tokens exceeds 80% of 256k window — resume should be rejected"
-        );
+        !window.fits(240_000),
+        "240k of 256k is past the 90% threshold; resume must be refused"
+    );
 }
 #[test]
 fn provenance_carries_resumed_from() {
