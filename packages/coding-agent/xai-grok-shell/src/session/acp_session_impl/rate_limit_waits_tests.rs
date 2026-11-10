@@ -173,6 +173,27 @@ async fn subagent_fails_on_429_after_the_budget_is_spent() {
         .await;
 }
 
+/// A 429 with `x-should-retry: false` is a server veto. The child fails at
+/// once and does not charge the wait budget.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn subagent_honors_should_retry_false_on_429() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let sampling = child_sampling();
+            let (actor, _rx) = actor_with_sampling(Some(sampling.clone())).await;
+            let started = tokio::time::Instant::now();
+            let mut error = rate_limited(Some(5));
+            error.should_retry = Some(false);
+            assert!(actor.handle_sampling_failure(error).await.is_err());
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            let budget = sampling.budget.lock();
+            assert_eq!(budget.attempts, 0);
+            assert_eq!(budget.total_waited, Duration::ZERO);
+        })
+        .await;
+}
+
 /// A main session has a user who can retry, so its 429 still fails at once.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn main_session_429_still_fails_at_once() {

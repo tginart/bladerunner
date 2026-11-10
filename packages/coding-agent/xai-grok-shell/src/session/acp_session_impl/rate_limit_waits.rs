@@ -9,8 +9,8 @@
 //! semaphore that limits how many subagent requests are in flight at the
 //! same time, so a wide fan-out does not cause a burst of 429s.
 //!
-//! The logic is provider-generic: it reads only `SamplingErrorKind` and the
-//! `Retry-After` value that the sampler parsed.
+//! The logic is provider-generic: it reads only `SamplingErrorKind`, the
+//! `Retry-After` value, and the `x-should-retry` veto that the sampler parsed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,8 +168,9 @@ impl SessionActor {
     /// Purpose: Wait out a 429 in a subagent turn, then ask for a resubmit.
     /// Input: The sampling failure that the sampler gave up on.
     /// Output: `Some(CompactAndResubmit)` after the wait. `None` when the
-    /// failure is not a 429, the session is not a subagent, or the turn
-    /// budget is spent. The caller then fails the turn as before.
+    /// failure is not a 429, the server sent `x-should-retry: false`, the
+    /// session is not a subagent, or the turn budget is spent. The caller
+    /// then fails the turn as before.
     /// Method:
     ///     1. Charge the wait against the budget of the current turn.
     ///     2. Tell the client that the child is in a retry wait.
@@ -182,6 +183,11 @@ impl SessionActor {
         error: &SamplingErrorInfo,
     ) -> Option<SamplerFailureRecovery> {
         if !matches!(error.kind, SamplingErrorKind::RateLimited) {
+            return None;
+        }
+        // `x-should-retry: false` is a server veto. The sampler treats it as
+        // fatal, so the child must not resubmit or charge the budget.
+        if error.should_retry == Some(false) {
             return None;
         }
         let sampling = self.tool_context.subagent_sampling.as_ref()?;
