@@ -2147,10 +2147,12 @@ fn main() {
     xai_grok_telemetry::debug_log::flush();
     if let Err(e) = result {
         xai_tty_utils::restore_native_stderr();
-        match e.downcast_ref::<xai_grok_pager::app::StartupFailure>() {
-            Some(startup) => eprintln!("{}", startup.user_report()),
-            None => eprintln!("Error: {e:#}"),
-        }
+        let report = match e.downcast_ref::<xai_grok_pager::app::StartupFailure>() {
+            Some(startup) => startup.user_report(),
+            None => format!("Error: {e:#}"),
+        };
+        // The pane may have closed during exit; a panic here would abort.
+        xai_grok_pager::best_effort_stderr::eprint_line(&report);
         drop(_sentry_guard);
         std::process::exit(1);
     }

@@ -139,8 +139,11 @@ fn join_agent_thread(handle: thread::JoinHandle<Result<()>>, timeout: Duration) 
     match rx.recv_timeout(quiet) {
         Ok(result) => return classify_join(result),
         Err(RecvTimeoutError::Timeout) => {
+            // A slow session end is often caused by a pane that just closed.
+            // macOS still reports a pty with no master as a terminal, so the
+            // write can fail and must not panic.
             if std::io::stderr().is_terminal() {
-                eprintln!("{JOIN_NOTICE}");
+                crate::best_effort_stderr::eprint_line(JOIN_NOTICE);
             }
         }
         Err(RecvTimeoutError::Disconnected) => return JoinOutcome::HelperLost,
