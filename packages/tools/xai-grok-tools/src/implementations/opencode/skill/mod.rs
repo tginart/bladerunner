@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use crate::implementations::skills::skill::{SkillOutput, extract_skill_body, format_skill_name};
+use crate::implementations::skills::skill::{
+    SkillOutput, cap_skill_body, extract_skill_body, format_skill_name,
+};
 use crate::implementations::skills::types::SkillInfo;
 use crate::types::requirements::{Expr, ToolRequirement};
 #[allow(unused_imports)]
@@ -297,7 +299,7 @@ impl xai_tool_runtime::Tool for SkillTool {
         };
 
         // ── Load the skill content ───────────────────────────────────
-        let content = match load_skill_content(&skill).await {
+        let mut content = match load_skill_content(&skill).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(SkillOutput {
@@ -309,6 +311,14 @@ impl xai_tool_runtime::Tool for SkillTool {
                 });
             }
         };
+
+        if cap_skill_body(&mut content) {
+            tracing::info!(
+                skill = %skill.name,
+                path = %skill.path,
+                "skill body truncated at read cap"
+            );
+        }
 
         // ── List bundled files (up to 10) ────────────────────────────
         let files = list_skill_files(&skill, 10).await;
