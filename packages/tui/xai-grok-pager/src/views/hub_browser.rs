@@ -33,6 +33,8 @@ const COMPOSE_ROWS: u16 = 3;
 const GROUP_GAP_MS: u64 = 5 * 60 * 1000;
 /// Feed lines that PgUp and PgDn scroll.
 const PAGE_LINES: usize = 10;
+/// Lines for one wheel notch when an event reaches `handle_mouse` directly.
+const WHEEL_LINES: i32 = 3;
 /// Columns of the message body indent under a sender header.
 const BODY_INDENT: usize = 2;
 
@@ -95,6 +97,8 @@ pub enum HubKeyOutcome {
 #[derive(Debug, Clone, Default)]
 struct HitAreas {
     sidebar: Rect,
+    /// The thread pane right of the sidebar, with its scrollbar column.
+    main: Rect,
     /// Screen row and row index of each visible sidebar row.
     rows: Vec<(u16, usize)>,
     chip: Rect,
@@ -341,8 +345,8 @@ impl HubBrowserState {
     /// Note: The hit areas come from the last frame.
     pub fn handle_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> HubKeyOutcome {
         match kind {
-            MouseEventKind::ScrollUp => self.feed_scroll = self.feed_scroll.saturating_add(3),
-            MouseEventKind::ScrollDown => self.feed_scroll = self.feed_scroll.saturating_sub(3),
+            MouseEventKind::ScrollUp => self.handle_scroll(-WHEEL_LINES, col, row),
+            MouseEventKind::ScrollDown => self.handle_scroll(WHEEL_LINES, col, row),
             MouseEventKind::Down(MouseButton::Left)
                 if self.picker.is_none() && contains(self.hits.feed_scrollbar, col, row) =>
             {
@@ -360,6 +364,25 @@ impl HubBrowserState {
             _ => {}
         }
         HubKeyOutcome::Changed
+    }
+
+    /// Purpose: Apply one mouse-wheel scroll to the thread pane.
+    /// Input: The scroll lines (positive is down) and the screen position.
+    /// Output: None. The feed scroll changes in place.
+    /// Note: The app sends wheel events here, not to `handle_mouse`. The scroll
+    /// changes only when the pointer is over the thread pane and the picker
+    /// is closed.
+    pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
+        if self.picker.is_some() || !contains(self.hits.main, col, row) {
+            return;
+        }
+        let delta = lines.unsigned_abs() as usize;
+        // The feed scroll counts lines up from the newest message.
+        self.feed_scroll = if lines > 0 {
+            self.feed_scroll.saturating_sub(delta)
+        } else {
+            self.feed_scroll.saturating_add(delta)
+        };
     }
 
     /// Move the feed so that the scrollbar thumb sits at the screen row. A
@@ -921,6 +944,7 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     };
     render_top_bar(buf, top_bar, state, &theme);
     render_sidebar(buf, sidebar, state, &theme);
+    state.hits.main = main;
     render_main(buf, main, state, &theme);
     render_footer(buf, footer, state, &theme);
     if state.picker.is_some() {
@@ -2156,6 +2180,43 @@ mod tests {
             bar.bottom() - 1,
         );
         assert_eq!(state.feed_scroll, max_scroll);
+    }
+
+    #[test]
+    fn wheel_over_the_thread_scrolls_the_feed_and_its_scrollbar() {
+        let (_root, hub) = hub_with_dms();
+        let start_ms = store::now_ms();
+        for i in 0..80 {
+            let text = format!("line {i}");
+            hub.append(&message("me", "#general".to_string(), &text, start_ms + i))
+                .unwrap();
+        }
+        let mut state = open(hub);
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let bar = state.hits.feed_scrollbar;
+        let bar_before = column_text(&buf, bar);
+        let main = state.hits.main;
+        let (col, row) = (main.x + main.width / 2, main.y + main.height / 2);
+
+        state.handle_scroll(-5, col, row);
+        assert_eq!(state.feed_scroll, 5, "wheel up moves to older lines");
+        render_hub_browser(&mut buf, area, &mut state);
+        assert_ne!(column_text(&buf, bar), bar_before, "the thumb moves");
+        state.handle_scroll(3, col, row);
+        assert_eq!(state.feed_scroll, 2, "wheel down moves to newer lines");
+
+        // The wheel over the sidebar does not move the thread.
+        let side = state.hits.sidebar;
+        state.handle_scroll(-5, side.x + 1, side.y + 1);
+        assert_eq!(state.feed_scroll, 2);
+    }
+
+    fn column_text(buf: &Buffer, column: Rect) -> String {
+        (column.y..column.bottom())
+            .map(|y| buf[(column.x, y)].symbol().to_string())
+            .collect()
     }
 
     #[test]
