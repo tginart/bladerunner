@@ -185,7 +185,7 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
             let tail_h = area.height.saturating_sub(status_h + modal_h);
             let tick = (now_millis() / 100) as u64;
             if tail_h > 0 {
-                let turn_running = agent.session.state.is_turn_running();
+                let turn_running = minimal_api::is_turn_or_wake_running(agent);
                 draw_tail(
                     frame.buffer_mut(),
                     Rect {
@@ -281,7 +281,7 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
                 width: area.width,
                 height: tail_h,
             };
-            let turn_running = agent.session.state.is_turn_running();
+            let turn_running = minimal_api::is_turn_or_wake_running(agent);
             draw_tail(
                 frame.buffer_mut(),
                 tail_area,
@@ -734,7 +734,7 @@ pub(super) fn tail_height(
 ) -> u16 {
     let theme = Theme::current();
     let sb = &agent.scrollback;
-    let turn_running = agent.session.state.is_turn_running();
+    let turn_running = minimal_api::is_turn_or_wake_running(agent);
     let gap = super::commit::MINIMAL_BLOCK_GAP;
     let mut i = super::commit::scan_frontier(sb, turn_running).tail_start;
     let mut total = 0u16;
@@ -810,6 +810,35 @@ mod tests {
         assert_eq!(
             tail_height(&agent, width, &appearance),
             painted_height.saturating_add(super::super::commit::MINIMAL_BLOCK_GAP)
+        );
+    }
+    /// A wake turn streams while the session state is idle. Its reply must
+    /// stay in the live tail until it finishes. If the commit pass reads the
+    /// session as idle, it prints the half-streamed reply once and the rest
+    /// never reaches native scrollback.
+    #[test]
+    fn wake_turn_reply_stays_in_the_live_tail_while_it_streams() {
+        use xai_grok_pager::scrollback::RenderBlock;
+        use xai_grok_pager::scrollback::entry::ScrollbackEntry;
+        let mut agent = agent();
+        agent
+            .scrollback
+            .push(ScrollbackEntry::running(RenderBlock::agent_message(
+                "the subagent finished; here is the first half of the summary",
+            )));
+        let appearance = super::super::commit::committed_appearance(
+            &xai_grok_pager::appearance::AppearanceConfig::default(),
+        );
+        assert_eq!(
+            tail_height(&agent, 80, &appearance),
+            0,
+            "with no turn of any kind, a stale running entry is committable"
+        );
+        minimal_api::set_running_wake_turn_for_test(&mut agent, Some("task-completed-bg1"));
+        assert!(minimal_api::is_turn_or_wake_running(&agent));
+        assert!(
+            tail_height(&agent, 80, &appearance) > 0,
+            "the streaming wake reply must stay in the live tail"
         );
     }
     /// The tail and the committed footprint are one builder with a different

@@ -329,6 +329,14 @@ pub fn set_minimal_committed_plan_id(app: &mut AppView, id: Option<String>) {
 pub fn last_activity(v: &AgentView) -> Option<&TurnActivity> {
     v.last_activity.as_ref()
 }
+/// Whether the agent is streaming a reply: a normal turn, or a wake turn
+/// (a subagent or background task woke the idle session). The session state
+/// stays idle during a wake turn, so `is_turn_running` alone reads a
+/// streaming wake reply as stable and commits it before it is complete.
+pub fn is_turn_or_wake_running(v: &AgentView) -> bool {
+    v.session.state.is_turn_running() || v.wake_turn_active()
+}
+
 
 /// `AgentView::last_activity` (write).
 pub fn set_last_activity(v: &mut AgentView, val: Option<TurnActivity>) {
@@ -851,6 +859,15 @@ pub fn set_question_view(v: &mut AgentView, val: Option<QuestionViewState>) {
 pub fn set_plan_mode_active(v: &mut AgentView, on: bool) {
     v.plan_mode_active = on;
 }
+/// Test-only setter for `AgentView::running_wake_turn`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_running_wake_turn_for_test(v: &mut AgentView, prompt_id: Option<&str>) {
+    v.running_wake_turn = prompt_id.map(|id| crate::app::agent_view::RunningWakeTurn {
+        prompt_id: id.to_string(),
+        cancel_sent: false,
+    });
+}
+
 
 /// Test-only setter for `AgentView::plan_mode_pending`.
 #[cfg(any(test, feature = "test-support"))]
