@@ -123,6 +123,23 @@ mod tests {
         (root, view, bus)
     }
 
+    #[test]
+    fn wheel_scroll_goes_to_the_open_hub_thread() {
+        let (_root, mut view, bus) = browser_with_agent();
+        let hub = bus.hub();
+        for i in 0..80 {
+            agent_hub::post_as_person(&hub, "me", "#general", &format!("line {i}"), &[]).unwrap();
+        }
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let browser = view.hub_browser.as_mut().unwrap();
+        browser.reload().unwrap();
+        crate::views::hub_browser::render_hub_browser(&mut buf, area, browser);
+
+        view.handle_scroll(-4, 70, 12);
+        assert_eq!(view.hub_browser.as_ref().unwrap().feed_scroll, 4);
+    }
+
     fn key_event(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }

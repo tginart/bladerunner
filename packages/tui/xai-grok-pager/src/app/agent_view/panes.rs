@@ -500,6 +500,11 @@ impl AgentView {
     ///
     /// Positive `lines` = scroll down, negative = scroll up.
     pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
+        // The hub browser covers the whole view, like in `handle_input`.
+        if let Some(browser) = self.hub_browser.as_mut() {
+            browser.handle_scroll(lines, col, row);
+            return;
+        }
         if self.show_workflows {
             let runs = self.workflow_runs_newest_first();
             let mut view = self.workflows_view.clone();
