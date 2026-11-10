@@ -585,6 +585,7 @@ impl SessionActor {
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
         self.begin_prompt_transient_retry();
+        self.begin_prompt_length_salvage(json_schema.is_some());
         let yolo_mode = self.permissions.is_yolo_mode();
         let msg_count = self.chat_state_handle.get_conversation_len().await;
         let redirect_kind = if matches!(
@@ -2296,10 +2297,6 @@ impl SessionActor {
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
-        let mut salvage = super::length_salvage::LengthSalvage::new(
-            self.length_salvage_budget(json_schema.is_some()),
-        );
-        let mut length_salvage_streak = super::length_salvage::LengthSalvageStreak::default();
         // Validator is large; keep it on the heap for the whole turn.
         let structured_output_validator = std::sync::Arc::new(json_schema.as_ref().map(|schema| {
             jsonschema::validator_for(schema).map_err(|e| format!("invalid output schema: {e}"))
@@ -2509,9 +2506,7 @@ impl SessionActor {
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
                 .map_err(|message| acp::Error::internal_error().data(message))?;
-            if salvage.enabled() {
-                request.length_policy = xai_grok_sampling_types::LengthPolicy::CompletePartial;
-            }
+            request.length_policy = self.turn_length_policy();
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2796,11 +2791,7 @@ impl SessionActor {
             let refusal_explanation = response.stop_message.clone();
             let final_answer_text = json_schema.is_some().then(|| response.assistant_text());
             let is_length_stop = stop_reason == Some(xai_grok_sampling_types::StopReason::Length);
-            let is_salvage_streak_exhausted = self.observe_length_salvage_streak(
-                &mut length_salvage_streak,
-                is_length_stop && !tool_calls.is_empty(),
-            );
-            if is_salvage_streak_exhausted {
+            if self.observe_length_salvage_streak(is_length_stop && !tool_calls.is_empty()) {
                 return Err(Box::pin(self.fail_turn_length_salvage_exhausted()).await);
             }
             for item in response.items {
@@ -2847,18 +2838,17 @@ impl SessionActor {
                 .await;
             }
             self.send_buffered_xai_update(response_completed).await;
-            if is_length_stop && tool_calls.is_empty() && self.advance_length_salvage(&mut salvage)
-            {
+            if is_length_stop && tool_calls.is_empty() && self.advance_length_salvage() {
                 continue;
             }
             if !tool_calls.is_empty() {
-                salvage.step_boundary();
+                self.length_salvage_step_boundary();
             }
             if tool_calls.is_empty() {
                 // A cut-off answer is not a turn end the TodoGate should judge.
                 if !schema_ok
                     && !turn_refused
-                    && !salvage.is_truncated()
+                    && !self.length_salvage_is_truncated()
                     && let Some(gate_cfg) = self.todo_gate_policy()
                 {
                     let collected = self.collect_todo_gate_input(req_id).await;

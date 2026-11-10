@@ -1858,6 +1858,7 @@ pub(crate) async fn spawn_session_actor(
         observability_bridge: obs_bridge,
         current_turn_number: std::cell::Cell::new(0),
         transient_retry: std::cell::Cell::new(TransientRetryState::for_session(is_subagent_spawn)),
+        length_salvage: Default::default(),
         last_recap_main_turn: std::cell::Cell::new(initial_last_recap_main_turn),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),

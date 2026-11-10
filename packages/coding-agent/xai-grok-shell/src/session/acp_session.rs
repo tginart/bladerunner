@@ -1029,6 +1029,8 @@ pub(crate) struct SessionActor {
     /// Turn-level transient retry budget for the current prompt (see
     /// `transient_retry.rs`).
     pub(crate) transient_retry: std::cell::Cell<TransientRetryState>,
+    /// Per-prompt length-salvage state (see `length_salvage.rs`).
+    pub(crate) length_salvage: std::cell::Cell<length_salvage::PromptLengthSalvage>,
     /// Recap rate-limit watermark (`main_turns` of last finished recap; `0` = none).
     pub(crate) last_recap_main_turn: std::cell::Cell<usize>,
     /// True while a recap model call is in flight (auto or manual). Prevents
