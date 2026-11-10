@@ -527,6 +527,22 @@ async fn invalid_image_code_strips_and_retries() {
         matches!(events.last(), Some(SamplingEvent::Completed { .. })),
         "expected Completed after strip-retry, got {events:?}"
     );
+    let stripped: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ImagesStripped { stripped_urls, .. } => Some(stripped_urls),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stripped.len(),
+        1,
+        "a coded rejection reports the strip so the session can heal its history"
+    );
+    assert_eq!(
+        stripped[0].iter().map(|u| u.as_ref()).collect::<Vec<_>>(),
+        [IMAGE_URI]
+    );
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2, "one rejection, one strip-retry");

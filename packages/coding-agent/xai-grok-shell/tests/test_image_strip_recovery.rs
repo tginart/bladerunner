@@ -135,5 +135,20 @@ fn poisoned_image_session_recovers_within_the_failing_turn() {
             retry.contains("[image removed"),
             "strip-retry must carry the placeholder so the model knows an image was there"
         );
+
+        // The strip also heals the stored history: the next turn must not
+        // send the rejected image again and pay another strip-retry.
+        let before = bodies.len();
+        prompt_turn(&conn, &info.id, "and now?").await;
+        let bodies = chat_completion_bodies(&server);
+        assert_eq!(
+            bodies.len(),
+            before + 1,
+            "the next turn must succeed on its first attempt"
+        );
+        assert!(
+            !bodies[before].contains(image_marker),
+            "the next turn must not resend the poisoned image"
+        );
     });
 }

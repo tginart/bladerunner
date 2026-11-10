@@ -3098,6 +3098,9 @@ impl SessionActor {
             SamplingEvent::ModelMetadata { metadata, .. } => {
                 self.handle_model_metadata_update(metadata).await;
             }
+            SamplingEvent::ImagesStripped { stripped_urls, .. } => {
+                self.handle_images_stripped(stripped_urls).await;
+            }
             SamplingEvent::Retrying {
                 request_id,
                 attempt,
