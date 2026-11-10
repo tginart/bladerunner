@@ -2299,7 +2299,7 @@ model cannot convince the agent to relax restrictions at runtime.
 
 ### Event Logging
 
-Sandbox events (profile applied, violations) are logged to `~/.grok/sandbox-events.jsonl`
+Sandbox events (profile applied, violations) are logged to `~/.bladerunner/sessions/sandbox-events.jsonl`
 for telemetry and debugging.
 
 ---

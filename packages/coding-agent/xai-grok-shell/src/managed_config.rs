@@ -136,13 +136,7 @@ fn team_principal_signed_in() -> std::io::Result<bool> {
 /// Clear the synced files when no principal could own them: no deployment key
 /// configured and no team signed in (logout). A configured deployment key keeps
 /// its files (original "never auto-deletes" behavior). Runs at startup and on
-/// logout; best-effort.
-///
-/// **fail_closed:** when the marker or on-disk requirements opt in to fail-closed
-/// (or requirements exist but are unreadable), do **not** wipe. A personal/User
-/// principal (or signed-out auth) must not escape enforced policy by swapping
-/// `auth.json` and letting orphan clear delete the artifacts. Non-fail-closed
-/// team policy still clears on logout as before.
+/// logout; best-effort. See [`clear_orphan_at`] for which files qualify.
 pub fn clear_orphan() {
     if resolve_deployment_key().is_some() {
         return;
@@ -155,17 +149,34 @@ pub fn clear_orphan() {
             return;
         }
     }
-    let home = crate::util::grok_home::grok_home();
-    let Some(_lock) = try_lock_managed_config(&home) else {
+    clear_orphan_at(&crate::util::grok_home::grok_home());
+}
+
+/// Purpose: This function removes orphaned managed-config files from `home`.
+/// Input: The Bladerunner home. The caller has found no principal to own the files.
+/// Output: None. The function deletes files as a side effect.
+/// Method:
+///     1. If another process holds the managed-config lock, stop.
+///     2. If no sync marker is on disk, stop. A sync did not write the files.
+///     3. If fail-closed policy is armed, stop.
+///     4. Remove the synced artifacts, then the marker.
+/// Note: Step 2 keeps a policy that a user or an admin put in the home by hand.
+/// Every sync writes the marker, so a logged-out team's files still clear.
+/// Note: Step 3 stops a user who swaps `auth.json` to escape enforced policy.
+fn clear_orphan_at(home: &std::path::Path) {
+    let Some(_lock) = try_lock_managed_config(home) else {
         return; // another process is syncing; retry next call
     };
-    if xai_grok_config::fail_closed_policy_armed_at(&home) {
+    if !xai_grok_config::managed_sync_marker_present_at(home) {
+        return;
+    }
+    if xai_grok_config::fail_closed_policy_armed_at(home) {
         tracing::info!(
             "keeping fail_closed managed policy on disk; no team principal present to own a clear"
         );
         return;
     }
-    remove_managed_config_files(&home);
+    remove_managed_config_files(home);
 }
 
 /// Best-effort cross-process lock serializing apply/remove of the managed-config

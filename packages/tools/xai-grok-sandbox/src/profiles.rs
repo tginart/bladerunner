@@ -19,7 +19,9 @@ use crate::hook_write_deny::profile_hook_write_deny;
 use crate::paths::grok_home;
 #[cfg(all(feature = "enforce", unix))]
 use crate::paths::{DEVICE_DIRS, DEVICE_FILES};
-use crate::paths::{essential_writable_paths, essential_writable_paths_minimal};
+use crate::paths::{
+    essential_writable_paths, essential_writable_paths_minimal, essential_writable_paths_strict,
+};
 use xai_grok_config::GlobalHookSource;
 
 /// A resolved sandbox profile ready to be converted to a `CapabilitySet`.
@@ -255,15 +257,20 @@ impl ProfileName {
 
         // Read-write paths. nono/Landlock need the directory to exist at
         // apply time (it opens an O_PATH fd), but new files within it can
-        // be created freely after the sandbox is applied. Pre-create
-        // directories like ~/.grok/ that may not exist on first run.
+        // be created freely after the sandbox is applied. A symlinked child of
+        // grok_home fails closed unless it resolves to the expected directory.
+        let home = grok_home();
         for path in &profile.read_write {
-            if !path.exists() && std::fs::create_dir_all(path).is_err() {
-                tracing::warn!(path = ?path, "read_write path does not exist and could not be created, skipping");
+            let Some(grant) = read_write_grant_path(path, &home) else {
+                tracing::warn!(path = ?path, "skipping read_write grant");
+                continue;
+            };
+            if !grant.exists() && std::fs::create_dir_all(&grant).is_err() {
+                tracing::warn!(path = ?grant, "read_write path does not exist and could not be created, skipping");
                 continue;
             }
-            let Some(path_str) = path.to_str() else {
-                tracing::warn!(path = ?path, "Skipping non-UTF8 read_write path");
+            let Some(path_str) = grant.to_str() else {
+                tracing::warn!(path = ?grant, "Skipping non-UTF8 read_write path");
                 continue;
             };
             caps = caps.allow_path(path_str, AccessMode::ReadWrite)?;
@@ -467,13 +474,15 @@ impl ProfileName {
                 .chain(std::iter::once(home.join("Library")))
                 .filter(|p| p.exists())
                 .chain(std::iter::once(workspace.to_path_buf()))
+                // Read-only: auth, config, and hooks need the home. Landlock cannot
+                // carve children out of a write grant, so only sessions/ is writable.
                 .chain(std::iter::once(grok_home()))
                 .collect();
 
                 Ok(SandboxProfile {
                     name: "strict".to_string(),
                     read_only: system_read,
-                    read_write: essential_writable_paths(workspace),
+                    read_write: essential_writable_paths_strict(workspace),
                     deny: vec![],
                     write_deny: resolve_write_deny(self)?,
                     default_read: false,
@@ -546,6 +555,49 @@ impl ProfileName {
                 Ok(profile)
             }
         }
+    }
+}
+
+/// Purpose: This function gives the path to grant read-write access for one
+/// `read_write` entry of a profile.
+/// Input: The `read_write` entry. The Bladerunner home (`grok_home()`).
+/// Output: The path to grant, or `None` to skip the entry.
+/// Method:
+///     1. If the entry is not a symlink, grant the entry. Create it if missing.
+///     2. If the entry is a symlink outside the home (or the home itself), grant it.
+///     3. If the entry is a symlinked child of the home, resolve it. Grant the real
+///        directory only if it is the same-named child of the home, or the
+///        default `~/.bladerunner/sessions`.
+///     4. Skip all other symlinked children of the home.
+/// Note: Step 3 stops a planted symlink such as `sessions -> ..` from widening a
+/// strict grant to the full home.
+#[cfg(all(feature = "enforce", unix))]
+fn read_write_grant_path(path: &Path, home: &Path) -> Option<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if path == home || !path.starts_with(home) {
+                return Some(path.to_path_buf());
+            }
+            let real = dunce::canonicalize(path).ok()?;
+            if !real.is_dir() {
+                return None;
+            }
+            let file_name = path.file_name()?;
+            if real == home.join(file_name) {
+                return Some(real);
+            }
+            let default_sessions = xai_grok_config::default_grok_home().join("sessions");
+            if file_name == std::ffi::OsStr::new("sessions") && real == default_sessions {
+                return Some(real);
+            }
+            None
+        }
+        Ok(_) => Some(path.to_path_buf()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).ok()?;
+            Some(path.to_path_buf())
+        }
+        Err(_) => None,
     }
 }
 
@@ -732,6 +784,104 @@ mod tests {
                 profile.read_only
             );
         }
+    }
+
+    #[test]
+    fn strict_reads_grok_home_but_only_sessions_writable() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::temp_dir();
+        let home = grok_home();
+        let sessions = home.join("sessions");
+        let cases = [
+            (
+                "strict",
+                ProfileName::Strict.resolve_profile(&workspace, &SandboxConfig::default()),
+            ),
+            (
+                "strict-inherited",
+                ProfileName::Custom("strict-inherited".to_string())
+                    .resolve_profile(&workspace, &network_inheritance_config()),
+            ),
+        ];
+        for (label, resolved) in cases {
+            let profile = resolved.unwrap_or_else(|e| panic!("{label} resolves: {e}"));
+            assert!(
+                profile.read_only.iter().any(|p| p == &home),
+                "{label} read_only must include grok_home: {:?}",
+                profile.read_only
+            );
+            assert!(
+                !profile.read_write.iter().any(|p| p == &home),
+                "{label} read_write must not include grok_home: {:?}",
+                profile.read_write
+            );
+            for p in profile.read_write.iter().filter(|p| p.starts_with(&home)) {
+                assert!(
+                    p.starts_with(&sessions),
+                    "{label} read_write under grok_home must be under sessions/: {p:?}"
+                );
+            }
+            assert!(profile.read_write.iter().any(|p| p == &sessions));
+            assert!(profile.read_write.iter().any(|p| p == &workspace));
+            #[cfg(target_os = "macos")]
+            if let Some(user_home) = dirs::home_dir() {
+                let library = user_home.join("Library");
+                if library.exists() {
+                    assert!(profile.read_only.iter().any(|p| p == &library));
+                }
+            }
+        }
+        assert!(crate::paths::sandbox_events_log_path().starts_with(&sessions));
+    }
+
+    #[test]
+    fn workspace_and_read_only_still_include_grok_home() {
+        if skip_if_host_hook_write_deny_unresolvable() {
+            return;
+        }
+        let workspace = std::env::temp_dir();
+        let home = grok_home();
+        for name in [ProfileName::Workspace, ProfileName::ReadOnly] {
+            let profile = name
+                .resolve_profile(&workspace, &SandboxConfig::default())
+                .unwrap_or_else(|e| panic!("{name} resolves: {e}"));
+            assert!(
+                profile.read_write.iter().any(|p| p == &home),
+                "{name} read_write must include grok_home: {:?}",
+                profile.read_write
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn read_write_grant_rejects_symlinked_home_child_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = dunce::canonicalize(tmp.path()).unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let outside = home.parent().unwrap().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // sessions -> .. would widen the grant to the whole home.
+        let escape = home.join("sessions");
+        std::os::unix::fs::symlink(&home, &escape).unwrap();
+        assert_eq!(read_write_grant_path(&escape, &home), None);
+        std::fs::remove_file(&escape).unwrap();
+
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        assert_eq!(read_write_grant_path(&escape, &home), None);
+        std::fs::remove_file(&escape).unwrap();
+
+        // A plain directory, or a missing one, is granted as is.
+        assert_eq!(read_write_grant_path(&escape, &home), Some(escape.clone()));
+        assert!(escape.is_dir());
+
+        // Paths outside the home keep the old behavior.
+        let link = home.parent().unwrap().join("ws-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(read_write_grant_path(&link, &home), Some(link.clone()));
     }
 
     #[test]

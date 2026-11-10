@@ -458,3 +458,90 @@ fn auth_mode_classification() {
     assert_eq!(auth_mode(false, &Ok(false)), AuthMode::Personal);
     assert_eq!(auth_mode(false, &Err(err())), AuthMode::Unknown);
 }
+
+/// A policy that no sync wrote (no marker) is user- or admin-placed: orphan clear must
+/// keep it, because Bladerunner never has a team principal to own it.
+#[test]
+fn clear_orphan_keeps_policy_files_without_a_sync_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("managed_config.toml"), "model = \"x\"\n").unwrap();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
+
+    clear_orphan_at(home);
+
+    assert!(home.join("managed_config.toml").exists());
+    assert!(home.join("requirements.toml").exists());
+}
+
+/// Files a sync wrote (marker present) still clear once no principal owns them.
+#[test]
+fn clear_orphan_removes_synced_files_when_marker_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("managed_config.toml"), "model = \"x\"\n").unwrap();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
+    xai_grok_config::mark_managed_config_synced_at(
+        home,
+        xai_grok_config::SyncMarker {
+            principal: Some("team-1"),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    assert!(
+        home.join(xai_grok_config::MANAGED_CONFIG_CACHE_FILE)
+            .exists()
+    );
+
+    clear_orphan_at(home);
+
+    for f in [
+        "managed_config.toml",
+        "requirements.toml",
+        xai_grok_config::MANAGED_CONFIG_CACHE_FILE,
+    ] {
+        assert!(!home.join(f).exists(), "{f} must be removed");
+    }
+}
+
+/// A corrupt marker still shows that a sync once wrote here, so it does not disarm the clear.
+#[test]
+fn clear_orphan_treats_corrupt_marker_as_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("managed_config.toml"), "model = \"x\"\n").unwrap();
+    std::fs::write(
+        home.join(xai_grok_config::MANAGED_CONFIG_CACHE_FILE),
+        "{ bad",
+    )
+    .unwrap();
+
+    clear_orphan_at(home);
+
+    assert!(!home.join("managed_config.toml").exists());
+}
+
+/// Fail-closed policy stays even with a marker present.
+#[test]
+fn clear_orphan_keeps_fail_closed_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
+    xai_grok_config::mark_managed_config_synced_at(
+        home,
+        xai_grok_config::SyncMarker {
+            principal: Some("team-1"),
+            had_managed_config: false,
+            had_requirements: true,
+            key_fingerprint: None,
+            fail_closed: true,
+        },
+    );
+
+    clear_orphan_at(home);
+
+    assert!(home.join("requirements.toml").exists());
+}

@@ -11,6 +11,12 @@ pub(crate) fn grok_home() -> PathBuf {
     xai_grok_config::grok_home()
 }
 
+/// On-disk JSONL audit log under the sessions directory. The strict profile can
+/// write it through the sessions grant, because strict cannot write the home itself.
+pub(crate) fn sandbox_events_log_path() -> PathBuf {
+    grok_home().join("sessions").join("sandbox-events.jsonl")
+}
+
 // ── Device files & directories ──────────────────────────────────────────────
 
 /// Device files that need write access for normal tool operation.
@@ -78,6 +84,15 @@ pub(crate) fn temp_writable_paths() -> Vec<PathBuf> {
 /// Device files are handled separately via `allow_file` in `to_capability_set_with_config`.
 pub(crate) fn essential_writable_paths(workspace: &Path) -> Vec<PathBuf> {
     let mut paths = vec![workspace.to_path_buf(), grok_home()];
+    paths.extend(temp_writable_paths());
+    paths
+}
+
+/// Writable directory paths for the strict profile: workspace, sessions, and temp.
+/// Strict can read `grok_home()` but must not write it, so that a sandboxed command
+/// cannot change config, hooks, or permission state.
+pub(crate) fn essential_writable_paths_strict(workspace: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![workspace.to_path_buf(), grok_home().join("sessions")];
     paths.extend(temp_writable_paths());
     paths
 }

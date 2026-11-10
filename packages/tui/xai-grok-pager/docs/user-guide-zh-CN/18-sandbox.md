@@ -172,7 +172,7 @@ grok --sandbox project
 
 ## 事件日志
 
-沙箱事件会记录到 `~/.grok/sandbox-events.jsonl`，便于调试。事件包括：
+沙箱事件会记录到 `~/.bladerunner/sessions/sandbox-events.jsonl`，便于调试。事件包括：
 
 - 已应用的配置档（哪个配置档、时间戳）
 - 违规（试图访问被拒绝的路径）

@@ -199,6 +199,16 @@ pub fn fail_closed_policy_armed_at(home: &Path) -> bool {
     }
 }
 
+/// Whether a sync marker exists in `home`, in any state. Only a managed-config sync
+/// writes the marker, so its absence means no sync wrote the policy files there.
+/// An unreadable or corrupt marker counts as present.
+pub fn managed_sync_marker_present_at(home: &Path) -> bool {
+    match std::fs::symlink_metadata(home.join(MANAGED_CONFIG_CACHE_FILE)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// The sync marker, or `None` if absent / unreadable / corrupt. Allow-on-unreadable:
 /// a read blip or torn write mustn't lock out a managed user. Unreadable/corrupt are
 /// logged (a corruption-to-disarm isn't silent) and self-heal on the next sync.
