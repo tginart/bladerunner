@@ -1266,7 +1266,7 @@ impl ScrollbackState {
             new_tc.set_started_at(t);
         }
         let kind_changed = verb_group::verb_group_kind_changed(&entry.block, &block);
-        let (edit_to_edit, untrusted_rising) = match (&entry.block, &block) {
+        let (is_same_kind, untrusted_rising) = match (&entry.block, &block) {
             (
                 RenderBlock::ToolCall(ToolCallBlock::Edit(old)),
                 RenderBlock::ToolCall(ToolCallBlock::Edit(new)),
@@ -1277,12 +1277,18 @@ impl ScrollbackState {
             _ => (false, false),
         };
         entry.block = block;
-        if edit_to_edit {
-            // Keep the current mode: the entry was already an Edit, so any
-            // change since materialization is a user gesture — except on the
-            // untrusted rising edge, where the collapsed one-liner became a
-            // lie and Expanded is the only truthful default. Pins still win.
+        if is_same_kind {
+            // Keep the current mode: the entry already had this kind, so any
+            // change since materialization is a user gesture. Live progress
+            // (an Execute output tick) swaps the block through here, and must
+            // not snap a user's expand shut. The exception is the untrusted
+            // Edit rising edge, where the collapsed one-liner became a lie
+            // and Expanded is the only truthful default. Pins still win.
             if untrusted_rising && !(respect_manual_folds && entry.display_mode_pinned) {
+            (RenderBlock::ToolCall(old), RenderBlock::ToolCall(new)) => (
+                std::mem::discriminant(old) == std::mem::discriminant(new),
+                false,
+            ),
                 entry.display_mode = DisplayMode::Expanded;
             }
         } else if respect_manual_folds && entry.display_mode_pinned {
@@ -2168,6 +2174,120 @@ mod tests {
             !state.replace_tool_block(
                 EntryId::new(9999),
                 edit_block(EditToolCallBlock::new("f.rs", vec![])),
+    /// A same-kind swap keeps the current mode. Live Execute progress
+    /// rebuilds the row through `replace_tool_block`, so a user's expand must
+    /// survive it and the completion that follows. A collapsed Execute must
+    /// not open by itself.
+    #[test]
+    fn replace_tool_block_execute_same_kind_preserves_mode() {
+        use crate::scrollback::blocks::tool::ExecuteToolCallBlock;
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+        state.set_last_running(true);
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(id, RenderBlock::execute("cargo build"), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "Other to Execute is a kind change and adopts the default"
+        );
+
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output("cargo build", "Compiling\n", None::<String>),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Execute progress must keep the user's expand"
+        );
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output(
+                "cargo build",
+                "Compiling\nFinished\n",
+                None::<String>
+            ),
+            None
+        ));
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "completion must not snap a user-expanded Execute shut"
+        );
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::execute("cargo test"));
+        state.set_last_running(true);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed
+        );
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output("cargo test", "running 1 test\n", None::<String>),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "Execute progress must not open a collapsed Execute"
+        );
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::search("todo", 0, vec![]));
+        state.set_last_running(true);
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(id, RenderBlock::search("todo", 3, vec![]), None));
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Search to Search must keep a user expand through completion"
+        );
+
+        let bash = |output: Option<&str>| {
+            let mut b = ExecuteToolCallBlock::new("pytest");
+            b.bash_mode = true;
+            if let Some(o) = output {
+                b = b.with_output(o);
+            }
+            RenderBlock::ToolCall(ToolCallBlock::Execute(b))
+        };
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(bash(None));
+        state.set_last_running(true);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Truncated
+        );
+        assert!(state.replace_tool_block(id, bash(Some("running 1 test\n")), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Truncated,
+            "bash progress must not open a Truncated block"
+        );
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "bash finish still expands from the kept Truncated mode"
+        );
+    }
+
                 None
             ),
             "missing entry reports false"
