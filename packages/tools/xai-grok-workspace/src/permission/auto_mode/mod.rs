@@ -13,13 +13,15 @@ use super::bash_command_splitting::{
     PlainCommand, is_wrapper_command, strip_wrapper_command, try_parse_shell,
     try_parse_word_only_commands_sequence, unwrap_wrappers,
 };
-use super::exec_risk::{git_words_are_read_only_query, git_words_have_unsafe_query_option};
 use super::shell_access::{
     command_words_write_paths, command_write_paths_in_tree, is_safe_write_sink,
 };
 use super::types::AccessKind;
 
+mod routine_git;
 mod security_findings;
+
+use routine_git::git_words_are_routine;
 
 pub use security_findings::{BashSecurityAssessment, ClassifierSecurityFinding};
 
@@ -487,22 +489,10 @@ impl HeuristicPermissionClassifier {
 /// SAFE-subcommand allowlist in [`package_manager_subcommand_is_routine`].
 /// `cp`/`mv`/`mkdir`/`touch` are also ABSENT: they write/create arbitrary
 /// destinations the write model already Blocks. `cd`/`pushd`/`popd` only move
-/// the spawned shell's cwd; git entries are the local workflow plus read-only
-/// queries.
+/// the spawned shell's cwd. `git` is ABSENT: [`routine_git`] decides every git
+/// shape, so destructive `checkout`/`switch`/`stash` forms reach the classifier.
 const ROUTINE_PREFIXES: &[&str] = &[
     "cargo ",
-    // Read-only git queries are NOT listed here: they go through the shared
-    // `exec_risk::git_words_are_read_only_query` helper (single verb table +
-    // unsafe-option table) in `bash_command_is_routine`. Only the local
-    // write-workflow verbs stay prefix-matched.
-    "git add",
-    "git commit",
-    "git checkout",
-    "git switch",
-    "git stash",
-    "git pull",
-    "git fetch",
-    "git worktree list",
     "pytest",
     "python ",
     "python3 ",
@@ -697,19 +687,10 @@ fn bash_command_is_routine(words: &[String]) -> bool {
     if head == "find" {
         return find_is_read_only(inner);
     }
-    // Git: read-only queries decide via the shared helper (one verb table +
-    // one unsafe-option table with the manager safe lists — `--filters` /
-    // `--textconv` content drivers, `--output` write sink, `--ext-diff`,
-    // `grep -O` pager exec, with long-option abbreviations failing closed).
-    // The local write-workflow verbs (`git add`/`commit`/…) fall through to
-    // ROUTINE_PREFIXES, still subject to the same unsafe-option table.
+    // Git: the fail-closed allowlist in `routine_git` decides every shape. It
+    // reuses the shared exec_risk read-only verb table and unsafe-option table.
     if head == "git" {
-        if git_words_are_read_only_query(inner) {
-            return true;
-        }
-        if git_words_have_unsafe_query_option(inner) {
-            return false;
-        }
+        return git_words_are_routine(inner);
     }
     // `tree -o <file>` writes an arbitrary path outside the write model; short
     // flags group (`-ao`), so reject any short-flag word containing `o`.
@@ -3156,6 +3137,59 @@ mod tests {
             "treefmt --fix",
         ] {
             assert_eq!(v(cmd), ClassifierVerdict::Block, "`{cmd}` must not match");
+        }
+    }
+
+    /// Regression for #50: destructive `checkout`/`switch`/`stash` forms used to
+    /// ride the `git checkout`/`git switch`/`git stash` prefixes past the classifier.
+    #[test]
+    fn destructive_git_forms_are_not_routine() {
+        let empty = ClassifierContext::default();
+        let v = |cmd: &str| {
+            HeuristicPermissionClassifier::classify_sync(
+                "run_terminal_command",
+                &AccessKind::Bash(cmd.into()),
+                Some(cmd),
+                &empty,
+            )
+        };
+        for cmd in [
+            "git checkout -- .",
+            "git checkout -- src/lib.rs",
+            "git checkout HEAD -- Cargo.toml",
+            "git checkout -f main",
+            "git checkout Cargo.toml",
+            "git switch --discard-changes main",
+            "git switch -f main",
+            "git stash drop",
+            "git stash clear",
+            "git stash pop",
+            "env GIT_PAGER=cat git checkout -- .",
+            "git status && git checkout -- .",
+        ] {
+            assert_eq!(
+                v(cmd),
+                ClassifierVerdict::Block,
+                "`{cmd}` must reach the classifier"
+            );
+        }
+        for cmd in [
+            "git checkout main",
+            "git checkout -b feature/x",
+            "git switch -c feature/y",
+            "git stash",
+            "git stash push -m wip",
+            "git stash apply",
+            "git stash list",
+            "git add -A",
+            "git commit -m x",
+            "git fetch origin",
+        ] {
+            assert_eq!(
+                v(cmd),
+                ClassifierVerdict::Allow,
+                "`{cmd}` must stay routine"
+            );
         }
     }
 
