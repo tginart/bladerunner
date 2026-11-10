@@ -1119,6 +1119,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "show_inference_speed" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("show_inference_speed", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_show_inference_speed(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "combine_queued_prompts" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("combine_queued_prompts", "Bool", &value));

@@ -944,6 +944,9 @@ pub struct AgentView {
     /// Current goal orchestration state. Set by `GoalUpdated` session
     /// notifications, cleared when a new session starts.
     pub goal_state: Option<super::agent::GoalDisplayState>,
+    /// Speed of the latest live model response (`ResponseCompleted`). Shown
+    /// as a status-bar chip when `[ui].show_inference_speed` is on.
+    pub inference_speed: Option<crate::views::agent_status::InferenceSpeed>,
     pub workflow_blocks: std::collections::HashMap<String, crate::scrollback::entry::EntryId>,
     pub workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
     pub workflow_run_revisions: std::collections::HashMap<String, u64>,

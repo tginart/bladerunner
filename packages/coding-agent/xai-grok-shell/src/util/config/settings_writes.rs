@@ -64,6 +64,11 @@ pub async fn set_hooks_muted(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.hooks_muted = Some(value)).await
 }
 
+/// Persist `[ui].show_inference_speed` via `update_config`.
+pub async fn set_show_inference_speed(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.show_inference_speed = Some(value)).await
+}
+
 /// Persist `[web_search].provider` via `update_config`. `auto` removes the
 /// section, since it is the default.
 pub async fn set_web_search_provider(

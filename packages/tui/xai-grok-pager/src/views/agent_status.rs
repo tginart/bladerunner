@@ -325,9 +325,107 @@ pub fn mcp_status_line(
     ]))
 }
 
+/// Measured speed of one model response, as reported by the shell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InferenceSpeed {
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_sec: Option<f64>,
+}
+
+impl InferenceSpeed {
+    /// Returns `None` when the response carried no speed data at all.
+    pub fn new(ttft_ms: Option<u64>, tokens_per_sec: Option<f64>) -> Option<Self> {
+        let tokens_per_sec = tokens_per_sec.filter(|t| t.is_finite() && *t > 0.0);
+        if ttft_ms.is_none() && tokens_per_sec.is_none() {
+            return None;
+        }
+        Some(Self {
+            ttft_ms,
+            tokens_per_sec,
+        })
+    }
+}
+
+/// Purpose: This function makes the dim status-bar chip for inference speed.
+/// Input: The latest measured speed. The theme.
+/// Output: A line such as `42 tok/s · 380ms TTFT`.
+/// Note: A missing value is left out. The chip uses `text_secondary` so that
+/// it stays quiet next to the other status items.
+pub fn inference_speed_line(speed: &InferenceSpeed, theme: &Theme) -> Line<'static> {
+    let mut parts = Vec::with_capacity(2);
+    if let Some(tps) = speed.tokens_per_sec {
+        parts.push(format!("{} tok/s", format_tokens_per_sec(tps)));
+    }
+    if let Some(ttft_ms) = speed.ttft_ms {
+        parts.push(format!("{} TTFT", format_ttft(ttft_ms)));
+    }
+    let style = Style::default().fg(theme.text_secondary).bg(theme.bg_base);
+    Line::from(Span::styled(parts.join(" \u{00b7} "), style))
+}
+
+/// One decimal below 10 tok/s (where it matters), whole numbers above.
+fn format_tokens_per_sec(tps: f64) -> String {
+    if tps < 10.0 {
+        format!("{tps:.1}")
+    } else {
+        format!("{}", tps.round() as u64)
+    }
+}
+
+/// `380ms` under a second, `1.2s` under ten seconds, `12s` above.
+fn format_ttft(ttft_ms: u64) -> String {
+    if ttft_ms < 1_000 {
+        format!("{ttft_ms}ms")
+    } else if ttft_ms < 10_000 {
+        format!("{:.1}s", ttft_ms as f64 / 1_000.0)
+    } else {
+        format!("{}s", (ttft_ms as f64 / 1_000.0).round() as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn speed_text(ttft_ms: Option<u64>, tokens_per_sec: Option<f64>) -> Option<String> {
+        let theme = Theme::default();
+        InferenceSpeed::new(ttft_ms, tokens_per_sec).map(|s| {
+            inference_speed_line(&s, &theme)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn inference_speed_chip_formats_both_values() {
+        assert_eq!(
+            speed_text(Some(380), Some(42.4)).as_deref(),
+            Some("42 tok/s \u{00b7} 380ms TTFT")
+        );
+        assert_eq!(
+            speed_text(Some(1_240), Some(7.44)).as_deref(),
+            Some("7.4 tok/s \u{00b7} 1.2s TTFT")
+        );
+        assert_eq!(
+            speed_text(Some(12_400), Some(150.0)).as_deref(),
+            Some("150 tok/s \u{00b7} 12s TTFT")
+        );
+    }
+
+    #[test]
+    fn inference_speed_chip_drops_missing_values() {
+        assert_eq!(speed_text(Some(500), None).as_deref(), Some("500ms TTFT"));
+        assert_eq!(speed_text(None, Some(88.0)).as_deref(), Some("88 tok/s"));
+        // Zero / non-finite throughput is not a measurement.
+        assert_eq!(
+            speed_text(Some(500), Some(0.0)).as_deref(),
+            Some("500ms TTFT")
+        );
+        assert_eq!(speed_text(None, Some(f64::NAN)), None);
+        assert_eq!(speed_text(None, None), None);
+    }
 
     #[test]
     fn tokens_compact_sub_thousand() {

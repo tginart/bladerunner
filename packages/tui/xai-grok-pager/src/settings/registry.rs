@@ -609,6 +609,10 @@ pub fn current_value_for(
         "hooks_muted" => Some(SettingValue::Bool(
             crate::appearance::cache::load_hooks_muted(),
         )),
+        // Cache is the render-path source of truth (status-bar chip).
+        "show_inference_speed" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_show_inference_speed(),
+        )),
         "confirm_before_rewind" => Some(SettingValue::Bool(ui.confirm_before_rewind_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
@@ -987,6 +991,13 @@ mod tests {
                         *default,
                         ui.hooks_muted.unwrap_or(false),
                         "hooks_muted default drifts from UiConfig::default()"
+                    );
+                }
+                ("show_inference_speed", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.show_inference_speed.unwrap_or(false),
+                        "show_inference_speed default drifts from UiConfig::default()"
                     );
                 }
                 ("simple_mode", SettingKind::Bool { default }) => {

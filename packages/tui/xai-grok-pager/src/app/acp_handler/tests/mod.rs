@@ -2143,6 +2143,7 @@ mod session_routing;
 mod plugins;
 mod subagents;
 mod goals;
+mod inference_speed;
 mod interactions;
 mod background_tasks;
 mod models;

@@ -93,9 +93,10 @@ use super::settings::setters::{
     set_invert_scroll, set_keep_text_selection, set_language, set_max_thoughts_width,
     set_multiline_mode, set_page_flip_on_send, set_prompt_suggestions, set_remember_tool_approvals,
     set_render_mermaid, set_respect_manual_folds, set_screen_mode, set_scroll_lines,
-    set_scroll_mode, set_scroll_speed, set_show_thinking_blocks, set_show_tips, set_simple_mode,
-    set_theme, set_timeline, set_timestamps, set_turn_complete_sound, set_vim_mode,
-    set_voice_capture_mode, set_voice_keybind_enabled, set_voice_stt_language,
+    set_scroll_mode, set_scroll_speed, set_show_inference_speed, set_show_thinking_blocks,
+    set_show_tips, set_simple_mode, set_theme, set_timeline, set_timestamps,
+    set_turn_complete_sound, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
+    set_voice_stt_language,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
@@ -1220,6 +1221,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetConfirmBeforeRewind(v) => set_confirm_before_rewind(app, v),
         Action::SetCombineQueuedPrompts(v) => set_combine_queued_prompts(app, v),
         Action::SetHooksMuted(v) => set_hooks_muted(app, v),
+        Action::SetShowInferenceSpeed(v) => set_show_inference_speed(app, v),
         Action::SetSimpleMode(v) => set_simple_mode(app, v),
         Action::SetContextualHintUndo(v) => set_contextual_hint_undo(app, v),
         Action::SetContextualHintPlanMode(v) => set_contextual_hint_plan_mode(app, v),
