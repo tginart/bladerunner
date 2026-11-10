@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use xai_grok_tools::implementations::grok_build::agent_hub::{
-    AgentBus, HubView, MemberKind, ensure_person, store,
+    AgentBus, HubView, MemberKind, ensure_person, person_handle_in, store,
 };
 
 use crate::util::grok_home::grok_home;
@@ -163,7 +163,9 @@ fn session_hub_label(root: &Path, session_id: &str) -> Option<String> {
     if !hub.has_messages() {
         return None;
     }
-    let unread = unread_count(&hub, &store::person_handle()).ok()?;
+    // The same handle that the hub browser reads and saves the cursors of.
+    let person = person_handle_in(&hub.meta().ok()?, &store::person_handle());
+    let unread = unread_count(&hub, &person).ok()?;
     Some(with_unread("hub \u{b7} private".to_string(), unread))
 }
 
