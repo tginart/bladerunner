@@ -49,6 +49,8 @@ pub(crate) fn default_agent_type() -> String {
 pub const CLI_CHAT_PROXY_BASE_URL_DEFAULT: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Default base URL for the public xAI API.
 pub const XAI_API_BASE_URL_DEFAULT: &str = "https://api.x.ai/v1";
+/// Picker platform label for `vertex_messages` models without `platform_name`.
+pub const VERTEX_PLATFORM_NAME_DEFAULT: &str = "Google Vertex AI";
 /// One or more environment variable names that may hold a model API key.
 ///
 /// Serde `untagged`: accepts a string or an array in TOML/JSON.
@@ -4991,6 +4993,13 @@ impl ConfigModelOverride {
         }
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
+        }
+        // After `platform_name` and `api_backend` are applied, so an explicit
+        // label from the model or its provider always wins.
+        if entry.info.api_backend == ApiBackend::VertexMessages
+            && entry.info.platform_name.is_none()
+        {
+            entry.info.platform_name = Some(VERTEX_PLATFORM_NAME_DEFAULT.to_string());
         }
         if self.request_compat.is_some() {
             entry.info.request_compat.clone_from(&self.request_compat);

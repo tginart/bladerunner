@@ -261,7 +261,7 @@ Use Claude models served by Google-managed Vertex AI with `vertex_messages`:
 [model_providers.vertex-claude]
 base_url = "https://aiplatform.googleapis.com"   # global; regions use https://{region}-aiplatform.googleapis.com
 api_backend = "vertex_messages"
-platform_name = "Google Vertex AI"
+platform_name = "Google Vertex AI"                # optional; this is the default for vertex_messages
 
 [model."vertex-claude/claude-fable-5-2"]
 model_provider = "vertex-claude"
