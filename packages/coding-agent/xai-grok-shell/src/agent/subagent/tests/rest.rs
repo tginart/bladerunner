@@ -672,19 +672,12 @@ fn subagent_tool_params_default_bash_uses_production_ceiling() {
     );
 }
 
-/// Subagent spawns carry concrete ask_user_question timeout params. Tier
-/// precedence itself is pinned by the resolver's own tests; asserting
-/// concrete values here would read the host's disk layers and flake on
-/// configured dev machines.
+/// A child has no ask_user_question tool, so its spawn carries no params
+/// for that tool.
 #[test]
-fn subagent_tool_params_carry_ask_user_question_timeouts() {
+fn subagent_tool_params_omit_ask_user_question() {
     let ctx = ctx_with_toggle(std::collections::HashMap::new());
-    let params = ctx.resolve_tool_params_json();
-    let ask = params
-        .ask_user_question
-        .expect("subagents must receive resolved ask_user_question params");
-    assert!(ask.get("timeout_enabled").is_some_and(|v| v.is_boolean()));
-    assert!(ask.get("timeout_secs").is_some_and(|v| v.is_u64()));
+    assert!(ctx.resolve_tool_params_json().ask_user_question.is_none());
 }
 /// End-to-end glue: gate ON + a worktree present runs the completion
 /// sequence (snapshot → persist ref to meta.json → remove) and verifies the

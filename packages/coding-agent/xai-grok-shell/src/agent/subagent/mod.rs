@@ -191,8 +191,8 @@ pub(crate) struct SubagentSpawnContext {
     /// Whether goal mode (`/goal`) is enabled.
     pub goal_enabled: bool,
     pub background_workflows_enabled: bool,
-    /// Whether the `ask_user_question` tool is exposed to this subagent,
-    /// inherited from the parent session (see `build_subagent_spawn_context`).
+    /// Whether the `ask_user_question` tool is exposed to this subagent.
+    /// `build_subagent_spawn_context` always sets it to `false`.
     pub ask_user_question_enabled: bool,
     /// Whether the parent session is non-interactive (headless `-p` / SDK),
     /// copied onto the child's `StartupHints` so its ask_user_question also
@@ -434,8 +434,8 @@ impl SubagentSpawnContext {
     /// Bash resolves from the parent's `[toolset.bash]` config and remote
     /// settings, the same way the parent session does. Without this, a child
     /// fell back to the tool-server defaults: a 5 min foreground ceiling and
-    /// the parent's timeout and auto-background choices ignored. The
-    /// ask_user_question timeout resolves from the same tiers as the parent.
+    /// the parent's timeout and auto-background choices ignored. A child has
+    /// no ask_user_question tool, so it gets no params for that tool.
     pub(crate) fn resolve_tool_params_json(
         &self,
     ) -> crate::session::agent_rebuild::ResolvedToolParamsJson {
@@ -444,15 +444,9 @@ impl SubagentSpawnContext {
             .as_ref()
             .map(|cfg| cfg.toolset.bash.clone())
             .unwrap_or_default();
-        let ask_params = crate::util::config::resolve_ask_user_question_params_from_disk(
-            self.remote_settings.as_ref(),
-        );
         crate::session::agent_rebuild::ResolvedToolParamsJson {
             bash: Some(bash_config.to_bash_params_json_with_remote(self.remote_settings.as_ref())),
-            ask_user_question: match serde_json::to_value(ask_params) {
-                Ok(serde_json::Value::Object(map)) => Some(map),
-                _ => None,
-            },
+            ask_user_question: None,
         }
     }
 }

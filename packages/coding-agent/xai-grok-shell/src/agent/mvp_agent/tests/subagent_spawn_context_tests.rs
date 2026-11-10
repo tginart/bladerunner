@@ -100,32 +100,23 @@ async fn subagent_spawn_context_shares_parent_goal_loop_gate() {
     );
 }
 
-/// A subagent inherits the parent session's `ask_user_question` gate, so
-/// `--no-ask-user` strips the tool from subagents too, while the default keeps it.
+/// A subagent never gets `ask_user_question`, whatever the parent's gate is.
+/// Only the root session talks to the user.
 #[tokio::test]
-async fn subagent_spawn_context_inherits_parent_ask_user_question_gate() {
+async fn subagent_spawn_context_disables_ask_user_question() {
     let agent = build_minimal_agent_for_tests();
 
-    // Parent with the tool disabled (the `--no-ask-user` case) → child off.
-    let sid_off = acp::SessionId::new("parent-no-ask");
-    let mut handle_off = make_test_handle("test-model", false, None);
-    handle_off.ask_user_question_enabled = false;
-    agent.insert_resident(&sid_off, handle_off);
-    let ctx_off = agent.build_subagent_spawn_context(sid_off.0.as_ref());
-    assert!(
-        !ctx_off.ask_user_question_enabled,
-        "subagent must inherit the parent's disabled ask_user_question gate (--no-ask-user)"
-    );
-
-    // Parent with the tool enabled (the default) → child on.
-    let sid_on = acp::SessionId::new("parent-ask");
-    let handle_on = make_test_handle("test-model", false, None);
-    agent.insert_resident(&sid_on, handle_on);
-    let ctx_on = agent.build_subagent_spawn_context(sid_on.0.as_ref());
-    assert!(
-        ctx_on.ask_user_question_enabled,
-        "subagent must inherit the parent's enabled ask_user_question gate"
-    );
+    for (sid, parent_enabled) in [("parent-no-ask", false), ("parent-ask", true)] {
+        let sid = acp::SessionId::new(sid);
+        let mut handle = make_test_handle("test-model", false, None);
+        handle.ask_user_question_enabled = parent_enabled;
+        agent.insert_resident(&sid, handle);
+        let ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(
+            !ctx.ask_user_question_enabled,
+            "subagent must not get ask_user_question (parent enabled: {parent_enabled})"
+        );
+    }
 }
 
 /// A subagent copies the parent's `non_interactive` flag, so a headless (`-p`)
