@@ -3972,6 +3972,7 @@ impl MvpAgent {
             session_meta,
             model_agent_type,
             session_model_id,
+            initial_reasoning_effort,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
@@ -4342,13 +4343,15 @@ impl MvpAgent {
             );
             agent_definition.user_message_template = template;
         }
-        let (session_model_id, sampling_config) = self
+        let (session_model_id, mut sampling_config) = self
             .apply_agent_model_override(
                 pinned_model.as_ref(),
                 session_model_id,
                 sampling_config,
                 origin_client.clone(),
             );
+        self.models_manager
+            .apply_supported_effort(&mut sampling_config, initial_reasoning_effort);
         let max_turns = {
             let cfg = self.cfg.borrow();
             cfg.cli_agent_overrides

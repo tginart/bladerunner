@@ -1336,6 +1336,52 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
         "absent session effort falls back to the global default",
     );
 }
+/// `/new` and `/clear` send no effort. The sampler a new session spawns with
+/// must take the current effort (last `/effort` choice or config default),
+/// not the catalog default of the model.
+#[tokio::test]
+async fn new_session_sampler_keeps_current_effort_over_catalog_default() {
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use xai_grok_sampling_types::ReasoningEffort;
+    let agent = build_minimal_agent_for_tests();
+    let mut supported = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
+    supported.info.supports_reasoning_effort = true;
+    supported.info.reasoning_effort = Some(ReasoningEffort::High);
+    agent
+        .models_manager
+        .insert_test_entry("effort-model", supported.clone());
+    agent
+        .models_manager
+        .set_current_reasoning_effort(Some(ReasoningEffort::Low));
+
+    let mut cfg = agent.prepare_sampling_config_for_model(&supported, None);
+    assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::High));
+    let current = agent.models_manager.current_reasoning_effort();
+    assert!(agent.models_manager.apply_supported_effort(&mut cfg, current));
+    assert_eq!(
+        cfg.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "/clear must keep the chosen effort, not the catalog default",
+    );
+
+    let plain = ModelEntry::fallback("plain-model", &EndpointsConfig::default());
+    agent.models_manager.insert_test_entry("plain-model", plain.clone());
+    let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
+    assert!(!agent.models_manager.apply_supported_effort(&mut plain_cfg, current));
+    assert_eq!(plain_cfg.reasoning_effort, None);
+}
+/// The model switch that follows a `session/new` with a `modelId` rebuilds the
+/// sampler from the catalog, so its request must carry the chosen effort.
+#[test]
+fn reasoning_effort_meta_round_trips_through_the_switch_parser() {
+    use xai_grok_sampling_types::{ReasoningEffort, parse_reasoning_effort_meta};
+    let meta = super::reasoning_effort::reasoning_effort_meta(Some(ReasoningEffort::Low));
+    assert_eq!(
+        parse_reasoning_effort_meta(meta.as_ref()),
+        Some(ReasoningEffort::Low)
+    );
+    assert!(super::reasoning_effort::reasoning_effort_meta(None).is_none());
+}
 /// A session persisted under a routing *slug* (not the catalog map key) must
 /// still get reasoning modes and a selected model from
 /// `session_config_options` — the id is resolved to the catalog key before
