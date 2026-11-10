@@ -53,7 +53,8 @@ for line in sys.stdin:
 /// can take it. It answers every POST with plain JSON and has no SSE stream
 /// (GET and DELETE get 405). `FIXTURE_MODE=oauth` also serves OAuth
 /// authorization-server metadata. `FIXTURE_MODE=stall` holds every GET open
-/// and answers every POST with 503.
+/// and answers every POST with 503. `FIXTURE_MODE=list_stall` answers
+/// `initialize` and holds every `tools/list` open.
 const HTTP_SERVER_SCRIPT: &str = r#"
 import json
 import os
@@ -108,6 +109,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_empty(202)
             return
         method = request['method']
+        if MODE == 'list_stall' and method == 'tools/list':
+            time.sleep(30)
+            return
         if method == 'initialize':
             result = {
                 'protocolVersion': request['params']['protocolVersion'],
@@ -452,6 +456,57 @@ async fn stale_retry_attempt_discards_its_client() {
                     .await
                     .iter()
                     .any(|d| d.function.name == "flaky__proof")
+            );
+        })
+        .await;
+}
+
+/// Purpose: Verify that a retried server that answers `initialize` but
+///     stalls on `tools/list` cannot hold the retry pass past the
+///     discovery budget.
+/// Input: A due retry against a server with a 1 s startup timeout, so the
+///     budget is 7 s. The server holds `tools/list` open for 30 s.
+/// Output: The pass ends within the budget. The server has no client and
+///     waits one new cooldown, not the attempt lease.
+#[tokio::test(flavor = "current_thread")]
+async fn retried_server_that_stalls_on_tool_list_times_out() {
+    if python3_is_missing() {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let actor = actor(root.path()).await;
+            let server = HttpFixture::start(root.path(), "list_stall");
+            let cooldown = crate::session::mcp_servers::McpState::UNREACHABLE_RETRY_COOLDOWN;
+            {
+                let mut state = actor.mcp_state.lock().await;
+                state.configs = vec![http_server("slow", &server.url())];
+                state.meta_config_map.insert(
+                    "slow".to_string(),
+                    crate::session::mcp_servers::McpServerMetaConfig {
+                        startup_timeout_ms: Some(1000),
+                        ..Default::default()
+                    },
+                );
+                state.record_unreachable_failure("slow", "refused".to_string());
+            }
+            let pass = actor.retry_unreachable_servers_at(std::time::Instant::now() + cooldown);
+            tokio::time::timeout(Duration::from_secs(15), pass)
+                .await
+                .expect("the retry pass must end within the discovery budget");
+            let state = actor.mcp_state.lock().await;
+            assert!(state.get_client("slow").is_none());
+            assert!(state.init_failed.contains_key("slow"));
+            assert!(state.is_unreachable_retry_pending("slow"));
+            let now = std::time::Instant::now();
+            assert!(
+                !state.has_due_unreachable_retry(now),
+                "the timeout must start a new cooldown"
+            );
+            assert!(
+                state.has_due_unreachable_retry(now + cooldown),
+                "the timeout must settle the attempt, not hold it for the lease"
             );
         })
         .await;

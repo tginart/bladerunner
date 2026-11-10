@@ -529,7 +529,10 @@ impl SessionActor {
             client.set_event_tx(Some(tx));
         }
         let client = std::sync::Arc::new(client);
-        let registrations = match client.get_tool_registrations(self.mcp_state.clone()).await {
+        // A server can come back far enough to answer `initialize` and then
+        // stall on `tools/list`. Tool calls wait for this pass, so it needs
+        // the same deadline as startup discovery.
+        let registrations = match discover_tools_bounded(&client, self.mcp_state.clone()).await {
             Ok(registrations) => registrations,
             Err(e) => {
                 tracing::debug!(server = server_name, %e, "retry_unreachable: handshake still failing");
@@ -1416,21 +1419,7 @@ impl SessionActor {
                     if let Some(tx) = task_event_tx {
                         client.set_event_tx(Some(tx));
                     }
-                    let init_budget = std::time::Duration::from_secs(
-                        timeout_sec.saturating_mul(2).saturating_add(5),
-                    );
-                    let registrations = match tokio::time::timeout(
-                        init_budget,
-                        client.get_tool_registrations(mcp_state),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(crate::session::mcp_servers::McpError::Timeout {
-                            server: server_name.clone(),
-                            timeout_secs: init_budget.as_secs(),
-                        }),
-                    };
+                    let registrations = discover_tools_bounded(&client, mcp_state).await;
                     let result = match registrations {
                         Ok(handles) => {
                             Ok((server_name, handles, server_start.elapsed(), timeout_sec))
@@ -1981,6 +1970,35 @@ impl Drop for UnsettledUnreachableAttempts {
         runtime.spawn(async move {
             release_unreachable_attempts(&mut *mcp_state.lock().await, attempts);
         });
+    }
+}
+
+/// Purpose: Run the handshake and the tool discovery of one MCP client
+///     under one deadline.
+/// Input: The client and the shared MCP state.
+/// Output: The tool registrations, or `McpError::Timeout` when the budget
+///     ends first.
+/// Note: `get_tool_registrations` bounds only `initialize`. The budget also
+///     bounds the `tools/list` pages that follow it.
+async fn discover_tools_bounded(
+    client: &crate::session::mcp_servers::McpClient,
+    mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,
+) -> Result<
+    Vec<crate::session::mcp_servers::McpToolRegistration>,
+    crate::session::mcp_servers::McpError,
+> {
+    let budget = std::time::Duration::from_secs(
+        client
+            .startup_timeout_sec()
+            .saturating_mul(2)
+            .saturating_add(5),
+    );
+    match tokio::time::timeout(budget, client.get_tool_registrations(mcp_state)).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::session::mcp_servers::McpError::Timeout {
+            server: client.server_name().to_string(),
+            timeout_secs: budget.as_secs(),
+        }),
     }
 }
 
