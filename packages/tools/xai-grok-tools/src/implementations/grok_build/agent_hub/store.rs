@@ -183,8 +183,26 @@ impl Hub {
         Ok(hub)
     }
 
+    /// Open the hidden hub of a root session. Fail when it does not exist.
+    pub fn open_existing_session_hub(hubs_root: &Path, root_session_id: &str) -> Result<Hub> {
+        let name = session_hub_name(root_session_id);
+        let hub = Hub {
+            dir: hubs_root.join(&name),
+            name,
+        };
+        if !hub.dir.join(META_FILE).exists() {
+            bail!("this session has no hub");
+        }
+        Ok(hub)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// True when some channel or DM of the hub holds a message.
+    pub fn has_messages(&self) -> bool {
+        has_messages(&self.dir.join("channels")) || has_messages(&self.dir.join("dms"))
     }
 
     pub fn dir(&self) -> &Path {
@@ -669,10 +687,7 @@ fn is_idle_session_hub(hub: &Hub) -> bool {
         return false;
     };
     let is_old = now_ms().saturating_sub(meta.created_ms) > IDLE_SESSION_HUB_MS;
-    is_old
-        && !meta.members.iter().any(Member::is_live)
-        && !has_messages(&hub.dir.join("channels"))
-        && !has_messages(&hub.dir.join("dms"))
+    is_old && !meta.members.iter().any(Member::is_live) && !hub.has_messages()
 }
 
 fn has_messages(dir: &Path) -> bool {

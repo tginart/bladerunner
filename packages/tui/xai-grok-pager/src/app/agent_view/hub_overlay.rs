@@ -12,7 +12,9 @@ use crate::views::hub_browser::{HubBrowserState, HubKeyOutcome};
 
 impl AgentView {
     /// Open the browser on a hub: the named hub, or this session's hub when
-    /// `hub` is `None`. On failure, say why in the scrollback instead.
+    /// `hub` is `None`. This session's hub is the named hub it is in, or else
+    /// the private hub of main and its subagents. On failure, say why in the
+    /// scrollback instead.
     pub(crate) fn open_hub_browser(&mut self, hub: Option<&str>, channel: Option<&str>) {
         match self.load_hub_browser(hub, channel) {
             Ok(browser) => {
@@ -75,25 +77,42 @@ impl AgentView {
         channel: Option<&str>,
     ) -> anyhow::Result<HubBrowserState> {
         let root = xai_grok_shell::session::hub::hubs_root();
-        let name = match hub {
-            Some(name) => name.to_string(),
-            None => self.session_hub_name(&root)?,
+        let hub = match hub {
+            Some(name) => open_named_hub(&root, name)?,
+            None => self.open_session_hub(&root)?,
         };
-        let hub = open_named_hub(&root, &name)?;
         HubBrowserState::open(hub, &store::person_handle(), channel)
     }
 
-    fn session_hub_name(&self, root: &std::path::Path) -> anyhow::Result<String> {
+    fn open_session_hub(&self, root: &std::path::Path) -> anyhow::Result<store::Hub> {
         let session_id = self
             .session
             .session_id
             .as_ref()
             .context("the session has not started yet")?;
-        let (name, _handle) = store::find_membership(root, &session_id.0).context(
-            "this session is in no hub. Use /hub open <name>, /hub join <name>, or /hub new <name>.",
-        )?;
-        Ok(name)
+        open_hub_of_session(root, &session_id.0)
     }
+}
+
+/// Purpose: Open the hub of a session for the browser.
+/// Input: The hubs root and the session id.
+/// Output: The named hub where the session is a member, or else the private
+///     session hub of main and its subagents.
+/// Note: The person becomes a member of a session hub that holds messages.
+///     The browser saves the read positions of members only, so without this
+///     the unread count of the status-bar label never goes down.
+fn open_hub_of_session(root: &std::path::Path, session_id: &str) -> anyhow::Result<store::Hub> {
+    if let Some((name, _handle)) = store::find_membership(root, session_id) {
+        return open_named_hub(root, &name);
+    }
+    let hub = store::Hub::open_existing_session_hub(root, session_id).context(
+        "this session has no hub yet. Use /hub open <name>, /hub join <name>, or /hub new <name>.",
+    )?;
+    // An empty session hub stays free of a person, so the prune can remove it.
+    if hub.has_messages() {
+        agent_hub::ensure_person(&hub, &store::person_handle())?;
+    }
+    Ok(hub)
 }
 
 /// Open a hub by name, with a suggestion when the name does not exist.
@@ -121,6 +140,45 @@ mod tests {
         let mut view = crate::test_util::make_agent_view(None, "/tmp");
         view.hub_browser = Some(HubBrowserState::open(bus.hub(), "me", None).unwrap());
         (root, view, bus)
+    }
+
+    #[test]
+    fn session_hub_opens_when_the_session_is_in_no_named_hub() {
+        let root = tempfile::tempdir().unwrap();
+        let error = open_hub_of_session(root.path(), "root").unwrap_err();
+        assert!(error.to_string().contains("no hub yet"), "{error}");
+        let bus = AgentBus::new(root.path().to_path_buf(), "root").unwrap();
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = open_hub_of_session(root.path(), "root").unwrap();
+        let meta = hub.meta().unwrap();
+        assert!(meta.is_session_hub());
+        assert!(
+            meta.members
+                .iter()
+                .all(|m| m.kind != agent_hub::MemberKind::Person)
+        );
+        bus.join("team", Some("worker"), "unused", true).unwrap();
+        assert_eq!(
+            open_hub_of_session(root.path(), "root").unwrap().name(),
+            "team"
+        );
+    }
+
+    #[test]
+    fn reading_the_session_hub_clears_its_unread_label() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = AgentBus::new(root.path().to_path_buf(), "root").unwrap();
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.send(MAIN_PEER_ID, "#general", "status", None, &[])
+            .into_result()
+            .unwrap();
+        let hub = open_hub_of_session(root.path(), "root").unwrap();
+        let person = store::person_handle();
+        let browser = HubBrowserState::open(hub.clone(), &person, Some("#general")).unwrap();
+        assert!(browser.feed.iter().any(|m| m.text == "status"));
+        let handle = agent_hub::person_handle_in(&hub.meta().unwrap(), &person);
+        let read = hub.cursors(&handle).unwrap().read;
+        assert_eq!(read.get("#general").copied(), Some(1));
     }
 
     #[test]
