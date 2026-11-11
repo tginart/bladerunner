@@ -802,6 +802,8 @@ fn compaction_sample_error_to_intra(err: CompactionSampleError) -> IntraCompacti
         CompactionSampleError::Build(msg) => IntraCompactionError::SamplerBuild(msg),
         CompactionSampleError::Start(msg) => IntraCompactionError::SamplerStart(msg),
         CompactionSampleError::EmptyResponse => IntraCompactionError::EmptyResponse,
+        // Terminal like a build failure: the same input overflows again.
+        CompactionSampleError::ContextOverflow(msg) => IntraCompactionError::SamplerBuild(msg),
         CompactionSampleError::Other(e) => {
             let msg = e.to_string();
             if msg.contains("Failed to build") {

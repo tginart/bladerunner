@@ -519,6 +519,7 @@ async fn run_one_attempt(
     let system_sha256 = evidence.system.as_ref().map(|(sha, _)| sha.as_str());
     let hosted_tools = client.request_hosted_tools(&request);
     let sent_reasoning_effort = client.request_sent_effort(&request);
+    let length_policy = request.length_policy;
 
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
@@ -540,6 +541,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -576,6 +578,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 doom_check,
+                length_policy,
                 output_observed,
             )
             .await
@@ -604,6 +607,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -632,6 +636,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -660,6 +665,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -683,6 +689,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -738,6 +745,7 @@ async fn drive_l2(
     hosted_tools: &[serde_json::Value],
     sent_reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    length_policy: xai_grok_sampling_types::LengthPolicy,
     output_observed: Arc<AtomicBool>,
 ) -> AttemptOutcome {
     let mut l2 = pin!(l2);
@@ -779,11 +787,11 @@ async fn drive_l2(
                             };
                         }
                     }
-                    if response.stop_reason == Some(xai_grok_sampling_types::StopReason::Length) {
-                        return AttemptOutcome::Failed {
-                            error: SamplingError::MaxTokensTruncation,
-                        };
-                    }
+                    // Fail-or-salvage for a `Length` stop lives in the one shared gate.
+                    let response = match crate::client::apply_length_policy(length_policy, *response) {
+                        Ok(response) => Box::new(response),
+                        Err(error) => return AttemptOutcome::Failed { error },
+                    };
                     // A content-filtered turn (Anthropic refusal, OpenAI
                     // content_filter stop reason) is legitimately content-less and
                     // deterministic — resampling it would retry-storm.
@@ -1400,6 +1408,7 @@ mod tests {
             &[serde_json::json!({"type": "web_search", "filters": {"allowed_domains": ["example.com"]}})],
             sent,
             None,
+            xai_grok_sampling_types::LengthPolicy::default(),
             Arc::new(AtomicBool::new(false)),
         )
         .await;

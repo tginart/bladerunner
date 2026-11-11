@@ -211,9 +211,11 @@ fn classify(status: Option<u16>, wire: WireErrorType) -> Classified {
             Some("Check your network and try again."),
             None,
         ),
+        // No action: a shorter answer rarely helps, because the output budget
+        // is usually what the context window has left after the prompt.
         WireErrorType::MaxTokensTruncation => (
             "Response truncated",
-            Some("Try asking for a shorter answer."),
+            None,
             Some("The model hit its output limit."),
         ),
         WireErrorType::RateLimited => (
@@ -544,6 +546,21 @@ fn is_noise_detail(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_does_not_suggest_a_shorter_answer() {
+        let formatted = format_request_failure(
+            None,
+            Some("max_tokens_truncation"),
+            "response truncated by max_tokens",
+        );
+        assert_eq!(formatted.headline, "Response truncated");
+        assert!(
+            !formatted.message().contains("shorter answer"),
+            "got: {}",
+            formatted.message()
+        );
+    }
 
     #[test]
     fn formats_500_json_dump() {

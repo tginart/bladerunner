@@ -924,20 +924,77 @@ async fn compaction_reseed_without_provider_count_matches_plain_estimate() {
 }
 
 #[tokio::test]
-async fn non_compaction_replace_does_not_carry_overhead() {
+async fn non_compaction_replace_carries_confirmed_total() {
+    // The estimate runs high against the provider count, so a rewind or mode
+    // switch replace scales from the confirmed count, not the raw estimate.
     let h = TestHarness::new();
     h.handle
         .push_user_message(ConversationItem::user("x".repeat(4000)));
-    h.handle.record_token_usage(51_000);
+    h.handle.record_token_usage(500);
+    // Estimate at last response = 1_000, confirmed = 500, so the ratio is 0.5.
 
     h.handle
         .replace_conversation(vec![ConversationItem::user("q".repeat(4000))]);
 
     let total = h.handle.get_total_tokens().await;
     assert_eq!(
-        total, 1_000,
-        "non-compaction replace (e.g. rewind) keeps the plain estimate"
+        total, 500,
+        "same-size replace carries the provider-confirmed count"
     );
+}
+
+#[tokio::test]
+async fn shrinking_replace_never_increases_total_tokens() {
+    // The confirmed total is above the scaled estimate of the remaining
+    // history, which still fits under the cap.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.record_token_usage(1_500);
+    // History grows after the response (tool output), then a rewrite keeps
+    // more than the last-response estimate but less than the history.
+    h.handle
+        .push_user_message(ConversationItem::user("y".repeat(8000)));
+
+    h.handle
+        .replace_conversation(vec![ConversationItem::user("q".repeat(6000))]);
+
+    assert_eq!(h.handle.get_total_tokens().await, 1_500);
+}
+
+#[tokio::test]
+async fn growing_replace_uses_the_new_estimate() {
+    // A bigger system prompt or an AGENTS.md insert grows the history; a cap
+    // at the old total would under-count it.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.record_token_usage(1_500);
+
+    h.handle
+        .replace_conversation(vec![ConversationItem::user("q".repeat(40_000))]);
+
+    // Raw estimate 10_000 scaled by the confirmed ratio 1_500 / 1_000.
+    assert_eq!(h.handle.get_total_tokens().await, 15_000);
+}
+
+#[tokio::test]
+async fn truncate_scales_from_confirmed_total() {
+    // Rewind uses the same carry as `replace_conversation`.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.increment_prompt_index();
+    h.handle
+        .push_user_message(ConversationItem::user("y".repeat(4000)));
+    h.handle.increment_prompt_index();
+    h.handle.record_token_usage(1_000);
+    // Estimate at last response = 2_000, confirmed = 1_000, so the ratio is 0.5.
+
+    h.handle.truncate_to_prompt_index(1).await;
+
+    // Keeps the first user item (raw estimate 1_000), scaled to 500.
+    assert_eq!(h.handle.get_total_tokens().await, 500);
 }
 
 #[tokio::test]

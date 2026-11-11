@@ -850,6 +850,76 @@ pub trait RequestEvidenceSink: Send + Sync + std::fmt::Debug {
     fn record(&self, evidence: &RequestEvidence);
 }
 
+/// What the sampler does with a completed response whose stop reason is
+/// `Length` (max_tokens truncation). `Length` often arrives far below any
+/// client budget, because the output budget is the context window minus the
+/// prompt.
+///
+/// The default is `CompletePartial`, so side calls (compaction summaries,
+/// recaps, titles, classifiers) keep the cut text they always got from the
+/// direct-collect path. The main turn always sets its policy explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LengthPolicy {
+    /// Fail the attempt with `MaxTokensTruncation`.
+    Fail,
+    /// Complete a response whose tool calls all carry complete JSON
+    /// arguments, so they run. Text-only and empty `Length` stops still fail.
+    CompleteToolCalls,
+    /// Also complete with partial text, for callers that continue it or can
+    /// use it as is. An empty `Length` stop still fails.
+    #[default]
+    CompletePartial,
+}
+
+/// Outcome of applying a [`LengthPolicy`] to a completed response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthVerdict {
+    /// The stop reason is not `Length`; the policy does not apply.
+    Pass,
+    /// A `Length` stop delivered with its partial text.
+    Salvage,
+    /// A `Length` stop delivered with its complete tool calls.
+    SalvageToolCalls,
+    /// A `Length` stop the policy rejects (`MaxTokensTruncation`).
+    Fail,
+}
+
+impl LengthPolicy {
+    /// The fail-or-salvage decision for a completed response, including the
+    /// `Length` stop-reason check.
+    pub fn verdict(self, response: &ConversationResponse) -> LengthVerdict {
+        if response.stop_reason != Some(StopReason::Length) {
+            return LengthVerdict::Pass;
+        }
+        let tool_calls = response.tool_calls();
+        if !tool_calls.is_empty() {
+            return match (self, all_tool_call_arguments_complete(tool_calls)) {
+                (LengthPolicy::Fail, _) | (_, false) => LengthVerdict::Fail,
+                (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, true) => {
+                    LengthVerdict::SalvageToolCalls
+                }
+            };
+        }
+        if self == LengthPolicy::CompletePartial && response.empty_reason().is_none() {
+            LengthVerdict::Salvage
+        } else {
+            LengthVerdict::Fail
+        }
+    }
+}
+
+/// Whether every call's arguments parse as JSON. Empty arguments are the
+/// zero-argument convention (and a call cut before its first argument delta
+/// also collects as empty); running it as `{}` only bounces off argument
+/// validation, which is cheaper than failing the turn. One truncated call
+/// fails the whole batch.
+fn all_tool_call_arguments_complete(tool_calls: &[ToolCall]) -> bool {
+    tool_calls.iter().all(|tc| {
+        tc.arguments.trim().is_empty()
+            || serde_json::from_str::<serde::de::IgnoredAny>(&tc.arguments).is_ok()
+    })
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -912,6 +982,8 @@ pub struct ConversationRequest {
     pub bedrock_request_metadata: indexmap::IndexMap<String, String>,
     /// Bedrock-only custom headers injected before signing; reserved auth/SigV4 headers are rejected.
     pub bedrock_headers: indexmap::IndexMap<String, String>,
+    /// What the sampler does when the response stops with `Length`.
+    pub length_policy: LengthPolicy,
 }
 
 /// OpenAI caps prompt-cache keys at 64 characters (Pi `clampOpenAIPromptCacheKey`).
@@ -11108,6 +11180,59 @@ mod tests {
             message_id: None,
             raw_stop_reason: None,
             stop_sequence: None,
+        }
+    }
+
+    /// `LengthPolicy::verdict` is the one fail-or-salvage gate shared by the
+    /// actor and direct-collect paths; pin every cell.
+    #[test]
+    fn length_policy_verdict_gate() {
+        let length = |item: ConversationItem| {
+            let mut r = make_response(item);
+            r.stop_reason = Some(StopReason::Length);
+            r
+        };
+        let call = |arguments: &str| ToolCall {
+            id: "tc1".into(),
+            name: "do_thing".into(),
+            arguments: arguments.into(),
+        };
+        let text = length(ConversationItem::assistant("partial"));
+        let empty = length(ConversationItem::assistant(""));
+        let complete_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": 1}",
+        )]));
+        let empty_args_tools = length(ConversationItem::assistant_tool_calls(vec![call("")]));
+        let truncated_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": \"trunc",
+        )]));
+        let mixed_tools = length(ConversationItem::assistant_tool_calls(vec![
+            call("{\"x\": 1}"),
+            call("{\"x\": \"trunc"),
+        ]));
+        let stop = make_response(ConversationItem::assistant("done"));
+
+        assert_eq!(LengthPolicy::default(), LengthPolicy::CompletePartial);
+        use LengthPolicy::{CompletePartial, CompleteToolCalls, Fail};
+        use LengthVerdict as V;
+        for (policy, response, want) in [
+            (Fail, &text, V::Fail),
+            (Fail, &complete_tools, V::Fail),
+            (Fail, &stop, V::Pass),
+            (CompleteToolCalls, &complete_tools, V::SalvageToolCalls),
+            (CompleteToolCalls, &empty_args_tools, V::SalvageToolCalls),
+            (CompleteToolCalls, &truncated_tools, V::Fail),
+            (CompleteToolCalls, &mixed_tools, V::Fail),
+            (CompleteToolCalls, &text, V::Fail),
+            (CompleteToolCalls, &empty, V::Fail),
+            (CompleteToolCalls, &stop, V::Pass),
+            (CompletePartial, &text, V::Salvage),
+            (CompletePartial, &empty, V::Fail),
+            (CompletePartial, &complete_tools, V::SalvageToolCalls),
+            (CompletePartial, &truncated_tools, V::Fail),
+            (CompletePartial, &stop, V::Pass),
+        ] {
+            assert_eq!(policy.verdict(response), want, "{policy:?}");
         }
     }
 

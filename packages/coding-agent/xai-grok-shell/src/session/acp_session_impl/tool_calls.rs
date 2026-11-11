@@ -2344,11 +2344,13 @@ impl SessionActor {
         );
         self.signals_handle().record_tool_failure(function_name);
         let message = build_tool_parse_error_message(function_name, &err, raw_arguments);
+        let title = invented_tool_title(&err, function_name);
         self.send_update(
             acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                 tool_call_id.clone(),
                 acp::ToolCallUpdateFields::new()
                     .status(Some(acp::ToolCallStatus::Failed))
+                    .title(title)
                     .content(Some(vec![acp::ToolCallContent::from(
                         acp::ContentBlock::Text(acp::TextContent::new(message.clone())),
                     )])),
@@ -3787,5 +3789,32 @@ mod wait_interrupt_tests {
         );
         drop(new);
         assert_eq!(depth.depth(), 0);
+    }
+}
+
+/// Title for the failed tool card when the model called a tool that is not
+/// registered. Without it the card shows only the invented name, which reads
+/// like a real tool that broke.
+fn invented_tool_title(err: &xai_tool_runtime::ToolError, function_name: &str) -> Option<String> {
+    (err.kind == xai_tool_runtime::ToolErrorKind::NotFound)
+        .then(|| format!("Agent tried calling a tool that doesn't exist: {function_name}"))
+}
+
+#[cfg(test)]
+mod invented_tool_title_tests {
+    use super::invented_tool_title;
+
+    #[test]
+    fn not_found_gets_a_does_not_exist_title() {
+        let not_found = xai_tool_runtime::ToolError::new(
+            xai_tool_runtime::ToolErrorKind::NotFound,
+            "Tool not found: made_up",
+        );
+        assert_eq!(
+            invented_tool_title(&not_found, "made_up").as_deref(),
+            Some("Agent tried calling a tool that doesn't exist: made_up")
+        );
+        let bad_args = xai_tool_runtime::ToolError::invalid_arguments("missing field `path`");
+        assert_eq!(invented_tool_title(&bad_args, "read_file"), None);
     }
 }

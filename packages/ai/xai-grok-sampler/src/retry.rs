@@ -112,7 +112,7 @@ pub fn retry_backoff_with_jitter(retry_count: u32) -> Duration {
 
 /// +/-20% jitter around `base`, de-syncing clients that failed at the
 /// same instant (e.g. a mass Cloudflare 52x event during an origin outage).
-fn jittered(base: Duration) -> Duration {
+pub fn jittered(base: Duration) -> Duration {
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
 

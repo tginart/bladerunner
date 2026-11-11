@@ -14,10 +14,11 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use xai_grok_sampler::{
     ApiBackend, RequestId, SamplerConfig, SamplingChannel, SamplingClient, SamplingErrorInfo,
-    SamplingErrorKind, SamplingEvent, stream_chat_completions, stream_messages, stream_responses,
+    SamplingErrorKind, SamplingEvent, apply_length_policy, stream_chat_completions,
+    stream_messages, stream_responses,
 };
 use xai_grok_sampling_types::{
-    AssistantItem, ConversationItem, ConversationRequest, ConversationResponse,
+    AssistantItem, ConversationItem, ConversationRequest, ConversationResponse, LengthPolicy,
     RequestEvidenceSink, SamplingError, SentCredential, ToolCall, ToolSpec,
 };
 use xai_hyper_host::{
@@ -332,6 +333,7 @@ async fn drive_sampler_stream(
 ) -> Result<(), HostError> {
     let request_id = RequestId::random();
     let idle = Duration::from_secs(300);
+    let length_policy = request.length_policy;
     let recording = client
         .prepare_request_recording(&mut request)
         .map_err(open_sampling_error_to_host_error)?;
@@ -345,7 +347,14 @@ async fn drive_sampler_stream(
                 .await
                 .map_err(open_sampling_error_to_host_error)?;
             let stream = stream_chat_completions(raw, meta, request_id, idle);
-            forward_recorded_sampling_events(stream, tx, Some(recording), response_observer).await
+            forward_recorded_sampling_events(
+                stream,
+                tx,
+                Some(recording),
+                response_observer,
+                length_policy,
+            )
+            .await
         }
         ApiBackend::Responses | ApiBackend::CodexResponses => {
             let (raw, meta, doom) = client
@@ -353,7 +362,14 @@ async fn drive_sampler_stream(
                 .await
                 .map_err(open_sampling_error_to_host_error)?;
             let stream = stream_responses(raw, meta, request_id, idle, doom);
-            forward_recorded_sampling_events(stream, tx, Some(recording), response_observer).await
+            forward_recorded_sampling_events(
+                stream,
+                tx,
+                Some(recording),
+                response_observer,
+                length_policy,
+            )
+            .await
         }
         ApiBackend::Messages => {
             let (raw, meta) = client
@@ -361,7 +377,14 @@ async fn drive_sampler_stream(
                 .await
                 .map_err(open_sampling_error_to_host_error)?;
             let stream = stream_messages(raw, meta, request_id, idle);
-            forward_recorded_sampling_events(stream, tx, Some(recording), response_observer).await
+            forward_recorded_sampling_events(
+                stream,
+                tx,
+                Some(recording),
+                response_observer,
+                length_policy,
+            )
+            .await
         }
         other => Err(HostError::Message(format!(
             "unsupported api backend for hypercore Phase 1: {other:?}"
@@ -382,7 +405,7 @@ async fn forward_sampling_events<S>(
 where
     S: futures::Stream<Item = SamplingEvent> + Send,
 {
-    forward_recorded_sampling_events(stream, tx, None, None).await
+    forward_recorded_sampling_events(stream, tx, None, None, LengthPolicy::default()).await
 }
 
 async fn forward_recorded_sampling_events<S>(
@@ -390,6 +413,7 @@ async fn forward_recorded_sampling_events<S>(
     tx: mpsc::Sender<Result<ModelChunk, HostError>>,
     recording: Option<AssistantItem>,
     response_observer: Option<ResponseObserver>,
+    length_policy: LengthPolicy,
 ) -> Result<(), HostError>
 where
     S: futures::Stream<Item = SamplingEvent> + Send,
@@ -422,6 +446,10 @@ where
                         }
                     }
                 }
+                // A `Length` stop can carry a cut `tool_use`; the gate fails it
+                // before its truncated arguments go out as a `ToolCall`.
+                let response = apply_length_policy(length_policy, *response)
+                    .map_err(open_sampling_error_to_host_error)?;
                 if let Some(observer) = &response_observer {
                     observer(&response);
                 }
@@ -748,6 +776,7 @@ mod sampling_error_map_tests {
                 Some(std::sync::Arc::new(move |response| {
                     *result.lock().unwrap() = Some(response.clone());
                 })),
+                LengthPolicy::default(),
             )
             .await
             .unwrap();
@@ -771,6 +800,49 @@ mod sampling_error_map_tests {
                 echo.or(recording.reasoning_effort)
             );
         }
+    }
+
+    /// A `Length` stop with a cut `tool_use` fails under the request's
+    /// policy, and no `ToolCall` with the truncated arguments goes out.
+    #[tokio::test]
+    async fn forward_length_cut_tool_call_fails_without_emitting_it() {
+        let cut = ConversationResponse {
+            items: vec![ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: "tc1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"a.rs","content":"fn ma"#.into(),
+            }])],
+            stop_reason: Some(xai_grok_sampling_types::StopReason::Length),
+            usage: None,
+            cost_usd_ticks: None,
+            message_chunks_emitted: 0,
+            doom_loop_signals: vec![],
+            stop_message: None,
+            message_id: None,
+            raw_stop_reason: Some("max_tokens".into()),
+            stop_sequence: None,
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = forward_recorded_sampling_events(
+            futures::stream::iter(vec![SamplingEvent::Completed {
+                request_id: RequestId::random(),
+                response: Box::new(cut),
+                metrics: Default::default(),
+            }]),
+            tx,
+            None,
+            None,
+            LengthPolicy::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HostError::Transport(_))),
+            "a cut tool call must fail the stream, got {result:?}"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "no chunk may precede the failure"
+        );
     }
 
     /// Regression: forward itself must not write Err (would double with spawn).

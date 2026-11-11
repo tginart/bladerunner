@@ -806,6 +806,12 @@ impl SessionActor {
                     ))
                 }
             },
+            // Unreachable for an Auth error; terminal to avoid a loop.
+            Ok(SamplerFailureRecovery::RetryTransient { .. }) => {
+                Ok(Some(acp::Error::internal_error().data(format!(
+                    "hypercore auth recovery returned a transient retry: {message}"
+                ))))
+            }
             Ok(SamplerFailureRecovery::CompactAndResubmit) => {
                 // Unexpected for pure auth; treat as terminal to avoid loops.
                 Ok(Some(acp::Error::internal_error().data(format!(

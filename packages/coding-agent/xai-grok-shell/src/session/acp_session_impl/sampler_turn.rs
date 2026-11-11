@@ -1779,6 +1779,10 @@ impl SessionActor {
                 store: RecoveredStore::AuthProvider,
             });
         }
+        // After the compaction and auth arms, before the terminal path.
+        if let Some(recovery) = self.transient_retry_recovery(&error) {
+            return Ok(recovery);
+        }
         if matches!(error.kind, SamplingErrorKind::IdleTimeout) {
             self.signals_handle().record_idle_timeout();
         }
@@ -1971,6 +1975,15 @@ impl SessionActor {
                     SamplerFailureRecovery::RefreshAuthAndResubmit { credential, store } => {
                         Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store })
                     }
+                    SamplerFailureRecovery::RetryTransient {
+                        kind,
+                        status_code,
+                        grant,
+                    } => Ok(SamplerTurnOutcome::RetryTransient {
+                        kind,
+                        status_code,
+                        grant,
+                    }),
                 }
             }
         }

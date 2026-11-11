@@ -150,6 +150,11 @@ use session_mode::*;
 #[path = "acp_session_impl/sampler_turn.rs"]
 mod sampler_turn;
 use sampler_turn::*;
+#[path = "acp_session_impl/transient_retry.rs"]
+mod transient_retry;
+#[path = "acp_session_impl/length_salvage.rs"]
+mod length_salvage;
+use transient_retry::*;
 #[path = "acp_session_impl/tool_dispatch.rs"]
 mod tool_dispatch;
 use tool_dispatch::*;
@@ -1021,6 +1026,11 @@ pub(crate) struct SessionActor {
     /// increment).  Used by `ToolCallStarted` bridge emissions so they
     /// report the same turn number as `TurnStarted` / `TurnEnded`.
     pub(crate) current_turn_number: std::cell::Cell<u64>,
+    /// Turn-level transient retry budget for the current prompt (see
+    /// `transient_retry.rs`).
+    pub(crate) transient_retry: std::cell::Cell<TransientRetryState>,
+    /// Per-prompt length-salvage state (see `length_salvage.rs`).
+    pub(crate) length_salvage: std::cell::Cell<length_salvage::PromptLengthSalvage>,
     /// Recap rate-limit watermark (`main_turns` of last finished recap; `0` = none).
     pub(crate) last_recap_main_turn: std::cell::Cell<usize>,
     /// True while a recap model call is in flight (auto or manual). Prevents
@@ -1919,6 +1929,9 @@ mod auth_error_no_retry_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn/auth_retry_budget_tests.rs"]
 mod auth_retry_budget_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/turn/turn_recovery_loop_tests.rs"]
+mod turn_recovery_loop_tests;
 /// Regression coverage for the auto-wake suppression sweep + shutdown
 /// drain. These exercise the helpers added to fix the trailing
 /// `<system-reminder>` chat history bug.
