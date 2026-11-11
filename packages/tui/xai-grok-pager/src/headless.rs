@@ -24,6 +24,7 @@ use xai_grok_telemetry::startup::PendingStartup;
 
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::{AgentShutdownGuard, spawn_grok_shell};
+use crate::best_effort_stderr::eprint_line;
 use crate::client_identity::{HEADLESS_CLIENT_TYPE, PAGER_CLIENT_VERSION};
 use crate::headless::reducer::{
     Lifecycle, McpServer, Reducer, SessionContext, StreamEvent, TurnEnd, map_session_update,
@@ -195,7 +196,7 @@ impl HeadlessEmitter {
     fn on_lifecycle(&mut self, event: Lifecycle) {
         match self.format {
             OutputFormat::Plain => {
-                eprintln!("{}", event.plain_message());
+                eprint_line(&event.plain_message());
             }
             OutputFormat::Json => {}
             OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
@@ -347,7 +348,7 @@ impl HeadlessEmitter {
     /// Emit the max turns marker for the active format.
     fn on_max_turns(&mut self) {
         match self.format {
-            OutputFormat::Plain => eprintln!("Max turns reached"),
+            OutputFormat::Plain => eprint_line("Max turns reached"),
             // Conveyed by `stopReason` in the terminal JSON and result.
             OutputFormat::Json => {}
             OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
@@ -362,7 +363,7 @@ impl HeadlessEmitter {
     /// Emit the terminal error; `stop_reason_override` stamps a Messages stop reason (e.g. `max_tokens`).
     fn on_error(&mut self, message: &str, stop_reason_override: Option<&str>) {
         match self.format {
-            OutputFormat::Plain => eprintln!("{message}"),
+            OutputFormat::Plain => eprint_line(message),
             OutputFormat::Json => {
                 let mut err = serde_json::json!({"type":"error","message": message});
                 if let Some(usage) = &self.usage {
@@ -828,8 +829,8 @@ pub async fn run_single_turn(
     if options.include_partial_messages
         && options.output_format != OutputFormat::StreamingMessagesJson
     {
-        eprintln!(
-            "warning: --include-partial-messages only affects --output-format streaming-messages-json; ignoring it"
+        eprint_line(
+            "warning: --include-partial-messages only affects --output-format streaming-messages-json; ignoring it",
         );
     }
 

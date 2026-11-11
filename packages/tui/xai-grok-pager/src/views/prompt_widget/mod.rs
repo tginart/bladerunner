@@ -473,7 +473,9 @@ impl StashedPrompt {
             }
             chip.range = chip.range.start - start..chip.range.end - start;
             if chip.kind == KIND_IMAGE
-                && let Some(number) = parse_image_display_number(&text[chip.range.clone()])
+                && let Some(number) = text
+                    .get(chip.range.clone())
+                    .and_then(parse_image_display_number)
             {
                 image_numbers.insert(number);
             }
@@ -1253,7 +1255,11 @@ impl PromptWidget {
                     // absorb an element's byte: a chip's leading space is chip
                     // data, and replace_range expands any overlap to the whole
                     // element (the absorb would swallow the chip).
-                    let next_is_plain_space = self.textarea.text()[range.end..].starts_with(' ')
+                    let next_is_plain_space = self
+                        .textarea
+                        .text()
+                        .get(range.end..)
+                        .is_some_and(|s| s.starts_with(' '))
                         && !self
                             .textarea
                             .elements()
@@ -1445,7 +1451,7 @@ impl PromptWidget {
                 continue;
             }
             if cursor >= elem.range.start && cursor <= elem.range.end + 1 {
-                let text = &self.textarea.text()[elem.range.clone()];
+                let text = self.textarea.text().get(elem.range.clone())?;
                 return Some(Self::parse_file_ref_element(text));
             }
         }
@@ -1464,7 +1470,7 @@ impl PromptWidget {
                 continue;
             }
             if cursor == elem.range.end || cursor == elem.range.start {
-                let text = &self.textarea.text()[elem.range.clone()];
+                let text = self.textarea.text().get(elem.range.clone())?;
                 return Some(Self::parse_file_ref_element(text));
             }
         }
@@ -2293,7 +2299,11 @@ impl PromptWidget {
         // different paste and takes the normal path below.
         if !replacing_selection
             && let Some(elem) = self.paste_element_near_cursor()
-            && self.textarea.text()[elem.range.clone()] == *self.textarea.expand_tabs(text)
+            && self
+                .textarea
+                .text()
+                .get(elem.range.clone())
+                .is_some_and(|chip_text| *chip_text == *self.textarea.expand_tabs(text))
         {
             let id = elem.id;
             self.expand_element(id);
@@ -2479,7 +2489,11 @@ impl PromptWidget {
             if let Some(mut img) = stored_by_id.remove(id) {
                 // Refresh display_number from the live buffer text in
                 // case the chip was renumbered externally (sanity).
-                let parsed = parse_image_display_number(&self.textarea.text()[range.clone()])
+                let parsed = self
+                    .textarea
+                    .text()
+                    .get(range.clone())
+                    .and_then(parse_image_display_number)
                     .unwrap_or(img.display_number);
                 img.element_id = *id;
                 img.display_number = parsed;
@@ -2488,8 +2502,12 @@ impl PromptWidget {
             }
             // Fallback: redo path — match by display_number from the
             // stash, then rebind to the freshly-issued `element_id`.
-            let display_number =
-                parse_image_display_number(&self.textarea.text()[range.clone()]).unwrap_or(0);
+            let display_number = self
+                .textarea
+                .text()
+                .get(range.clone())
+                .and_then(parse_image_display_number)
+                .unwrap_or(0);
             if let Some(mut img) = stash_by_number.remove(&display_number) {
                 img.element_id = *id;
                 img.display_number = display_number;
@@ -2647,10 +2665,13 @@ impl PromptWidget {
             if elem.kind != KIND_IMAGE {
                 continue;
             }
-            out.push_str(&text[prev_end..elem.range.start]);
+            let Some(gap) = text.get(prev_end..elem.range.start) else {
+                continue;
+            };
+            out.push_str(gap);
             prev_end = elem.range.end;
         }
-        out.push_str(&text[prev_end..]);
+        out.push_str(text.get(prev_end..).unwrap_or_default());
         out
     }
 
@@ -2709,7 +2730,10 @@ impl PromptWidget {
             if elem.kind != KIND_IMAGE {
                 continue;
             }
-            if let Some(dn) = parse_image_display_number(&buf[elem.range.clone()]) {
+            if let Some(dn) = buf
+                .get(elem.range.clone())
+                .and_then(parse_image_display_number)
+            {
                 if by_number.iter().any(|(seen_dn, _)| *seen_dn == dn) {
                     tracing::warn!(
                         target: PROMPT_IMAGES_TRACING_TARGET,
@@ -2761,7 +2785,10 @@ impl PromptWidget {
 
     /// Buffer text of `elem` if it is a paste chip (`KIND_PASTE`).
     fn paste_text(&self, elem: &TextElement) -> Option<&str> {
-        (elem.kind == KIND_PASTE).then(|| &self.textarea.text()[elem.range.clone()])
+        if elem.kind != KIND_PASTE {
+            return None;
+        }
+        self.textarea.text().get(elem.range.clone())
     }
 
     /// Check if the cursor is currently on a paste element (strict on-chip
@@ -3597,7 +3624,9 @@ fn strip_all_elements(
 
     for elem in elements {
         // Append text between the previous element and this one.
-        let gap = &text[prev_end..elem.range.start];
+        let Some(gap) = text.get(prev_end..elem.range.start) else {
+            continue;
+        };
         result.push_str(gap);
 
         // Adjust cursor: if cursor is after this element, subtract
@@ -3614,7 +3643,7 @@ fn strip_all_elements(
     }
 
     // Append any text after the last element.
-    result.push_str(&text[prev_end..]);
+    result.push_str(text.get(prev_end..).unwrap_or_default());
 
     let len = result.len();
     (result, adjusted_cursor.min(len))
@@ -3746,3 +3775,6 @@ fn images_high_water(images: &[PastedImage]) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod slice_tests;

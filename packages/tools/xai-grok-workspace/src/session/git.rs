@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 pub use crate::restore_fetch::git_object_exists;
 use anyhow::Result;
-use git2::{DiffOptions, Repository, StatusOptions};
+use git2::{DiffOptions, Reference, Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -368,11 +368,11 @@ pub fn resolve_persisted_session_git_metadata_sync(cwd: &Path) -> PersistedGitMe
             }
         }
     }
-    let head_ref = repo.head().ok();
+    let head_ref = head_reference(&repo);
     let head_commit = head_ref
         .as_ref()
-        .and_then(|h| h.peel_to_commit().ok())
-        .map(|c| c.id().to_string());
+        .and_then(|h| h.target())
+        .map(|oid| oid.to_string());
     let head_branch = head_ref.as_ref().and_then(|h| {
         h.shorthand()
             .filter(|s| *s != "HEAD")
@@ -604,6 +604,28 @@ fn compute_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     let upstream = local_branch.upstream().ok()?;
     let upstream_oid = upstream.get().target()?;
     repo.graph_ahead_behind(local_oid, upstream_oid).ok()
+}
+/// HEAD resolved from refs only. It never peels to the commit, because on a
+/// huge or corrupt pack that object read can hang session startup.
+fn head_reference(repo: &Repository) -> Option<Reference<'_>> {
+    match repo.head() {
+        Ok(head) => Some(head),
+        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => None,
+        Err(e) => {
+            tracing::debug!(
+                path = %repo.path().display(),
+                code = ?e.code(),
+                error = %e,
+                "git HEAD is not resolvable"
+            );
+            None
+        }
+    }
+}
+/// The hash that HEAD stores, as `git rev-parse HEAD` prints it. It does not
+/// load the object, so the hash can name an object that the repo lacks.
+fn head_sha(repo: &Repository) -> Option<String> {
+    Some(head_reference(repo)?.target()?.to_string())
 }
 fn read_blob_from_tree(repo: &Repository, tree: &git2::Tree, path: &str) -> Result<Vec<u8>> {
     let entry = tree
@@ -976,9 +998,7 @@ pub async fn get_current_commit(git_root: &Path) -> Option<String> {
     let cwd = git_root.to_path_buf();
     tokio::task::spawn_blocking(move || -> Option<String> {
         let repo = Repository::discover(&cwd).ok()?;
-        let head = repo.head().ok()?;
-        let commit = head.peel_to_commit().ok()?;
-        Some(commit.id().to_string())
+        head_sha(&repo)
     })
     .await
     .ok()
@@ -1355,11 +1375,7 @@ async fn status_ungated(
             .commondir()
             .parent()
             .map(|p| p.to_string_lossy().trim_end_matches('/').to_string());
-        let commit = repo
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_commit().ok())
-            .map(|c| c.id().to_string());
+        let commit = head_sha(&repo);
         let (ahead, behind) = compute_ahead_behind(&repo)
             .map(|(a, b)| (Some(a), Some(b)))
             .unwrap_or((None, None));
@@ -3148,6 +3164,33 @@ mod tests {
             strip_url_credentials(url_with_creds),
             "https://github.com/xai-org/example.git"
         );
+    }
+    /// HEAD names an object that the object database lacks, as in a corrupt
+    /// or partial clone. Only a code path that peels HEAD to the commit
+    /// fails here, so the test proves that the startup path reads refs only.
+    #[tokio::test]
+    async fn head_hash_is_read_from_refs_without_loading_the_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        let head_target = repo.find_reference("HEAD").unwrap();
+        let branch_ref = head_target.symbolic_target().unwrap().to_string();
+        std::fs::write(repo.path().join(&branch_ref), format!("{missing}\n")).unwrap();
+        assert!(repo.head().unwrap().peel_to_commit().is_err());
+
+        assert_eq!(head_sha(&repo).as_deref(), Some(missing));
+        let metadata = resolve_persisted_session_git_metadata_sync(tmp.path());
+        assert_eq!(metadata.head_commit.as_deref(), Some(missing));
+        assert_eq!(
+            get_current_commit(tmp.path()).await.as_deref(),
+            Some(missing)
+        );
+    }
+    #[test]
+    fn head_hash_is_none_on_an_unborn_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        assert_eq!(head_sha(&repo), None);
     }
     #[test]
     fn detect_default_branch_falls_back_to_unique_remote_tracking_branch() {

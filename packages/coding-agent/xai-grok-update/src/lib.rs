@@ -1,4 +1,5 @@
 pub mod auto_update;
+mod cleanup_downloads;
 #[cfg(feature = "community-build")]
 mod community;
 pub mod version;
