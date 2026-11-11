@@ -394,8 +394,12 @@ pub(super) fn mcp_args_lines(req: &acp::RequestPermissionRequest) -> Vec<String>
     if !is_mcp {
         return Vec::new();
     }
+    // A tool that takes no arguments sends `{}`; a stray `{}` line would
+    // only look like a missing payload.
     let args = match raw.get("tool_input") {
         Some(serde_json::Value::Null) | None => return Vec::new(),
+        Some(serde_json::Value::Object(map)) if map.is_empty() => return Vec::new(),
+        Some(serde_json::Value::Array(items)) if items.is_empty() => return Vec::new(),
         Some(args) => args,
     };
     let pretty = match serde_json::to_string_pretty(args) {

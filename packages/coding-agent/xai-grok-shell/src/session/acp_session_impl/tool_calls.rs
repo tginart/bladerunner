@@ -507,6 +507,11 @@ impl SessionActor {
         if approved.iter().any(|p| p.tool_name == "search_tool") {
             self.retry_auth_required_servers().await;
         }
+        // The model is about to use MCP: give unreachable servers whose
+        // cooldown is over another connect attempt first.
+        if approved.iter().any(|p| is_mcp_surface_tool(&p.tool_name)) {
+            self.retry_unreachable_servers().await;
+        }
         // Resolve after hooks/permissions finalize arguments. Each filesystem
         // lookup is bounded, and failed lookups never dispatch without a key.
         let read_only: Vec<_> = approved.iter().map(|p| p.is_read_only).collect();
@@ -3307,6 +3312,12 @@ fn execute_tool_call_parts(
             acp::TextContent::new(description.unwrap_or_default().to_string()),
         ))],
     )
+}
+/// True for the MCP meta-tools and for a direct `server__tool` call.
+fn is_mcp_surface_tool(tool_name: &str) -> bool {
+    tool_name == "search_tool"
+        || tool_name == "use_tool"
+        || tool_name.contains(crate::session::mcp_servers::MCP_TOOL_NAME_DELIMITER)
 }
 #[cfg(test)]
 mod execute_tool_call_parts_tests {

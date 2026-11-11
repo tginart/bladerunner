@@ -3,11 +3,9 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use futures::StreamExt;
-use regex::Regex;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::{ChildStderr, Command},
@@ -45,6 +43,11 @@ use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 /// for callers that historically imported it from this module.
 pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
 
+pub use crate::tool_name::{
+    MCP_QUALIFIED_NAME_MAX_CHARS, McpToolAdmissionError, PROVIDER_TOOL_NAME_MAX_CHARS,
+    parse_mcp_qualified_name, parse_mcp_tool_name, qualify_mcp_tool_name, validate_tool_name,
+};
+
 /// Reqwest 0.13 adapter over `xai_grok_extra_ca::extra_root_ders` (DER is version-neutral).
 fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     for der in xai_grok_extra_ca::extra_root_ders() {
@@ -65,37 +68,6 @@ fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest:
 /// lookup keys agree.
 fn normalize_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
-}
-
-/// Regex for strictest cross-provider tool name validation.
-///
-/// Requirements across providers:
-/// - Anthropic/OpenAI: `^[a-zA-Z0-9_-]{1,64}$` (allows starting with digit/hyphen)
-/// - Google Gemini: `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$` (must start with letter/underscore, allows dots)
-///
-/// Strictest common denominator: must start with letter/underscore, only alphanumeric/_/- allowed, max 64 chars.
-static TOOL_NAME_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$").unwrap());
-
-/// Validate that a tool name matches the strictest cross-provider LLM API requirements.
-///
-/// Pattern: `^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$`
-/// - Must start with a letter or underscore (Gemini requirement)
-/// - Only letters, digits, underscores, hyphens allowed (no dots — Anthropic/OpenAI requirement)
-/// - Maximum 64 characters
-///
-/// Returns `Ok(())` if valid, or `Err(reason)` if invalid.
-pub fn validate_tool_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("tool name cannot be empty".to_string());
-    }
-    if !TOOL_NAME_REGEX.is_match(name) {
-        return Err(format!(
-            "tool name '{}' is invalid — must match ^[a-zA-Z_][a-zA-Z0-9_-]{{0,63}}$ (start with letter/underscore, max 64 chars)",
-            name
-        ));
-    }
-    Ok(())
 }
 
 /// Sanitize an MCP server or tool name into a single safe path segment
@@ -351,6 +323,22 @@ struct AcpMcpRegistry {
     invoker: Arc<dyn crate::acp_transport::AcpReverseInvoker>,
 }
 
+/// Retry state of a server whose last connect failed because the endpoint
+/// was unreachable. `Cooling` waits out the backoff. `InFlight` marks a
+/// running respawn and holds the token that the attempt must show to settle,
+/// so two triggers never spawn the same server and a config change makes a
+/// stale attempt's result unusable.
+#[derive(Debug, Clone, Copy)]
+enum UnreachableRetry {
+    Cooling {
+        retry_at: std::time::Instant,
+    },
+    InFlight {
+        token: u64,
+        started_at: std::time::Instant,
+    },
+}
+
 /// Consolidated MCP state behind a single lock. Generation counter detects stale inits.
 pub struct McpState {
     pub configs: Vec<acp::McpServer>,
@@ -385,6 +373,17 @@ pub struct McpState {
     /// `tools/list` and registered zero tools — does not misleadingly show
     /// as `Ready`. Cleared when the server begins a fresh init attempt.
     pub init_failed: std::collections::HashMap<McpServerName, String>,
+    /// Servers whose last connect failed because the endpoint was
+    /// unreachable. Its keys are a subset of [`Self::init_failed`] and are
+    /// cleared with it. Drives the session's unreachable-server retry, so a
+    /// network blip at startup does not remove the server's tools for the
+    /// rest of the session.
+    unreachable_retry: HashMap<McpServerName, UnreachableRetry>,
+    /// Source of [`UnreachableRetry::InFlight`] attempt tokens.
+    unreachable_attempt_counter: u64,
+    /// Wait between connect attempts for an unreachable server. It is
+    /// [`Self::UNREACHABLE_RETRY_COOLDOWN`]; tests shorten it.
+    pub unreachable_retry_cooldown: std::time::Duration,
     /// Per-server set of unqualified tool names that the user has disabled.
     /// Persisted to `~/.grok/config.toml` under `[mcp_servers.<name>].disabled_tools`.
     pub disabled_tools: HashMap<McpServerName, std::collections::HashSet<ToolName>>,
@@ -436,6 +435,9 @@ impl McpState {
             mcp_tool_meta: HashMap::new(),
             auth_required: std::collections::HashSet::new(),
             init_failed: HashMap::new(),
+            unreachable_retry: HashMap::new(),
+            unreachable_attempt_counter: 0,
+            unreachable_retry_cooldown: Self::UNREACHABLE_RETRY_COOLDOWN,
             disabled_tools: HashMap::new(),
             disabled_tool_registrations: HashMap::new(),
             event_writer: xai_file_utils::events::EventWriter::noop(),
@@ -578,6 +580,7 @@ impl McpState {
         self.init_progress.cancel();
         self.auth_required.clear();
         self.init_failed.clear();
+        self.unreachable_retry.clear();
         self.generation = self.generation.wrapping_add(1);
         true
     }
@@ -646,6 +649,7 @@ impl McpState {
         for name in &removed {
             self.owned_clients.remove(name);
             self.auth_required.remove(name);
+            self.unreachable_retry.remove(name);
             self.init_progress.mark_handshake_complete(name);
             let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
             self.mcp_tool_meta.retain(|k, _| !k.starts_with(&prefix));
@@ -757,6 +761,7 @@ impl McpState {
         // a server that recovers on retry stops showing as `Unavailable`.
         for name in &names {
             self.init_failed.remove(name);
+            self.unreachable_retry.remove(name);
         }
         self.init_progress.mark_handshaking(names);
     }
@@ -795,6 +800,151 @@ impl McpState {
     /// with a stale non-auth `detail`.
     pub fn clear_init_failed(&mut self, name: &str) {
         self.init_failed.remove(name);
+        self.unreachable_retry.remove(name);
+    }
+
+    /// Minimum wait between connect attempts for an unreachable server, so
+    /// retry triggers (tool batches, `/mcps` refreshes) cannot pile up
+    /// attempts while the server is down.
+    pub const UNREACHABLE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// How long an attempt keeps the server to itself. Far above any bounded
+    /// connect, so it only expires for an attempt whose future was dropped
+    /// and can never settle.
+    pub const UNREACHABLE_ATTEMPT_LEASE: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Record a connect failure caused by an unreachable endpoint. The server
+    /// shows as `Unavailable` and becomes a retry candidate after the
+    /// cooldown. An in-flight attempt is not demoted: its settle call owns
+    /// the next transition.
+    pub fn record_unreachable_failure(&mut self, name: &str, detail: String) {
+        self.init_failed.insert(name.to_string(), detail);
+        if let Some(UnreachableRetry::InFlight { .. }) = self.unreachable_retry.get(name) {
+            return;
+        }
+        let retry_at = std::time::Instant::now() + self.unreachable_retry_cooldown;
+        self.unreachable_retry
+            .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
+    }
+
+    /// True when `name` waits for (or runs) an unreachable-server retry.
+    pub fn is_unreachable_retry_pending(&self, name: &str) -> bool {
+        self.unreachable_retry.contains_key(name)
+    }
+
+    /// True when at least one server is due for a retry at `now`. It does
+    /// not claim the servers.
+    pub fn has_due_unreachable_retry(&self, now: std::time::Instant) -> bool {
+        !self.due_unreachable_servers(now).is_empty()
+    }
+
+    /// Claim the servers due for a retry at `now`: the cooldown is over (or
+    /// an earlier attempt's lease expired) and the server is still
+    /// configured. Each claimed server moves to `InFlight` with a new token,
+    /// so a concurrent caller does not get it again.
+    pub fn take_unreachable_retry_candidates(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<(McpServerName, u64)> {
+        let due = self.due_unreachable_servers(now);
+        let mut claimed = Vec::with_capacity(due.len());
+        for name in due {
+            self.unreachable_attempt_counter += 1;
+            let token = self.unreachable_attempt_counter;
+            self.unreachable_retry.insert(
+                name.clone(),
+                UnreachableRetry::InFlight {
+                    token,
+                    started_at: now,
+                },
+            );
+            claimed.push((name, token));
+        }
+        claimed
+    }
+
+    /// Settle an attempt as recovered. Returns `false` when a config change
+    /// removed the server during the attempt; the caller must then discard
+    /// its new client.
+    pub fn finish_unreachable_attempt(&mut self, name: &str, token: u64) -> bool {
+        if !self.owns_unreachable_attempt(name, token) {
+            return false;
+        }
+        self.unreachable_retry.remove(name);
+        self.init_failed.remove(name);
+        true
+    }
+
+    /// Settle an attempt that still could not connect: restart the cooldown
+    /// from now and refresh the failure detail. No-op for a stale token.
+    pub fn settle_unreachable_attempt_failed(&mut self, name: &str, token: u64, detail: String) {
+        if !self.owns_unreachable_attempt(name, token) {
+            return;
+        }
+        self.init_failed.insert(name.to_string(), detail);
+        let retry_at = std::time::Instant::now() + self.unreachable_retry_cooldown;
+        self.unreachable_retry
+            .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
+    }
+
+    /// Give back the claim of an attempt that stopped before it settled
+    /// (its future was dropped, e.g. by a turn cancel). The server becomes
+    /// due one cooldown after the attempt started, so the cooldown still
+    /// holds. No-op for a stale token.
+    pub fn release_unreachable_attempt(&mut self, name: &str, token: u64) {
+        let Some(UnreachableRetry::InFlight {
+            token: t,
+            started_at,
+        }) = self.unreachable_retry.get(name).copied()
+        else {
+            return;
+        };
+        if t != token {
+            return;
+        }
+        let retry_at = started_at + self.unreachable_retry_cooldown;
+        self.unreachable_retry
+            .insert(name.to_string(), UnreachableRetry::Cooling { retry_at });
+    }
+
+    /// Settle an attempt and stop retrying (a failure that is not about
+    /// connectivity, or a handoff to the auth flow). Returns whether the
+    /// attempt still owned the server. The `init_failed` entry is left to
+    /// the caller.
+    pub fn settle_unreachable_attempt_unretryable(&mut self, name: &str, token: u64) -> bool {
+        if !self.owns_unreachable_attempt(name, token) {
+            return false;
+        }
+        self.unreachable_retry.remove(name);
+        true
+    }
+
+    fn due_unreachable_servers(&self, now: std::time::Instant) -> Vec<McpServerName> {
+        let configured: std::collections::HashSet<&str> =
+            self.configs.iter().map(mcp_server_name).collect();
+        self.unreachable_retry
+            .iter()
+            .filter(|(name, state)| {
+                configured.contains(name.as_str()) && Self::is_retry_due(state, now)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    fn is_retry_due(state: &UnreachableRetry, now: std::time::Instant) -> bool {
+        match state {
+            UnreachableRetry::Cooling { retry_at } => *retry_at <= now,
+            UnreachableRetry::InFlight { started_at, .. } => {
+                now.saturating_duration_since(*started_at) > Self::UNREACHABLE_ATTEMPT_LEASE
+            }
+        }
+    }
+
+    fn owns_unreachable_attempt(&self, name: &str, token: u64) -> bool {
+        matches!(
+            self.unreachable_retry.get(name),
+            Some(UnreachableRetry::InFlight { token: t, .. }) if *t == token
+        )
     }
 
     /// Clear the entire handshaking set in one shot. Used by the
@@ -1067,33 +1217,6 @@ pub fn parse_mcp_meta_config(
 /// here so existing call sites continue to work.
 pub use xai_grok_telemetry::enums::McpInitStrategy;
 
-/// Parse a non-empty `server__tool` ID with one overlap-aware delimiter and
-/// valid [`xai_tool_protocol::ToolId`] syntax.
-pub fn parse_mcp_qualified_name(name: &str) -> Option<(xai_tool_protocol::ToolId, &str, &str)> {
-    let delimiter = MCP_TOOL_NAME_DELIMITER.as_bytes();
-    // Byte windows preserve both overlapping `__` boundaries in `___`.
-    let mut boundaries = name
-        .as_bytes()
-        .windows(delimiter.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == delimiter).then_some(index));
-    let boundary = boundaries.next()?;
-    if boundaries.next().is_some() {
-        return None;
-    }
-    let (server, tool_with_delimiter) = name.split_at(boundary);
-    let tool = &tool_with_delimiter[MCP_TOOL_NAME_DELIMITER.len()..];
-    if server.is_empty() || tool.is_empty() {
-        return None;
-    }
-    Some((xai_tool_protocol::ToolId::new(name).ok()?, server, tool))
-}
-
-/// Parse an MCP tool name in `server__tool` format into owned segments.
-pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
-    parse_mcp_qualified_name(name).map(|(_, server, tool)| (server.to_owned(), tool.to_owned()))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP client error: {0}")]
@@ -1120,6 +1243,12 @@ pub enum McpError {
     )]
     AuthRequired { server: String },
 
+    /// Pre-spawn gate: neither OAuth discovery nor the anonymous-access probe
+    /// could reach the server. A connectivity failure, not an auth verdict,
+    /// so the session retries it.
+    #[error("MCP server '{server}': unreachable during startup (connection failed; will retry)")]
+    Unreachable { server: String },
+
     #[error("MCP service error: {0}")]
     ServiceError(#[from] ServiceError),
 }
@@ -1143,6 +1272,7 @@ impl McpError {
             Self::Timeout { .. } => McpErrorCategory::Timeout,
             Self::HandshakeFailed { .. } => McpErrorCategory::HandshakeFailed,
             Self::AuthRequired { .. } => McpErrorCategory::AuthRequired,
+            Self::Unreachable { .. } => McpErrorCategory::SpawnFailed,
             Self::ClientError(_) | Self::ServiceError(_) => McpErrorCategory::ClientError,
         }
     }
@@ -1152,7 +1282,8 @@ impl McpError {
             Self::SpawnFailed { server, .. }
             | Self::Timeout { server, .. }
             | Self::HandshakeFailed { server, .. }
-            | Self::AuthRequired { server } => Some(server),
+            | Self::AuthRequired { server }
+            | Self::Unreachable { server } => Some(server),
             Self::ClientError(_) | Self::ServiceError(_) => None,
         }
     }
@@ -1166,9 +1297,105 @@ impl McpError {
             Self::HandshakeFailed { source, .. } => is_auth_rejection_message(&source.to_string()),
             Self::ServiceError(e) => is_auth_rejection_message(&e.to_string()),
             Self::ClientError(s) => is_auth_rejection_message(s),
-            Self::Timeout { .. } | Self::SpawnFailed { .. } => false,
+            Self::Timeout { .. } | Self::SpawnFailed { .. } | Self::Unreachable { .. } => false,
         }
     }
+
+    /// True for the pre-spawn [`Self::Unreachable`] verdict.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable { .. })
+    }
+
+    /// True for failures that say nothing about the server itself, only
+    /// about the path to it, so another connect attempt can help. Protocol
+    /// rejections and malformed responses are not transient.
+    pub fn is_transient_connectivity(&self) -> bool {
+        match self {
+            Self::Unreachable { .. } | Self::Timeout { .. } => true,
+            Self::HandshakeFailed { source, .. } => {
+                is_transport_error_message(&error_chain_text(source.as_ref()))
+            }
+            Self::ClientError(s) => is_transport_error_message(s),
+            Self::ServiceError(e) => is_transport_error_message(&error_chain_text(e)),
+            Self::SpawnFailed { .. } | Self::AuthRequired { .. } => false,
+        }
+    }
+
+    /// The never-connected subset of [`Self::is_transient_connectivity`]: the
+    /// client did not reach the server at all.
+    pub fn is_connect_failure(&self) -> bool {
+        match self {
+            Self::Unreachable { .. } => true,
+            Self::HandshakeFailed { source, .. } => {
+                init_error_is_connect_phase(source)
+                    || is_connect_failure_message(&error_chain_text(source.as_ref()))
+            }
+            Self::ClientError(s) => is_connect_failure_message(s),
+            Self::ServiceError(e) => is_connect_failure_message(&error_chain_text(e)),
+            Self::Timeout { .. } | Self::SpawnFailed { .. } | Self::AuthRequired { .. } => false,
+        }
+    }
+}
+
+/// True when the handshake failed because reqwest could not open a
+/// connection to the streamable-HTTP endpoint.
+fn init_error_is_connect_phase(err: &ClientInitializeError) -> bool {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    let ClientInitializeError::TransportError { error, .. } = err else {
+        return false;
+    };
+    matches!(
+        error
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest::Error>>(),
+        Some(StreamableHttpError::Client(e)) if e.is_connect()
+    )
+}
+
+/// `Display` of an error and all its sources. reqwest keeps the OS cause
+/// ("connection refused") in the source chain, not in its own message.
+fn error_chain_text(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// Connect-level subset of [`is_transport_error_message`].
+fn is_connect_failure_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "connection refused",
+        "dns error",
+        "network unreachable",
+        "host unreachable",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Detect transport-level failures from the error text, for error types
+/// that carry no typed connectivity verdict.
+fn is_transport_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "error sending request",
+        "network unreachable",
+        "host unreachable",
+        "timed out",
+        "transport closed",
+        "dns error",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// True when a failed refresh-token grant was a **network-level** failure
@@ -1294,33 +1521,22 @@ impl McpTool {
 
     /// Convert into the data needed for `ToolBridge::register_erased()`.
     ///
-    /// Invalid or ambiguous qualified IDs and provider-invalid names are logged
-    /// and skipped; the upstream connector must provide non-empty `server` and
-    /// `tool` segments separated by exactly one `__` boundary.
+    /// Invalid or ambiguous qualified IDs are logged and skipped. A qualified
+    /// name longer than the 64-char provider limit is kept: it is a catalog
+    /// key for `search_tool` / `use_tool`, never a provider function name.
     pub fn into_registration(self) -> Option<McpToolRegistration> {
-        let qualified_name = format!(
-            "{}{}{}",
-            self.server_name, MCP_TOOL_NAME_DELIMITER, self.name
-        );
-
-        if parse_mcp_qualified_name(&qualified_name).is_none() {
-            tracing::error!(
-                server = %self.server_name,
-                tool = %self.name,
-                qualified = %qualified_name,
-                "Skipping MCP tool with invalid or ambiguous qualified name"
-            );
-            return None;
-        }
-        if let Err(reason) = validate_tool_name(&qualified_name) {
-            tracing::error!(
-                tool_name = %qualified_name,
-                server = %self.server_name,
-                reason = %reason,
-                "Skipping MCP tool with invalid name"
-            );
-            return None;
-        }
+        let qualified_name = match qualify_mcp_tool_name(&self.server_name, &self.name) {
+            Ok(name) => name,
+            Err(reason) => {
+                tracing::error!(
+                    server = %self.server_name,
+                    tool = %self.name,
+                    reason = %reason,
+                    "Skipping MCP tool with invalid name"
+                );
+                return None;
+            }
+        };
 
         let description = self.description.clone();
         let input_schema = self.schema.clone();
@@ -1800,18 +2016,202 @@ enum HttpOauthPrep {
     ManagerReady(Arc<tokio::sync::Mutex<rmcp::transport::auth::AuthorizationManager>>),
     /// OAuth is required but cannot complete in non-interactive mode — do not start unauthenticated.
     NeedsInteractiveLogin,
+    /// Non-interactive only: discovery gave no verdict (manager-create
+    /// error, discovery error, or timeout). The anonymous-access probe
+    /// decides.
+    Inconclusive,
+    /// Neither discovery nor the anonymous-access probe reached the server.
+    Unreachable,
 }
 
 impl HttpOauthPrep {
     /// Inconclusive OAuth probe (manager-create error, discovery error, or timeout):
-    /// interactive proceeds as plain HTTP; non-interactive fails closed to avoid rmcp
-    /// auth-worker stderr noise.
+    /// interactive proceeds as plain HTTP. Non-interactive must not start an
+    /// unauthenticated worker that fatals on an OAuth challenge, so it asks
+    /// the anonymous-access probe first.
     fn on_probe_failure(mode: OauthInteractivity) -> Self {
         match mode {
             OauthInteractivity::Interactive => Self::NoOauthSupport,
-            OauthInteractivity::NonInteractive => Self::NeedsInteractiveLogin,
+            OauthInteractivity::NonInteractive => Self::Inconclusive,
         }
     }
+}
+
+/// Bound on the anonymous-access probe request.
+const ANONYMOUS_ACCESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether an MCP server answers a request that carries no credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnonymousAccess {
+    Accepted,
+    AuthChallenged,
+    Unreachable,
+}
+
+/// Decide how to connect to an HTTP/SSE server that has no configured
+/// credential: OAuth discovery first, then, when discovery is inconclusive
+/// in a non-interactive session, one anonymous request.
+async fn decide_http_auth(
+    server_name: &str,
+    url: &str,
+    headers: &[(String, String)],
+    ctx: &McpSpawnCtx<'_>,
+    discovery_timeout: std::time::Duration,
+) -> HttpOauthPrep {
+    let prep = {
+        let _auth_discovery_timer =
+            xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
+        match tokio::time::timeout(
+            discovery_timeout,
+            discover_and_prepare_auth(server_name, url, ctx.mode),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    server = %server_name,
+                    url = %url,
+                    mode = ?ctx.mode,
+                    timeout_secs = discovery_timeout.as_secs(),
+                    "OAuth discovery timed out"
+                );
+                ctx.event_writer
+                    .emit(xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
+                        server_name: server_name.to_string(),
+                        url: url.to_string(),
+                    });
+                HttpOauthPrep::on_probe_failure(ctx.mode)
+            }
+        }
+    };
+    let HttpOauthPrep::Inconclusive = prep else {
+        return prep;
+    };
+    match probe_anonymous_access(server_name, url, headers).await {
+        AnonymousAccess::Accepted => {
+            tracing::info!(
+                server = server_name,
+                "OAuth discovery was inconclusive but the server accepts unauthenticated requests; connecting without auth"
+            );
+            HttpOauthPrep::NoOauthSupport
+        }
+        AnonymousAccess::AuthChallenged => {
+            tracing::warn!(
+                server = server_name,
+                "OAuth discovery was inconclusive and the server challenges unauthenticated requests; authenticate in TUI or set an Authorization header"
+            );
+            HttpOauthPrep::NeedsInteractiveLogin
+        }
+        AnonymousAccess::Unreachable => {
+            tracing::warn!(
+                server = server_name,
+                "OAuth discovery was inconclusive and the anonymous-access probe could not reach the server; will retry"
+            );
+            HttpOauthPrep::Unreachable
+        }
+    }
+}
+
+/// One POST to the MCP endpoint without credentials, judged by status class.
+/// A POST, not a GET: a streamable-HTTP server may answer GET with an SSE
+/// stream that never ends.
+async fn probe_anonymous_access(
+    server_name: &str,
+    url: &str,
+    headers: &[(String, String)],
+) -> AnonymousAccess {
+    let client = match with_extra_root_certificates(reqwest::Client::builder())
+        .timeout(ANONYMOUS_ACCESS_PROBE_TIMEOUT)
+        .redirect(anonymous_probe_redirect_policy())
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(server = server_name, error = %e, "anonymous-access probe: building HTTP client failed");
+            return AnonymousAccess::Unreachable;
+        }
+    };
+    // The real transport sends the configured headers (e.g. `X-Api-Key`), so
+    // the probe must too, or a header-authenticated server looks closed.
+    let mut probe_headers = reqwest::header::HeaderMap::new();
+    for (key, value) in headers {
+        match (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            value.parse::<reqwest::header::HeaderValue>(),
+        ) {
+            (Ok(name), Ok(value)) => {
+                probe_headers.insert(name, value);
+            }
+            _ => tracing::warn!("Skipping invalid MCP HTTP header: {key}"),
+        }
+    }
+    probe_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    probe_headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    ensure_figma_user_agent(&mut probe_headers, server_name, url);
+    match client
+        .post(url)
+        .headers(probe_headers)
+        .body("{}")
+        .send()
+        .await
+    {
+        Ok(response) => classify_anonymous_response(response.status()),
+        Err(e) => {
+            tracing::warn!(server = server_name, error = %e, "anonymous-access probe failed");
+            AnonymousAccess::Unreachable
+        }
+    }
+}
+
+/// The probe follows one redirect, and only a same-origin 307 or 308 (such as
+/// Starlette's `/mcp` -> `/mcp/`). A redirect to another origin, a second
+/// redirect, or one that changes the POST to a GET stops the probe, and the
+/// 3xx counts as an auth challenge: a gateway that sends an anonymous POST
+/// to a login page challenges it. The configured headers therefore never go
+/// to an origin other than the configured one.
+fn anonymous_probe_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let is_first_redirect = attempt.previous().len() == 1;
+        let is_same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        let keeps_method = matches!(
+            attempt.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+        );
+        if is_first_redirect && is_same_origin && keeps_method {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+fn classify_anonymous_response(status: reqwest::StatusCode) -> AnonymousAccess {
+    // 407 asks for proxy credentials, which a headless session cannot
+    // supply either.
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        || status.is_redirection()
+    {
+        return AnonymousAccess::AuthChallenged;
+    }
+    // A 5xx is often an ingress or proxy blip that says nothing about auth.
+    if status.is_server_error() {
+        return AnonymousAccess::Unreachable;
+    }
+    // Any other answer, even a 4xx about the `{}` body, shows that the
+    // server serves unauthenticated requests.
+    AnonymousAccess::Accepted
 }
 
 /// Proactive OAuth discovery per RFC 8414 + 9728.
@@ -2812,6 +3212,12 @@ impl McpClient {
 
     pub fn has_auth(&self) -> bool {
         self.auth_manager.is_some()
+    }
+
+    /// The user- or plugin-supplied OAuth client settings that the browser
+    /// login of this client uses.
+    pub fn byo_oauth_config(&self) -> Option<&McpOAuthConfig> {
+        self.byo_oauth_config.as_ref()
     }
 
     /// Try to recover tokens from disk or via refresh — no browser flow.
@@ -4370,32 +4776,14 @@ pub async fn start_mcp_server(
                 );
                 HttpOauthPrep::NoOauthSupport
             } else {
-                let _auth_discovery_timer =
-                    xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
-                match tokio::time::timeout(
+                decide_http_auth(
+                    &name,
+                    &url,
+                    &http_config.headers,
+                    ctx,
                     OAUTH_DISCOVERY_TIMEOUT,
-                    discover_and_prepare_auth(&name, &url, ctx.mode),
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            server = %name,
-                            url = %url,
-                            mode = ?ctx.mode,
-                            timeout_secs = OAUTH_DISCOVERY_TIMEOUT.as_secs(),
-                            "OAuth discovery timed out"
-                        );
-                        ctx.event_writer.emit(
-                            xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
-                                server_name: name.clone(),
-                                url: url.clone(),
-                            },
-                        );
-                        HttpOauthPrep::on_probe_failure(ctx.mode)
-                    }
-                }
             };
             match auth_prep {
                 HttpOauthPrep::ManagerReady(auth_mgr) => Ok(McpClient::new_http_auth(
@@ -4416,6 +4804,13 @@ pub async fn start_mcp_server(
                 HttpOauthPrep::NeedsInteractiveLogin => Err(McpError::AuthRequired {
                     server: name.clone(),
                 }),
+                HttpOauthPrep::Unreachable => Err(McpError::Unreachable {
+                    server: name.clone(),
+                }),
+                // `decide_http_auth` resolves an inconclusive discovery itself.
+                HttpOauthPrep::Inconclusive => {
+                    unreachable!("decide_http_auth resolves Inconclusive")
+                }
             }
         }
         // TODO(acp-0.10): `McpServer` is #[non_exhaustive]; reject unknown transports.
@@ -4442,17 +4837,17 @@ pub async fn start_mcp_servers(
         );
     }
 
-    futures::stream::iter(mcp_servers)
-        .map(|server| {
-            let server_name = mcp_server_name(&server);
-            let overrides = overrides_map.get(server_name);
-            let mc = meta_config_map.get(server_name);
-            let byo = oauth_config_map.get(server_name);
-            start_mcp_server(server, overrides, mc, byo, ctx)
-        })
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await
+    // One future per server, no cap: the count is bounded by config, the
+    // work is I/O-bound, and any cap is a slot that waits behind a stalled
+    // server (an OAuth discovery can take its full 5 s timeout).
+    futures::future::join_all(mcp_servers.into_iter().map(|server| {
+        let server_name = mcp_server_name(&server);
+        let overrides = overrides_map.get(server_name);
+        let mc = meta_config_map.get(server_name);
+        let byo = oauth_config_map.get(server_name);
+        start_mcp_server(server, overrides, mc, byo, ctx)
+    }))
+    .await
 }
 
 /// Extract the name from an MCP server enum variant.
@@ -5162,6 +5557,356 @@ mod tests {
         assert!(!state.init_failed.contains_key("dead-srv"));
         // Idempotent: clearing an absent entry is a no-op.
         state.clear_init_failed("never-seen");
+    }
+
+    #[test]
+    fn unreachable_server_becomes_a_candidate_after_the_cooldown() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        let now = std::time::Instant::now();
+        state.record_unreachable_failure("down", "connection refused".to_string());
+        assert_eq!(
+            state.init_failed.get("down").map(String::as_str),
+            Some("connection refused")
+        );
+        assert!(state.take_unreachable_retry_candidates(now).is_empty());
+
+        let later = now + McpState::UNREACHABLE_RETRY_COOLDOWN + std::time::Duration::from_secs(1);
+        let claimed = state.take_unreachable_retry_candidates(later);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, "down");
+        // An in-flight server is not handed to a second trigger.
+        assert!(state.take_unreachable_retry_candidates(later).is_empty());
+
+        assert!(state.finish_unreachable_attempt("down", claimed[0].1));
+        assert!(!state.init_failed.contains_key("down"));
+        assert!(!state.is_unreachable_retry_pending("down"));
+    }
+
+    #[test]
+    fn stale_unreachable_attempt_cannot_settle() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        state.record_unreachable_failure("down", String::new());
+        let later = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        let (_, token) = state.take_unreachable_retry_candidates(later).remove(0);
+
+        // A config change tears the server down during the attempt.
+        assert!(state.update_configs(vec![make_http_server("down", "http://127.0.0.1:2/mcp")]));
+        assert!(!state.finish_unreachable_attempt("down", token));
+        state.settle_unreachable_attempt_failed("down", token, "late".to_string());
+        assert!(!state.init_failed.contains_key("down"));
+        assert!(!state.is_unreachable_retry_pending("down"));
+    }
+
+    #[test]
+    fn failed_unreachable_attempt_restarts_the_cooldown() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        state.record_unreachable_failure("down", String::new());
+        let later = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        let (_, token) = state.take_unreachable_retry_candidates(later).remove(0);
+        state.settle_unreachable_attempt_failed("down", token, "still down".to_string());
+        assert!(state.is_unreachable_retry_pending("down"));
+        assert!(state.take_unreachable_retry_candidates(later).is_empty());
+        assert_eq!(
+            state.init_failed.get("down").map(String::as_str),
+            Some("still down")
+        );
+    }
+
+    #[test]
+    fn released_unreachable_attempt_is_due_one_cooldown_after_it_started() {
+        let mut state = McpState::new(vec![make_http_server("down", "http://127.0.0.1:1/mcp")]);
+        state.record_unreachable_failure("down", String::new());
+        let started = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        assert!(state.has_due_unreachable_retry(started));
+        let (_, token) = state.take_unreachable_retry_candidates(started).remove(0);
+        assert!(!state.has_due_unreachable_retry(started));
+
+        // A stale token does not release the claim.
+        state.release_unreachable_attempt("down", token + 1);
+        let after_cooldown = started + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        assert!(!state.has_due_unreachable_retry(after_cooldown));
+
+        // The dropped attempt gives the server back without the 600 s lease,
+        // and the cooldown still counts from the attempt start.
+        state.release_unreachable_attempt("down", token);
+        assert!(!state.has_due_unreachable_retry(started));
+        assert!(state.has_due_unreachable_retry(after_cooldown));
+        assert_eq!(
+            state
+                .take_unreachable_retry_candidates(after_cooldown)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unconfigured_unreachable_server_is_not_retried() {
+        let mut state = McpState::new(vec![]);
+        state.record_unreachable_failure("gone", String::new());
+        let later = std::time::Instant::now() + McpState::UNREACHABLE_RETRY_COOLDOWN;
+        assert!(state.take_unreachable_retry_candidates(later).is_empty());
+    }
+
+    #[test]
+    fn connect_failures_are_classified_as_unreachable() {
+        let unreachable = McpError::Unreachable {
+            server: "s".to_string(),
+        };
+        assert!(unreachable.is_unreachable());
+        assert!(unreachable.is_connect_failure());
+        assert!(!unreachable.is_auth_rejection());
+        let refused = McpError::ClientError("tcp connect error: Connection refused".to_string());
+        assert!(refused.is_connect_failure());
+        assert!(refused.is_transient_connectivity());
+        let reset = McpError::ClientError("connection reset by peer".to_string());
+        assert!(!reset.is_connect_failure());
+        assert!(reset.is_transient_connectivity());
+        let protocol = McpError::ClientError("invalid params".to_string());
+        assert!(!protocol.is_connect_failure());
+        assert!(!protocol.is_transient_connectivity());
+    }
+
+    /// Purpose: Serve canned HTTP answers on 127.0.0.1 for the auth probes.
+    /// Input: The status line for a POST. A GET never gets an answer, like
+    ///     a never-ending SSE stream, so OAuth discovery times out.
+    /// Output: The base URL of the server. The server thread lives until the
+    ///     test process exits.
+    fn spawn_probe_server(post_status: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if !buf[..n].starts_with(b"POST") {
+                        // Hold the connection open with no answer.
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        return;
+                    }
+                    let body = "{}";
+                    let response = format!(
+                        "HTTP/1.1 {post_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn start_mcp_servers_does_not_queue_behind_stalled_discovery() {
+        // Every discovery hangs until its timeout. With a fixed batch of 8,
+        // the ninth server waited for a free slot: two timeouts in a row.
+        let url = spawn_probe_server("200 OK");
+        let servers: Vec<acp::McpServer> = (0..9)
+            .map(|i| make_http_server(&format!("srv{i}"), &url))
+            .collect();
+        let ew = xai_file_utils::events::EventWriter::noop();
+        let ctx = McpSpawnCtx::for_session("s", &ew, OauthInteractivity::Interactive, None);
+        let started = std::time::Instant::now();
+        let results = start_mcp_servers(
+            servers,
+            &HashMap::new(),
+            &McpMetaConfigMap::new(),
+            &crate::oauth_config::McpOAuthConfigMap::new(),
+            &ctx,
+        )
+        .await;
+        assert_eq!(results.len(), 9);
+        assert!(results.iter().all(Result::is_ok));
+        assert!(
+            started.elapsed() < OAUTH_DISCOVERY_TIMEOUT * 2,
+            "servers must start concurrently, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn anonymous_probe_status_classes() {
+        use reqwest::StatusCode;
+        for (status, expected) in [
+            (StatusCode::OK, AnonymousAccess::Accepted),
+            (StatusCode::BAD_REQUEST, AnonymousAccess::Accepted),
+            (StatusCode::METHOD_NOT_ALLOWED, AnonymousAccess::Accepted),
+            (StatusCode::UNAUTHORIZED, AnonymousAccess::AuthChallenged),
+            (StatusCode::FORBIDDEN, AnonymousAccess::AuthChallenged),
+            (
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                AnonymousAccess::AuthChallenged,
+            ),
+            (StatusCode::FOUND, AnonymousAccess::AuthChallenged),
+            (StatusCode::BAD_GATEWAY, AnonymousAccess::Unreachable),
+        ] {
+            assert_eq!(classify_anonymous_response(status), expected, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_reaches_the_endpoint() {
+        let open = spawn_probe_server("200 OK");
+        assert_eq!(
+            probe_anonymous_access("open", &open, &[]).await,
+            AnonymousAccess::Accepted
+        );
+        let locked = spawn_probe_server("401 Unauthorized");
+        assert_eq!(
+            probe_anonymous_access("locked", &locked, &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/mcp", listener.local_addr().unwrap())
+        };
+        assert_eq!(
+            probe_anonymous_access("closed", &closed, &[]).await,
+            AnonymousAccess::Unreachable
+        );
+    }
+
+    /// Purpose: Serve one canned POST answer per path on 127.0.0.1, and
+    ///     record every request head it gets.
+    /// Input: Pairs of a path and the full response head for a POST to it.
+    ///     Any other request gets 404.
+    /// Output: The base URL (`http://host:port`) and the recorded heads.
+    fn spawn_routed_probe_server(
+        routes: Vec<(&'static str, String)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                seen_by_server.lock().unwrap().push(head);
+                let response = routes
+                    .iter()
+                    .find(|(path, _)| request_line == format!("POST {path} HTTP/1.1"))
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(|| "HTTP/1.1 404 Not Found".to_string());
+                let _ = stream.write_all(
+                    format!("{response}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_follows_only_a_same_origin_method_preserving_redirect() {
+        // Starlette and FastMCP answer `/mcp` with `307 -> /mcp/`.
+        let (open, _) = spawn_routed_probe_server(vec![
+            (
+                "/mcp",
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: /mcp/".to_string(),
+            ),
+            ("/mcp/", "HTTP/1.1 200 OK".to_string()),
+        ]);
+        assert_eq!(
+            probe_anonymous_access("open", &format!("{open}/mcp"), &[]).await,
+            AnonymousAccess::Accepted
+        );
+
+        // A same-origin redirect to a login page that challenges.
+        let (locked, _) = spawn_routed_probe_server(vec![
+            (
+                "/mcp",
+                "HTTP/1.1 308 Permanent Redirect\r\nlocation: /mcp/".to_string(),
+            ),
+            ("/mcp/", "HTTP/1.1 401 Unauthorized".to_string()),
+        ]);
+        assert_eq!(
+            probe_anonymous_access("locked", &format!("{locked}/mcp"), &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+
+        // A 302 turns the POST into a GET, so it is not followed.
+        let (login, _) = spawn_routed_probe_server(vec![(
+            "/mcp",
+            "HTTP/1.1 302 Found\r\nlocation: /login".to_string(),
+        )]);
+        assert_eq!(
+            probe_anonymous_access("login", &format!("{login}/mcp"), &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+
+        // A second redirect is not followed.
+        let (chain, chain_seen) = spawn_routed_probe_server(vec![
+            (
+                "/mcp",
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: /a".to_string(),
+            ),
+            (
+                "/a",
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: /b".to_string(),
+            ),
+            ("/b", "HTTP/1.1 200 OK".to_string()),
+        ]);
+        assert_eq!(
+            probe_anonymous_access("chain", &format!("{chain}/mcp"), &[]).await,
+            AnonymousAccess::AuthChallenged
+        );
+        assert_eq!(chain_seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_never_sends_headers_to_another_origin() {
+        let (other, other_seen) =
+            spawn_routed_probe_server(vec![("/mcp", "HTTP/1.1 200 OK".to_string())]);
+        let (origin, _) = spawn_routed_probe_server(vec![(
+            "/mcp",
+            format!("HTTP/1.1 307 Temporary Redirect\r\nlocation: {other}/mcp"),
+        )]);
+        let headers = vec![("X-Api-Key".to_string(), "secret-value".to_string())];
+        assert_eq!(
+            probe_anonymous_access("cross", &format!("{origin}/mcp"), &headers).await,
+            AnonymousAccess::AuthChallenged
+        );
+        assert!(
+            other_seen.lock().unwrap().is_empty(),
+            "the probe must not follow a redirect to another origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_keeps_a_tokenless_server_when_discovery_is_inconclusive() {
+        let ew = xai_file_utils::events::EventWriter::noop();
+        let ctx = McpSpawnCtx::for_session("s", &ew, OauthInteractivity::NonInteractive, None);
+        let timeout = std::time::Duration::from_millis(300);
+
+        let open = spawn_probe_server("200 OK");
+        assert!(matches!(
+            decide_http_auth("open", &open, &[], &ctx, timeout).await,
+            HttpOauthPrep::NoOauthSupport
+        ));
+        let locked = spawn_probe_server("401 Unauthorized");
+        assert!(matches!(
+            decide_http_auth("locked", &locked, &[], &ctx, timeout).await,
+            HttpOauthPrep::NeedsInteractiveLogin
+        ));
+        let flaky = spawn_probe_server("503 Service Unavailable");
+        assert!(matches!(
+            decide_http_auth("flaky", &flaky, &[], &ctx, timeout).await,
+            HttpOauthPrep::Unreachable
+        ));
+
+        // An interactive session still connects without asking the probe.
+        let ctx = McpSpawnCtx::for_session("s", &ew, OauthInteractivity::Interactive, None);
+        assert!(matches!(
+            decide_http_auth("locked", &locked, &[], &ctx, timeout).await,
+            HttpOauthPrep::NoOauthSupport
+        ));
     }
 
     #[test]
@@ -6013,43 +6758,6 @@ mod tests {
     }
 
     #[test]
-    fn qualified_mcp_name_parser_accepts_structurally_valid_tool_ids() {
-        for (name, expected) in [
-            ("linear__list_issues", ("linear", "list_issues")),
-            ("123__lookup", ("123", "lookup")),
-            ("server:scope__tool", ("server:scope", "tool")),
-        ] {
-            let (id, server, tool) = parse_mcp_qualified_name(name).expect("valid qualified ID");
-            assert_eq!(id.as_str(), name);
-            assert_eq!((server, tool), expected);
-            assert_eq!(
-                parse_mcp_tool_name(name),
-                Some((expected.0.to_owned(), expected.1.to_owned()))
-            );
-        }
-    }
-
-    #[test]
-    fn qualified_mcp_name_parser_rejects_malformed_names() {
-        for name in [
-            "server__part__tool",
-            "server__tool__part",
-            "foo___bar",
-            "foo____bar",
-            "__tool",
-            "server__",
-            "server",
-            "",
-            "server__bad.tool",
-        ] {
-            assert!(
-                parse_mcp_qualified_name(name).is_none(),
-                "unexpectedly accepted {name:?}"
-            );
-        }
-    }
-
-    #[test]
     fn into_registration_validates_qualified_name() {
         let registration = make_mcp_tool("linear", "list_issues")
             .into_registration()
@@ -6073,23 +6781,24 @@ mod tests {
     }
 
     #[test]
-    fn into_registration_preserves_provider_name_policy() {
+    fn into_registration_keeps_names_over_the_provider_limit() {
         for qualified in ["123__lookup", "server:scope__tool"] {
             assert!(parse_mcp_qualified_name(qualified).is_some());
             let (server, tool) = qualified.split_once("__").unwrap();
             assert!(make_mcp_tool(server, tool).into_registration().is_none());
         }
 
-        let server_61 = format!("a{}", "b".repeat(60));
-        let server_62 = format!("a{}", "b".repeat(61));
-        let valid_64 = format!("{server_61}__b");
-        let invalid_65 = format!("{server_62}__b");
-        assert_eq!(valid_64.len(), 64);
-        assert_eq!(invalid_65.len(), 65);
-        assert!(parse_mcp_qualified_name(&valid_64).is_some());
-        assert!(parse_mcp_qualified_name(&invalid_65).is_some());
-        assert!(make_mcp_tool(&server_61, "b").into_registration().is_some());
-        assert!(make_mcp_tool(&server_62, "b").into_registration().is_none());
+        // A long server prefix pushes the qualified name past 64 chars. Such
+        // a tool used to be dropped; it is a catalog key, so it is kept as is.
+        let server = format!("a{}", "b".repeat(61));
+        let registration = make_mcp_tool(&server, "b")
+            .into_registration()
+            .expect("long qualified name is admitted");
+        assert_eq!(registration.name, format!("{server}__b"));
+        assert_eq!(registration.name.len(), PROVIDER_TOOL_NAME_MAX_CHARS + 1);
+
+        let too_long = "t".repeat(MCP_QUALIFIED_NAME_MAX_CHARS);
+        assert!(make_mcp_tool("s", &too_long).into_registration().is_none());
     }
 
     // ── is_retriable_transport_error tests ───────────────────────────

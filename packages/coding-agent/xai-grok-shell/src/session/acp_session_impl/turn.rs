@@ -805,6 +805,7 @@ impl SessionActor {
             };
             xai_grok_telemetry::session_ctx::log_event_dual(self.telemetry_enabled, ev);
         }
+        self.spawn_due_unreachable_retry().await;
         self.maybe_inject_mcp_reminder().await;
         self.maybe_inject_mcp_connecting_reminder().await;
         self.maybe_inject_date_rollover_reminder().await;

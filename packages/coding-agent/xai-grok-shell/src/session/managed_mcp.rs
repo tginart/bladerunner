@@ -21,8 +21,18 @@ use std::collections::HashMap;
 
 use agent_client_protocol as acp;
 
-/// Dedup key for the merge map: normalized URL for Http/Sse, name for Stdio.
+/// Dedup key for the merge map: the server name. Two servers that share a
+/// URL under different names (for example two accounts on one endpoint)
+/// stay separate entries.
 fn mcp_server_key(s: &acp::McpServer) -> String {
+    mcp_server_name(s).to_string()
+}
+
+/// Identity that matches a client-forwarded server against a disabled
+/// vendor's disk config: normalized URL for Http/Sse, name for Stdio. A
+/// vendor may forward its own server under another name, so the URL is the
+/// stronger match here.
+fn vendor_block_key(s: &acp::McpServer) -> String {
     match s {
         acp::McpServer::Http(acp::McpServerHttp { url, .. })
         | acp::McpServer::Sse(acp::McpServerSse { url, .. }) => normalize_url(url),
@@ -100,7 +110,7 @@ pub(crate) fn admit_client_mcp_servers(
         blocked.extend(
             crate::util::config::load_cursor_mcp_servers(cwd, &forced)
                 .iter()
-                .map(mcp_server_key),
+                .map(vendor_block_key),
         );
     }
     if !compat.claude.mcps {
@@ -109,7 +119,7 @@ pub(crate) fn admit_client_mcp_servers(
         blocked.extend(
             crate::util::config::load_claude_json_mcp_servers_for_attribution(cwd)
                 .iter()
-                .map(mcp_server_key),
+                .map(vendor_block_key),
         );
     }
     if blocked.is_empty() {
@@ -117,7 +127,7 @@ pub(crate) fn admit_client_mcp_servers(
     }
     client_mcp_servers
         .into_iter()
-        .filter(|s| !blocked.contains(&mcp_server_key(s)))
+        .filter(|s| !blocked.contains(&vendor_block_key(s)))
         .collect()
 }
 
@@ -286,7 +296,7 @@ pub(crate) fn merge_managed_mcp_servers_sourced(
 /// Plugin / Claude / Cursor / `.mcp.json` servers in merge priority order.
 ///
 /// Callers insert with `entry(key).or_insert` so the first listed source wins a
-/// shared URL key. TOML is applied separately (last-wins for merge and for
+/// shared name. TOML is applied separately (last-wins for merge and for
 /// discovery force-enable).
 fn non_toml_mcp_servers_with_source(
     cwd: &std::path::Path,
@@ -583,6 +593,33 @@ mod tests {
 
     fn client_stdio(name: &str) -> acp::McpServer {
         acp::McpServer::Stdio(acp::McpServerStdio::new(name.to_string(), "true"))
+    }
+
+    /// Two servers on one URL under different names (two accounts on one
+    /// endpoint) used to collapse into one, because HTTP servers were keyed
+    /// by normalized URL.
+    #[test]
+    fn servers_with_the_same_url_and_different_names_stay_separate() {
+        let cwd = empty_cwd();
+        let compat = xai_grok_tools::types::compat::CompatConfig::default();
+        let client = vec![
+            acp::McpServer::Http(acp::McpServerHttp::new(
+                "work-account",
+                "https://mcp.example.com/mcp",
+            )),
+            acp::McpServer::Http(acp::McpServerHttp::new(
+                "home-account",
+                "https://mcp.example.com/mcp/",
+            )),
+        ];
+        let merged = merge_managed_mcp_servers(client, cwd.path(), None, &compat);
+        let mut names: Vec<&str> = merged
+            .iter()
+            .map(mcp_server_name)
+            .filter(|name| name.ends_with("-account"))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["home-account", "work-account"]);
     }
 
     /// Vendor mcps kill switch must drop client-forwarded servers that match

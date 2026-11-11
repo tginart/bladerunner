@@ -1991,7 +1991,13 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
             }
             RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block))
         }
-        _ if extract_raw_field(tc, "variant").as_deref() == Some("UseTool") => {
+        // A direct `server__tool` call has the `MCPTool` input variant and the
+        // same `tool_name` / `tool_input` shape as `use_tool`.
+        _ if matches!(
+            extract_raw_field(tc, "variant").as_deref(),
+            Some("UseTool") | Some("MCPTool")
+        ) =>
+        {
             let tool_name = extract_raw_field(tc, "tool_name").unwrap_or_else(|| tc.title.clone());
             let mut block = UseToolCallBlock::new(tool_name);
             block.input_args = extract_use_tool_args(tc);
@@ -6684,6 +6690,27 @@ mod tests {
         .content(vec![])
         .locations(vec![]);
         let _block = tool_call_to_block(&tc, None);
+    }
+    #[test]
+    fn direct_mcp_tool_call_shows_name_args_and_error() {
+        let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("mcp3")), "MCP tool")
+            .kind(acp::ToolKind::Other)
+            .status(acp::ToolCallStatus::Failed)
+            .content(vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+                acp::TextContent::new("issue not found".to_string()),
+            ))])
+            .raw_input(Some(serde_json::json!(
+                { "variant" : "MCPTool", "tool_name" : "linear__get_issue",
+                "tool_input" : { "id" : "ENG-1" } }
+            )))
+            .locations(vec![]);
+        let block = tool_call_to_block(&tc, None);
+        let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
+            panic!("expected UseTool block, got {block:?}");
+        };
+        assert_eq!(ut.tool_name, "linear__get_issue");
+        assert_eq!(ut.input_args, [("id".to_string(), "ENG-1".to_string())]);
+        assert_eq!(ut.error.as_deref(), Some("issue not found"));
     }
     #[test]
     fn cursor_todo_write_suppressed_by_title() {

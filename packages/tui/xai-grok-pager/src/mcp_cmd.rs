@@ -117,7 +117,7 @@ pub struct AddArgs {
     #[arg(value_name = "ARGS")]
     args: Vec<String>,
 
-    /// Transport type. Defaults to stdio.
+    /// Transport type. Defaults to http for a bare http(s) URL, else stdio.
     #[arg(short = 't', long, value_enum)]
     transport: Option<McpTransport>,
 
@@ -270,8 +270,9 @@ async fn run_add(args: AddArgs) -> Result<()> {
 
 /// Validate an `mcp add` request and build the transport config.
 ///
-/// The transport flag fully determines how `command_or_url` is interpreted;
-/// URL-looking commands only produce a warning, never a behavior change.
+/// An explicit transport flag decides how `command_or_url` is read. Without
+/// one, a bare positional http(s):// URL means an HTTP server; any other
+/// URL-looking command stays stdio with a warning.
 fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
     validate_server_name(&args.name)?;
 
@@ -282,6 +283,7 @@ fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
             Some(t) if t.eq_ignore_ascii_case("sse") => McpTransport::Sse,
             _ => McpTransport::Http,
         },
+        None if is_bare_http_url(args) => McpTransport::Http,
         None => McpTransport::Stdio,
     };
     let explicit_transport = args.transport.is_some();
@@ -447,6 +449,19 @@ fn parse_headers(headers: &[String]) -> Result<HashMap<String, String>> {
         parsed.insert(name.to_string(), value.trim().to_string());
     }
     Ok(parsed)
+}
+
+/// True when the only source is a positional http(s):// URL. Extra args or
+/// `-e` mean the user describes a command, and the legacy `--command` /
+/// `--url` flags keep their own rules.
+fn is_bare_http_url(args: &AddArgs) -> bool {
+    args.url.is_none()
+        && args.args.is_empty()
+        && args.env.is_empty()
+        && args
+            .command_or_url
+            .as_deref()
+            .is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"))
 }
 
 fn looks_like_url(command: &str) -> bool {
@@ -896,16 +911,44 @@ mod tests {
     }
 
     #[test]
-    fn add_default_transport_warns_on_url_looking_command() {
-        let add = parse_add(&["grok", "mcp", "add", "api", "https://mcp.example.com/mcp"]);
-        let resolved = resolve_add(&add).expect("defaults to stdio with a warning");
+    fn add_bare_http_url_is_an_http_server() {
+        for url in ["https://mcp.example.com/mcp", "http://127.0.0.1:3000/mcp"] {
+            let add = parse_add(&["grok", "mcp", "add", "api", url]);
+            let resolved = resolve_add(&add).expect("a bare URL resolves");
+            assert_eq!(resolved.kind, McpTransport::Http);
+            match resolved.transport {
+                McpServerTransportConfig::StreamableHttp {
+                    url: got,
+                    transport_type,
+                    ..
+                } => {
+                    assert_eq!(got, url);
+                    assert_eq!(transport_type, None);
+                }
+                other => panic!("expected http transport, got {other:?}"),
+            }
+            assert!(resolved.warnings.is_empty());
+        }
+
+        // A URL with server args describes a command, so it stays stdio.
+        let add = parse_add(&[
+            "grok",
+            "mcp",
+            "add",
+            "api",
+            "--",
+            "https://mcp.example.com/mcp",
+            "--flag",
+        ]);
+        let resolved = resolve_add(&add).expect("a URL with args stays stdio");
         assert!(matches!(
             resolved.transport,
             McpServerTransportConfig::Stdio { .. }
         ));
-        assert_eq!(resolved.warnings.len(), 1);
-        assert!(resolved.warnings[0].contains("--transport http"));
+    }
 
+    #[test]
+    fn add_default_transport_warns_on_url_looking_command() {
         // Scheme-less commands get http:// prepended so the suggested
         // command passes URL validation verbatim.
         let add = parse_add(&["grok", "mcp", "add", "local", "localhost:3000"]);

@@ -1695,6 +1695,7 @@ pub(super) async fn run_session(
                             let s = session.clone();
                             tokio::task::spawn_local(async move {
                                 s.retry_auth_required_servers().await;
+                                s.retry_unreachable_servers().await;
                                 let _ = respond_to.send(());
                             });
                         }

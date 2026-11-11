@@ -22,6 +22,7 @@
 //!    - [`servers`] -- MCP transport layer (rmcp's `StreamableHttpClientTransport`
 //!      and `TokioChildProcess`) plus client lifecycle, tool invocation, error
 //!      classification, and managed-MCP refresh.
+//!    - [`tool_name`] -- `server__tool` qualification and catalog admission.
 //!    - [`mcp_http_client`] -- backoff wrapper around the HTTP client handed to
 //!      rmcp's streamable-HTTP transport (works around rmcp's zero-backoff SSE
 //!      reconnect loop).
@@ -35,6 +36,7 @@ pub mod mcp_http_client;
 pub mod oauth;
 pub mod oauth_config;
 pub mod servers;
+pub mod tool_name;
 pub mod wire;
 
 mod bearer_token_file;
