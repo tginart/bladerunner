@@ -259,7 +259,7 @@ Use Claude models served by Google-managed Vertex AI with `vertex_messages`:
 
 ```toml
 [model_providers.vertex-claude]
-base_url = "https://aiplatform.googleapis.com"   # global; regions use https://{region}-aiplatform.googleapis.com
+base_url = "https://aiplatform.googleapis.com"   # global; us/eu multi-region use https://aiplatform.{us|eu}.rep.googleapis.com; regions use https://{region}-aiplatform.googleapis.com
 api_backend = "vertex_messages"
 platform_name = "Google Vertex AI"                # optional; this is the default for vertex_messages
 

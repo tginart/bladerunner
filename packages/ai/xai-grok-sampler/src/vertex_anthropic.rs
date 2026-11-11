@@ -21,8 +21,13 @@ const STRIPPED_SAMPLING_FIELDS: [&str; 3] = ["temperature", "top_p", "top_k"];
 /// Body fields that Vertex carries in the URL or does not accept.
 const STRIPPED_ROUTE_FIELDS: [&str; 1] = ["model"];
 
-/// The global Vertex host. Regional hosts are `{region}-aiplatform.googleapis.com`.
-const VERTEX_GLOBAL_HOST: &str = "aiplatform.googleapis.com";
+/// Exact Vertex hosts: global, and the `us` / `eu` multi-region endpoints.
+/// Regional hosts are `{region}-aiplatform.googleapis.com`.
+const VERTEX_EXACT_HOSTS: [&str; 3] = [
+    "aiplatform.googleapis.com",
+    "aiplatform.us.rep.googleapis.com",
+    "aiplatform.eu.rep.googleapis.com",
+];
 const VERTEX_REGIONAL_HOST_SUFFIX: &str = "-aiplatform.googleapis.com";
 
 /// Build the Vertex Anthropic publisher path for one model.
@@ -37,6 +42,7 @@ const VERTEX_REGIONAL_HOST_SUFFIX: &str = "-aiplatform.googleapis.com";
 ///        variables as the Gemini Vertex route.
 ///     3. Use `streamRawPredict` for streams and `rawPredict` if not.
 /// Note: For `global`, the base URL must be `https://aiplatform.googleapis.com`.
+/// For the `us` or `eu` multi-region, use `https://aiplatform.{us|eu}.rep.googleapis.com`.
 /// For a region, use `https://{region}-aiplatform.googleapis.com`.
 pub fn path(base_url: &str, model: &str, stream: bool) -> Result<String> {
     require_vertex_host(base_url)?;
@@ -112,12 +118,13 @@ fn require_vertex_host(base_url: &str) -> Result<()> {
         SamplingError::InvalidConfiguration("Vertex Messages base_url is not a valid URL")
     })?;
     let host = url.host_str().unwrap_or_default();
-    let is_vertex_host = host == VERTEX_GLOBAL_HOST || host.ends_with(VERTEX_REGIONAL_HOST_SUFFIX);
+    let is_vertex_host =
+        VERTEX_EXACT_HOSTS.contains(&host) || host.ends_with(VERTEX_REGIONAL_HOST_SUFFIX);
     if url.scheme() == "https" && is_vertex_host {
         return Ok(());
     }
     Err(SamplingError::InvalidConfiguration(
-        "Vertex Messages base_url must be https://aiplatform.googleapis.com or https://{region}-aiplatform.googleapis.com",
+        "Vertex Messages base_url must be https://aiplatform.googleapis.com, https://aiplatform.{us|eu}.rep.googleapis.com, or https://{region}-aiplatform.googleapis.com",
     ))
 }
 
@@ -139,11 +146,14 @@ mod tests {
     fn vertex_host_check_accepts_only_https_google_hosts() {
         assert!(require_vertex_host("https://aiplatform.googleapis.com").is_ok());
         assert!(require_vertex_host("https://us-east5-aiplatform.googleapis.com/").is_ok());
+        assert!(require_vertex_host("https://aiplatform.us.rep.googleapis.com").is_ok());
+        assert!(require_vertex_host("https://aiplatform.eu.rep.googleapis.com").is_ok());
         for base in [
             "http://aiplatform.googleapis.com",
             "https://api.anthropic.com",
             "https://evil.example/aiplatform.googleapis.com",
             "https://aiplatform.googleapis.com.evil.example",
+            "https://aiplatform.evil.rep.googleapis.com.example",
             "not a url",
         ] {
             assert!(
