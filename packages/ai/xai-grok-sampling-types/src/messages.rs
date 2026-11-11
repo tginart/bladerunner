@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 /// POST /v1/messages request body
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessagesRequest {
+    /// Empty only on Vertex, where the URL carries the model id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     pub messages: Vec<Message>,
     pub max_tokens: u32,

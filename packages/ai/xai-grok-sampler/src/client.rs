@@ -1721,8 +1721,6 @@ struct MessagesTarget {
     sent: SentRequest,
     /// Full request URL, used in logs and 401 messages.
     endpoint: String,
-    /// Replacement JSON body. `None` sends the typed request unchanged.
-    body: Option<serde_json::Value>,
 }
 
 /// The one way a 401 becomes a `SamplingError::Auth` with a wire-derived
@@ -2455,19 +2453,18 @@ impl SamplingClient {
     /// Purpose: This function selects the URL, the credentials and the body
     /// envelope for the Messages wire.
     /// Input: The request after defaults, the model id, and the response mode.
-    /// Output: A [`MessagesTarget`]. Its `body` is `None` when the typed
-    /// request is sent as is.
+    /// Output: A [`MessagesTarget`].
     /// Method:
     ///     1. For a standard Messages route, use the configured endpoint and
     ///        [`Self::post`].
-    ///     2. For Vertex, build the `publishers/anthropic` URL, the `rawPredict`
-    ///        body, and an ADC bearer. The URL keeps the configured query
-    ///        parameters.
+    ///     2. For Vertex, build the `publishers/anthropic` URL and an ADC
+    ///        bearer, and strip the request in place for the `rawPredict`
+    ///        body. The URL keeps the configured query parameters.
     /// Note: The Vertex route does not send configured API keys,
     /// `anthropic-version` headers or `x-grok-*` headers to Google.
     async fn messages_target(
         &self,
-        request: &messages::MessagesRequest,
+        request: &mut messages::MessagesRequest,
         model: &str,
         mode: crate::vertex_anthropic::ResponseMode,
     ) -> Result<MessagesTarget> {
@@ -2476,12 +2473,11 @@ impl SamplingClient {
             return Ok(MessagesTarget {
                 sent: self.post(endpoint.as_str()),
                 endpoint,
-                body: None,
             });
         }
         let path = crate::vertex_anthropic::path(&self.base_url, model, mode)?;
         let endpoint = self.endpoint.url_for_path(&path);
-        let body = crate::vertex_anthropic::request_body(request)?;
+        crate::vertex_anthropic::strip_request(request);
         let token = self.google_adc.token().await?;
         let headers = crate::vertex_anthropic::headers(&self.default_headers, &token, mode);
         Ok(MessagesTarget {
@@ -2490,8 +2486,21 @@ impl SamplingClient {
                 sent_bearer: Some(Self::bearer_suffix(&token)),
             },
             endpoint,
-            body: Some(body),
         })
+    }
+
+    /// Serialize the Messages body: the typed request, or the Vertex envelope
+    /// around it. Both stream straight into the HTTP body with no JSON tree.
+    fn messages_json(
+        &self,
+        http_request: reqwest::RequestBuilder,
+        request: &messages::MessagesRequest,
+    ) -> reqwest::RequestBuilder {
+        if self.defaults.adapter.uses_vertex_anthropic_dialect() {
+            http_request.json(&crate::vertex_anthropic::VertexBody::new(request))
+        } else {
+            http_request.json(request)
+        }
     }
 
     /// Turn a 401 on the Messages wire into a `SamplingError`.
@@ -3441,10 +3450,9 @@ impl SamplingClient {
                 sent_bearer,
             },
             endpoint,
-            body,
         } = self
             .messages_target(
-                &request.inner,
+                &mut request.inner,
                 &model_id,
                 crate::vertex_anthropic::ResponseMode::Single,
             )
@@ -3470,10 +3478,7 @@ impl SamplingClient {
                 serde_json::to_value(&request.inner).map_err(SamplingError::Serialization)?;
             http_request = apply_copilot_dynamic_headers(http_request, &request_body);
         }
-        let http_request = match &body {
-            Some(body) => http_request.json(body),
-            None => http_request.json(&request.inner),
-        };
+        let http_request = self.messages_json(http_request, &request.inner);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -3586,10 +3591,9 @@ impl SamplingClient {
                 sent_bearer,
             },
             endpoint,
-            body,
         } = self
             .messages_target(
-                &request.inner,
+                &mut request.inner,
                 &model_id,
                 crate::vertex_anthropic::ResponseMode::Stream,
             )
@@ -3606,10 +3610,7 @@ impl SamplingClient {
                 serde_json::to_value(&request.inner).map_err(SamplingError::Serialization)?;
             http_request = apply_copilot_dynamic_headers(http_request, &request_body);
         }
-        let http_request = match &body {
-            Some(body) => http_request.json(body),
-            None => http_request.json(&request.inner),
-        };
+        let http_request = self.messages_json(http_request, &request.inner);
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);

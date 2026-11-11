@@ -7,7 +7,7 @@
 //! headers, and the body envelope are specific to Vertex.
 
 use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
-use serde_json::Value;
+use serde::Serialize;
 
 use xai_grok_sampling_types::{Result, SamplingError, messages::MessagesRequest};
 
@@ -15,18 +15,11 @@ use xai_grok_sampling_types::{Result, SamplingError, messages::MessagesRequest};
 /// a substitute; Vertex reads only the body field.
 pub const VERTEX_ANTHROPIC_VERSION: &str = "2026-10-21";
 
-/// Sampling knobs that the pinned API version rejects on current Claude models.
-const STRIPPED_SAMPLING_FIELDS: [&str; 3] = ["temperature", "top_p", "top_k"];
-
-/// Body fields that Vertex carries in the URL or does not accept.
-const STRIPPED_ROUTE_FIELDS: [&str; 1] = ["model"];
-
-/// Exact Vertex hosts: global, and the `us` / `eu` multi-region endpoints.
+/// Exact Vertex hosts: global, and the `us` multi-region endpoint.
 /// Regional hosts are `{region}-aiplatform.googleapis.com`.
-const VERTEX_EXACT_HOSTS: [&str; 3] = [
+const VERTEX_EXACT_HOSTS: [&str; 2] = [
     "aiplatform.googleapis.com",
     "aiplatform.us.rep.googleapis.com",
-    "aiplatform.eu.rep.googleapis.com",
 ];
 const VERTEX_REGIONAL_HOST_SUFFIX: &str = "-aiplatform.googleapis.com";
 
@@ -53,7 +46,7 @@ pub enum ResponseMode {
 ///        variables as the Gemini Vertex route.
 ///     3. Use `streamRawPredict` for a stream and `rawPredict` if not.
 /// Note: For `global`, the base URL must be `https://aiplatform.googleapis.com`.
-/// For the `us` or `eu` multi-region, use `https://aiplatform.{us|eu}.rep.googleapis.com`.
+/// For the `us` multi-region, use `https://aiplatform.us.rep.googleapis.com`.
 /// For a region, use `https://{region}-aiplatform.googleapis.com`.
 pub fn path(base_url: &str, model: &str, mode: ResponseMode) -> Result<String> {
     require_vertex_host(base_url)?;
@@ -85,34 +78,41 @@ pub fn headers(default_headers: &HeaderMap, token: &str, mode: ResponseMode) -> 
     headers
 }
 
-/// Serialize a Messages request into the Vertex `rawPredict` body.
+/// Strip a Messages request in place for the Vertex `rawPredict` body.
 ///
-/// Purpose: This function makes the JSON body that Vertex accepts.
+/// Purpose: This function removes the fields that Vertex does not accept.
 /// Input: The typed Messages request, after the client applied its defaults.
-/// Output: A JSON object.
 /// Method:
-///     1. Serialize the request with the shared Messages serializer.
-///     2. Remove `model`, because the URL carries it.
-///     3. Remove `temperature`, `top_p` and `top_k`.
-///     4. Insert `anthropic_version`.
+///     1. Clear `model`, because the URL carries it. An empty model is not
+///        serialized.
+///     2. Remove `temperature`, `top_p` and `top_k`.
 /// Note: Thinking blocks, signatures, `output_config.effort` and block order
-/// pass through unchanged.
-pub fn request_body(request: &MessagesRequest) -> Result<Value> {
-    let mut body = serde_json::to_value(request).map_err(SamplingError::Serialization)?;
-    let object = body
-        .as_object_mut()
-        .expect("MessagesRequest always serializes to a JSON object");
-    for field in STRIPPED_ROUTE_FIELDS
-        .iter()
-        .chain(&STRIPPED_SAMPLING_FIELDS)
-    {
-        object.remove(*field);
+/// do not change.
+pub fn strip_request(request: &mut MessagesRequest) {
+    request.model.clear();
+    request.temperature = None;
+    request.top_p = None;
+    request.top_k = None;
+}
+
+/// The Vertex body: a stripped request plus `anthropic_version`.
+///
+/// It borrows the request, so serde writes it straight into the HTTP body
+/// with no copy of the conversation.
+#[derive(Serialize)]
+pub struct VertexBody<'a> {
+    anthropic_version: &'static str,
+    #[serde(flatten)]
+    request: &'a MessagesRequest,
+}
+
+impl<'a> VertexBody<'a> {
+    pub fn new(request: &'a MessagesRequest) -> Self {
+        Self {
+            anthropic_version: VERTEX_ANTHROPIC_VERSION,
+            request,
+        }
     }
-    object.insert(
-        "anthropic_version".to_string(),
-        Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-    );
-    Ok(body)
 }
 
 pub(crate) fn publisher_path(location_path: &str, model: &str, mode: ResponseMode) -> String {
@@ -134,7 +134,7 @@ fn require_vertex_host(base_url: &str) -> Result<()> {
         return Ok(());
     }
     Err(SamplingError::InvalidConfiguration(
-        "Vertex Messages base_url must be https://aiplatform.googleapis.com, https://aiplatform.{us|eu}.rep.googleapis.com, or https://{region}-aiplatform.googleapis.com",
+        "Vertex Messages base_url must be https://aiplatform.googleapis.com, https://aiplatform.us.rep.googleapis.com, or https://{region}-aiplatform.googleapis.com",
     ))
 }
 
@@ -160,7 +160,6 @@ mod tests {
         assert!(require_vertex_host("https://aiplatform.googleapis.com").is_ok());
         assert!(require_vertex_host("https://us-east5-aiplatform.googleapis.com/").is_ok());
         assert!(require_vertex_host("https://aiplatform.us.rep.googleapis.com").is_ok());
-        assert!(require_vertex_host("https://aiplatform.eu.rep.googleapis.com").is_ok());
         for base in [
             "http://aiplatform.googleapis.com",
             "https://api.anthropic.com",
@@ -206,24 +205,27 @@ mod tests {
 
     #[test]
     fn body_moves_model_to_url_and_adds_version() {
-        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+        let mut request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-fable-5-2",
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": "hi"}],
             "temperature": 0.5,
             "top_p": 0.9,
+            "top_k": 40,
             "stream": true,
             "thinking": {"type": "adaptive"},
             "output_config": {"effort": "xhigh"}
         }))
         .expect("valid Messages request");
-        let body = request_body(&request).expect("body serializes");
+        strip_request(&mut request);
+        let body = serde_json::to_value(VertexBody::new(&request)).expect("body serializes");
         assert!(body.get("model").is_none());
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
         assert!(body.get("top_k").is_none());
         assert_eq!(body["anthropic_version"], VERTEX_ANTHROPIC_VERSION);
         assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 1024);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "xhigh");
     }
