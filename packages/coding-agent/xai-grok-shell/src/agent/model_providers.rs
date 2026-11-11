@@ -509,6 +509,14 @@ mod tests {
             platform_name("vertex-claude/labeled").as_deref(),
             Some("MyCorp Vertex")
         );
+        // Google ADC is the credential: a keyless Vertex model must not force
+        // a Bladerunner login.
+        assert!(
+            resolved
+                .get("vertex-claude/claude-fable-5-2")
+                .expect("model should exist")
+                .has_own_credentials()
+        );
     }
 
     #[test]

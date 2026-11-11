@@ -5397,11 +5397,17 @@ impl ModelEntry {
         self.auth_provider.as_ref()
     }
     /// `true` when the model has a non-empty `api_key`, an `env_key` that
-    /// resolves to a non-empty value, or a named auth provider.
+    /// resolves to a non-empty value, a named auth provider, or uses
+    /// `vertex_messages` (the sampler authenticates with Google ADC, so no
+    /// Bladerunner login is needed).
     /// Probes `std::env::var` at call time: result is not stable across env
-    /// changes. Never executes a provider command.
+    /// changes. Never executes a provider command, and never checks that ADC
+    /// is set up: a missing ADC fails on the first request with a `gcloud`
+    /// hint.
     pub(crate) fn has_own_credentials(&self) -> bool {
-        self.own_credential().is_some() || self.auth_provider.is_some()
+        self.own_credential().is_some()
+            || self.auth_provider.is_some()
+            || self.info.api_backend == ApiBackend::VertexMessages
     }
 }
 impl std::ops::Deref for ModelEntry {
