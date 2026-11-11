@@ -2144,6 +2144,7 @@ mod plugins;
 mod subagents;
 mod deferred_finishes;
 mod goals;
+mod inference_speed;
 mod interactions;
 mod background_tasks;
 mod models;

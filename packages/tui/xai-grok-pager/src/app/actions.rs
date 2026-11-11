@@ -609,6 +609,10 @@ pub enum Action {
     /// where hook notifications arrive) and persists to `[ui].hooks_muted`
     /// via `Effect::PersistSetting`.
     SetHooksMuted(bool),
+    /// Set whether the status bar shows the latest model response's tok/s and
+    /// TTFT. SHARED-owned: updates the process-wide cache (read at render)
+    /// and persists to `[ui].show_inference_speed` via `Effect::PersistSetting`.
+    SetShowInferenceSpeed(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).

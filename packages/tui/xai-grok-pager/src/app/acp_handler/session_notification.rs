@@ -1191,6 +1191,20 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         XaiSessionUpdate::InteractionResolved { tool_call_id } => {
             agent.dismiss_resolved_interaction(&tool_call_id)
         }
+        XaiSessionUpdate::ResponseCompleted {
+            ttft_ms,
+            tokens_per_sec,
+            ..
+        } => {
+            // Replayed history is not a live measurement; keep the chip empty.
+            if meta.is_replay || agent.session.loading_replay {
+                false
+            } else {
+                agent.inference_speed =
+                    crate::views::agent_status::InferenceSpeed::new(ttft_ms, tokens_per_sec);
+                crate::appearance::cache::load_show_inference_speed()
+            }
+        }
         _ => {
             tracing::trace!(
                 "Ignoring {}: {:?}",

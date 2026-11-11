@@ -35,6 +35,8 @@ const PAGE_FLIP_ON_SEND_DEFAULT: bool = UiConfig::PAGE_FLIP_ON_SEND_DEFAULT;
 const COMBINE_QUEUED_PROMPTS_DEFAULT: bool = false;
 /// `/hooks mute` defaults OFF: hook results show in the transcript.
 const HOOKS_MUTED_DEFAULT: bool = false;
+/// Inference-speed status chip defaults OFF (opt-in).
+const SHOW_INFERENCE_SPEED_DEFAULT: bool = false;
 const SIMPLE_MODE_DEFAULT: bool = true;
 /// Vim-mode scrollback default — matches the previous on-disk default.
 const VIM_MODE_DEFAULT: bool = false;
@@ -223,6 +225,35 @@ pub fn load_hooks_muted() -> bool {
 pub fn set_hooks_muted(muted: bool) {
     HOOKS_MUTED_CURRENT.with(|c| c.set(muted));
     HOOKS_MUTED_LOADED.with(|l| l.set(true));
+}
+
+// -- Show inference speed -----------------------------------------------------
+
+thread_local! {
+    static SHOW_INFERENCE_SPEED_CURRENT: Cell<bool> =
+        const { Cell::new(SHOW_INFERENCE_SPEED_DEFAULT) };
+    static SHOW_INFERENCE_SPEED_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cached `show_inference_speed`, seeding from `[ui]` on first call.
+pub fn load_show_inference_speed() -> bool {
+    SHOW_INFERENCE_SPEED_LOADED.with(|loaded| {
+        if !loaded.get() {
+            SHOW_INFERENCE_SPEED_CURRENT.with(|c| {
+                c.set(load_bool_from_effective_config(
+                    "show_inference_speed",
+                    SHOW_INFERENCE_SPEED_DEFAULT,
+                ))
+            });
+            loaded.set(true);
+        }
+    });
+    SHOW_INFERENCE_SPEED_CURRENT.with(|c| c.get())
+}
+
+pub fn set_show_inference_speed(enabled: bool) {
+    SHOW_INFERENCE_SPEED_CURRENT.with(|c| c.set(enabled));
+    SHOW_INFERENCE_SPEED_LOADED.with(|l| l.set(true));
 }
 
 // -- Simple mode --------------------------------------------------------------
@@ -641,6 +672,10 @@ pub fn prime(ui: &UiConfig) {
             .unwrap_or(COMBINE_QUEUED_PROMPTS_DEFAULT),
     );
     set_hooks_muted(ui.hooks_muted.unwrap_or(HOOKS_MUTED_DEFAULT));
+    set_show_inference_speed(
+        ui.show_inference_speed
+            .unwrap_or(SHOW_INFERENCE_SPEED_DEFAULT),
+    );
     set_simple_mode(ui.simple_mode.unwrap_or(SIMPLE_MODE_DEFAULT));
     set_keep_text_selection(text_selection_from_ui(ui));
     // Layered-config keys (not the `UiConfig` arg) — seed so the first frame
@@ -761,6 +796,11 @@ mod tests {
         assert_eq!(
             HOOKS_MUTED_DEFAULT,
             ui.hooks_muted.unwrap_or(HOOKS_MUTED_DEFAULT)
+        );
+        assert_eq!(
+            SHOW_INFERENCE_SPEED_DEFAULT,
+            ui.show_inference_speed
+                .unwrap_or(SHOW_INFERENCE_SPEED_DEFAULT)
         );
         assert_eq!(SIMPLE_MODE_DEFAULT, ui.simple_mode.unwrap_or(true));
         assert_eq!(VIM_MODE_DEFAULT, ui.vim_mode.unwrap_or(false));

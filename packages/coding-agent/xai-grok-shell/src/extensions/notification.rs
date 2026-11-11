@@ -1171,6 +1171,14 @@ pub enum SessionUpdate {
         /// `streaming-messages-json` stamps it onto the assistant frame.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_sequence: Option<String>,
+        /// Time from request start to the first content token, in ms. Feeds
+        /// the TUI's optional inference-speed chip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u64>,
+        /// Output tokens per second over the decode phase (after the first
+        /// token), rounded to 0.1. `None` when the response had no output tokens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_per_sec: Option<f64>,
     },
     /// Catch-all for unrecognized session update types.
     /// Allows forward/backward compatibility when variants are added or removed.

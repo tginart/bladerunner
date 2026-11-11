@@ -182,6 +182,10 @@ pub struct UiConfig {
     /// `None` = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_muted: Option<bool>,
+    /// Show the latest model response's tokens/sec and time to first token
+    /// (TTFT) in the TUI status bar. `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_inference_speed: Option<bool>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -325,6 +329,7 @@ impl Default for UiConfig {
             contextual_hints: ContextualHints::default(),
             combine_queued_prompts: None,
             hooks_muted: None,
+            show_inference_speed: None,
             display_refresh: DisplayRefreshSettings::default(),
             notifications: UiNotificationsConfig::default(),
         }
