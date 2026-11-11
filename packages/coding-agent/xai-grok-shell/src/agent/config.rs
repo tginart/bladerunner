@@ -6114,7 +6114,9 @@ pub(crate) fn resolve_aux_model_sampling_config(
             None,
             None,
         );
-        if sampler.api_key.is_some() {
+        // Vertex mints its Google ADC bearer per request, so no key is expected.
+        let is_vertex = entry.info.api_backend == ApiBackend::VertexMessages;
+        if sampler.api_key.is_some() || is_vertex {
             return Some(sampler);
         }
         if entry.effective_auth_provider().is_some() {
@@ -7504,6 +7506,35 @@ reasoning_effort = "low"
         assert_eq!(resolved.model, "v9m-rl-learnability-tp8");
         assert_eq!(resolved.base_url, "https://vendor.example/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("vendor-key"));
+    }
+    /// A keyless Vertex aux model keeps its own ADC route: it must not fall
+    /// back to the session model or reroute through the xAI proxy.
+    #[test]
+    fn resolve_aux_model_accepts_keyless_vertex_adc() {
+        let endpoints = EndpointsConfig::default();
+        let mut entry = test_model_entry(
+            "claude-fable-5-2",
+            "https://aiplatform.googleapis.com",
+            None,
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::VertexMessages;
+        let mut catalog = IndexMap::new();
+        catalog.insert("vertex-fable".to_string(), entry);
+        for session_key in [None, Some("session-jwt")] {
+            let resolved = resolve_aux_model_sampling_config(
+                "vertex-fable",
+                &catalog,
+                &endpoints,
+                session_key,
+                false,
+                None,
+                None,
+            )
+            .expect("a Vertex model resolves with Google ADC and no API key");
+            assert_eq!(resolved.base_url, "https://aiplatform.googleapis.com");
+        }
     }
     /// Cold cache falls back to the session model, never the xAI proxy;
     /// warm cache serves the provider token at the provider endpoint.
