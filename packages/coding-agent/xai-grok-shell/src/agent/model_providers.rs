@@ -498,8 +498,8 @@ mod tests {
                 .get(key)
                 .expect("model should exist")
                 .info
-                .platform_name
-                .clone()
+                .display_platform_name()
+                .map(str::to_string)
         };
         assert_eq!(
             platform_name("vertex-claude/claude-fable-5-2").as_deref(),

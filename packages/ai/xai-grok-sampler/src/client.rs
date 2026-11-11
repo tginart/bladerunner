@@ -100,7 +100,7 @@ pub fn is_first_party_grok_endpoint(base_url: &str) -> bool {
 /// Remove every `x-grok-*` header. Used when the configured base URL is not a
 /// first-party endpoint so product/session identity cannot leak to third parties
 /// via `extra_headers`, env headers, or late injectors.
-fn strip_x_grok_headers(headers: &mut HeaderMap) {
+pub(crate) fn strip_x_grok_headers(headers: &mut HeaderMap) {
     let keys: Vec<HeaderName> = headers
         .keys()
         .filter(|name| {
@@ -1457,7 +1457,7 @@ fn auth_header_value(auth_scheme: AuthScheme, api_key: &str) -> Option<HeaderVal
     HeaderValue::from_str(&value).ok()
 }
 
-fn remove_known_auth_headers(headers: &mut HeaderMap) {
+pub(crate) fn remove_known_auth_headers(headers: &mut HeaderMap) {
     headers.remove(AUTHORIZATION);
     headers.remove(HeaderName::from_static("x-api-key"));
     headers.remove(HeaderName::from_static("api-key"));
@@ -1886,6 +1886,12 @@ impl SamplingClient {
         };
         let adapter = BackendAdapter::from_route(adapter_kind, config.api_backend.clone())?;
         adapter.ensure_implemented()?;
+        // The Vertex route builds its own resource path from the model id.
+        if adapter.uses_vertex_anthropic_dialect() && config.endpoint_path.is_some() {
+            return Err(SamplingError::InvalidConfiguration(
+                "endpoint_path is not supported with api_backend = \"vertex_messages\"",
+            ));
+        }
 
         let defaults = ClientDefaults {
             model: config.model,
@@ -2461,7 +2467,8 @@ impl SamplingClient {
     ///     1. For a standard Messages route, use the configured endpoint and
     ///        [`Self::post`].
     ///     2. For Vertex, build the `publishers/anthropic` URL, the `rawPredict`
-    ///        body, and an ADC bearer.
+    ///        body, and an ADC bearer. The URL keeps the configured query
+    ///        parameters.
     /// Note: The Vertex route does not send configured API keys,
     /// `anthropic-version` headers or `x-grok-*` headers to Google.
     async fn messages_target(
@@ -2478,17 +2485,11 @@ impl SamplingClient {
                 body: None,
             });
         }
-        let endpoint = crate::vertex_anthropic::url(&self.base_url, model, stream)?;
+        let path = crate::vertex_anthropic::path(&self.base_url, model, stream)?;
+        let endpoint = self.endpoint.url_for_path(&path);
         let body = crate::vertex_anthropic::request_body(request)?;
         let token = self.google_adc.token().await?;
-        let mut headers = self.default_headers.clone();
-        remove_known_auth_headers(&mut headers);
-        strip_x_grok_headers(&mut headers);
-        headers.remove(HeaderName::from_static("anthropic-version"));
-        crate::google::apply_google_auth_headers(&mut headers, None, Some(&token));
-        if !stream {
-            headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        }
+        let headers = crate::vertex_anthropic::headers(&self.default_headers, &token, stream);
         Ok(MessagesTarget {
             sent: SentRequest {
                 builder: self.http.post(endpoint.as_str()).headers(headers),
@@ -2497,6 +2498,34 @@ impl SamplingClient {
             endpoint,
             body: Some(body),
         })
+    }
+
+    /// Turn a 401 on the Messages wire into a `SamplingError::Auth`.
+    ///
+    /// Purpose: This function reports a rejected Messages credential.
+    /// Input: The 401 site, the request URL, the server message, and the
+    /// bearer fragment that was sent.
+    /// Output: A `SamplingError::Auth`.
+    /// Note: A Vertex 401 rejects a Google ADC token, not a Bladerunner
+    /// credential. Thus it skips the 401 attribution hook and tells the user
+    /// how to refresh ADC.
+    fn messages_unauthorized(
+        &self,
+        consumer: crate::attribution::SamplingConsumer,
+        endpoint: &str,
+        server_message: &str,
+        sent_bearer: Option<&str>,
+    ) -> SamplingError {
+        let mut message = format!("Unauthorized (401) from {endpoint}: {server_message}");
+        if self.defaults.adapter.uses_vertex_anthropic_dialect() {
+            message.push_str(
+                " (Google ADC rejected: run `gcloud auth application-default login` \
+                 or check the service account's Vertex AI permissions)",
+            );
+        } else {
+            self.record_401_attribution(consumer, sent_bearer);
+        }
+        auth_rejected(message, sent_bearer)
     }
 
     fn apply_messages_session_affinity(
@@ -3459,13 +3488,11 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(
-                    crate::attribution::SamplingConsumer::Messages,
-                    sent_bearer.as_deref(),
-                );
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
-                return Err(auth_rejected(
-                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                return Err(self.messages_unauthorized(
+                    crate::attribution::SamplingConsumer::Messages,
+                    &endpoint,
+                    &server_message,
                     sent_bearer.as_deref(),
                 ));
             }
@@ -3511,7 +3538,7 @@ impl SamplingClient {
         name = "http.create_message_stream",
         skip_all,
         fields(
-            endpoint = %self.endpoint("messages"),
+            endpoint = tracing::field::Empty,
             model_id = request.inner.model.as_str(),
             status_code = tracing::field::Empty,
             success = tracing::field::Empty,
@@ -3563,6 +3590,7 @@ impl SamplingClient {
         } = self
             .messages_target(&request.inner, &model_id, true)
             .await?;
+        tracing::Span::current().record("endpoint", endpoint.as_str());
         let mut http_request = self
             .apply_messages_session_affinity(
                 grok_headers.apply(builder, self.allows_x_grok_headers()),
@@ -3604,14 +3632,12 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(
-                    crate::attribution::SamplingConsumer::MessagesStream,
-                    sent_bearer.as_deref(),
-                );
                 let body = response.bytes().await.unwrap_or_default();
                 let server_message = user_facing_api_error_message(status, body.as_ref());
-                return Err(auth_rejected(
-                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                return Err(self.messages_unauthorized(
+                    crate::attribution::SamplingConsumer::MessagesStream,
+                    &endpoint,
+                    &server_message,
                     sent_bearer.as_deref(),
                 ));
             }

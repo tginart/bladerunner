@@ -38,11 +38,19 @@ impl BackendAdapter {
     /// Resolve and validate provider adapter metadata against its catalog wire
     /// backend. This is the only factory used by `SamplingClient`.
     pub fn from_route(kind: AdapterKind, backend: ApiBackend) -> Result<Self> {
+        // Resolve the Vertex backend before the per-kind arms: adapters that
+        // wrap any backend (Nexus, Copilot) would otherwise drop the Vertex
+        // URL, body envelope, and ADC auth.
+        if backend == ApiBackend::VertexMessages {
+            return match kind {
+                AdapterKind::Standard | AdapterKind::VertexAnthropic => Ok(Self::VertexAnthropic),
+                _ => Err(SamplingError::InvalidConfiguration(
+                    "api_backend = \"vertex_messages\" requires the standard or Vertex Anthropic adapter",
+                )),
+            };
+        }
         match kind {
             AdapterKind::Standard if backend == ApiBackend::CodexResponses => Ok(Self::OpenAiCodex),
-            AdapterKind::Standard if backend == ApiBackend::VertexMessages => {
-                Ok(Self::VertexAnthropic)
-            }
             AdapterKind::Standard => Ok(Self::Standard(backend)),
             AdapterKind::KimiCoding
                 if matches!(backend, ApiBackend::ChatCompletions | ApiBackend::Messages) =>
@@ -86,7 +94,9 @@ impl BackendAdapter {
             AdapterKind::BedrockConverseStream => Err(SamplingError::InvalidConfiguration(
                 "Bedrock ConverseStream adapter requires the Bedrock ConverseStream backend",
             )),
-            AdapterKind::VertexAnthropic if backend.is_messages_wire() => Ok(Self::VertexAnthropic),
+            AdapterKind::VertexAnthropic if backend == ApiBackend::Messages => {
+                Ok(Self::VertexAnthropic)
+            }
             AdapterKind::VertexAnthropic => Err(SamplingError::InvalidConfiguration(
                 "Vertex Anthropic adapter requires the Messages or VertexMessages backend",
             )),
@@ -229,6 +239,35 @@ mod tests {
         assert!(adapter.ensure_implemented().is_ok());
         assert!(
             BackendAdapter::from_route(AdapterKind::MistralConversations, ApiBackend::Responses)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vertex_messages_backend_always_uses_the_vertex_adapter() {
+        for kind in [AdapterKind::Standard, AdapterKind::VertexAnthropic] {
+            let adapter = BackendAdapter::from_route(kind, ApiBackend::VertexMessages)
+                .expect("Vertex Messages route");
+            assert!(adapter.uses_vertex_anthropic_dialect());
+            assert_eq!(adapter.wire_backend(), Some(&ApiBackend::Messages));
+        }
+        let explicit =
+            BackendAdapter::from_route(AdapterKind::VertexAnthropic, ApiBackend::Messages)
+                .expect("Vertex adapter on the Messages backend");
+        assert!(explicit.uses_vertex_anthropic_dialect());
+
+        for kind in [
+            AdapterKind::Nexus,
+            AdapterKind::GitHubCopilot,
+            AdapterKind::KimiCoding,
+        ] {
+            assert!(
+                BackendAdapter::from_route(kind, ApiBackend::VertexMessages).is_err(),
+                "{kind:?} must not wrap the Vertex backend"
+            );
+        }
+        assert!(
+            BackendAdapter::from_route(AdapterKind::VertexAnthropic, ApiBackend::Responses)
                 .is_err()
         );
     }

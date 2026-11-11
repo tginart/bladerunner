@@ -3,9 +3,10 @@
 //! Purpose: This module changes a typed Anthropic Messages request into the
 //! Vertex `rawPredict` / `streamRawPredict` envelope.
 //! Note: The Messages serializer, the SSE parser, and the Google ADC token
-//! provider stay shared with the other transports. Only the URL and the body
-//! envelope are specific to Vertex.
+//! provider stay shared with the other transports. Only the URL path, the
+//! headers, and the body envelope are specific to Vertex.
 
+use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
 use xai_grok_sampling_types::{Result, SamplingError, messages::MessagesRequest};
@@ -20,40 +21,51 @@ const STRIPPED_SAMPLING_FIELDS: [&str; 3] = ["temperature", "top_p", "top_k"];
 /// Body fields that Vertex carries in the URL or does not accept.
 const STRIPPED_ROUTE_FIELDS: [&str; 1] = ["model"];
 
-/// Build the Vertex Anthropic publisher URL for one model.
+/// The global Vertex host. Regional hosts are `{region}-aiplatform.googleapis.com`.
+const VERTEX_GLOBAL_HOST: &str = "aiplatform.googleapis.com";
+const VERTEX_REGIONAL_HOST_SUFFIX: &str = "-aiplatform.googleapis.com";
+
+/// Build the Vertex Anthropic publisher path for one model.
 ///
-/// Purpose: This function makes the `publishers/anthropic` resource URL.
+/// Purpose: This function makes the `publishers/anthropic` resource path.
 /// Input: The configured base URL, the model id, and the stream flag.
-/// Output: The full request URL, or a configuration error.
+/// Output: The path with no leading slash, or a configuration error.
 /// Method:
-///     1. Read the project and location from the same environment variables
-///        as the native Google transport.
-///     2. Use `streamRawPredict` for streams and `rawPredict` if not.
+///     1. Make sure that the base URL is an HTTPS Vertex host. The caller
+///        sends a Google ADC bearer to this host.
+///     2. Read the project and the location from the same environment
+///        variables as the Gemini Vertex route.
+///     3. Use `streamRawPredict` for streams and `rawPredict` if not.
 /// Note: For `global`, the base URL must be `https://aiplatform.googleapis.com`.
 /// For a region, use `https://{region}-aiplatform.googleapis.com`.
-pub fn url(base_url: &str, model: &str, stream: bool) -> Result<String> {
+pub fn path(base_url: &str, model: &str, stream: bool) -> Result<String> {
+    require_vertex_host(base_url)?;
     let endpoint = crate::google::GoogleEndpoint::from_config(base_url, model);
-    let project = endpoint
-        .project
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(SamplingError::InvalidConfiguration(
-            "Vertex Messages requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT",
-        ))?;
-    let location = endpoint
-        .location
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(SamplingError::InvalidConfiguration(
-            "Vertex Messages requires GOOGLE_CLOUD_LOCATION (for example `global`)",
-        ))?;
-    Ok(url_for(
-        &endpoint.base_url,
-        project,
-        location,
-        model,
-        stream,
-    ))
+    let location_path = endpoint.vertex_location_path()?;
+    Ok(publisher_path(&location_path, model, stream))
+}
+
+/// Build the request headers for one Vertex Anthropic request.
+///
+/// Purpose: This function makes the headers that Google receives.
+/// Input: The client default headers, the ADC access token, and the stream
+/// flag.
+/// Output: A new header map.
+/// Method:
+///     1. Remove the configured API keys, the `x-grok-*` headers, and the
+///        `anthropic-version` header.
+///     2. Add the ADC bearer, the JSON content type, and the `Accept` header.
+/// Note: `anthropic-beta` and other provider headers pass through.
+pub fn headers(default_headers: &HeaderMap, token: &str, stream: bool) -> HeaderMap {
+    let mut headers = default_headers.clone();
+    crate::client::remove_known_auth_headers(&mut headers);
+    crate::client::strip_x_grok_headers(&mut headers);
+    headers.remove(HeaderName::from_static("anthropic-version"));
+    crate::google::apply_google_auth_headers(&mut headers, None, Some(token));
+    if !stream {
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    }
+    headers
 }
 
 /// Serialize a Messages request into the Vertex `rawPredict` body.
@@ -86,16 +98,27 @@ pub fn request_body(request: &MessagesRequest) -> Result<Value> {
     Ok(body)
 }
 
-fn url_for(base_url: &str, project: &str, location: &str, model: &str, stream: bool) -> String {
+fn publisher_path(location_path: &str, model: &str, stream: bool) -> String {
     let method = if stream {
         "streamRawPredict"
     } else {
         "rawPredict"
     };
-    let base = base_url.trim_end_matches('/');
-    format!(
-        "{base}/v1/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:{method}"
-    )
+    format!("{location_path}/publishers/anthropic/models/{model}:{method}")
+}
+
+fn require_vertex_host(base_url: &str) -> Result<()> {
+    let url = reqwest::Url::parse(base_url).map_err(|_| {
+        SamplingError::InvalidConfiguration("Vertex Messages base_url is not a valid URL")
+    })?;
+    let host = url.host_str().unwrap_or_default();
+    let is_vertex_host = host == VERTEX_GLOBAL_HOST || host.ends_with(VERTEX_REGIONAL_HOST_SUFFIX);
+    if url.scheme() == "https" && is_vertex_host {
+        return Ok(());
+    }
+    Err(SamplingError::InvalidConfiguration(
+        "Vertex Messages base_url must be https://aiplatform.googleapis.com or https://{region}-aiplatform.googleapis.com",
+    ))
 }
 
 #[cfg(test)]
@@ -103,13 +126,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_uses_anthropic_publisher_and_raw_predict_methods() {
-        let base = "https://aiplatform.googleapis.com/";
+    fn path_uses_anthropic_publisher_and_raw_predict_methods() {
+        let location_path = "v1/projects/proj/locations/global";
         assert_eq!(
-            url_for(base, "proj", "global", "claude-fable-5-2", true),
-            "https://aiplatform.googleapis.com/v1/projects/proj/locations/global/publishers/anthropic/models/claude-fable-5-2:streamRawPredict"
+            publisher_path(location_path, "claude-fable-5-2", true),
+            "v1/projects/proj/locations/global/publishers/anthropic/models/claude-fable-5-2:streamRawPredict"
         );
-        assert!(url_for(base, "proj", "global", "m", false).ends_with("/models/m:rawPredict"));
+        assert!(publisher_path(location_path, "m", false).ends_with("/models/m:rawPredict"));
+    }
+
+    #[test]
+    fn vertex_host_check_accepts_only_https_google_hosts() {
+        assert!(require_vertex_host("https://aiplatform.googleapis.com").is_ok());
+        assert!(require_vertex_host("https://us-east5-aiplatform.googleapis.com/").is_ok());
+        for base in [
+            "http://aiplatform.googleapis.com",
+            "https://api.anthropic.com",
+            "https://evil.example/aiplatform.googleapis.com",
+            "https://aiplatform.googleapis.com.evil.example",
+            "not a url",
+        ] {
+            assert!(
+                require_vertex_host(base).is_err(),
+                "{base} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn headers_drop_configured_credentials_and_add_adc_bearer() {
+        let mut defaults = HeaderMap::new();
+        for (name, value) in [
+            ("authorization", "Bearer configured-key"),
+            ("x-api-key", "sk-ant-configured"),
+            ("anthropic-version", "2023-06-01"),
+            ("x-grok-conv-id", "conv"),
+            ("anthropic-beta", "some-beta"),
+        ] {
+            defaults.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        let headers = headers(&defaults, "adc-token", false);
+        assert_eq!(headers["authorization"], "Bearer adc-token");
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("anthropic-version").is_none());
+        assert!(headers.get("x-grok-conv-id").is_none());
+        assert_eq!(headers["anthropic-beta"], "some-beta");
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(
+            super::headers(&defaults, "adc-token", true)["accept"],
+            "text/event-stream"
+        );
     }
 
     #[test]

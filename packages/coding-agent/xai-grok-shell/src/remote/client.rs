@@ -867,6 +867,9 @@ pub(crate) fn parse_remote_model_value(
             }
             "chat_completions" => Some(crate::sampling::ApiBackend::ChatCompletions),
             "messages" => Some(crate::sampling::ApiBackend::Messages),
+            "vertex_messages" | "vertex-messages" => {
+                Some(crate::sampling::ApiBackend::VertexMessages)
+            }
             _ => None,
         })
         .unwrap_or_default();

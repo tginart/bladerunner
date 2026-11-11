@@ -4994,13 +4994,6 @@ impl ConfigModelOverride {
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
         }
-        // After `platform_name` and `api_backend` are applied, so an explicit
-        // label from the model or its provider always wins.
-        if entry.info.api_backend == ApiBackend::VertexMessages
-            && entry.info.platform_name.is_none()
-        {
-            entry.info.platform_name = Some(VERTEX_PLATFORM_NAME_DEFAULT.to_string());
-        }
         if self.request_compat.is_some() {
             entry.info.request_compat.clone_from(&self.request_compat);
         }
@@ -5169,6 +5162,25 @@ pub struct ModelInfo {
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
 impl ModelInfo {
+    /// Platform label shown beside the model in `/model`.
+    ///
+    /// Purpose: This function gives the label for every model source.
+    /// Output: The trimmed `platform_name`. If it is not set, the default
+    /// label for the backend (only `vertex_messages` has one).
+    /// Note: The default lives here, not in config parsing, so that remote and
+    /// catalog entries get it too.
+    pub fn display_platform_name(&self) -> Option<&str> {
+        let configured = self
+            .platform_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        if configured.is_some() {
+            return configured;
+        }
+        (self.api_backend == ApiBackend::VertexMessages).then_some(VERTEX_PLATFORM_NAME_DEFAULT)
+    }
+
     /// Minimal fallback descriptor for an unknown model slug.
     /// Used when a configured model ID isn't found in presets or remote models.
     pub fn fallback(slug: &str) -> Self {
@@ -6875,12 +6887,7 @@ pub(crate) fn to_acp_model_info(
                         reasoning_efforts_meta_value(&info.reasoning_efforts),
                     );
                 }
-                if let Some(platform_name) = info
-                    .platform_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                {
+                if let Some(platform_name) = info.display_platform_name() {
                     map.insert(
                         xai_grok_sampling_types::PLATFORM_NAME_META_KEY.to_string(),
                         platform_name.into(),

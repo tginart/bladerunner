@@ -73,14 +73,9 @@ impl GoogleEndpoint {
                 format!("{base}/v1/publishers/google/models/{}:{suffix}", self.model)
             }
             GoogleEndpointKind::Vertex => {
-                let project = self.project.as_deref().ok_or(SamplingError::InvalidConfiguration(
-                    "Google Vertex requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT when no Vertex API key is configured",
-                ))?;
-                let location = self.location.as_deref().ok_or(SamplingError::InvalidConfiguration(
-                    "Google Vertex requires GOOGLE_CLOUD_LOCATION when no Vertex API key is configured",
-                ))?;
+                let location_path = self.vertex_location_path()?;
                 format!(
-                    "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:{suffix}",
+                    "{base}/{location_path}/publishers/google/models/{}:{suffix}",
                     self.model
                 )
             }
@@ -90,6 +85,26 @@ impl GoogleEndpoint {
         } else {
             Ok(url)
         }
+    }
+
+    /// Purpose: This function makes the Vertex resource path for the project
+    /// and the location.
+    /// Output: `v1/projects/{project}/locations/{location}`, with no leading
+    /// slash, or a configuration error.
+    /// Note: The Gemini route and the Anthropic route on Vertex share this path.
+    /// Gemini can also use a Vertex API key and skip this path.
+    pub fn vertex_location_path(&self) -> Result<String> {
+        let project = non_empty(self.project.as_deref()).ok_or(
+            SamplingError::InvalidConfiguration(
+                "Google Vertex requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT (Gemini also accepts a Vertex API key)",
+            ),
+        )?;
+        let location = non_empty(self.location.as_deref()).ok_or(
+            SamplingError::InvalidConfiguration(
+                "Google Vertex requires GOOGLE_CLOUD_LOCATION, for example `global` (Gemini also accepts a Vertex API key)",
+            ),
+        )?;
+        Ok(format!("v1/projects/{project}/locations/{location}"))
     }
 
     fn resolved_base_url(&self, vertex_express: bool) -> String {
@@ -737,6 +752,10 @@ impl Default for VertexAdcTokenProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 pub fn apply_google_auth_headers(
