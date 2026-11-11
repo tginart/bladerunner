@@ -15,6 +15,7 @@ use xai_grok_pager::app::PagerTerminal;
 use xai_grok_pager::app::app_view::{ActiveView, AppView};
 use xai_grok_pager::appearance::AppearanceConfig;
 use xai_grok_pager::minimal_api;
+use xai_grok_pager::minimal_reprint;
 use xai_grok_pager::render::Renderable;
 use xai_grok_pager::scrollback::block::RenderBlock;
 use xai_grok_pager::scrollback::blocks::ToolCallBlock;
@@ -336,7 +337,7 @@ pub(crate) fn minimal_renderer<'a>(
 /// **full** `desired_height` so wrapping is byte-identical to an uncapped commit
 /// (K5); the `insert_before` buffer is only `commit_h` rows tall, so any content
 /// past it is clipped — bounding the allocation to the cap.
-fn insert_committed(
+pub(crate) fn insert_committed(
     terminal: &mut PagerTerminal,
     renderer: EntryRenderer<'_>,
     width: u16,
@@ -412,6 +413,75 @@ fn paint_committed(
     }
 }
 
+/// Like [`insert_committed`], but a block taller than `max_rows` keeps its
+/// newest rows instead of its oldest. The history reprint uses it for the
+/// block at the edge of its row budget, so the output the user saw last stays.
+pub(crate) fn insert_committed_tail(
+    terminal: &mut PagerTerminal,
+    renderer: EntryRenderer<'_>,
+    width: u16,
+    max_rows: u16,
+    footer_style: Style,
+) -> std::io::Result<()> {
+    let full_h = renderer.desired_height(width);
+    if full_h == 0 {
+        return Ok(());
+    }
+    let commit_h = full_h.min(max_rows);
+    terminal.insert_before(commit_h, move |buf| {
+        paint_committed_tail(buf, renderer, width, full_h, footer_style);
+    })?;
+    insert_gap(terminal);
+    Ok(())
+}
+
+/*
+Purpose: This function paints the newest rows of a committed block into buf.
+Input: A buffer of commit_h rows. The renderer. The width. The full block
+    height full_h. The note style.
+Output: None. The function writes into buf.
+Method:
+    1. If the block fits in buf, paint it with paint_committed.
+    2. If not, the first row is a note that tells how many earlier lines are
+       left out.
+    3. Paint the last commit_h - 1 rows of the block below the note.
+*/
+fn paint_committed_tail(
+    buf: &mut ratatui::buffer::Buffer,
+    renderer: EntryRenderer<'_>,
+    width: u16,
+    full_h: u16,
+    footer_style: Style,
+) {
+    let commit_h = buf.area.height;
+    if commit_h >= full_h {
+        paint_committed(buf, renderer, width, full_h, footer_style);
+        return;
+    }
+    assert!(
+        commit_h >= 2,
+        "a tail clip needs a note row and a content row"
+    );
+    let hidden = full_h - (commit_h - 1);
+    let style = footer_style.bg(Color::Reset);
+    let note_row = Rect {
+        x: buf.area.x,
+        y: buf.area.y,
+        width,
+        height: 1,
+    };
+    buf.set_style(note_row, style);
+    let text = format!("\u{2026} {hidden} earlier lines \u{2014} /transcript to view");
+    buf.set_span(buf.area.x, buf.area.y, &Span::styled(text, style), width);
+    let area = Rect {
+        x: buf.area.x,
+        y: buf.area.y + 1,
+        width,
+        height: commit_h - 1,
+    };
+    renderer.with_skip_rows(hidden).render(area, buf);
+}
+
 /// Commit the active agent's newly-finalized blocks into native scrollback.
 ///
 /// For each entry in the leading committable run: stamp its print-once display
@@ -449,7 +519,7 @@ pub fn commit_active(app: &mut AppView, terminal: &mut PagerTerminal) {
     // Whether a turn is actively running. When idle, every remaining entry is
     // stable and committable (see `is_committable`); a stale `is_running` flag
     // left by the tracker must not wedge the frontier.
-    let turn_running = agent.session.state.is_turn_running();
+    let turn_running = minimal_api::is_turn_or_wake_running(agent);
     let cwd = agent.session.cwd.as_path();
     let sb = &mut agent.scrollback;
 
@@ -468,7 +538,7 @@ pub fn commit_active(app: &mut AppView, terminal: &mut PagerTerminal) {
     // Drive the ONE frontier walk (`commit_leading_run` — also what the unit
     // tests exercise) with the production per-entry work: finalize, stamp the
     // print-once display mode, print, then remember folded blocks for Ctrl+E.
-    commit_leading_run(sb, turn_running, |sb, i| {
+    let committed = commit_leading_run(sb, turn_running, |sb, i| {
         // If the turn is idle but this entry still carries a stale
         // `is_running` flag, finalize it first so it renders in its
         // finished form (e.g. "Thought for Xs", not an animated "Thinking…").
@@ -521,6 +591,9 @@ pub fn commit_active(app: &mut AppView, terminal: &mut PagerTerminal) {
         e.set_display_mode(mode);
         j += 1;
     }
+    if committed > 0 {
+        minimal_reprint::record_minimal_rows_printed(app, width);
+    }
 }
 
 /// Re-print the entries queued by `Ctrl+E` / `/expand` into native scrollback,
@@ -566,6 +639,7 @@ pub fn expand_pending(app: &mut AppView, terminal: &mut PagerTerminal) {
     // /expand request.
     let ids = minimal_api::take_minimal_pending_expand(app);
     let mut requeue: Vec<EntryId> = Vec::new();
+    let mut is_printed = false;
     {
         let Some(agent) = app.agents.get_mut(&id) else {
             // Can't happen (existence checked just above, nothing in between
@@ -593,11 +667,15 @@ pub fn expand_pending(app: &mut AppView, terminal: &mut PagerTerminal) {
                     requeue.extend(iter);
                     break;
                 }
+                is_printed = true;
             }
         }
     }
     if !requeue.is_empty() {
         minimal_api::requeue_minimal_pending_expand(app, requeue);
+    }
+    if is_printed {
+        minimal_reprint::record_minimal_rows_printed(app, width);
     }
 }
 

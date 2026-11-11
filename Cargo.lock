@@ -17435,7 +17435,6 @@ name = "xai-ratatui-textarea"
 version = "0.1.0"
 dependencies = [
  "arboard",
- "chrono",
  "crossterm",
  "fuzzy-matcher",
  "ignore",
