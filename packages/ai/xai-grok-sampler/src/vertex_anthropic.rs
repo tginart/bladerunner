@@ -30,45 +30,56 @@ const VERTEX_EXACT_HOSTS: [&str; 3] = [
 ];
 const VERTEX_REGIONAL_HOST_SUFFIX: &str = "-aiplatform.googleapis.com";
 
+/// Shown when Google rejects the ADC credential. A Bladerunner `/login` does
+/// not fix this, so the error must not trigger the re-login prompt.
+pub const VERTEX_ADC_REJECTED_MESSAGE: &str = "Google Vertex AI rejected the Google ADC credential (401). Run `gcloud auth application-default login`, or check that the account has Vertex AI access to the project.";
+
+/// How the response comes back: one SSE stream, or one JSON body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    Stream,
+    Single,
+}
+
 /// Build the Vertex Anthropic publisher path for one model.
 ///
 /// Purpose: This function makes the `publishers/anthropic` resource path.
-/// Input: The configured base URL, the model id, and the stream flag.
+/// Input: The configured base URL, the model id, and the response mode.
 /// Output: The path with no leading slash, or a configuration error.
 /// Method:
 ///     1. Make sure that the base URL is an HTTPS Vertex host. The caller
 ///        sends a Google ADC bearer to this host.
 ///     2. Read the project and the location from the same environment
 ///        variables as the Gemini Vertex route.
-///     3. Use `streamRawPredict` for streams and `rawPredict` if not.
+///     3. Use `streamRawPredict` for a stream and `rawPredict` if not.
 /// Note: For `global`, the base URL must be `https://aiplatform.googleapis.com`.
 /// For the `us` or `eu` multi-region, use `https://aiplatform.{us|eu}.rep.googleapis.com`.
 /// For a region, use `https://{region}-aiplatform.googleapis.com`.
-pub fn path(base_url: &str, model: &str, stream: bool) -> Result<String> {
+pub fn path(base_url: &str, model: &str, mode: ResponseMode) -> Result<String> {
     require_vertex_host(base_url)?;
     let endpoint = crate::google::GoogleEndpoint::from_config(base_url, model);
     let location_path = endpoint.vertex_location_path()?;
-    Ok(publisher_path(&location_path, model, stream))
+    Ok(publisher_path(&location_path, model, mode))
 }
 
 /// Build the request headers for one Vertex Anthropic request.
 ///
 /// Purpose: This function makes the headers that Google receives.
-/// Input: The client default headers, the ADC access token, and the stream
-/// flag.
+/// Input: The client default headers, the ADC access token, and the response
+/// mode.
 /// Output: A new header map.
 /// Method:
 ///     1. Remove the configured API keys, the `x-grok-*` headers, and the
 ///        `anthropic-version` header.
 ///     2. Add the ADC bearer, the JSON content type, and the `Accept` header.
 /// Note: `anthropic-beta` and other provider headers pass through.
-pub fn headers(default_headers: &HeaderMap, token: &str, stream: bool) -> HeaderMap {
+pub fn headers(default_headers: &HeaderMap, token: &str, mode: ResponseMode) -> HeaderMap {
     let mut headers = default_headers.clone();
     crate::client::remove_known_auth_headers(&mut headers);
     crate::client::strip_x_grok_headers(&mut headers);
     headers.remove(HeaderName::from_static("anthropic-version"));
     crate::google::apply_google_auth_headers(&mut headers, None, Some(token));
-    if !stream {
+    if mode == ResponseMode::Single {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     }
     headers
@@ -104,11 +115,10 @@ pub fn request_body(request: &MessagesRequest) -> Result<Value> {
     Ok(body)
 }
 
-fn publisher_path(location_path: &str, model: &str, stream: bool) -> String {
-    let method = if stream {
-        "streamRawPredict"
-    } else {
-        "rawPredict"
+pub(crate) fn publisher_path(location_path: &str, model: &str, mode: ResponseMode) -> String {
+    let method = match mode {
+        ResponseMode::Stream => "streamRawPredict",
+        ResponseMode::Single => "rawPredict",
     };
     format!("{location_path}/publishers/anthropic/models/{model}:{method}")
 }
@@ -136,10 +146,13 @@ mod tests {
     fn path_uses_anthropic_publisher_and_raw_predict_methods() {
         let location_path = "v1/projects/proj/locations/global";
         assert_eq!(
-            publisher_path(location_path, "claude-fable-5-2", true),
+            publisher_path(location_path, "claude-fable-5-2", ResponseMode::Stream),
             "v1/projects/proj/locations/global/publishers/anthropic/models/claude-fable-5-2:streamRawPredict"
         );
-        assert!(publisher_path(location_path, "m", false).ends_with("/models/m:rawPredict"));
+        assert!(
+            publisher_path(location_path, "m", ResponseMode::Single)
+                .ends_with("/models/m:rawPredict")
+        );
     }
 
     #[test]
@@ -178,7 +191,7 @@ mod tests {
                 HeaderValue::from_static(value),
             );
         }
-        let headers = headers(&defaults, "adc-token", false);
+        let headers = headers(&defaults, "adc-token", ResponseMode::Single);
         assert_eq!(headers["authorization"], "Bearer adc-token");
         assert!(headers.get("x-api-key").is_none());
         assert!(headers.get("anthropic-version").is_none());
@@ -186,7 +199,7 @@ mod tests {
         assert_eq!(headers["anthropic-beta"], "some-beta");
         assert_eq!(headers["accept"], "application/json");
         assert_eq!(
-            super::headers(&defaults, "adc-token", true)["accept"],
+            super::headers(&defaults, "adc-token", ResponseMode::Stream)["accept"],
             "text/event-stream"
         );
     }

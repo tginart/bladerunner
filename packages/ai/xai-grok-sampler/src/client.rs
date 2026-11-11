@@ -1886,12 +1886,6 @@ impl SamplingClient {
         };
         let adapter = BackendAdapter::from_route(adapter_kind, config.api_backend.clone())?;
         adapter.ensure_implemented()?;
-        // The Vertex route builds its own resource path from the model id.
-        if adapter.uses_vertex_anthropic_dialect() && config.endpoint_path.is_some() {
-            return Err(SamplingError::InvalidConfiguration(
-                "endpoint_path is not supported with api_backend = \"vertex_messages\"",
-            ));
-        }
 
         let defaults = ClientDefaults {
             model: config.model,
@@ -2460,7 +2454,7 @@ impl SamplingClient {
     ///
     /// Purpose: This function selects the URL, the credentials and the body
     /// envelope for the Messages wire.
-    /// Input: The request after defaults, the model id, and the stream flag.
+    /// Input: The request after defaults, the model id, and the response mode.
     /// Output: A [`MessagesTarget`]. Its `body` is `None` when the typed
     /// request is sent as is.
     /// Method:
@@ -2475,7 +2469,7 @@ impl SamplingClient {
         &self,
         request: &messages::MessagesRequest,
         model: &str,
-        stream: bool,
+        mode: crate::vertex_anthropic::ResponseMode,
     ) -> Result<MessagesTarget> {
         if !self.defaults.adapter.uses_vertex_anthropic_dialect() {
             let endpoint = self.endpoint("messages");
@@ -2485,11 +2479,11 @@ impl SamplingClient {
                 body: None,
             });
         }
-        let path = crate::vertex_anthropic::path(&self.base_url, model, stream)?;
+        let path = crate::vertex_anthropic::path(&self.base_url, model, mode)?;
         let endpoint = self.endpoint.url_for_path(&path);
         let body = crate::vertex_anthropic::request_body(request)?;
         let token = self.google_adc.token().await?;
-        let headers = crate::vertex_anthropic::headers(&self.default_headers, &token, stream);
+        let headers = crate::vertex_anthropic::headers(&self.default_headers, &token, mode);
         Ok(MessagesTarget {
             sent: SentRequest {
                 builder: self.http.post(endpoint.as_str()).headers(headers),
@@ -2500,15 +2494,16 @@ impl SamplingClient {
         })
     }
 
-    /// Turn a 401 on the Messages wire into a `SamplingError::Auth`.
+    /// Turn a 401 on the Messages wire into a `SamplingError`.
     ///
     /// Purpose: This function reports a rejected Messages credential.
     /// Input: The 401 site, the request URL, the server message, and the
     /// bearer fragment that was sent.
-    /// Output: A `SamplingError::Auth`.
+    /// Output: A `SamplingError::Auth`, or a configuration error for Vertex.
     /// Note: A Vertex 401 rejects a Google ADC token, not a Bladerunner
-    /// credential. Thus it skips the 401 attribution hook and tells the user
-    /// how to refresh ADC.
+    /// credential. A `SamplingError::Auth` makes the client show "Run /login",
+    /// which cannot fix ADC. Thus Vertex skips the 401 attribution hook and
+    /// returns [`crate::vertex_anthropic::VERTEX_ADC_REJECTED_MESSAGE`].
     fn messages_unauthorized(
         &self,
         consumer: crate::attribution::SamplingConsumer,
@@ -2516,16 +2511,17 @@ impl SamplingClient {
         server_message: &str,
         sent_bearer: Option<&str>,
     ) -> SamplingError {
-        let mut message = format!("Unauthorized (401) from {endpoint}: {server_message}");
         if self.defaults.adapter.uses_vertex_anthropic_dialect() {
-            message.push_str(
-                " (Google ADC rejected: run `gcloud auth application-default login` \
-                 or check the service account's Vertex AI permissions)",
+            tracing::warn!(%endpoint, %server_message, "Vertex rejected the Google ADC token");
+            return SamplingError::InvalidConfiguration(
+                crate::vertex_anthropic::VERTEX_ADC_REJECTED_MESSAGE,
             );
-        } else {
-            self.record_401_attribution(consumer, sent_bearer);
         }
-        auth_rejected(message, sent_bearer)
+        self.record_401_attribution(consumer, sent_bearer);
+        auth_rejected(
+            format!("Unauthorized (401) from {endpoint}: {server_message}"),
+            sent_bearer,
+        )
     }
 
     fn apply_messages_session_affinity(
@@ -3447,7 +3443,11 @@ impl SamplingClient {
             endpoint,
             body,
         } = self
-            .messages_target(&request.inner, &model_id, false)
+            .messages_target(
+                &request.inner,
+                &model_id,
+                crate::vertex_anthropic::ResponseMode::Single,
+            )
             .await?;
         tracing::debug!("endpoint: {:?}", endpoint);
 
@@ -3588,7 +3588,11 @@ impl SamplingClient {
             endpoint,
             body,
         } = self
-            .messages_target(&request.inner, &model_id, true)
+            .messages_target(
+                &request.inner,
+                &model_id,
+                crate::vertex_anthropic::ResponseMode::Stream,
+            )
             .await?;
         tracing::Span::current().record("endpoint", endpoint.as_str());
         let mut http_request = self
@@ -6261,6 +6265,78 @@ mod tests {
             "session-123"
         );
         assert!(request.headers().get("session_id").is_none());
+    }
+
+    fn vertex_messages_config() -> SamplerConfig {
+        SamplerConfig {
+            base_url: "https://aiplatform.googleapis.com".to_string(),
+            api_backend: ApiBackend::VertexMessages,
+            ..minimal_config()
+        }
+    }
+
+    #[test]
+    fn vertex_401_is_a_configuration_error_not_a_relogin_prompt() {
+        let vertex = SamplingClient::new(vertex_messages_config()).expect("Vertex client");
+        let error = vertex.messages_unauthorized(
+            crate::attribution::SamplingConsumer::MessagesStream,
+            "https://aiplatform.googleapis.com/v1/x",
+            "Request had invalid authentication credentials",
+            Some("tail"),
+        );
+        assert!(
+            matches!(
+                error,
+                SamplingError::InvalidConfiguration(message)
+                    if message == crate::vertex_anthropic::VERTEX_ADC_REJECTED_MESSAGE
+            ),
+            "Vertex 401 must not be SamplingError::Auth: {error:?}"
+        );
+
+        let standard = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::Messages,
+            ..minimal_config()
+        })
+        .expect("Messages client");
+        let error = standard.messages_unauthorized(
+            crate::attribution::SamplingConsumer::MessagesStream,
+            "https://example.test/messages",
+            "bad key",
+            Some("tail"),
+        );
+        assert!(matches!(error, SamplingError::Auth { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn vertex_url_keeps_configured_query_params() {
+        let mut query_params = IndexMap::new();
+        query_params.insert("trace".to_string(), "on".to_string());
+        let client = SamplingClient::new(SamplerConfig {
+            query_params,
+            ..vertex_messages_config()
+        })
+        .expect("Vertex client");
+        let path = crate::vertex_anthropic::publisher_path(
+            "v1/projects/p/locations/global",
+            "claude-fable-5-2",
+            crate::vertex_anthropic::ResponseMode::Stream,
+        );
+        assert_eq!(
+            client.endpoint.url_for_path(&path),
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/anthropic/models/claude-fable-5-2:streamRawPredict?trace=on"
+        );
+    }
+
+    #[test]
+    fn vertex_client_builds_when_a_catalog_endpoint_path_is_set() {
+        // Built-in models carry a catalog `endpoint_path`. The Vertex route
+        // does not use it, so it must not block a switch to vertex_messages.
+        let client = SamplingClient::new(SamplerConfig {
+            endpoint_path: Some("v1/messages".to_string()),
+            ..vertex_messages_config()
+        })
+        .expect("Vertex client with a catalog endpoint_path");
+        assert!(client.backend_adapter().uses_vertex_anthropic_dialect());
     }
 
     #[test]

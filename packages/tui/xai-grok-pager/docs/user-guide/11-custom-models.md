@@ -291,6 +291,9 @@ The backend uses the Messages request and stream format, with these Vertex chang
   or a service account) and refreshes the token automatically. Do not set `api_key`; configured keys,
   `anthropic-version` headers, and `x-grok-*` headers are not sent to Google.
 
+If Google rejects the credential, or ADC is not set up, Bladerunner shows a `gcloud auth application-default login` hint, not `/login`.
+`endpoint_path` is not used: the backend builds the Vertex path from the project, location, and model.
+
 Add the provider prefix to `[models] allowed_models` (for example `"vertex-claude/*"`) if you use an allowlist.
 `vertex-messages` is accepted as an input alias.
 
