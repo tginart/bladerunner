@@ -49,6 +49,19 @@ pub fn should_wrap_osc11(ctx: &TerminalContext) -> bool {
     passthrough_available(ctx) && ctx.embedded_editor.is_none()
 }
 
+/// Whether to wrap frames in DEC 2026 synchronized output.
+///
+/// The wrapper is skipped when tmux is the immediate terminal, in any
+/// version. tmux already synchronizes its own output toward the outer
+/// terminal and repaints the whole pane each time a block closes, so the
+/// pane-level wrapper only multiplies traffic and makes typing lag. An
+/// editor `:terminal` inherits `TMUX` but is itself the immediate terminal,
+/// so the wrapper stays there.
+#[must_use]
+pub fn should_emit_synchronized_output(ctx: &TerminalContext) -> bool {
+    !(ctx.is_tmux_backed() && ctx.embedded_editor.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +136,57 @@ mod tests {
         };
         assert!(passthrough_available(&nvim));
         assert!(!should_wrap_osc11(&nvim));
+    }
+
+    #[test]
+    fn synchronized_output_skipped_in_any_tmux_version() {
+        for tmux_version in [None, Some("tmux 3.2".into()), Some("tmux 3.6".into())] {
+            let tmux = TerminalContext {
+                multiplexer: MultiplexerKind::Tmux,
+                tmux_version,
+                ..Default::default()
+            };
+            assert!(!should_emit_synchronized_output(&tmux));
+        }
+    }
+
+    #[test]
+    fn synchronized_output_kept_in_editor_terminal_inside_tmux() {
+        for editor in [
+            EmbeddedEditor::Neovim,
+            EmbeddedEditor::Vim,
+            EmbeddedEditor::Emacs,
+        ] {
+            let ctx = TerminalContext {
+                multiplexer: MultiplexerKind::Tmux,
+                tmux_version: Some("tmux 3.6".into()),
+                embedded_editor: Some(editor),
+                ..Default::default()
+            };
+            assert!(
+                should_emit_synchronized_output(&ctx),
+                "{editor:?} is the immediate terminal, not tmux"
+            );
+        }
+    }
+
+    #[test]
+    fn synchronized_output_emitted_outside_tmux() {
+        assert!(should_emit_synchronized_output(&TerminalContext::default()));
+        for multiplexer in [
+            MultiplexerKind::Zellij,
+            MultiplexerKind::Screen,
+            MultiplexerKind::Cmux,
+            MultiplexerKind::Herdr,
+        ] {
+            let ctx = TerminalContext {
+                multiplexer,
+                ..Default::default()
+            };
+            assert!(
+                should_emit_synchronized_output(&ctx),
+                "{multiplexer:?} must keep synchronized output"
+            );
+        }
     }
 }

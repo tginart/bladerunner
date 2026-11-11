@@ -427,6 +427,8 @@ pub(crate) async fn create_test_actor_with_terminal(
         events: crate::session::events::EventTracker::new(cwd.as_path()),
         observability_bridge: noop_observability_bridge(),
         current_turn_number: std::cell::Cell::new(0),
+        transient_retry: Default::default(),
+        length_salvage: Default::default(),
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),

@@ -5,6 +5,7 @@
 //! - `mutations`: State mutation handlers (push_user_message, replace_conversation, etc.)
 //! - `queries`: Read-only query handlers (get_conversation, snapshot, etc.)
 
+mod image_strip;
 mod mutations;
 mod queries;
 pub(crate) mod request_builder;
@@ -220,6 +221,9 @@ impl ChatStateActor {
                 is_compaction,
             } => {
                 self.replace_conversation(items, is_compaction);
+            }
+            ChatStateCommand::StripConversationImages { urls, reply } => {
+                let _ = reply.send(self.strip_conversation_images(&urls));
             }
             ChatStateCommand::RepairHistory {
                 dry_run,

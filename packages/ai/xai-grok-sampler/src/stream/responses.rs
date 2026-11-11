@@ -904,12 +904,16 @@ pub(crate) fn stream_responses_tracked<'a>(
             _ => false,
         });
 
-        let stop_reason = if has_tool_calls {
+        // Length wins over tool calls: an incomplete response can end in a
+        // call whose arguments were cut, so the `LengthPolicy` gate must see
+        // the stop and check them (same rule as the Messages stream).
+        let stop_reason = if matches!(status, Status::Incomplete) {
+            Some(StopReason::Length)
+        } else if has_tool_calls {
             Some(StopReason::ToolCalls)
         } else {
             match status {
                 Status::Completed => Some(StopReason::Stop),
-                Status::Incomplete => Some(StopReason::Length),
                 _ => None,
             }
         };
@@ -1849,6 +1853,43 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// An incomplete response that ends in a function call keeps `Length`, so
+    /// the policy gate checks the (possibly cut) arguments.
+    #[tokio::test]
+    async fn incomplete_response_with_tool_calls_keeps_length_stop_reason() {
+        let mut response = build_response(rs_types::Status::Incomplete);
+        response.output = vec![rs_types::OutputItem::FunctionCall(
+            rs_types::FunctionToolCall {
+                arguments: "{\"path\":\"a.r".into(),
+                call_id: "call_cut".into(),
+                name: "read_file".into(),
+                id: None,
+                status: None,
+            },
+        )];
+        let raw = raw_events(vec![Ok(rs::ResponseStreamEvent::ResponseIncomplete(
+            rs_types::ResponseIncompleteEvent {
+                response,
+                sequence_number: 0,
+            },
+        ))]);
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+        match evs.last().expect("events") {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.tool_calls().len(), 1);
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+            }
+            other => panic!("expected Completed(Length), got {other:?}"),
+        }
     }
 
     #[tokio::test]

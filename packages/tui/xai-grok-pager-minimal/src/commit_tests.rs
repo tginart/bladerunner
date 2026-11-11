@@ -782,6 +782,62 @@ fn large_commit_is_capped_with_footer() {
 }
 
 #[test]
+fn tail_clip_keeps_the_newest_rows_of_an_expanded_block() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let theme = Theme::current();
+    let appearance = committed_appearance(&AppearanceConfig::default());
+    let lines: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+    let body = format!("```\n{}\n```", lines.join("\n"));
+    let mut entry = ScrollbackEntry::new(RenderBlock::agent_message(body));
+    entry.set_display_mode(DisplayMode::Expanded);
+
+    let width = 80u16;
+    let appearance_full = appearance.clone();
+    let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
+    let full_h = renderer.desired_height(width);
+    let rows = 12u16;
+    assert!(full_h > rows, "expected a tall block, got {full_h}");
+
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, rows));
+    paint_committed_tail(&mut buf, renderer, width, full_h, theme.dim());
+
+    let row_text = |y: u16| -> String {
+        (0..width)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect()
+    };
+    let note = row_text(0);
+    let hidden = full_h - (rows - 1);
+    assert!(note.contains("earlier lines"), "note row: {note:?}");
+    assert!(note.contains(&hidden.to_string()), "note row: {note:?}");
+    let body: String = (1..rows).map(row_text).collect();
+    assert!(
+        body.contains("line 59"),
+        "tail must keep the last line: {body:?}"
+    );
+    assert!(
+        !body.contains("line 0 "),
+        "tail must drop the first line: {body:?}"
+    );
+
+    // Each content row must match the same row of an unclipped paint, so the
+    // skip count has no off-by-one.
+    let full_renderer =
+        minimal_renderer(&entry, &theme, appearance_full, test_cwd(), COMMITTED_TICK);
+    let mut full_buf = Buffer::empty(Rect::new(0, 0, width, full_h));
+    full_renderer.render(full_buf.area, &mut full_buf);
+    for y in 1..rows {
+        let full_y = hidden + y - 1;
+        let full_row: String = (0..width)
+            .filter_map(|x| full_buf.cell((x, full_y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert_eq!(row_text(y), full_row, "clip row {y} vs full row {full_y}");
+    }
+}
+
+#[test]
 fn small_commit_is_not_capped() {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;

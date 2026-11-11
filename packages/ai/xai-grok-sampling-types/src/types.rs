@@ -856,7 +856,7 @@ impl CompactionsRemaining {
 /// (Responses API, Codex, Kimi K3 catalogs). `"ultra"` is Hyper/Codex's
 /// subagent-delegation tier and maps to `"max"` on Chat Completions and
 /// Messages wire forms.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
@@ -975,6 +975,19 @@ impl std::str::FromStr for ReasoningEffort {
                 "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max, ultra)"
             )),
         }
+    }
+}
+
+/// Deserializes through [`FromStr`](std::str::FromStr), so a hand-written
+/// `reasoning_effort = "xHigh"` in config.toml parses like `"xhigh"`.
+/// Serialization stays lowercase.
+impl<'de> serde::Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -1500,6 +1513,23 @@ impl From<crate::messages::MessagesRequest> for MessagesRequestWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_deserializes_mixed_case_and_serializes_lowercase() {
+        for (raw, want) in [
+            (r#""xHigh""#, ReasoningEffort::Xhigh),
+            (r#""XHIGH""#, ReasoningEffort::Xhigh),
+            (r#""High""#, ReasoningEffort::High),
+            (r#""max""#, ReasoningEffort::Max),
+        ] {
+            assert_eq!(serde_json::from_str::<ReasoningEffort>(raw).unwrap(), want);
+        }
+        assert!(serde_json::from_str::<ReasoningEffort>(r#""extreme""#).is_err());
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Xhigh).unwrap(),
+            r#""xhigh""#
+        );
+    }
 
     #[test]
     fn codex_responses_serde_is_canonical_and_accepts_hyphen_alias() {

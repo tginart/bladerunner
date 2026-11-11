@@ -4830,7 +4830,8 @@ impl AppView {
                     })
             });
         let fps_frame_started = fps_overlay.as_ref().map(|_| std::time::Instant::now());
-        crate::render::draw::draw_frame(terminal, cursor, |f, link_spans| {
+        let terminal_ctx = crate::terminal::terminal_context();
+        crate::render::draw::draw_frame(terminal, cursor, terminal_ctx, |f, link_spans| {
             let full_area = f.area();
             let tracing_height = 0u16;
             #[allow(unused_variables)]
@@ -5713,7 +5714,7 @@ impl AppView {
     /// or when new tracing entries arrive via the channel.
     pub fn tick(&mut self) -> bool {
         let mut needs_redraw = false;
-        needs_redraw |= self.minimal_state.transcript.is_some();
+        needs_redraw |= self.minimal_state.needs_frames();
         needs_redraw |= self.poll_clipboard_focus_tip();
         #[cfg(feature = "codex-live")]
         if self.live_active() && self.live_runtime.visualizer.peak_decay > 0.0 {
@@ -6056,7 +6057,7 @@ impl AppView {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return TickDemand::Fast;
         }
         if self

@@ -1507,6 +1507,16 @@ impl AgentView {
             let link_style = Style::default().fg(theme.link_fg).bg(theme.bg_base);
             status.push("link_url", Line::from(Span::styled(display, link_style)));
         }
+        // Leftmost item of the right-aligned group: its width changes every
+        // response, and here that never moves the other chips.
+        if crate::appearance::cache::load_show_inference_speed()
+            && let Some(speed) = self.inference_speed.as_ref()
+        {
+            status.push(
+                "inference_speed",
+                crate::views::agent_status::inference_speed_line(speed, &theme),
+            );
+        }
         let running_count = self.tasks.running_count(
             &self.session.bg_tasks,
             &self.subagent_sessions,

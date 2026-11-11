@@ -1347,6 +1347,9 @@ impl SessionActor {
             return Err(acp::Error::invalid_params().data(friendly));
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
+            if let Some(recovery) = self.wait_out_subagent_rate_limit(&error).await {
+                return Ok(recovery);
+            }
             self.log_terminal_failure("rate_limited", error.status_code, &detailed_message);
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Exhausted {
@@ -1779,6 +1782,10 @@ impl SessionActor {
                 store: RecoveredStore::AuthProvider,
             });
         }
+        // After the compaction and auth arms, before the terminal path.
+        if let Some(recovery) = self.transient_retry_recovery(&error) {
+            return Ok(recovery);
+        }
         if matches!(error.kind, SamplingErrorKind::IdleTimeout) {
             self.signals_handle().record_idle_timeout();
         }
@@ -1932,11 +1939,14 @@ impl SessionActor {
         };
         let request_id = xai_grok_sampler::RequestId::random();
         let request_id_str = request_id.as_str().to_string();
-        match self
-            .sampler_handle
-            .submit_and_collect(request_id, request)
-            .await
-        {
+        let collected = {
+            // Scoped so a child does not hold its slot through a 429 wait.
+            let _permit = self.acquire_subagent_sampling_permit().await;
+            self.sampler_handle
+                .submit_and_collect(request_id, request)
+                .await
+        };
+        match collected {
             Ok((response, metrics)) => {
                 let span = tracing::Span::current();
                 span.record("request_id", request_id_str.as_str());
@@ -1971,6 +1981,15 @@ impl SessionActor {
                     SamplerFailureRecovery::RefreshAuthAndResubmit { credential, store } => {
                         Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store })
                     }
+                    SamplerFailureRecovery::RetryTransient {
+                        kind,
+                        status_code,
+                        grant,
+                    } => Ok(SamplerTurnOutcome::RetryTransient {
+                        kind,
+                        status_code,
+                        grant,
+                    }),
                 }
             }
         }

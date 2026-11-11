@@ -125,6 +125,7 @@ mod tests {
             "memory_enabled": false,
             "is_non_interactive": false,
             "system_prompt_label": crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL,
+            "scratch_dir": "/tmp/",
         })
     }
 
@@ -452,6 +453,24 @@ mod tests {
             !prompt.contains("<memory>"),
             "Memory section must be omitted"
         );
+    }
+
+    // ── Scratch files ───────────────────────────────────────────────
+
+    #[test]
+    fn test_scratch_files_point_at_temp_dir_when_execute_exists() {
+        let prompt = render_base(&default_renderer(), &default_placeholders());
+        assert!(prompt.contains("<scratch_files>"));
+        assert!(prompt.contains("under `/tmp/`, never inside the repository"));
+        assert!(prompt.contains("--body-file /tmp/pr.md"));
+    }
+
+    #[test]
+    fn test_scratch_files_omitted_without_execute() {
+        let tools: HashMap<ToolKind, String> = [(ToolKind::Read, "read_file".to_string())].into();
+        let r = TemplateRenderer::new(tools, HashMap::new());
+        let prompt = render_base(&r, &default_placeholders());
+        assert!(!prompt.contains("<scratch_files>"));
     }
 
     // ── Web search disabled ─────────────────────────────────────────

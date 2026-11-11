@@ -161,6 +161,7 @@ impl ChatStateActor {
             request_compat: self.state.sampling_config.request_compat.clone(),
             bedrock_request_metadata: Default::default(),
             bedrock_headers: Default::default(),
+            length_policy: Default::default(),
         };
         self.persistence.persist_request_evidence(&mut request);
         request

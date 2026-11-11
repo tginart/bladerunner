@@ -985,6 +985,33 @@
         );
     }
 
+    #[test]
+    fn ext_auto_compact_started_refreshes_context_used() {
+        // The bar must show the count the trigger fired on as soon as
+        // compaction starts, not the stale pre-turn number.
+        let mut app = make_app_with_agent("sess-A");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .apply_context_used(60_000, 131_072);
+
+        handle(
+            make_ext_session_notification(
+                "sess-A",
+                XaiSessionUpdate::AutoCompactStarted {
+                    tokens_used: 112_000,
+                    context_window: 131_072,
+                    percentage: 85,
+                    reason: "Context window 85% full".into(),
+                },
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.context_state.as_ref().map(|c| c.used), Some(112_000));
+    }
+
     /// design-oracle.md Phase 1: an oracle resolving to the SAME model as the
     /// parent session is no upgrade — spawn must surface a non-fatal pin hint.
     #[test]

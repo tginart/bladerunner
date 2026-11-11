@@ -11,6 +11,14 @@ use xai_grok_tools::types::memory_backend::{MemorySearchResult, format_staleness
 /// Maximum characters to include per snippet in the injection.
 const SNIPPET_MAX_CHARS: usize = 500;
 
+/// Recalled memory can be out of date: files move, commands change, and plans
+/// get dropped. This note asks the model to check memory against the live
+/// workspace instead of following it as the current plan.
+const MEMORY_FRAMING_NOTE: &str = "Treat memory as historical context, not as the current \
+    plan. Verify recalled paths, commands, repository state, and external facts with live \
+    tools before you rely on them. When current evidence conflicts with memory, prefer the \
+    current evidence.";
+
 /// Returns `true` if a memory-context block is already persisted in the
 /// leading system message. Callers reuse a persisted block verbatim instead
 /// of re-searching: a re-scored block would mutate the system-prompt prefix
@@ -34,8 +42,10 @@ pub fn format_memory_reminder(results: &[MemorySearchResult]) -> Option<String> 
         return None;
     }
 
-    let mut section =
-        format!("{MEMORY_CONTEXT_OPEN_TAG}\n## Relevant Memory from Past Sessions\n\n");
+    let mut section = format!(
+        "{MEMORY_CONTEXT_OPEN_TAG}\n## Relevant Memory from Past Sessions\n\n\
+         {MEMORY_FRAMING_NOTE}\n\n"
+    );
 
     for (i, r) in results.iter().enumerate() {
         let truncated = r.snippet.chars().count() > SNIPPET_MAX_CHARS;
@@ -116,6 +126,28 @@ mod tests {
         assert!(output.contains("score: 0.90"));
         assert!(output.contains("**File:** MEMORY.md (lines 0-5)"));
         assert!(output.contains("```\nUse tracing for logging"));
+    }
+
+    #[test]
+    fn test_format_frames_memory_as_history_to_verify() {
+        let results = vec![MemorySearchResult {
+            chunk_id: "test:0".to_string(),
+            path: "MEMORY.md".to_string(),
+            start_line: 0,
+            end_line: 1,
+            score: 0.5,
+            snippet: "Run make deploy".to_string(),
+            source: "workspace".to_string(),
+            created_at: None,
+        }];
+        let output = format_memory_reminder(&results).unwrap();
+        let note_at = output.find(MEMORY_FRAMING_NOTE).expect("framing note");
+        assert!(
+            note_at < output.find("### Result 1").unwrap(),
+            "the note comes before the results"
+        );
+        assert!(output.contains("historical context, not as the current plan"));
+        assert!(output.contains("Verify recalled paths"));
     }
 
     #[test]

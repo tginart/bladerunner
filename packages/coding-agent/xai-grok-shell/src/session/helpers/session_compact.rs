@@ -52,6 +52,9 @@ pub(crate) enum CompactFailure {
 }
 /// Stable error payload for a user-cancelled compact (pager + retry loop).
 pub(crate) const COMPACT_CANCELLED_MSG: &str = "compact cancelled";
+/// Prefix the classifiers put on every compact-failure detail; user-facing
+/// text strips it again.
+pub(crate) const COMPACT_FAILED_PREFIX: &str = "compact failed: ";
 impl CompactFailure {
     pub(crate) fn cancelled_error() -> acp::Error {
         acp::Error::internal_error().data(COMPACT_CANCELLED_MSG)
@@ -142,28 +145,32 @@ pub(crate) async fn verify_compaction_images(
 /// and stuck-model conditions all persist). 4xx API responses other than
 /// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
 /// transport errors, stream-level blips, and 5xx responses are transient.
+///
+/// A size overflow (HTTP 413, or size wording) is deterministic so the input
+/// ladder steps down. A 429 with `Retry-After` is not a size overflow even
+/// when it says "Request too large": that is a TPM rate limit, so it stays
+/// transient and the engine backs off.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
-    let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
-    let deterministic = match &err {
-        SamplingError::Auth { .. }
-        | SamplingError::InvalidConfiguration(_)
-        | SamplingError::Serialization(_)
-        | SamplingError::IdleTimeout { .. } => true,
-        SamplingError::Api {
-            status, message, ..
-        } => {
-            is_context_length_error(message)
-                || (status.is_client_error()
+    let acp_err = acp::Error::internal_error().data(format!("{COMPACT_FAILED_PREFIX}{err}"));
+    let size_overflow = err.is_payload_too_large() || err.is_context_length_error();
+    let deterministic = size_overflow
+        || match &err {
+            SamplingError::Auth { .. }
+            | SamplingError::InvalidConfiguration(_)
+            | SamplingError::Serialization(_)
+            | SamplingError::IdleTimeout { .. } => true,
+            SamplingError::Api { status, .. } => {
+                status.is_client_error()
                     && *status != StatusCode::REQUEST_TIMEOUT
-                    && *status != StatusCode::TOO_MANY_REQUESTS)
-        }
-        SamplingError::MaxTokensTruncation => true,
-        SamplingError::Http(_)
-        | SamplingError::EventStreamError(_)
-        | SamplingError::StreamError { .. }
-        | SamplingError::EmptyResponse { .. }
-        | SamplingError::DoomLoopDetected { .. } => false,
-    };
+                    && *status != StatusCode::TOO_MANY_REQUESTS
+            }
+            SamplingError::MaxTokensTruncation => true,
+            SamplingError::Http(_)
+            | SamplingError::EventStreamError(_)
+            | SamplingError::StreamError { .. }
+            | SamplingError::EmptyResponse { .. }
+            | SamplingError::DoomLoopDetected { .. } => false,
+        };
     if deterministic {
         CompactFailure::Deterministic(acp_err)
     } else {
@@ -183,8 +190,8 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
 /// the same payload).
 fn classify_response_event_error(code: Option<&str>, message: &str) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(match code {
-        Some(c) => format!("compact failed: {c}: {message}"),
-        None => format!("compact failed: {message}"),
+        Some(c) => format!("{COMPACT_FAILED_PREFIX}{c}: {message}"),
+        None => format!("{COMPACT_FAILED_PREFIX}{message}"),
     });
     if matches!(code, Some("invalid_request_error")) || message.contains("invalid_request_error") {
         return CompactFailure::Deterministic(acp_err);
@@ -873,6 +880,9 @@ pub(crate) async fn generate_session_compact(
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),
                 x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                // A summary cut at the output cap is still a usable summary;
+                // the other backends' stream readers keep it the same way.
+                length_policy: xai_grok_sampling_types::LengthPolicy::CompletePartial,
                 ..Default::default()
             };
             let response = client
@@ -882,7 +892,8 @@ pub(crate) async fn generate_session_compact(
             CompactOutput {
                 content: response.assistant_text(),
                 stop_reason: response.stop_reason.map(|reason| format!("{reason:?}")),
-                truncated: false,
+                truncated: response.stop_reason
+                    == Some(xai_grok_sampling_types::StopReason::Length),
                 ttft_ms: None,
                 stream_ms: None,
                 delta_count: response.message_chunks_emitted,
@@ -1036,6 +1047,41 @@ mod classify_tests {
         assert!(is_det(&classify_sampling_error(
             SamplingError::Serialization(serde_err)
         )));
+    }
+    #[test]
+    fn tpm_429_with_retry_after_is_transient_not_overflow() {
+        let tpm = |retry_after_secs: Option<u64>| SamplingError::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "Request too large for model: Limit 30000, Requested 50000 \
+                      tokens per min"
+                .into(),
+            model_metadata: None,
+            retry_after_secs,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(matches!(
+            classify_sampling_error(tpm(Some(7))),
+            CompactFailure::Transient(_)
+        ));
+        // No Retry-After: the request exceeds the per-request cap outright.
+        assert!(is_det(&classify_sampling_error(tpm(None))));
+    }
+    #[test]
+    fn http_413_is_deterministic_with_size_text() {
+        let CompactFailure::Deterministic(err) = classify_sampling_error(SamplingError::Api {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "Request failed (HTTP 413).".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        }) else {
+            panic!("expected Deterministic for 413");
+        };
+        let data = err.data.as_ref().and_then(|d| d.as_str()).unwrap();
+        // The engine reads this text to flag the overflow for the input ladder.
+        assert!(is_context_length_error(data), "got: {data}");
     }
     #[test]
     fn classifier_preserves_acp_error_data() {
@@ -2163,6 +2209,66 @@ mod reasoning_compaction_regression_tests {
                 .to_string(),
             ),
         ]
+    }
+    /// A Google summary that stops at MAX_TOKENS: the direct-collect path
+    /// must keep the cut summary, not fail it as `MaxTokensTruncation`
+    /// (which would suppress auto-compaction until the context overflows).
+    #[tokio::test]
+    async fn google_compaction_keeps_a_summary_cut_at_the_output_cap() {
+        let app = Router::new().fallback(post(|| async {
+            let chunk = json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Summary of the work so f"}]},
+                    "finishReason": "MAX_TOKENS"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 50,
+                    "totalTokenCount": 150
+                }
+            });
+            let events = vec![Ok::<_, std::convert::Infallible>(
+                Event::default().data(chunk.to_string()),
+            )];
+            Sse::new(stream::iter(events)).keep_alive(KeepAlive::default())
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let mut config = test_config(&format!("http://{addr}/v1beta"));
+        config.api_backend = ApiBackend::GoogleGenerateContent;
+        let chat_history = vec![
+            ConversationItem::system("You are a helpful assistant."),
+            ConversationItem::user("<user_query>\nfix the bug\n</user_query>"),
+            ConversationItem::assistant("I fixed it."),
+            ConversationItem::user("Summarize the conversation so far."),
+        ];
+        let client = Client::new(config.clone()).unwrap();
+        let output = generate_session_compact(
+            chat_history,
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("test-session"),
+            &config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::Auto,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a summary cut at the cap must not fail compaction"));
+        assert_eq!(output.content, "Summary of the work so f");
+        assert!(output.truncated, "the cut is reported as truncated");
+        let _ = shutdown_tx.send(());
     }
     fn test_config_responses(base_url: &str) -> SamplerConfig {
         let mut config = test_config(base_url);

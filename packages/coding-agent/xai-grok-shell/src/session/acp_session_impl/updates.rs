@@ -904,9 +904,12 @@ impl SessionActor {
     }
     /// Build the per-response boundary update, projecting the response's usage
     /// into the Messages API `message.usage` shape (uncached `input_tokens`).
+    /// `ttft_ms` and `tokens_per_sec` are this response's measured speed.
     pub(super) fn response_completed_update(
         &self,
         response: &xai_grok_sampling_types::ConversationResponse,
+        ttft_ms: Option<u64>,
+        tokens_per_sec: Option<f64>,
     ) -> XaiSessionUpdate {
         let usage =
             response
@@ -932,6 +935,8 @@ impl SessionActor {
             usage,
             signature,
             stop_sequence: response.stop_sequence.clone(),
+            ttft_ms,
+            tokens_per_sec,
         }
     }
     /// [`Self::send_xai_notification`] with caller-supplied `_meta` keys merged

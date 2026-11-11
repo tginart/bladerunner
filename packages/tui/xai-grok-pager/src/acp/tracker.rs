@@ -237,9 +237,12 @@ pub struct AcpUpdateTracker {
     /// a skill metadata chunk. It should be silently absorbed so the
     /// raw skill instructions don't appear in scrollback.
     skip_next_skill_body: bool,
-    /// Tool call IDs suppressed from scrollback (e.g. TodoWrite).
-    /// Their ToolCallUpdate counterparts are silently dropped too.
-    suppressed_tools: std::collections::HashSet<String>,
+    /// Tool calls suppressed from scrollback (e.g. TodoWrite), keyed by
+    /// tool-call ID. Their ToolCallUpdate counterparts are dropped too, except
+    /// a `Failed` one: the surface that justified hiding the call (todo pane,
+    /// subagent block, tasks pane) never shows a failure, so the stashed call
+    /// is rendered then.
+    suppressed_tools: std::collections::HashMap<String, acp::ToolCall>,
     /// Suppressed-but-blocking tool calls, keyed by tool-call ID → the reason
     /// the turn is waiting. These tools (`get_command_or_subagent_output`,
     /// `wait_tasks`, `Sleep`, …) are kept out of `pending_tools` (so they never
@@ -862,6 +865,43 @@ impl AcpUpdateTracker {
         self.orphan_updates.clear();
         self.skip_next_skill_body = false;
     }
+    /// Apply a status update to a suppressed tool call. A failed call is
+    /// rendered from its stash (bg-task plumbing stays hidden: the tasks pane
+    /// shows those). Returns whether scrollback changed.
+    fn handle_suppressed_tool_status(
+        &mut self,
+        tcu: acp::ToolCallUpdate,
+        tc_id: &str,
+        scrollback: &mut ScrollbackState,
+        is_replay: bool,
+    ) -> bool {
+        match tcu.fields.status.unwrap_or_default() {
+            acp::ToolCallStatus::Failed => {
+                self.blocking_waits.remove(tc_id);
+                let Some(mut base) = self.suppressed_tools.remove(tc_id) else {
+                    return false;
+                };
+                if is_bg_plumbing_tool(&base) {
+                    return false;
+                }
+                base.update(tcu.fields);
+                let block = tool_call_to_block(&base, self.session_cwd.as_deref());
+                self.finish_completed_tool(block, scrollback, is_replay);
+                true
+            }
+            acp::ToolCallStatus::Completed => {
+                self.suppressed_tools.remove(tc_id);
+                self.blocking_waits.remove(tc_id);
+                false
+            }
+            _ => {
+                if let Some(base) = self.suppressed_tools.get_mut(tc_id) {
+                    base.update(tcu.fields);
+                }
+                false
+            }
+        }
+    }
     /// Finish the current thinking block, passing elapsed time to the entry.
     ///
     /// Empty thinking blocks (pre-created but never received content) are
@@ -1044,7 +1084,8 @@ impl AcpUpdateTracker {
                     },
                 );
             }
-            self.suppressed_tools.insert(tc.tool_call_id.0.to_string());
+            self.suppressed_tools
+                .insert(tc.tool_call_id.0.to_string(), tc);
             return false;
         }
         let tc_id = tc.tool_call_id.0.to_string();
@@ -1089,7 +1130,7 @@ impl AcpUpdateTracker {
         if self.bg_deferred_tools.contains_key(&tc_id_str) {
             return false;
         }
-        if self.suppressed_tools.contains(&tc_id_str) {
+        if self.suppressed_tools.contains_key(&tc_id_str) {
             if let Some(ref raw_input) = tcu.fields.raw_input {
                 let variant = raw_input.get("variant").and_then(|v| v.as_str());
                 if is_task_variant(variant) {
@@ -1124,15 +1165,7 @@ impl AcpUpdateTracker {
                     }
                 }
             }
-            let status = tcu.fields.status.unwrap_or_default();
-            if matches!(
-                status,
-                acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
-            ) {
-                self.suppressed_tools.remove(&tc_id_str);
-                self.blocking_waits.remove(&tc_id_str);
-            }
-            return false;
+            return self.handle_suppressed_tool_status(tcu, &tc_id_str, scrollback, is_replay);
         }
         let status = tcu.fields.status.unwrap_or_default();
         let is_completed = matches!(
@@ -1958,7 +1991,13 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
             }
             RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block))
         }
-        _ if extract_raw_field(tc, "variant").as_deref() == Some("UseTool") => {
+        // A direct `server__tool` call has the `MCPTool` input variant and the
+        // same `tool_name` / `tool_input` shape as `use_tool`.
+        _ if matches!(
+            extract_raw_field(tc, "variant").as_deref(),
+            Some("UseTool") | Some("MCPTool")
+        ) =>
+        {
             let tool_name = extract_raw_field(tc, "tool_name").unwrap_or_else(|| tc.title.clone());
             let mut block = UseToolCallBlock::new(tool_name);
             block.input_args = extract_use_tool_args(tc);
@@ -5843,6 +5882,47 @@ mod tests {
         )));
     }
     #[test]
+    fn failed_suppressed_todo_call_appears_in_scrollback() {
+        let mut sb = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        tracker.handle_update(
+            tool_call("tc1", acp::ToolKind::Other, "todo_write"),
+            &meta(),
+            &mut sb,
+        );
+        assert_eq!(sb.len(), 0, "todo_write starts suppressed");
+        let failed = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from("tc1")),
+            acp::ToolCallUpdateFields::new().status(Some(acp::ToolCallStatus::Failed)),
+        ));
+        assert!(tracker.handle_update(failed, &meta(), &mut sb));
+        assert_eq!(sb.len(), 1, "a failed todo call must not vanish");
+        assert!(!tracker.suppressed_tools.contains_key("tc1"));
+    }
+    #[test]
+    fn completed_or_failed_bg_plumbing_stays_suppressed() {
+        let mut sb = ScrollbackState::new();
+        let mut tracker = AcpUpdateTracker::new();
+        tracker.handle_update(
+            tool_call("tc1", acp::ToolKind::Other, "todo_write"),
+            &meta(),
+            &mut sb,
+        );
+        tracker.handle_update(tool_update_completed("tc1"), &meta(), &mut sb);
+        assert_eq!(sb.len(), 0, "a completed todo call stays in the todo pane");
+        tracker.handle_update(
+            tool_call("tc2", acp::ToolKind::Other, "wait_tasks"),
+            &meta(),
+            &mut sb,
+        );
+        let failed = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from("tc2")),
+            acp::ToolCallUpdateFields::new().status(Some(acp::ToolCallStatus::Failed)),
+        ));
+        tracker.handle_update(failed, &meta(), &mut sb);
+        assert_eq!(sb.len(), 0, "the tasks pane shows bg plumbing failures");
+    }
+    #[test]
     fn pascal_case_task_tool_call_is_suppressed_from_scrollback() {
         let mut sb = ScrollbackState::new();
         let mut tracker = AcpUpdateTracker::new();
@@ -5852,7 +5932,7 @@ mod tests {
             &mut sb,
         );
         assert_eq!(sb.len(), 0, "PascalCase Task tool must be suppressed");
-        assert!(tracker.suppressed_tools.contains("tc1"));
+        assert!(tracker.suppressed_tools.contains_key("tc1"));
         tracker.handle_update(tool_update_completed("tc1"), &meta(), &mut sb);
         assert_eq!(
             sb.len(),
@@ -6610,6 +6690,27 @@ mod tests {
         .content(vec![])
         .locations(vec![]);
         let _block = tool_call_to_block(&tc, None);
+    }
+    #[test]
+    fn direct_mcp_tool_call_shows_name_args_and_error() {
+        let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("mcp3")), "MCP tool")
+            .kind(acp::ToolKind::Other)
+            .status(acp::ToolCallStatus::Failed)
+            .content(vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+                acp::TextContent::new("issue not found".to_string()),
+            ))])
+            .raw_input(Some(serde_json::json!(
+                { "variant" : "MCPTool", "tool_name" : "linear__get_issue",
+                "tool_input" : { "id" : "ENG-1" } }
+            )))
+            .locations(vec![]);
+        let block = tool_call_to_block(&tc, None);
+        let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
+            panic!("expected UseTool block, got {block:?}");
+        };
+        assert_eq!(ut.tool_name, "linear__get_issue");
+        assert_eq!(ut.input_args, [("id".to_string(), "ENG-1".to_string())]);
+        assert_eq!(ut.error.as_deref(), Some("issue not found"));
     }
     #[test]
     fn cursor_todo_write_suppressed_by_title() {

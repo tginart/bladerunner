@@ -850,6 +850,76 @@ pub trait RequestEvidenceSink: Send + Sync + std::fmt::Debug {
     fn record(&self, evidence: &RequestEvidence);
 }
 
+/// What the sampler does with a completed response whose stop reason is
+/// `Length` (max_tokens truncation). `Length` often arrives far below any
+/// client budget, because the output budget is the context window minus the
+/// prompt.
+///
+/// The default is `CompletePartial`, so side calls (compaction summaries,
+/// recaps, titles, classifiers) keep the cut text they always got from the
+/// direct-collect path. The main turn always sets its policy explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LengthPolicy {
+    /// Fail the attempt with `MaxTokensTruncation`.
+    Fail,
+    /// Complete a response whose tool calls all carry complete JSON
+    /// arguments, so they run. Text-only and empty `Length` stops still fail.
+    CompleteToolCalls,
+    /// Also complete with partial text, for callers that continue it or can
+    /// use it as is. An empty `Length` stop still fails.
+    #[default]
+    CompletePartial,
+}
+
+/// Outcome of applying a [`LengthPolicy`] to a completed response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthVerdict {
+    /// The stop reason is not `Length`; the policy does not apply.
+    Pass,
+    /// A `Length` stop delivered with its partial text.
+    Salvage,
+    /// A `Length` stop delivered with its complete tool calls.
+    SalvageToolCalls,
+    /// A `Length` stop the policy rejects (`MaxTokensTruncation`).
+    Fail,
+}
+
+impl LengthPolicy {
+    /// The fail-or-salvage decision for a completed response, including the
+    /// `Length` stop-reason check.
+    pub fn verdict(self, response: &ConversationResponse) -> LengthVerdict {
+        if response.stop_reason != Some(StopReason::Length) {
+            return LengthVerdict::Pass;
+        }
+        let tool_calls = response.tool_calls();
+        if !tool_calls.is_empty() {
+            return match (self, all_tool_call_arguments_complete(tool_calls)) {
+                (LengthPolicy::Fail, _) | (_, false) => LengthVerdict::Fail,
+                (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, true) => {
+                    LengthVerdict::SalvageToolCalls
+                }
+            };
+        }
+        if self == LengthPolicy::CompletePartial && response.empty_reason().is_none() {
+            LengthVerdict::Salvage
+        } else {
+            LengthVerdict::Fail
+        }
+    }
+}
+
+/// Whether every call's arguments parse as JSON. Empty arguments are the
+/// zero-argument convention (and a call cut before its first argument delta
+/// also collects as empty); running it as `{}` only bounces off argument
+/// validation, which is cheaper than failing the turn. One truncated call
+/// fails the whole batch.
+fn all_tool_call_arguments_complete(tool_calls: &[ToolCall]) -> bool {
+    tool_calls.iter().all(|tc| {
+        tc.arguments.trim().is_empty()
+            || serde_json::from_str::<serde::de::IgnoredAny>(&tc.arguments).is_ok()
+    })
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -912,6 +982,8 @@ pub struct ConversationRequest {
     pub bedrock_request_metadata: indexmap::IndexMap<String, String>,
     /// Bedrock-only custom headers injected before signing; reserved auth/SigV4 headers are rejected.
     pub bedrock_headers: indexmap::IndexMap<String, String>,
+    /// What the sampler does when the response stops with `Length`.
+    pub length_policy: LengthPolicy,
 }
 
 /// OpenAI caps prompt-cache keys at 64 characters (Pi `clampOpenAIPromptCacheKey`).
@@ -1045,6 +1117,71 @@ impl ConversationRequest {
         }
         stripped
     }
+}
+
+/// Replaces a user image that the server rejected. The text is explicit on
+/// purpose: a silent gap makes the model invent what the image showed.
+pub const IMAGE_STRIP_PLACEHOLDER: &str = "[image removed \u{2014} the server could not \
+    process it; its contents are unavailable. Ask the user to re-attach the image if it is \
+    still needed.]";
+
+/// The URLs of all images in `items`, in order, with duplicates kept.
+pub fn collect_image_urls(items: &[ConversationItem]) -> Vec<Arc<str>> {
+    let mut urls = Vec::new();
+    for item in items {
+        let parts: &[ContentPart] = match item {
+            ConversationItem::User(user) => &user.content,
+            ConversationItem::ToolResult(t) => &t.images,
+            _ => continue,
+        };
+        for part in parts {
+            if let ContentPart::Image { url } = part {
+                urls.push(Arc::clone(url));
+            }
+        }
+    }
+    urls
+}
+
+/// Purpose: Remove the images with the given URLs from `items`.
+/// Input: The conversation items. The image URLs to remove.
+/// Output: The number of image parts that the function removed.
+/// Method:
+///     1. Replace each matched user image with [`IMAGE_STRIP_PLACEHOLDER`].
+///     2. Drop each matched tool-result image. A placeholder there does not
+///        reach the model, because the wire conversions skip text parts.
+/// Note: The function never adds or removes a `ConversationItem`, so indexes
+/// into the conversation stay valid.
+pub fn strip_images_by_url(items: &mut [ConversationItem], urls: &[Arc<str>]) -> usize {
+    let is_listed = |url: &Arc<str>| urls.iter().any(|u| u.as_ref() == url.as_ref());
+    let mut stripped = 0usize;
+    for item in items {
+        match item {
+            ConversationItem::User(user) => {
+                for part in &mut user.content {
+                    if matches!(part, ContentPart::Image { url } if is_listed(url)) {
+                        *part = ContentPart::Text {
+                            text: Arc::<str>::from(IMAGE_STRIP_PLACEHOLDER),
+                        };
+                        stripped += 1;
+                    }
+                }
+            }
+            ConversationItem::ToolResult(t) => {
+                let before = t.images.len();
+                t.images
+                    .retain(|part| !matches!(part, ContentPart::Image { url } if is_listed(url)));
+                stripped += before - t.images.len();
+            }
+            // Listed so that a new image-bearing variant must choose here.
+            ConversationItem::System(_)
+            | ConversationItem::Assistant(_)
+            | ConversationItem::BackendToolCall(_)
+            | ConversationItem::Reasoning(_)
+            | ConversationItem::Compaction(_) => {}
+        }
+    }
+    stripped
 }
 
 /// Tool choice options
@@ -10361,6 +10498,44 @@ mod tests {
         assert_eq!(conv.len(), 2);
     }
 
+    // ========== strip_images_by_url tests ==========
+
+    #[test]
+    fn strip_images_by_url_removes_only_listed_images() {
+        let bad = "data:image/png;base64,BAD";
+        let good = "data:image/png;base64,GOOD";
+        let mut user = ConversationItem::user("look");
+        user.add_image(bad.to_string());
+        user.add_image(good.to_string());
+        let mut tool = ConversationItem::tool_result("call-1", "screenshot");
+        if let ConversationItem::ToolResult(t) = &mut tool {
+            t.images.push(ContentPart::Image {
+                url: Arc::<str>::from(bad),
+            });
+        }
+        let mut items = vec![user, tool];
+        assert_eq!(collect_image_urls(&items).len(), 3);
+
+        let stripped = strip_images_by_url(&mut items, &[Arc::<str>::from(bad)]);
+
+        assert_eq!(stripped, 2);
+        assert_eq!(items.len(), 2, "no item is added or removed");
+        let urls = collect_image_urls(&items);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].as_ref(), good);
+        let ConversationItem::User(user) = &items[0] else {
+            panic!("expected user item");
+        };
+        assert_matches!(&user.content[1], ContentPart::Text { text } => {
+            assert_eq!(text.as_ref(), IMAGE_STRIP_PLACEHOLDER);
+        });
+        assert_eq!(
+            strip_images_by_url(&mut items, &[Arc::<str>::from(bad)]),
+            0,
+            "a second strip is a no-op"
+        );
+    }
+
     // ========== strip_images tests ==========
 
     #[test]
@@ -11108,6 +11283,59 @@ mod tests {
             message_id: None,
             raw_stop_reason: None,
             stop_sequence: None,
+        }
+    }
+
+    /// `LengthPolicy::verdict` is the one fail-or-salvage gate shared by the
+    /// actor and direct-collect paths; pin every cell.
+    #[test]
+    fn length_policy_verdict_gate() {
+        let length = |item: ConversationItem| {
+            let mut r = make_response(item);
+            r.stop_reason = Some(StopReason::Length);
+            r
+        };
+        let call = |arguments: &str| ToolCall {
+            id: "tc1".into(),
+            name: "do_thing".into(),
+            arguments: arguments.into(),
+        };
+        let text = length(ConversationItem::assistant("partial"));
+        let empty = length(ConversationItem::assistant(""));
+        let complete_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": 1}",
+        )]));
+        let empty_args_tools = length(ConversationItem::assistant_tool_calls(vec![call("")]));
+        let truncated_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": \"trunc",
+        )]));
+        let mixed_tools = length(ConversationItem::assistant_tool_calls(vec![
+            call("{\"x\": 1}"),
+            call("{\"x\": \"trunc"),
+        ]));
+        let stop = make_response(ConversationItem::assistant("done"));
+
+        assert_eq!(LengthPolicy::default(), LengthPolicy::CompletePartial);
+        use LengthPolicy::{CompletePartial, CompleteToolCalls, Fail};
+        use LengthVerdict as V;
+        for (policy, response, want) in [
+            (Fail, &text, V::Fail),
+            (Fail, &complete_tools, V::Fail),
+            (Fail, &stop, V::Pass),
+            (CompleteToolCalls, &complete_tools, V::SalvageToolCalls),
+            (CompleteToolCalls, &empty_args_tools, V::SalvageToolCalls),
+            (CompleteToolCalls, &truncated_tools, V::Fail),
+            (CompleteToolCalls, &mixed_tools, V::Fail),
+            (CompleteToolCalls, &text, V::Fail),
+            (CompleteToolCalls, &empty, V::Fail),
+            (CompleteToolCalls, &stop, V::Pass),
+            (CompletePartial, &text, V::Salvage),
+            (CompletePartial, &empty, V::Fail),
+            (CompletePartial, &complete_tools, V::SalvageToolCalls),
+            (CompletePartial, &truncated_tools, V::Fail),
+            (CompletePartial, &stop, V::Pass),
+        ] {
+            assert_eq!(policy.verdict(response), want, "{policy:?}");
         }
     }
 

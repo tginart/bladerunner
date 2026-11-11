@@ -77,7 +77,10 @@ pub use prompt::CompactionPrompt;
 // Only the summary-injection helper is re-exported at the crate root — both
 // intra FullReplace and inter already use it by this name.
 pub use reminder::append_reminder_block;
-pub use sampler::{CompactionSampleError, CompactionSampler, LlmCompactionOutput};
+pub use sampler::{
+    CompactionSampleError, CompactionSampler, LlmCompactionOutput, SAMPLER_BUILD_FAILED_PREFIX,
+    SAMPLER_START_FAILED_PREFIX,
+};
 pub use select::{SplitPlan, select_turns_to_compact};
 pub use steps::format_compaction_prompt;
 pub use token::ItemTokenCounter;

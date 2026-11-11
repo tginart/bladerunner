@@ -651,6 +651,12 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // SHELL-owned collapsed_edit_blocks (Appearance; live cache,
             // default OFF rollout flag).
             "collapsed_edit_blocks",
+            // SHARED-owned hooks_muted (Appearance; live cache, same value
+            // as `/hooks mute`).
+            "hooks_muted",
+            // SHARED-owned show_inference_speed (Appearance; live cache,
+            // hidden in minimal).
+            "show_inference_speed",
             // SHELL-owned display_refresh_auto_cadence (Appearance).
             "display_refresh_auto_cadence",
             // Mouse — scroll + drag selection. The scroll

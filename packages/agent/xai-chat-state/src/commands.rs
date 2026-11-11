@@ -136,6 +136,13 @@ pub enum ChatStateCommand {
         is_compaction: bool,
     },
 
+    /// Remove the images with these URLs from the conversation and rewrite the
+    /// stored history. Replies with the number of removed image parts.
+    StripConversationImages {
+        urls: Vec<std::sync::Arc<str>>,
+        reply: oneshot::Sender<usize>,
+    },
+
     /// Out-of-band history repair (`x.ai/session/repair`): run
     /// [`crate::compaction_utils::repair_history`] and persist when changed;
     /// `dry_run` only reports.

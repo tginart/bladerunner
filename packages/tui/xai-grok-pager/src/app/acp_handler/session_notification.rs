@@ -44,6 +44,17 @@ pub(super) fn refresh_context_used(view: &mut AgentView, used: u64) {
     let total = view.session.models.get_context_window().unwrap_or(0);
     view.apply_context_used(used, total);
 }
+/// Context-bar count carried by a compaction lifecycle update, if any.
+/// `AutoCompactStarted` carries the count the trigger fired on, and the
+/// "N% full" banner derives from it; without this refresh the bar shows the
+/// stale pre-turn number next to that banner until compaction ends.
+pub(super) fn compaction_context_refresh(update: &XaiSessionUpdate) -> Option<u64> {
+    match update {
+        XaiSessionUpdate::AutoCompactStarted { tokens_used, .. } => Some(*tokens_used),
+        XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } => Some(*tokens_after),
+        _ => None,
+    }
+}
 /// Refresh the bar and record `used` as the confirmed count for a pending
 /// compaction message; call only from the `meta.totalTokens` path.
 pub(super) fn confirm_context_used(view: &mut AgentView, used: u64) {
@@ -194,6 +205,15 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         );
         return false;
     }
+    if defer_finish_before_spawn(agent, notif, &session_notif.update) {
+        return false;
+    }
+    let spawned_child = match &session_notif.update {
+        XaiSessionUpdate::SubagentSpawned {
+            child_session_id, ..
+        } => Some(child_session_id.clone()),
+        _ => None,
+    };
     let mut plugins_changed_needs_skills_refetch = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
@@ -239,8 +259,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 &mut agent.scrollback,
                 is_api_key_auth,
             );
-            if let XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } = update {
-                refresh_context_used(agent, *tokens_after);
+            if let Some(used) = compaction_context_refresh(update) {
+                refresh_context_used(agent, used);
+            }
+            if let XaiSessionUpdate::AutoCompactCompleted { .. } = update {
                 agent.todo.update_todos(Vec::new());
             }
             changed
@@ -1169,6 +1191,20 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         XaiSessionUpdate::InteractionResolved { tool_call_id } => {
             agent.dismiss_resolved_interaction(&tool_call_id)
         }
+        XaiSessionUpdate::ResponseCompleted {
+            ttft_ms,
+            tokens_per_sec,
+            ..
+        } => {
+            // Replayed history is not a live measurement; keep the chip empty.
+            if meta.is_replay || agent.session.loading_replay {
+                false
+            } else {
+                agent.inference_speed =
+                    crate::views::agent_status::InferenceSpeed::new(ttft_ms, tokens_per_sec);
+                crate::appearance::cache::load_show_inference_speed()
+            }
+        }
         _ => {
             tracing::trace!(
                 "Ignoring {}: {:?}",
@@ -1235,12 +1271,113 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         }
     }
 
+    let finish_changed =
+        spawned_child.is_some_and(|child| apply_deferred_finish(app, parent_id, &child));
     if let Some(outcome) = terminal_outcome {
         return super::super::turn_completion::apply_terminal_outcome(
             outcome, app, parent_id, is_active,
         );
     }
-    changed && is_active
+    (changed || finish_changed) && is_active
+}
+/// Purpose: Hold a `SubagentFinished` whose spawn has not arrived yet.
+/// Output: `true` when the finish was held. The caller then returns
+/// without applying it or moving the dedup highwater, so the later spawn
+/// (with a lower event seq) is not dropped.
+fn defer_finish_before_spawn(
+    agent: &mut AgentView,
+    notif: &acp::ExtNotification,
+    update: &XaiSessionUpdate,
+) -> bool {
+    let XaiSessionUpdate::SubagentFinished {
+        child_session_id, ..
+    } = update
+    else {
+        return false;
+    };
+    if agent.subagent_sessions.contains_key(child_session_id) {
+        return false;
+    }
+    tracing::debug!(
+        child_session_id = %child_session_id,
+        "subagent finish arrived before its spawn; holding it"
+    );
+    agent.deferred_subagent_finishes.defer(
+        child_session_id,
+        without_finish_output(notif),
+        std::time::Instant::now(),
+    );
+    true
+}
+/// Purpose: Copy a `SubagentFinished` notification without its `output`.
+/// Note: The output has no size limit, and the finish arm does not read it.
+/// A held finish therefore keeps only the fields that the arm applies.
+fn without_finish_output(notif: &acp::ExtNotification) -> acp::ExtNotification {
+    let Ok(mut parsed) = serde_json::from_str::<SessionNotification>(notif.params.get()) else {
+        return notif.clone();
+    };
+    let XaiSessionUpdate::SubagentFinished { output, .. } = &mut parsed.update else {
+        return notif.clone();
+    };
+    if output.take().is_none() {
+        return notif.clone();
+    }
+    match serde_json::value::to_raw_value(&parsed) {
+        Ok(raw) => acp::ExtNotification::new(notif.method.clone(), raw.into()),
+        Err(error) => {
+            tracing::warn!(%error, "could not re-encode a held subagent finish");
+            notif.clone()
+        }
+    }
+}
+/// Purpose: Apply the finish held for `child_session_id` after its spawn.
+/// Output: Whether the replayed finish changed the view.
+fn apply_deferred_finish(app: &mut AppView, parent_id: AgentId, child_session_id: &str) -> bool {
+    let Some(agent) = app.agents.get_mut(&parent_id) else {
+        return false;
+    };
+    let Some(finish) = agent
+        .deferred_subagent_finishes
+        .take(child_session_id, std::time::Instant::now())
+    else {
+        return false;
+    };
+    let finish = without_stale_event_id(finish, agent.last_applied_xai_event_seq);
+    handle_session_notification(&finish, app)
+}
+/// Purpose: Let a held finish pass the dedup highwater after its spawn.
+/// Input: The held notification and the current xAI highwater.
+/// Output: The notification as is when its event seq is above the
+/// highwater. If not, a copy without `eventId`.
+/// Note: A finish that the shell sent before its spawn has a lower seq than
+/// the spawn, so the dedup check would drop it. The finish already passed
+/// that check when it arrived. Without `eventId` it applies once and does
+/// not move the reconnect cursor back.
+fn without_stale_event_id(
+    notif: acp::ExtNotification,
+    highwater: Option<u64>,
+) -> acp::ExtNotification {
+    let Ok(mut parsed) = serde_json::from_str::<SessionNotification>(notif.params.get()) else {
+        return notif;
+    };
+    let meta = NotificationMeta::from_json(parsed.meta.as_ref().and_then(|v| v.as_object()));
+    let is_stale = meta
+        .event_seq
+        .zip(highwater)
+        .is_some_and(|(seq, last)| seq <= last);
+    if !is_stale {
+        return notif;
+    }
+    if let Some(map) = parsed.meta.as_mut().and_then(|v| v.as_object_mut()) {
+        map.remove("eventId");
+    }
+    match serde_json::value::to_raw_value(&parsed) {
+        Ok(raw) => acp::ExtNotification::new(notif.method.clone(), raw.into()),
+        Err(error) => {
+            tracing::warn!(%error, "could not re-encode a deferred subagent finish");
+            notif
+        }
+    }
 }
 /// Handle an xAI session notification that targets a child (subagent) session.
 ///

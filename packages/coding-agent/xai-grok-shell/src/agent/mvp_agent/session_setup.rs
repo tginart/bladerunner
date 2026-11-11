@@ -410,13 +410,9 @@ impl MvpAgent {
                 origin_client.clone(),
             )
         });
-        if let Some(effort) = self.models_manager.current_reasoning_effort()
-            && self
-                .models_manager
-                .model_supports_reasoning_effort(&session_sampling.model)
-        {
-            session_sampling.reasoning_effort = Some(effort);
-        }
+        let new_session_effort = self.models_manager.current_reasoning_effort();
+        self.models_manager
+            .apply_supported_effort(&mut session_sampling, new_session_effort);
         let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         let model_id = match &session_initial_model {
@@ -490,6 +486,7 @@ impl MvpAgent {
                     session_meta: arguments.meta.as_ref(),
                     model_agent_type: model_agent_type.as_deref(),
                     session_model_id,
+                    initial_reasoning_effort: new_session_effort,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd: None,
@@ -545,7 +542,8 @@ impl MvpAgent {
             let _ = crate::timed!(log: "new_session: set_session_model", {
                 crate::agent::handlers::model_switch::apply(
                     self,
-                    acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
+                    acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id))
+                        .meta(reasoning_effort::reasoning_effort_meta(new_session_effort)),
                 )
                 .await
             });
@@ -707,6 +705,9 @@ impl MvpAgent {
         }
         let session_info = begin_session(&session_id, &cwd);
         let current_session_dir = crate::session::persistence::session_dir(&session_info);
+        // Before the sweep and the load: the sweep of another process may judge
+        // this dir now, and it sees only mtimes.
+        crate::session::persistence::mark_session_live(&current_session_dir);
         tokio::task::spawn_blocking(move || {
             crate::session::persistence::cleanup_stale_sessions(Some(&current_session_dir));
         });
@@ -891,6 +892,7 @@ impl MvpAgent {
                     session_meta: request_meta.as_ref(),
                     model_agent_type: persisted_agent_name.as_deref(),
                     session_model_id: summary.current_model_id.clone(),
+                    initial_reasoning_effort: None,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
                     prompt_display_cwd,
@@ -1337,14 +1339,7 @@ impl MvpAgent {
         );
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
-            let restore_meta = summary.reasoning_effort.map(|effort| {
-                let mut map = acp::Meta::new();
-                map.insert(
-                    REASONING_EFFORT_META_KEY.to_string(),
-                    reasoning_effort_meta_value(effort),
-                );
-                map
-            });
+            let restore_meta = reasoning_effort::reasoning_effort_meta(summary.reasoning_effort);
             let _ = crate::agent::handlers::model_switch::apply(
                 self,
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)

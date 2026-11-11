@@ -42,6 +42,7 @@ impl AgentView {
             self.last_seen_event_id = None;
             self.last_applied_event_seq = None;
             self.last_applied_xai_event_seq = None;
+            self.deferred_subagent_finishes.clear();
             self.clear_minimal_btw_lifecycle();
             effects.extend(self.teardown_review_chat());
             if matches!(
@@ -140,6 +141,7 @@ impl AgentView {
             rewound_prompt_ids: VecDeque::new(),
             last_applied_event_seq: None,
             last_applied_xai_event_seq: None,
+            deferred_subagent_finishes: Default::default(),
             last_seen_event_id: None,
             session_reload: None,
             unexpected_replay_drops: 0,
@@ -173,6 +175,7 @@ impl AgentView {
             credit_balance: None,
             auto_topup: None,
             goal_state: None,
+            inference_speed: None,
             workflow_blocks: std::collections::HashMap::new(),
             workflow_runs: Vec::new(),
             workflow_run_revisions: std::collections::HashMap::new(),

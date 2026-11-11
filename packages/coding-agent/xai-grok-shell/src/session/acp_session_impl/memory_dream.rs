@@ -783,88 +783,17 @@ impl SessionActor {
             model: Some("grok-build".to_owned()),
             temperature: Some(0.3),
             max_output_tokens: Some(1024),
+            // A note cut at the 1024-token cap must not persist to MEMORY.md.
+            length_policy: xai_grok_sampling_types::LengthPolicy::Fail,
             ..Default::default()
         };
 
-        let request_id = xai_grok_sampler::RequestId::random();
-        let idle_timeout = std::time::Duration::from_secs(15);
-
-        let result = match sampling_client.api_backend() {
-            crate::sampling::ApiBackend::ChatCompletions => {
-                let (raw, meta) = sampling_client
-                    .conversation_stream(request)
-                    .await
-                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
-                let events =
-                    xai_grok_sampler::stream_chat_completions(raw, meta, request_id, idle_timeout);
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::Responses
-            | crate::sampling::ApiBackend::CodexResponses => {
-                let (raw, meta, doom_loop) = sampling_client
-                    .conversation_stream_responses(request)
-                    .await
-                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
-                let events = xai_grok_sampler::stream_responses(
-                    raw,
-                    meta,
-                    request_id,
-                    idle_timeout,
-                    doom_loop,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::Messages | crate::sampling::ApiBackend::VertexMessages => {
-                let (raw, meta) = sampling_client
-                    .conversation_stream_messages(request)
-                    .await
-                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
-                let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::GoogleGenerateContent => {
-                let (raw, identity) = sampling_client
-                    .conversation_stream_google(request)
-                    .await
-                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
-                let events = xai_grok_sampler::google::stream_google_generate_content(
-                    raw,
-                    request_id,
-                    identity,
-                    idle_timeout,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::BedrockConverseStream => {
-                let (raw, identity) = sampling_client
-                    .conversation_stream_bedrock(request)
-                    .await
-                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
-                let events = xai_grok_sampler::bedrock::stream_bedrock_converse(
-                    raw,
-                    request_id,
-                    identity,
-                    idle_timeout,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-            crate::sampling::ApiBackend::PiMessages => {
-                let (raw, identity) = sampling_client
-                    .conversation_stream_pi_messages(request)
-                    .await
-                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
-                let events = xai_grok_sampler::pi_messages::stream_pi_messages(
-                    raw,
-                    request_id,
-                    identity,
-                    idle_timeout,
-                );
-                xai_grok_sampler::collect_response(events).await
-            }
-        };
-
-        match result {
-            Ok((response, _metrics)) => {
+        // Collect via the client so the `LengthPolicy` gate applies.
+        match sampling_client
+            .conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(15))
+            .await
+        {
+            Ok(response) => {
                 let text = response.assistant_text();
                 if text.is_empty() {
                     Err("LLM returned empty response".to_string())
@@ -873,8 +802,8 @@ impl SessionActor {
                 }
             }
             Err(e) => {
-                tracing::debug!(error = %e.message, "memory note rewrite inference failed");
-                Err(format!("rewrite inference failed: {}", e.message))
+                tracing::debug!(error = %e, "memory note rewrite inference failed");
+                Err(format!("rewrite inference failed: {e}"))
             }
         }
     }

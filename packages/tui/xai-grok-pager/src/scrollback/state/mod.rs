@@ -85,6 +85,10 @@ pub struct ScrollbackState {
     /// `minimal_api::{is_committed, mark_committed}`.
     committed: HashSet<EntryId>,
 
+    /// Edits that this session opened for a permission prompt. Only these
+    /// fold again when the prompt ends; an edit the user opened stays open.
+    permission_opened: HashSet<EntryId>,
+
     /// Minimal mode only: lowest entry index that *might* be uncommitted (not
     /// yet printed into native scrollback). A lower-bound perf hint so the
     /// per-frame commit pass is O(new) rather than O(history); the authoritative
@@ -246,6 +250,7 @@ impl ScrollbackState {
             flashing: Vec::new(),
             dirty_heights: HashSet::new(),
             committed: HashSet::new(),
+            permission_opened: HashSet::new(),
             commit_scan_cursor: 0,
             commit_expand_ring: VecDeque::new(),
             scroll_offset: 0,
@@ -379,6 +384,7 @@ impl ScrollbackState {
         // traveled with the entry; as an id-set it must be merged explicitly so
         // already-committed tail blocks are not re-emitted after the reload.
         self.committed.extend(tail.committed);
+        self.permission_opened.extend(tail.permission_opened);
         self.expanded_groups.extend(tail.expanded_groups);
         self.next_id = self.next_id.max(tail.next_id);
         // The tail (live during the window) is what equality-cached consumers
@@ -728,6 +734,7 @@ impl ScrollbackState {
         self.running.remove(&id);
         self.dirty_heights.remove(&id);
         self.committed.remove(&id);
+        self.permission_opened.remove(&id);
         self.expanded_groups.remove(&id);
         if let Some(sel) = self.selected
             && sel >= self.entries.len()
@@ -756,6 +763,7 @@ impl ScrollbackState {
                 self.running.remove(&id);
                 self.dirty_heights.remove(&id);
                 self.committed.remove(&id);
+                self.permission_opened.remove(&id);
                 self.expanded_groups.remove(&id);
                 removed.push(entry);
             }
@@ -1091,6 +1099,7 @@ impl ScrollbackState {
         self.flashing.clear();
         self.dirty_heights.clear();
         self.committed.clear();
+        self.permission_opened.clear();
         self.expanded_groups.clear();
         // Note: we don't reset next_id to avoid ID reuse
         self.selected = None;
@@ -1266,7 +1275,7 @@ impl ScrollbackState {
             new_tc.set_started_at(t);
         }
         let kind_changed = verb_group::verb_group_kind_changed(&entry.block, &block);
-        let (edit_to_edit, untrusted_rising) = match (&entry.block, &block) {
+        let (is_same_kind, untrusted_rising) = match (&entry.block, &block) {
             (
                 RenderBlock::ToolCall(ToolCallBlock::Edit(old)),
                 RenderBlock::ToolCall(ToolCallBlock::Edit(new)),
@@ -1274,14 +1283,20 @@ impl ScrollbackState {
                 true,
                 new.is_success() && new.summary_untrusted && !old.summary_untrusted,
             ),
+            (RenderBlock::ToolCall(old), RenderBlock::ToolCall(new)) => (
+                std::mem::discriminant(old) == std::mem::discriminant(new),
+                false,
+            ),
             _ => (false, false),
         };
         entry.block = block;
-        if edit_to_edit {
-            // Keep the current mode: the entry was already an Edit, so any
-            // change since materialization is a user gesture — except on the
-            // untrusted rising edge, where the collapsed one-liner became a
-            // lie and Expanded is the only truthful default. Pins still win.
+        if is_same_kind {
+            // Keep the current mode: the entry already had this kind, so any
+            // change since materialization is a user gesture. Live progress
+            // (an Execute output tick) swaps the block through here, and must
+            // not snap a user's expand shut. The exception is the untrusted
+            // Edit rising edge, where the collapsed one-liner became a lie
+            // and Expanded is the only truthful default. Pins still win.
             if untrusted_rising && !(respect_manual_folds && entry.display_mode_pinned) {
                 entry.display_mode = DisplayMode::Expanded;
             }
@@ -1299,9 +1314,16 @@ impl ScrollbackState {
                 block => block.default_display_mode(),
             };
         }
+        let is_pending = entry.is_pending_user_input;
         entry.invalidate_cache();
         if kind_changed {
             self.mark_structurally_dirty(entry_id);
+        }
+        // The permission mark often lands first on the eager Other
+        // placeholder, before the Edit and its hunks exist. Open the diff
+        // when the Edit arrives.
+        if is_pending {
+            self.open_permission_edit(entry_id);
         }
         true
     }
@@ -1485,6 +1507,72 @@ impl ScrollbackState {
         // to surface the prompt row (and refold once it resolves).
         self.mark_structurally_dirty(id);
         true
+    }
+
+    /// Expand an Edit diff once for a permission prompt.
+    ///
+    /// The user must see the diff to decide on the prompt. A pinned fold is
+    /// a user choice and is left alone. The `permission_opened` set makes
+    /// this run once per prompt, so the per-frame clear and re-mark of the
+    /// pending flag does not undo a user's collapse.
+    pub(crate) fn open_permission_edit(&mut self, id: EntryId) {
+        if self.permission_opened.contains(&id) {
+            return;
+        }
+        let Some(entry) = self.get_by_id_mut(id) else {
+            return;
+        };
+        if entry.display_mode_pinned || entry.display_mode == DisplayMode::Expanded {
+            return;
+        }
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = &entry.block else {
+            return;
+        };
+        if edit.hunks.is_empty() {
+            return;
+        }
+        entry.display_mode = DisplayMode::Expanded;
+        entry.invalidate_cache();
+        self.permission_opened.insert(id);
+        self.mark_structurally_dirty(id);
+    }
+
+    /// Fold a permission-opened Edit back to its default once the prompt
+    /// is gone. Edits that this session did not open, and pinned folds,
+    /// are left alone.
+    pub(crate) fn close_permission_edit(&mut self, id: EntryId) {
+        if !self.permission_opened.remove(&id) {
+            return;
+        }
+        let expanded_by_default = self
+            .appearance
+            .scrollback
+            .blocks
+            .edit
+            .effective_expanded(crate::appearance::cache::load_collapsed_edit_blocks());
+        let Some(entry) = self.get_by_id_mut(id) else {
+            return;
+        };
+        if entry.display_mode_pinned {
+            return;
+        }
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = &entry.block else {
+            return;
+        };
+        let mode = edit_default_display_mode(expanded_by_default, edit);
+        if entry.display_mode != mode {
+            entry.display_mode = mode;
+            entry.invalidate_cache();
+            self.mark_structurally_dirty(id);
+        }
+    }
+
+    /// Entry ids that are flagged as awaiting user input.
+    pub(crate) fn pending_user_input_ids(&self) -> HashSet<EntryId> {
+        self.entries
+            .iter()
+            .filter_map(|(id, entry)| entry.is_pending_user_input.then_some(*id))
+            .collect()
     }
 
     /// Clear the pending-user-input flag from every entry.
@@ -2171,6 +2259,256 @@ mod tests {
                 None
             ),
             "missing entry reports false"
+        );
+    }
+
+    /// A same-kind swap keeps the current mode. Live Execute progress
+    /// rebuilds the row through `replace_tool_block`, so a user's expand must
+    /// survive it and the completion that follows. A collapsed Execute must
+    /// not open by itself.
+    #[test]
+    fn replace_tool_block_execute_same_kind_preserves_mode() {
+        use crate::scrollback::blocks::tool::ExecuteToolCallBlock;
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+        state.set_last_running(true);
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(id, RenderBlock::execute("cargo build"), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "Other to Execute is a kind change and adopts the default"
+        );
+
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output("cargo build", "Compiling\n", None::<String>),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Execute progress must keep the user's expand"
+        );
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output(
+                "cargo build",
+                "Compiling\nFinished\n",
+                None::<String>
+            ),
+            None
+        ));
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "completion must not snap a user-expanded Execute shut"
+        );
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::execute("cargo test"));
+        state.set_last_running(true);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed
+        );
+        assert!(state.replace_tool_block(
+            id,
+            RenderBlock::execute_with_output("cargo test", "running 1 test\n", None::<String>),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "Execute progress must not open a collapsed Execute"
+        );
+
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(RenderBlock::search("todo", 0, vec![]));
+        state.set_last_running(true);
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        assert!(state.replace_tool_block(id, RenderBlock::search("todo", 3, vec![]), None));
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Search to Search must keep a user expand through completion"
+        );
+
+        let bash = |output: Option<&str>| {
+            let mut b = ExecuteToolCallBlock::new("pytest");
+            b.bash_mode = true;
+            if let Some(o) = output {
+                b = b.with_output(o);
+            }
+            RenderBlock::ToolCall(ToolCallBlock::Execute(b))
+        };
+        let mut state = ScrollbackState::new();
+        let id = state.push_block(bash(None));
+        state.set_last_running(true);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Truncated
+        );
+        assert!(state.replace_tool_block(id, bash(Some("running 1 test\n")), None));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Truncated,
+            "bash progress must not open a Truncated block"
+        );
+        state.finish_running(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "bash finish still expands from the kept Truncated mode"
+        );
+    }
+
+    /// A permission prompt opens a collapsed Edit diff. A pinned fold stays.
+    #[test]
+    fn pending_permission_edit_expands() {
+        let mut state = edit_state(false);
+        let id = state.push_block(edit_block(EditToolCallBlock::new(
+            "config.toml",
+            vec![vec![]],
+        )));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed
+        );
+        state.open_permission_edit(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded
+        );
+
+        let mut state = edit_state(false);
+        let id = state.push_block(edit_block(EditToolCallBlock::new(
+            "config.toml",
+            vec![vec![]],
+        )));
+        state.get_by_id_mut(id).unwrap().display_mode_pinned = true;
+        state.open_permission_edit(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "a pinned fold is a user choice"
+        );
+    }
+
+    /// The prompt opens the diff once. A user's collapse during the prompt
+    /// sticks, and the close step folds only the rows that the prompt opened.
+    #[test]
+    fn permission_open_is_once_and_refolds_only_that_row() {
+        let mut state = edit_state(false);
+        let id = state.push_block(edit_block(EditToolCallBlock::new(
+            "config.toml",
+            vec![vec![]],
+        )));
+        state.set_pending_user_input(id, true);
+        state.open_permission_edit(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded
+        );
+
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Collapsed);
+        assert!(state.replace_tool_block(
+            id,
+            edit_block(EditToolCallBlock::new("config.toml", vec![vec![]])),
+            None
+        ));
+        state.open_permission_edit(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "the user's collapse during the prompt sticks"
+        );
+
+        state
+            .get_by_id_mut(id)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        state.set_pending_user_input(id, false);
+        state.close_permission_edit(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "the prompt is gone, so the row folds back to its default"
+        );
+
+        let other = state.push_block(edit_block(EditToolCallBlock::new("other.rs", vec![vec![]])));
+        state
+            .get_by_id_mut(other)
+            .unwrap()
+            .set_display_mode(DisplayMode::Expanded);
+        state.close_permission_edit(other);
+        assert_eq!(
+            state.get_by_id(other).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "a row the prompt did not open is left alone"
+        );
+
+        state.open_permission_edit(id);
+        let mut tail = state.fresh_continuation();
+        tail.permission_opened.insert(id);
+        state.append_entries_from(tail);
+        assert!(state.permission_opened.contains(&id));
+    }
+
+    /// A permission can mark the eager Other placeholder before the Edit
+    /// and its hunks exist. The later refine must open the row, and a
+    /// pinned fold must still stick.
+    #[test]
+    fn pending_other_refine_to_edit_expands() {
+        let mut state = edit_state(false);
+        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+        assert!(state.set_pending_user_input(id, true));
+        state.open_permission_edit(id);
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "the placeholder is not an Edit yet"
+        );
+        assert!(state.replace_tool_block(
+            id,
+            edit_block(EditToolCallBlock::new("config.toml", vec![vec![]])),
+            None
+        ));
+        assert_eq!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "Other to Edit refine during a pending prompt must open"
+        );
+
+        let mut state = edit_state(false);
+        let id = state.push_block(RenderBlock::tool_call("Other", "pending", true));
+        assert!(state.set_pending_user_input(id, true));
+        state.get_by_id_mut(id).unwrap().display_mode_pinned = true;
+        assert!(state.replace_tool_block(
+            id,
+            edit_block(EditToolCallBlock::new("config.toml", vec![vec![]])),
+            None
+        ));
+        assert_ne!(
+            state.get_by_id(id).unwrap().display_mode,
+            DisplayMode::Expanded,
+            "a pinned fold survives the refine while the prompt is up"
         );
     }
 

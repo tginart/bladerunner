@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, ConversationResponse, EmptyResponseContext,
-    ReasoningModelIdentity, SamplingError, SentCredential, error::Result as SamplingResult,
+    ApiErrorCode, ConversationItem, ConversationRequest, ConversationResponse,
+    EmptyResponseContext, ReasoningModelIdentity, SamplingError, SentCredential,
+    error::Result as SamplingResult,
 };
 
 use crate::client::{ApiBackend, SamplingClient};
@@ -312,6 +313,17 @@ pub(crate) async fn run_request_task(
     }
 }
 
+/// True when the server named the images as the cause with the coded
+/// `invalid_image` error. Only this verdict lets the session change its
+/// stored history; a phrase match on the message stays request-local.
+fn is_coded_image_rejection(err: &SamplingError) -> bool {
+    match err {
+        SamplingError::Api { error_code, .. } => *error_code == Some(ApiErrorCode::InvalidImage),
+        SamplingError::StreamError { code, .. } => *code == Some(ApiErrorCode::InvalidImage),
+        _ => false,
+    }
+}
+
 /// Apply a [`RetryDecision`]. Returns `true` if the loop should
 /// continue, `false` if the request is finished (either fatal or
 /// emit-to-session). Performs the side-effects of the decision:
@@ -398,7 +410,15 @@ async fn apply_retry_decision(
             true
         }
         RetryDecision::RetryWithImageStrip => {
-            let stripped = request.strip_images();
+            let stripped_urls = xai_grok_sampling_types::collect_image_urls(&request.items);
+            // A 413 says the request is too large, not that an image is bad,
+            // so it keeps the size placeholder and never heals history.
+            let is_oversize = err.is_payload_too_large();
+            let stripped = if is_oversize {
+                request.strip_images()
+            } else {
+                xai_grok_sampling_types::strip_images_by_url(&mut request.items, &stripped_urls)
+            };
             if stripped == 0 {
                 // Nothing left to strip; upgrade to fatal.
                 emit_failed(event_tx, request_id, err);
@@ -410,6 +430,12 @@ async fn apply_retry_decision(
                 error = %err,
                 "stripped {stripped} image(s) after server rejection; retrying without them"
             );
+            if !is_oversize && is_coded_image_rejection(err) {
+                let _ = event_tx.send(SamplingEvent::ImagesStripped {
+                    request_id: request_id.clone(),
+                    stripped_urls,
+                });
+            }
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
             true
@@ -519,6 +545,7 @@ async fn run_one_attempt(
     let system_sha256 = evidence.system.as_ref().map(|(sha, _)| sha.as_str());
     let hosted_tools = client.request_hosted_tools(&request);
     let sent_reasoning_effort = client.request_sent_effort(&request);
+    let length_policy = request.length_policy;
 
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
@@ -540,6 +567,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -576,6 +604,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 doom_check,
+                length_policy,
                 output_observed,
             )
             .await
@@ -604,6 +633,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -632,6 +662,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -660,6 +691,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -683,6 +715,7 @@ async fn run_one_attempt(
                 &hosted_tools,
                 sent_reasoning_effort,
                 None,
+                length_policy,
                 output_observed,
             )
             .await
@@ -738,6 +771,7 @@ async fn drive_l2(
     hosted_tools: &[serde_json::Value],
     sent_reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    length_policy: xai_grok_sampling_types::LengthPolicy,
     output_observed: Arc<AtomicBool>,
 ) -> AttemptOutcome {
     let mut l2 = pin!(l2);
@@ -779,11 +813,11 @@ async fn drive_l2(
                             };
                         }
                     }
-                    if response.stop_reason == Some(xai_grok_sampling_types::StopReason::Length) {
-                        return AttemptOutcome::Failed {
-                            error: SamplingError::MaxTokensTruncation,
-                        };
-                    }
+                    // Fail-or-salvage for a `Length` stop lives in the one shared gate.
+                    let response = match crate::client::apply_length_policy(length_policy, *response) {
+                        Ok(response) => Box::new(response),
+                        Err(error) => return AttemptOutcome::Failed { error },
+                    };
                     // A content-filtered turn (Anthropic refusal, OpenAI
                     // content_filter stop reason) is legitimately content-less and
                     // deterministic — resampling it would retry-storm.
@@ -1400,6 +1434,7 @@ mod tests {
             &[serde_json::json!({"type": "web_search", "filters": {"allowed_domains": ["example.com"]}})],
             sent,
             None,
+            xai_grok_sampling_types::LengthPolicy::default(),
             Arc::new(AtomicBool::new(false)),
         )
         .await;

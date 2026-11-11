@@ -1552,7 +1552,7 @@ pub(super) async fn build_skill_information_for_refs(
 ) -> Option<String> {
     use xai_grok_tools::implementations::skills::skill::{
         SkillRef, SubstitutionContext, apply_substitutions, build_skill_block,
-        build_skill_information, load_skill_content,
+        build_skill_information, cap_skill_body, load_skill_content,
     };
     let mut skill_blocks: Vec<String> = Vec::new();
     for sk in parsed_skills {
@@ -1561,6 +1561,13 @@ pub(super) async fn build_skill_information_for_refs(
         };
         match load_skill_content(info).await {
             Ok(mut content) => {
+                if cap_skill_body(&mut content) {
+                    tracing::info!(
+                        skill = %sk.name,
+                        path = %info.path,
+                        "skill body truncated at read cap"
+                    );
+                }
                 let skill_dir = std::path::Path::new(&info.path)
                     .parent()
                     .and_then(|p| p.to_str());

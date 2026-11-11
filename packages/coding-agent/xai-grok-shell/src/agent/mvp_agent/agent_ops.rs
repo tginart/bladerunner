@@ -2488,6 +2488,9 @@ impl MvpAgent {
             subagent_presentation: RefCell::new(
                 crate::agent::subagent::SubagentPresentation::new(),
             ),
+            subagent_sampling_gate: crate::session::new_subagent_sampling_gate(
+                cfg.subagents_max_concurrent,
+            ),
             monitor_event_buffer: xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer::default(),
             bundle_sync_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             post_unblock_jwt_retry_in_flight: Arc::new(
@@ -3972,6 +3975,7 @@ impl MvpAgent {
             session_meta,
             model_agent_type,
             session_model_id,
+            initial_reasoning_effort,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
@@ -4342,13 +4346,15 @@ impl MvpAgent {
             );
             agent_definition.user_message_template = template;
         }
-        let (session_model_id, sampling_config) = self
+        let (session_model_id, mut sampling_config) = self
             .apply_agent_model_override(
                 pinned_model.as_ref(),
                 session_model_id,
                 sampling_config,
                 origin_client.clone(),
             );
+        self.models_manager
+            .apply_supported_effort(&mut sampling_config, initial_reasoning_effort);
         let max_turns = {
             let cfg = self.cfg.borrow();
             cfg.cli_agent_overrides
@@ -4487,17 +4493,9 @@ impl MvpAgent {
         let auth_manager = Some(self.auth_manager.clone());
         let bash_params_json = {
             let cfg = self.cfg.borrow();
-            let remote_auto_bg = cfg
-                .remote_settings
-                .as_ref()
-                .and_then(|r| r.auto_background_on_timeout);
-            let remote_allow_background_operator = cfg
-                .remote_settings
-                .as_ref()
-                .and_then(|r| r.allow_background_operator);
             cfg.toolset
                 .bash
-                .to_bash_params_json(remote_auto_bg, remote_allow_background_operator)
+                .to_bash_params_json_with_remote(cfg.remote_settings.as_ref())
         };
         let ask_user_question_params_json = {
             let cfg = self.cfg.borrow();

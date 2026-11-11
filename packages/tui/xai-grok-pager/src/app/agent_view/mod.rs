@@ -832,6 +832,10 @@ pub struct AgentView {
     /// xAI-stream sibling of [`Self::last_applied_event_seq`] (see there for
     /// why the highwaters are split). Same drop rule, replay-exempt.
     pub last_applied_xai_event_seq: Option<u64>,
+    /// `SubagentFinished` updates that arrived before their spawn. Applied
+    /// when the spawn arrives; see `crate::app::deferred_subagent_finishes`.
+    pub(crate) deferred_subagent_finishes:
+        crate::app::deferred_subagent_finishes::DeferredSubagentFinishes,
     /// Raw `eventId` of the most recent update APPLIED to this root session —
     /// replay or live, on both the ACP and xAI paths; dropped updates (dedup,
     /// promptId gate, unexpected replay) don't move it. Sent as `_meta.cursor`
@@ -944,6 +948,9 @@ pub struct AgentView {
     /// Current goal orchestration state. Set by `GoalUpdated` session
     /// notifications, cleared when a new session starts.
     pub goal_state: Option<super::agent::GoalDisplayState>,
+    /// Speed of the latest live model response (`ResponseCompleted`). Shown
+    /// as a status-bar chip when `[ui].show_inference_speed` is on.
+    pub inference_speed: Option<crate::views::agent_status::InferenceSpeed>,
     pub workflow_blocks: std::collections::HashMap<String, crate::scrollback::entry::EntryId>,
     pub workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
     pub workflow_run_revisions: std::collections::HashMap<String, u64>,

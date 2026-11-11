@@ -9,7 +9,7 @@ use xai_grok_test_support::sse::{
 use xai_grok_test_support::{MockInferenceServer, ScriptedResponse};
 
 /// `SessionActor` turn futures overflow the default test thread stack.
-fn block_on_session(f: impl FnOnce() + Send + 'static) {
+pub(super) fn block_on_session(f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(f)
@@ -18,7 +18,7 @@ fn block_on_session(f: impl FnOnce() + Send + 'static) {
         .expect("test thread");
 }
 
-fn current_thread_local<F>(f: F)
+pub(super) fn current_thread_local<F>(f: F)
 where
     F: Future<Output = ()> + 'static,
 {
@@ -31,7 +31,9 @@ where
 
 const TODO_ARGS: &str = r#"{"todos":[{"id":"t1","content":"poll","status":"completed"}]}"#;
 
-fn drain_gateway(mut rx: tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>) {
+pub(super) fn drain_gateway(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
+) {
     tokio::task::spawn_local(async move {
         while let Some(msg) = rx.recv().await {
             if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = msg {
@@ -51,7 +53,7 @@ fn drain_persistence_flush_enospc(mut rx: tokio::sync::mpsc::UnboundedReceiver<P
     });
 }
 
-async fn actor_with_mock_sampler(
+pub(super) async fn actor_with_mock_sampler(
     server: &MockInferenceServer,
     persistence_tx: tokio::sync::mpsc::UnboundedSender<PersistenceMsg>,
     gateway_tx: tokio::sync::mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
@@ -121,7 +123,7 @@ async fn actor_with_mock_sampler(
     actor
 }
 
-async fn run_prompt(
+pub(super) async fn run_prompt(
     actor: &Arc<SessionActor>,
     prompt_id: &str,
 ) -> Result<crate::session::commands::PromptTurnOk, acp::Error> {

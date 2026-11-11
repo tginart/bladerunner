@@ -473,7 +473,9 @@ impl StashedPrompt {
             }
             chip.range = chip.range.start - start..chip.range.end - start;
             if chip.kind == KIND_IMAGE
-                && let Some(number) = parse_image_display_number(&text[chip.range.clone()])
+                && let Some(number) = text
+                    .get(chip.range.clone())
+                    .and_then(parse_image_display_number)
             {
                 image_numbers.insert(number);
             }
@@ -745,6 +747,9 @@ impl PromptWidget {
         let Some(rest) = self.prompt_suggestion.accept(&text) else {
             return false;
         };
+        // Accepting rewrites the token; an unrelated highlight must not
+        // survive it.
+        self.textarea.clear_selection();
         self.textarea.insert_str(&rest);
         self.update_file_search_context();
         true
@@ -818,6 +823,9 @@ impl PromptWidget {
     /// written (`Stale` is a draft-preserving no-op); cursor lands after the
     /// insert.
     pub fn apply_completion_splice(&mut self, splice: CompletionSplice) -> bool {
+        // Accepting rewrites the token; an unrelated highlight must not
+        // survive it.
+        self.textarea.clear_selection();
         match splice {
             CompletionSplice::WholeLine(line) => {
                 self.set_text(&line);
@@ -1228,6 +1236,9 @@ impl PromptWidget {
         let Some(row) = snap.selection() else {
             return false;
         };
+        // Accepting rewrites the token; an unrelated highlight must not
+        // survive it.
+        self.textarea.clear_selection();
         let insert_text = row.insert_text.clone();
         let record_mru = snap.cursor_in_command;
         let mru_record = if record_mru {
@@ -1253,7 +1264,11 @@ impl PromptWidget {
                     // absorb an element's byte: a chip's leading space is chip
                     // data, and replace_range expands any overlap to the whole
                     // element (the absorb would swallow the chip).
-                    let next_is_plain_space = self.textarea.text()[range.end..].starts_with(' ')
+                    let next_is_plain_space = self
+                        .textarea
+                        .text()
+                        .get(range.end..)
+                        .is_some_and(|s| s.starts_with(' '))
                         && !self
                             .textarea
                             .elements()
@@ -1445,7 +1460,7 @@ impl PromptWidget {
                 continue;
             }
             if cursor >= elem.range.start && cursor <= elem.range.end + 1 {
-                let text = &self.textarea.text()[elem.range.clone()];
+                let text = self.textarea.text().get(elem.range.clone())?;
                 return Some(Self::parse_file_ref_element(text));
             }
         }
@@ -1464,7 +1479,7 @@ impl PromptWidget {
                 continue;
             }
             if cursor == elem.range.end || cursor == elem.range.start {
-                let text = &self.textarea.text()[elem.range.clone()];
+                let text = self.textarea.text().get(elem.range.clone())?;
                 return Some(Self::parse_file_ref_element(text));
             }
         }
@@ -1683,6 +1698,16 @@ impl PromptWidget {
             }
         }
 
+        // Esc/Tab: drop the highlight, but decline the press so that it still
+        // cancels or moves focus. A modified Esc falls through to the
+        // textarea, which clears the highlight and reports a change.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            || (key.code == KeyCode::Esc && key.modifiers.is_empty())
+        {
+            self.textarea.clear_selection();
+            return PromptEvent::Ignored;
+        }
+
         // ── Ctrl-L / : on element → open line viewer ────────────────────
         // Ctrl-L when cursor is on or adjacent to a file ref element,
         // or ':' typed right at element boundary → open viewer.
@@ -1713,8 +1738,7 @@ impl PromptWidget {
         // Newline: Shift/Alt+Enter, or Apple Terminal bare Enter with a
         // newline modifier held (CoreGraphics rescue inside is_mod_enter).
         if crate::input::is_mod_enter(key) {
-            self.textarea.insert_str("\n");
-            self.update_file_search_context();
+            self.insert_replacing_selection("\n");
             return PromptEvent::Edited;
         }
 
@@ -1749,13 +1773,12 @@ impl PromptWidget {
         // without creating a [Pasted: N lines] element.
         if crate::input::key::is_inline_paste_key(key) {
             if let Some(text) = system_clipboard_get() {
-                let text = normalize_cr(&text);
+                let text = normalize_line_breaks(&text);
                 if text.is_empty() {
                     crate::clipboard::log_paste_key_empty_host_clipboard("prompt_widget_inline");
                     return PromptEvent::Ignored;
                 }
-                self.textarea.insert_str(&text);
-                self.update_file_search_context();
+                self.insert_replacing_selection(&text);
                 return PromptEvent::Edited;
             }
             crate::clipboard::log_paste_key_empty_host_clipboard("prompt_widget_inline");
@@ -1806,24 +1829,34 @@ impl PromptWidget {
         }
 
         // Everything else: delegate to textarea.
-        // Track whether it actually changed anything.
+        // Track whether it actually changed anything. The selection is drawn
+        // state, so a selection-only change (Shift+arrow, or a plain arrow
+        // that collapses it) must report Edited, or no frame is drawn.
         let old_text = self.textarea.text().to_owned();
         let old_cursor = self.textarea.cursor();
-        let old_has_selection = self.textarea.selection_range().is_some();
+        let old_selection = self.textarea.selection_range();
+        let old_has_selection = old_selection.is_some();
         self.textarea.input(*key);
         let new_cursor = self.textarea.cursor();
-        let changed = self.textarea.text() != old_text || new_cursor != old_cursor;
+        let new_selection = self.textarea.selection_range();
+        let changed = self.textarea.text() != old_text
+            || new_cursor != old_cursor
+            || new_selection != old_selection;
         self.last_input_delta = crate::input_log::LastInputDelta {
             cursor_before: Some(old_cursor),
             cursor_after: Some(new_cursor),
             text_len_before: Some(old_text.len()),
             text_len_after: Some(self.textarea.text().len()),
             had_selection_before: Some(old_has_selection),
-            had_selection_after: Some(self.textarea.selection_range().is_some()),
+            had_selection_after: Some(new_selection.is_some()),
             textarea_changed: Some(changed),
         };
         if changed {
-            self.sync_images_with_textarea();
+            // Image chips change only with the text. Skip the resync on
+            // cursor or selection moves (a held Shift+arrow repeats fast).
+            if self.textarea.text() != old_text {
+                self.sync_images_with_textarea();
+            }
             self.update_file_search_context();
             PromptEvent::Edited
         } else {
@@ -1983,6 +2016,10 @@ impl PromptWidget {
         let Some(ctx) = ctx else { return };
         let Some(res) = result else { return };
 
+        // Accepting rewrites the token; an unrelated highlight must not
+        // survive it.
+        self.textarea.clear_selection();
+
         // File results behave exactly like Tab (insert + trailing space).
         // "Drill down" only makes sense for directories — there is nothing
         // to nest into beneath a file — so for file selections Right and
@@ -2036,6 +2073,10 @@ impl PromptWidget {
 
         let Some(ctx) = ctx else { return };
         let Some(res) = result else { return };
+
+        // Accepting rewrites the token; an unrelated highlight must not
+        // survive it.
+        self.textarea.clear_selection();
 
         if ctx.is_dir_mode() && res.is_dir {
             // Descending into a selected directory while navigating (dir-mode):
@@ -2092,6 +2133,10 @@ impl PromptWidget {
 
         let Some(ctx) = ctx else { return };
         let Some(res) = result else { return };
+
+        // Accepting rewrites the token; an unrelated highlight must not
+        // survive it.
+        self.textarea.clear_selection();
 
         let path_str = res.path.to_string();
         let path = normalize_display_path(&path_str);
@@ -2154,7 +2199,7 @@ impl PromptWidget {
         // modifier state — if Shift/Option/Cmd is physically held, insert
         // a newline instead of submitting.
         if key.code == KeyCode::Enter && crate::input::is_apple_terminal_newline_modifier_held() {
-            self.textarea.insert_str("\n");
+            self.insert_replacing_selection("\n");
             return EnterOutcome::NewlineInserted;
         }
 
@@ -2225,6 +2270,18 @@ impl PromptWidget {
     /// ALL mouse events (not just those in the prompt area) because TextArea
     /// tracks drag state internally and handles drag-beyond-edge.
     pub fn handle_mouse(&mut self, mouse: &crossterm::event::MouseEvent) -> PromptEvent {
+        self.handle_mouse_inner(mouse).0
+    }
+
+    /// Handle a wheel event. Returns `true` only if the textarea scrolled.
+    ///
+    /// A prompt with no overflow, or one already at the edge, does not
+    /// scroll. The caller then sends the wheel to the history instead.
+    pub fn handle_mouse_scroll(&mut self, mouse: &crossterm::event::MouseEvent) -> bool {
+        self.handle_mouse_inner(mouse).1
+    }
+
+    fn handle_mouse_inner(&mut self, mouse: &crossterm::event::MouseEvent) -> (PromptEvent, bool) {
         use xai_ratatui_textarea::{MouseAction, TextElementEventKind};
 
         self.post_insert_image_preview = None;
@@ -2253,7 +2310,8 @@ impl PromptWidget {
             }
         }
 
-        match action {
+        let did_scroll = matches!(action, MouseAction::Scrolled);
+        let event = match action {
             MouseAction::CursorPlaced
             | MouseAction::SelectionUpdated
             | MouseAction::SelectionFinished
@@ -2264,7 +2322,8 @@ impl PromptWidget {
                 PromptEvent::Edited
             }
             MouseAction::Nothing => PromptEvent::Edited,
-        }
+        };
+        (event, did_scroll)
     }
 
     /// Handle a paste event.
@@ -2282,18 +2341,22 @@ impl PromptWidget {
         }
         self.post_insert_image_preview = None;
 
-        let text = normalize_cr(text);
+        let text = normalize_line_breaks(text);
         let text = &text;
         let replacing_selection = self.textarea.selection_range().is_some();
 
         // Repaste-to-expand: "paste didn't do what I want? paste again."
         // Requires exact byte equality after the same canonicalization the
-        // original insertion applied (normalize_cr above + the textarea's
+        // original insertion applied (normalize_line_breaks above + the textarea's
         // tab expansion) — e.g. a trailing-newline difference is a
         // different paste and takes the normal path below.
         if !replacing_selection
             && let Some(elem) = self.paste_element_near_cursor()
-            && self.textarea.text()[elem.range.clone()] == *self.textarea.expand_tabs(text)
+            && self
+                .textarea
+                .text()
+                .get(elem.range.clone())
+                .is_some_and(|chip_text| *chip_text == *self.textarea.expand_tabs(text))
         {
             let id = elem.id;
             self.expand_element(id);
@@ -2404,6 +2467,17 @@ impl PromptWidget {
         Ok(())
     }
 
+    /// Insert text in place of the selection, or at the cursor when there is
+    /// none. A selection can swallow image chips, so the images resync.
+    pub(crate) fn insert_replacing_selection(&mut self, text: &str) {
+        let is_replacing = self.textarea.selection_range().is_some();
+        self.textarea.insert_str_replacing_selection(text);
+        if is_replacing {
+            self.sync_images_with_textarea();
+        }
+        self.update_file_search_context();
+    }
+
     fn sync_images_with_textarea(&mut self) {
         use std::collections::HashMap;
         use std::collections::hash_map::Entry;
@@ -2479,7 +2553,11 @@ impl PromptWidget {
             if let Some(mut img) = stored_by_id.remove(id) {
                 // Refresh display_number from the live buffer text in
                 // case the chip was renumbered externally (sanity).
-                let parsed = parse_image_display_number(&self.textarea.text()[range.clone()])
+                let parsed = self
+                    .textarea
+                    .text()
+                    .get(range.clone())
+                    .and_then(parse_image_display_number)
                     .unwrap_or(img.display_number);
                 img.element_id = *id;
                 img.display_number = parsed;
@@ -2488,8 +2566,12 @@ impl PromptWidget {
             }
             // Fallback: redo path — match by display_number from the
             // stash, then rebind to the freshly-issued `element_id`.
-            let display_number =
-                parse_image_display_number(&self.textarea.text()[range.clone()]).unwrap_or(0);
+            let display_number = self
+                .textarea
+                .text()
+                .get(range.clone())
+                .and_then(parse_image_display_number)
+                .unwrap_or(0);
             if let Some(mut img) = stash_by_number.remove(&display_number) {
                 img.element_id = *id;
                 img.display_number = display_number;
@@ -2647,10 +2729,13 @@ impl PromptWidget {
             if elem.kind != KIND_IMAGE {
                 continue;
             }
-            out.push_str(&text[prev_end..elem.range.start]);
+            let Some(gap) = text.get(prev_end..elem.range.start) else {
+                continue;
+            };
+            out.push_str(gap);
             prev_end = elem.range.end;
         }
-        out.push_str(&text[prev_end..]);
+        out.push_str(text.get(prev_end..).unwrap_or_default());
         out
     }
 
@@ -2709,7 +2794,10 @@ impl PromptWidget {
             if elem.kind != KIND_IMAGE {
                 continue;
             }
-            if let Some(dn) = parse_image_display_number(&buf[elem.range.clone()]) {
+            if let Some(dn) = buf
+                .get(elem.range.clone())
+                .and_then(parse_image_display_number)
+            {
                 if by_number.iter().any(|(seen_dn, _)| *seen_dn == dn) {
                     tracing::warn!(
                         target: PROMPT_IMAGES_TRACING_TARGET,
@@ -2761,7 +2849,10 @@ impl PromptWidget {
 
     /// Buffer text of `elem` if it is a paste chip (`KIND_PASTE`).
     fn paste_text(&self, elem: &TextElement) -> Option<&str> {
-        (elem.kind == KIND_PASTE).then(|| &self.textarea.text()[elem.range.clone()])
+        if elem.kind != KIND_PASTE {
+            return None;
+        }
+        self.textarea.text().get(elem.range.clone())
     }
 
     /// Check if the cursor is currently on a paste element (strict on-chip
@@ -3597,7 +3688,9 @@ fn strip_all_elements(
 
     for elem in elements {
         // Append text between the previous element and this one.
-        let gap = &text[prev_end..elem.range.start];
+        let Some(gap) = text.get(prev_end..elem.range.start) else {
+            continue;
+        };
         result.push_str(gap);
 
         // Adjust cursor: if cursor is after this element, subtract
@@ -3614,7 +3707,7 @@ fn strip_all_elements(
     }
 
     // Append any text after the last element.
-    result.push_str(&text[prev_end..]);
+    result.push_str(text.get(prev_end..).unwrap_or_default());
 
     let len = result.len();
     (result, adjusted_cursor.min(len))
@@ -3697,19 +3790,22 @@ fn chip_line(label: String) -> Line<'static> {
     ])
 }
 
-/// Normalize bare `\r` to `\n`, leaving `\r\n` pairs intact.
+/// Normalize bare `\r`, U+2028 and U+2029 to `\n`, leaving `\r\n` pairs
+/// intact.
 ///
-/// Some terminals send bare `\r` for line breaks in bracketed-paste content.
-/// Rust's `str::lines()` only splits on `\n` and `\r\n`, so without this
-/// normalization multi-line pastes would be treated as a single line.
-fn normalize_cr(text: &str) -> String {
+/// Some terminals send bare `\r` for line breaks in bracketed-paste content,
+/// and text copied from some editors and web pages has the Unicode line and
+/// paragraph separators. Rust's `str::lines()` splits on none of these, so
+/// without this normalization such a paste counts as a single line, and the
+/// invisible separators break the textarea's width model.
+fn normalize_line_breaks(text: &str) -> String {
     let mut s = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\r' && chars.peek() != Some(&'\n') {
-            s.push('\n');
-        } else {
-            s.push(c);
+        match c {
+            '\r' if chars.peek() != Some(&'\n') => s.push('\n'),
+            '\u{2028}' | '\u{2029}' => s.push('\n'),
+            _ => s.push(c),
         }
     }
     s
@@ -3746,3 +3842,6 @@ fn images_high_water(images: &[PastedImage]) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod slice_tests;

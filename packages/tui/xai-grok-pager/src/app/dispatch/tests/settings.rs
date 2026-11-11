@@ -1773,6 +1773,14 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "collapsed_edit_blocks" => {
             let _ = dispatch(Action::SetCollapsedEditBlocks(true), app);
         }
+        "hooks_muted" => {
+            let away = !crate::appearance::cache::load_hooks_muted();
+            let _ = dispatch(Action::SetHooksMuted(away), app);
+        }
+        "show_inference_speed" => {
+            let away = !crate::appearance::cache::load_show_inference_speed();
+            let _ = dispatch(Action::SetShowInferenceSpeed(away), app);
+        }
         "prompt_suggestions" => {
             let _ = dispatch(Action::SetPromptSuggestions(false), app);
         }

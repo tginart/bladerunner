@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use xai_grok_shell::sampling::{
     ApiBackend, Client, ConversationItem, ConversationRequest, ConversationToolChoice,
-    SamplingError, ToolCall, ToolSpec, rs,
+    LengthPolicy, SamplingError, ToolCall, ToolSpec, rs,
 };
 use xai_grok_shell::session::storage::JsonlStorageAdapter;
 use xai_grok_test_support::sse::responses_api_reasoning_and_text_events;
@@ -1499,4 +1499,41 @@ async fn test_chat_completions_backend_hits_chat_endpoint_not_responses() {
         !server.has_responses_request(),
         "Should NOT have called /v1/responses"
     );
+}
+
+// ============================================================================
+// LengthPolicy gate on the direct-collect path
+// ============================================================================
+
+/// A Messages stream that ends with `stop_reason: max_tokens` completes in
+/// the stream, so the collect path must apply the request's `LengthPolicy`.
+/// `Fail` (side callers that must not keep cut text) returns
+/// `MaxTokensTruncation`; the default keeps the partial text.
+#[tokio::test]
+async fn messages_max_tokens_collect_honors_length_policy() {
+    let server = MockInferenceServer::start().await.unwrap();
+    server.set_response("half an ans");
+    server.set_messages_stop_reason("max_tokens");
+    let client = create_test_client(&server.url(), ApiBackend::Messages);
+    let request = || ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
+
+    let failed = client
+        .conversation_collect_with_idle_timeout(
+            ConversationRequest {
+                length_policy: LengthPolicy::Fail,
+                ..request()
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        matches!(failed, Err(SamplingError::MaxTokensTruncation)),
+        "LengthPolicy::Fail must reject a max_tokens stop, got {failed:?}"
+    );
+
+    let kept = client
+        .conversation_collect(request())
+        .await
+        .expect("the default policy keeps the partial text");
+    assert_eq!(kept.assistant_text(), "half an ans");
 }

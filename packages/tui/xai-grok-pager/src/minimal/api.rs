@@ -157,6 +157,17 @@ pub(crate) struct MinimalState {
     /// because each revision is a fresh ExitPlanMode with a new id, still commits
     /// every revised plan as its own block.
     pub(crate) committed_plan_tool_call_id: Option<String>,
+    /// The layout that the history was printed in, and a pending reprint
+    /// after a resize.
+    pub(crate) reprint: crate::minimal_reprint::ReprintState,
+}
+
+impl MinimalState {
+    /// The sliced `/transcript` build and a waiting reprint advance only
+    /// inside a draw, so the tick loop keeps drawing while either is pending.
+    pub(crate) fn needs_frames(&self) -> bool {
+        self.transcript.is_some() || self.reprint.is_waiting()
+    }
 }
 
 /// `AppView::minimal_state.show_todos`.
@@ -316,6 +327,14 @@ pub fn minimal_ctrl_o_opens_transcript(app: &AppView) -> bool {
         agent.session.state.is_turn_running(),
         has_payload,
     )
+}
+
+/// Whether the agent is streaming a reply: a normal turn, or a wake turn
+/// (a subagent or background task woke the idle session). The session state
+/// stays idle during a wake turn, so `is_turn_running` alone reads a
+/// streaming wake reply as stable and commits it before it is complete.
+pub fn is_turn_or_wake_running(v: &AgentView) -> bool {
+    v.session.state.is_turn_running() || v.wake_turn_active()
 }
 
 /// `AppView::minimal_state.committed_plan_tool_call_id` (write).
@@ -838,6 +857,15 @@ pub fn test_agent_view(session_id: Option<&str>, cwd: std::path::PathBuf) -> Age
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_extensions_modal(v: &mut AgentView, val: Option<ExtensionsModalState>) {
     v.extensions_modal = val;
+}
+
+/// Test-only setter for `AgentView::running_wake_turn`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_running_wake_turn_for_test(v: &mut AgentView, prompt_id: Option<&str>) {
+    v.running_wake_turn = prompt_id.map(|id| crate::app::agent_view::RunningWakeTurn {
+        prompt_id: id.to_string(),
+        cancel_sent: false,
+    });
 }
 
 /// Test-only setter for `AgentView::question_view`.
