@@ -59,7 +59,8 @@ use crate::agent::folder_trust;
 use crate::agent::models::{resolve_catalog_key, selectable_catalog_key_for_persisted};
 use crate::agent::session_config;
 use xai_grok_sampling_types::{
-    REASONING_EFFORT_META_KEY, ReasoningEffortOption, reasoning_effort_meta_value,
+    REASONING_EFFORT_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    reasoning_effort_meta_value,
     supports_reasoning_effort_meta,
 };
 use crate::agent::update_chunk_merge;
@@ -268,6 +269,10 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub session_meta: Option<&'a acp::Meta>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// Effort for a new session's sampler, applied when the model supports
+    /// it. `None` keeps the catalog default; a loaded session restores its
+    /// persisted effort through the model switch instead.
+    pub initial_reasoning_effort: Option<ReasoningEffort>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
@@ -443,6 +448,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         session_meta,
         model_agent_type,
         session_model_id,
+        initial_reasoning_effort: None,
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
@@ -1396,6 +1402,7 @@ mod subagent_coordinator;
 mod agent_ops;
 mod acp_agent;
 mod session_setup;
+mod reasoning_effort;
 use session_registry::SessionRegistry;
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;

@@ -1119,6 +1119,71 @@ impl ConversationRequest {
     }
 }
 
+/// Replaces a user image that the server rejected. The text is explicit on
+/// purpose: a silent gap makes the model invent what the image showed.
+pub const IMAGE_STRIP_PLACEHOLDER: &str = "[image removed \u{2014} the server could not \
+    process it; its contents are unavailable. Ask the user to re-attach the image if it is \
+    still needed.]";
+
+/// The URLs of all images in `items`, in order, with duplicates kept.
+pub fn collect_image_urls(items: &[ConversationItem]) -> Vec<Arc<str>> {
+    let mut urls = Vec::new();
+    for item in items {
+        let parts: &[ContentPart] = match item {
+            ConversationItem::User(user) => &user.content,
+            ConversationItem::ToolResult(t) => &t.images,
+            _ => continue,
+        };
+        for part in parts {
+            if let ContentPart::Image { url } = part {
+                urls.push(Arc::clone(url));
+            }
+        }
+    }
+    urls
+}
+
+/// Purpose: Remove the images with the given URLs from `items`.
+/// Input: The conversation items. The image URLs to remove.
+/// Output: The number of image parts that the function removed.
+/// Method:
+///     1. Replace each matched user image with [`IMAGE_STRIP_PLACEHOLDER`].
+///     2. Drop each matched tool-result image. A placeholder there does not
+///        reach the model, because the wire conversions skip text parts.
+/// Note: The function never adds or removes a `ConversationItem`, so indexes
+/// into the conversation stay valid.
+pub fn strip_images_by_url(items: &mut [ConversationItem], urls: &[Arc<str>]) -> usize {
+    let is_listed = |url: &Arc<str>| urls.iter().any(|u| u.as_ref() == url.as_ref());
+    let mut stripped = 0usize;
+    for item in items {
+        match item {
+            ConversationItem::User(user) => {
+                for part in &mut user.content {
+                    if matches!(part, ContentPart::Image { url } if is_listed(url)) {
+                        *part = ContentPart::Text {
+                            text: Arc::<str>::from(IMAGE_STRIP_PLACEHOLDER),
+                        };
+                        stripped += 1;
+                    }
+                }
+            }
+            ConversationItem::ToolResult(t) => {
+                let before = t.images.len();
+                t.images
+                    .retain(|part| !matches!(part, ContentPart::Image { url } if is_listed(url)));
+                stripped += before - t.images.len();
+            }
+            // Listed so that a new image-bearing variant must choose here.
+            ConversationItem::System(_)
+            | ConversationItem::Assistant(_)
+            | ConversationItem::BackendToolCall(_)
+            | ConversationItem::Reasoning(_)
+            | ConversationItem::Compaction(_) => {}
+        }
+    }
+    stripped
+}
+
 /// Tool choice options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10431,6 +10496,44 @@ mod tests {
         // Second run should be a no-op.
         assert_eq!(dedup_duplicate_tool_results(&mut conv), 0);
         assert_eq!(conv.len(), 2);
+    }
+
+    // ========== strip_images_by_url tests ==========
+
+    #[test]
+    fn strip_images_by_url_removes_only_listed_images() {
+        let bad = "data:image/png;base64,BAD";
+        let good = "data:image/png;base64,GOOD";
+        let mut user = ConversationItem::user("look");
+        user.add_image(bad.to_string());
+        user.add_image(good.to_string());
+        let mut tool = ConversationItem::tool_result("call-1", "screenshot");
+        if let ConversationItem::ToolResult(t) = &mut tool {
+            t.images.push(ContentPart::Image {
+                url: Arc::<str>::from(bad),
+            });
+        }
+        let mut items = vec![user, tool];
+        assert_eq!(collect_image_urls(&items).len(), 3);
+
+        let stripped = strip_images_by_url(&mut items, &[Arc::<str>::from(bad)]);
+
+        assert_eq!(stripped, 2);
+        assert_eq!(items.len(), 2, "no item is added or removed");
+        let urls = collect_image_urls(&items);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].as_ref(), good);
+        let ConversationItem::User(user) = &items[0] else {
+            panic!("expected user item");
+        };
+        assert_matches!(&user.content[1], ContentPart::Text { text } => {
+            assert_eq!(text.as_ref(), IMAGE_STRIP_PLACEHOLDER);
+        });
+        assert_eq!(
+            strip_images_by_url(&mut items, &[Arc::<str>::from(bad)]),
+            0,
+            "a second strip is a no-op"
+        );
     }
 
     // ========== strip_images tests ==========

@@ -527,6 +527,22 @@ async fn invalid_image_code_strips_and_retries() {
         matches!(events.last(), Some(SamplingEvent::Completed { .. })),
         "expected Completed after strip-retry, got {events:?}"
     );
+    let stripped: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SamplingEvent::ImagesStripped { stripped_urls, .. } => Some(stripped_urls),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stripped.len(),
+        1,
+        "a coded rejection reports the strip so the session can heal its history"
+    );
+    assert_eq!(
+        stripped[0].iter().map(|u| u.as_ref()).collect::<Vec<_>>(),
+        [IMAGE_URI]
+    );
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2, "one rejection, one strip-retry");
@@ -534,6 +550,79 @@ async fn invalid_image_code_strips_and_retries() {
     assert!(
         !bodies[1].contains(IMAGE_URI),
         "strip-retry must not resend the image"
+    );
+}
+
+/// A 413 says the request is too large, not that an image is bad. The retry
+/// keeps the size placeholder, and the session gets no `ImagesStripped`, so
+/// it does not change its history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payload_too_large_strip_keeps_size_placeholder_and_does_not_heal() {
+    const IMAGE_URI: &str = "data:image/png;base64,aHVnZQ==";
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let bodies_handler = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: String| {
+            let bodies = Arc::clone(&bodies_handler);
+            async move {
+                let n = {
+                    let mut b = bodies.lock().unwrap();
+                    b.push(body);
+                    b.len()
+                };
+                if n == 1 {
+                    Err::<Sse<_>, (StatusCode, String)>((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        json!({ "error": { "message": "request entity too large" } }).to_string(),
+                    ))
+                } else {
+                    let events = sse::chat_completion_events("recovered", "test-model");
+                    Ok(Sse::new(stream::iter(
+                        events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                    )))
+                }
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+
+    let mut request = user_request("what is in this image?");
+    if let Some(ConversationItem::User(u)) = request.items.first_mut() {
+        u.add_image(IMAGE_URI);
+    }
+    handle.submit(RequestId::from("req-413-strip"), request);
+
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Completed { .. })),
+        "expected Completed after strip-retry, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::ImagesStripped { .. })),
+        "a 413 must not heal the stored history"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "one rejection, one strip-retry");
+    assert!(!bodies[1].contains(IMAGE_URI));
+    assert!(
+        bodies[1].contains("conversation too large"),
+        "the retry keeps the size placeholder: {}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1].contains("could not process"),
+        "the image-rejection placeholder is wrong for a 413"
     );
 }
 

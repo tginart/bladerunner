@@ -3876,9 +3876,17 @@ static CLEANUP_SESSIONS_ONCE: std::sync::Once = std::sync::Once::new();
 /// Default TTL for stale session files (30 days).
 const DEFAULT_CLEANUP_TTL_DAYS: u32 = 30;
 
+/// The only subdirectories swept inside a live session. Everything else in a
+/// live session (compaction checkpoints, prompt offloads, ...) is a write-once
+/// file that `updates.jsonl` still refers to, so its own age does not tell if
+/// it is still needed.
+const SWEPT_BLOB_DIRS: [&str; 3] = ["images", "videos", "downloads"];
+
 /// Walk `~/.grok/sessions/` and delete files with mtime older than `ttl_days`.
 /// Removes empty session directories after file cleanup.
 /// Skips `skip_session_dir` if provided (current session).
+/// A session with recent activity is live: only its media files
+/// ([`SWEPT_BLOB_DIRS`]) age out, so a long session keeps its old checkpoints.
 ///
 /// This is a **synchronous** function intended to be called via
 /// `tokio::task::spawn_blocking` so it runs on the thread pool and
@@ -4072,6 +4080,25 @@ fn cleanup_stale_sessions_inner(
             } else {
                 None
             };
+            if lease.is_some() {
+                match session_last_activity(&path) {
+                    Ok(last_activity) if !is_stale(last_activity, ttl_days) => {
+                        prune_blob_dirs(&path, ttl_days, &mut stats);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        stats.errors += 1;
+                        tracing::debug!(
+                            target: "xai_grok_shell::session::persistence",
+                            dir = %path.display(),
+                            %error,
+                            "SESSION_CLEANUP_METADATA_ERROR"
+                        );
+                        continue;
+                    }
+                }
+            }
             let next = match level {
                 CleanupLevel::SessionsRoot => CleanupLevel::Cwd,
                 CleanupLevel::Cwd | CleanupLevel::Session => CleanupLevel::Session,
@@ -4122,6 +4149,222 @@ fn cleanup_stale_sessions_inner(
 fn is_stale(mtime: std::time::SystemTime, ttl_days: u32) -> bool {
     let ttl = std::time::Duration::from_secs(u64::from(ttl_days) * 86400);
     mtime.elapsed().is_ok_and(|age| age > ttl)
+}
+
+/// Newest mtime among the session dir's own regular files, or the mtime of
+/// the dir itself when it has none. `updates.jsonl` grows with every
+/// persisted update, and [`mark_session_live`] bumps `summary.json` on every
+/// attach. A load alone writes neither.
+fn session_last_activity(session_dir: &Path) -> io::Result<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir(session_dir)? {
+        let metadata = std::fs::symlink_metadata(entry?.path())?;
+        if metadata.file_type().is_file()
+            && let Ok(mtime) = metadata.modified()
+        {
+            newest = Some(newest.map_or(mtime, |n| n.max(mtime)));
+        }
+    }
+    match newest {
+        Some(mtime) => Ok(mtime),
+        None => std::fs::symlink_metadata(session_dir)?.modified(),
+    }
+}
+
+/// Purpose: Bump the mtime of `summary.json` so that a sweep sees the attach
+/// that is about to read this session dir.
+/// Input: The session dir.
+/// Output: None. A failure is only logged.
+/// Note: Call it synchronously before the sweep and the load. The sweep of
+/// another process sees only mtimes, and its skip covers only its own
+/// session. A dir without a summary has nothing to bump.
+pub(crate) fn mark_session_live(session_dir: &Path) {
+    let summary = session_dir.join("summary.json");
+    let Ok(metadata) = std::fs::symlink_metadata(&summary) else {
+        return;
+    };
+    if !metadata.file_type().is_file() {
+        return;
+    }
+    // Windows needs write access for `set_modified`. Nothing is written.
+    let touched = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&summary)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(
+            target: "xai_grok_shell::session::persistence",
+            file = %summary.display(),
+            %error,
+            "SESSION_MARK_LIVE_ERROR"
+        );
+    }
+}
+
+/// Delete regular files older than `ttl_days` from a live session's
+/// [`SWEPT_BLOB_DIRS`]. The directories stay: a writer may sit between its
+/// `create_dir_all` and its write. A media dir that is a symlink is skipped,
+/// so the sweep never deletes files outside the session dir.
+fn prune_blob_dirs(session_dir: &Path, ttl_days: u32, stats: &mut CleanupStats) {
+    for dir_name in SWEPT_BLOB_DIRS {
+        let blob_dir = session_dir.join(dir_name);
+        // `read_dir` follows a symlink, so check the dir itself first.
+        let is_real_dir = std::fs::symlink_metadata(&blob_dir)
+            .is_ok_and(|metadata| metadata.file_type().is_dir());
+        if !is_real_dir {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&blob_dir) else {
+            continue;
+        };
+        for entry_result in entries {
+            let Ok(entry) = entry_result else {
+                stats.errors += 1;
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                stats.errors += 1;
+                continue;
+            };
+            let is_stale_file = metadata.file_type().is_file()
+                && metadata
+                    .modified()
+                    .is_ok_and(|mtime| is_stale(mtime, ttl_days));
+            if !is_stale_file {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                stats.files_deleted += 1;
+            } else {
+                stats.errors += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_stale_sessions_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const TTL_DAYS: u32 = 30;
+
+    fn age_file(path: &Path, days: u64) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old)).unwrap();
+    }
+
+    /// One session dir with a summary, an update log, an old checkpoint and
+    /// an old image. `active_days_ago` sets the age of the top-level files.
+    fn make_session(sessions_root: &Path, id: &str, active_days_ago: u64) -> std::path::PathBuf {
+        let dir = sessions_root
+            .join(crate::util::grok_home::encode_cwd_dirname("/project"))
+            .join(id);
+        fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        fs::create_dir_all(dir.join("images")).unwrap();
+        for (name, body) in [("summary.json", "{}"), ("updates.jsonl", "")] {
+            fs::write(dir.join(name), body).unwrap();
+            age_file(&dir.join(name), active_days_ago);
+        }
+        let checkpoint = dir.join("compaction_checkpoints/ckpt1.json");
+        fs::write(&checkpoint, "{}").unwrap();
+        age_file(&checkpoint, 90);
+        let image = dir.join("images/image-1.png");
+        fs::write(&image, "png").unwrap();
+        age_file(&image, 90);
+        dir
+    }
+
+    fn sweep(grok_home: &Path) -> CleanupStats {
+        let sessions_root = grok_home.join("sessions");
+        let view = storage_view(&sessions_root).unwrap();
+        cleanup_stale_sessions_inner(
+            &sessions_root,
+            TTL_DAYS,
+            None,
+            &view,
+            grok_home,
+            CleanupLevel::SessionsRoot,
+        )
+    }
+
+    #[test]
+    fn sweep_keeps_old_checkpoints_of_a_live_session() {
+        let home = TempDir::new().unwrap();
+        let dir = make_session(&home.path().join("sessions"), "live-session", 1);
+
+        sweep(home.path());
+
+        assert!(
+            dir.join("compaction_checkpoints/ckpt1.json").exists(),
+            "a live session still needs its old checkpoint for /rewind"
+        );
+        assert!(dir.join("summary.json").exists());
+        assert!(
+            !dir.join("images/image-1.png").exists(),
+            "old media in a live session still ages out"
+        );
+        assert!(dir.join("images").is_dir(), "the media dir itself stays");
+    }
+
+    /// The sweep of another process sees only mtimes, so an attach must bump
+    /// one before it loads an idle session.
+    #[test]
+    fn mark_session_live_keeps_an_idle_session_out_of_a_foreign_sweep() {
+        let home = TempDir::new().unwrap();
+        let sessions_root = home.path().join("sessions");
+        let attaching = make_session(&sessions_root, "attaching", 40);
+        let summary_before = fs::read(attaching.join("summary.json")).unwrap();
+        let idle = make_session(&sessions_root, "idle", 40);
+
+        mark_session_live(&attaching);
+        mark_session_live(&sessions_root.join("not-created-yet"));
+        sweep(home.path());
+
+        assert!(attaching.join("updates.jsonl").is_file());
+        assert!(attaching.join("compaction_checkpoints/ckpt1.json").is_file());
+        assert_eq!(
+            fs::read(attaching.join("summary.json")).unwrap(),
+            summary_before,
+            "the bump changes only the mtime"
+        );
+        assert!(!idle.join("updates.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_does_not_follow_a_symlinked_media_dir() {
+        let home = TempDir::new().unwrap();
+        let dir = make_session(&home.path().join("sessions"), "live-session", 1);
+        let outside = home.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("keep.png");
+        fs::write(&outside_file, "png").unwrap();
+        age_file(&outside_file, 90);
+        fs::remove_dir_all(dir.join("images")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("images")).unwrap();
+
+        sweep(home.path());
+
+        assert!(
+            outside_file.is_file(),
+            "the sweep must not delete files behind a symlinked media dir"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_a_stale_session() {
+        let home = TempDir::new().unwrap();
+        let dir = make_session(&home.path().join("sessions"), "stale-session", 60);
+
+        let stats = sweep(home.path());
+
+        assert!(!dir.join("compaction_checkpoints/ckpt1.json").exists());
+        assert!(!dir.join("summary.json").exists());
+        assert!(stats.files_deleted >= 4);
+    }
 }
 
 #[cfg(test)]

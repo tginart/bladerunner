@@ -161,6 +161,21 @@ fn default_system_prompt_label() -> String {
 fn is_template_override_none(t: &TemplateOverride) -> bool {
     matches!(t, TemplateOverride::None)
 }
+/// The temp directory for the `<scratch_files>` section, with a trailing
+/// separator. The prompt gets a literal path, so the model does not have to
+/// expand a shell variable. A fixed `/tmp/` on Unix keeps the prompt prefix the
+/// same across users and sessions.
+fn scratch_dir() -> String {
+    if !cfg!(windows) {
+        return "/tmp/".to_string();
+    }
+    let dir = std::env::temp_dir().display().to_string();
+    if dir.ends_with(std::path::MAIN_SEPARATOR) {
+        dir
+    } else {
+        format!("{dir}{}", std::path::MAIN_SEPARATOR)
+    }
+}
 impl PromptContext {
     /// Normalize this context for persistence based on audience.
     ///
@@ -251,6 +266,7 @@ impl PromptContext {
             "current_date": self.current_date.as_deref().unwrap_or(""),
             "is_non_interactive": self.is_non_interactive,
             "system_prompt_label": self.system_prompt_label.as_str(),
+            "scratch_dir": scratch_dir(),
         })
     }
     /// Render the full system prompt via `ToolBridge`.

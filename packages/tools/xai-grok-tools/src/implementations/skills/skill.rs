@@ -3,7 +3,12 @@
 //! Skills are user-defined prompts stored as Markdown files that can be invoked
 //! by the user via slash commands (e.g., /commit) or by the model via this tool.
 
+use crate::implementations::grok_build::read_file::MAX_NUM_TOKENS;
 use crate::implementations::skills::types::SkillInfo;
+use crate::util::truncate::{estimate_tokens, floor_char_boundary};
+
+/// Byte budget that matches the `MAX_NUM_TOKENS` read cap.
+const SKILL_BODY_MAX_BYTES: usize = MAX_NUM_TOKENS * xai_token_estimation::BYTES_PER_TOKEN as usize;
 
 /// Input for the Skill tool
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -80,6 +85,37 @@ pub fn build_skill_block(name: &str, args: &str, content: &str) -> String {
     } else {
         format!("<skill name=\"{name}\" args=\"{args}\">\n{content}\n</skill>")
     }
+}
+
+/// Purpose: Keep a skill body under the `MAX_NUM_TOKENS` cap that file reads use.
+/// Input: The skill body. The function changes it in place.
+/// Output: `true` when the function cut the body.
+/// Method:
+///     1. If the body is under the cap, do nothing.
+///     2. Cut the body at the last full line that fits the byte budget.
+///     3. If the body is one long line, cut at a char boundary.
+///     4. Append a note that tells the model how to read the remainder.
+/// Note: Call this before `apply_substitutions`, so that the arguments suffix
+/// stays after the cut. The cut body and the note together stay under the cap.
+pub fn cap_skill_body(body: &mut String) -> bool {
+    if estimate_tokens(body) <= MAX_NUM_TOKENS {
+        return false;
+    }
+    let note = format!(
+        "[Skill body truncated at the {MAX_NUM_TOKENS}-token cap. Read the rest of the \
+         skill file with the file read tool, using a line offset and limit.]"
+    );
+    let budget = SKILL_BODY_MAX_BYTES.saturating_sub(note.len() + 2);
+    let end = floor_char_boundary(body, budget);
+    let cut = body
+        .get(..end)
+        .and_then(|head| head.rfind('\n'))
+        .filter(|&i| i > 0)
+        .unwrap_or(end);
+    body.truncate(cut);
+    body.push_str("\n\n");
+    body.push_str(&note);
+    true
 }
 
 /// A skill reference for the `<skills_referenced>` index inside
@@ -526,6 +562,39 @@ pub async fn load_skill_with_body(skill: &SkillInfo) -> Result<SkillInfo, String
 mod tests {
     use super::*;
     use crate::implementations::skills::types::SkillScope;
+
+    #[test]
+    fn cap_skill_body_leaves_small_body_untouched() {
+        let mut body = "# Small skill\n\nDo the thing.".to_owned();
+        assert!(!cap_skill_body(&mut body));
+        assert_eq!("# Small skill\n\nDo the thing.", body);
+    }
+
+    #[test]
+    fn cap_skill_body_cuts_oversize_body_on_a_line_boundary() {
+        let mut body = (1..=1100)
+            .map(|n| format!("{n:05} {}", "x".repeat(194)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(estimate_tokens(&body) > MAX_NUM_TOKENS);
+
+        assert!(cap_skill_body(&mut body));
+        assert!(estimate_tokens(&body) <= MAX_NUM_TOKENS);
+        assert!(!body.contains("01100 "));
+        assert!(body.ends_with("line offset and limit.]"));
+        let (head, _) = body.rsplit_once("\n\n").expect("note separator");
+        let last_line = head.rsplit('\n').next().expect("head has a line");
+        assert_eq!(200, last_line.len(), "the cut keeps only whole lines");
+    }
+
+    #[test]
+    fn cap_skill_body_cuts_one_long_line_at_a_char_boundary() {
+        let mut body = "é".repeat(60_000);
+
+        assert!(cap_skill_body(&mut body));
+        assert!(estimate_tokens(&body) <= MAX_NUM_TOKENS);
+        assert!(body.starts_with("éé"));
+    }
 
     #[test]
     fn test_escape_xml() {

@@ -1158,6 +1158,50 @@ mod tests {
         assert!(matches!(results[0], HookRunResult::Skipped { .. }));
     }
 
+    /// A SessionEnd hook that hangs is killed at its own budget, and the next
+    /// hook still runs, so one slow hook cannot hold the session close.
+    #[tokio::test]
+    async fn slow_session_end_hook_is_cut_off_at_its_budget() {
+        let json = r#"{ "hooks": { "SessionEnd": [{ "hooks": [
+            { "type": "command", "command": "sleep 30" },
+            { "type": "command", "command": "echo ok" }
+        ] }] } }"#;
+        let (specs, errors) =
+            crate::config::parse_hook_file(json, std::path::Path::new("/tmp/test.json"));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(
+            specs[0].timeout_ms,
+            crate::config::SESSION_END_HOOK_BUDGET_DEFAULT_MS
+        );
+        let registry = registry_from_specs(specs);
+        let mut envelope = session_start_envelope();
+        envelope.hook_event_name = HookEventName::SessionEnd;
+        envelope.payload = HookPayload::SessionEnd {
+            reason: "exit".into(),
+            turn_count: None,
+            tool_call_count: None,
+        };
+
+        let started = std::time::Instant::now();
+        let results =
+            dispatch_non_blocking(&registry, HookEventName::SessionEnd, &envelope, &run_ctx())
+                .await;
+
+        assert!(
+            started.elapsed()
+                < std::time::Duration::from_millis(crate::config::DEFAULT_TIMEOUT_MS - 1_000),
+            "the slow hook must not hold the close, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(results.len(), 2);
+        assert!(
+            matches!(results[0], HookRunResult::Failed { .. }),
+            "the timeout is recorded as a failure, got {:?}",
+            results[0]
+        );
+        assert!(matches!(results[1], HookRunResult::Success { .. }));
+    }
+
     #[tokio::test]
     async fn non_blocking_failure_does_not_stop_chain() {
         let mut spec1 = make_command_spec("crasher", None, true, "exit 1");

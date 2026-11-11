@@ -109,6 +109,16 @@ pub enum SamplingEvent {
         doom_loop_aborted_at_chunk: Option<u64>,
     },
 
+    /// The server rejected an image of this request with a coded
+    /// `invalid_image` error, and the retry goes out without the images.
+    /// `stripped_urls` lists the URLs that were removed from the request,
+    /// with duplicates kept. The session may remove the same images from its
+    /// stored history, so that later turns do not send them again.
+    ImagesStripped {
+        request_id: RequestId,
+        stripped_urls: Vec<std::sync::Arc<str>>,
+    },
+
     /// Request failed (after exhausting retries or non-retryable error).
     Failed {
         request_id: RequestId,

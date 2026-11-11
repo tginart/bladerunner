@@ -209,6 +209,16 @@ impl ChatStateHandle {
         });
     }
 
+    /// Remove server-rejected images from the conversation and its stored
+    /// history; see [`ChatStateCommand::StripConversationImages`]. Returns
+    /// the number of removed image parts, or `None` if the actor is dead.
+    pub async fn strip_conversation_images(&self, urls: Vec<std::sync::Arc<str>>) -> Option<usize> {
+        self.query("StripConversationImages", |reply| {
+            ChatStateCommand::StripConversationImages { urls, reply }
+        })
+        .await
+    }
+
     /// Out-of-band history repair (`x.ai/session/repair`); see
     /// [`ChatStateCommand::RepairHistory`]. Returns `None` if the actor is
     /// dead, `Some(Err(_))` if a turn was in flight at processing time.

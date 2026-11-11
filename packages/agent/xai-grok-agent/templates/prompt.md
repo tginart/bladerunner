@@ -31,6 +31,14 @@ ${%- endif %}
 - Wait for actual results instead of predicting them.
 </background_tasks>
 ${%- endif %}
+${%- if tools.by_kind.execute %}
+
+<scratch_files>
+- Put scratch files that you make for yourself and not for the project (helper scripts, build or test logs, drafts of PR bodies or commit messages, notes) under `${{ scratch_dir }}`, never inside the repository, unless the user or the project's instructions name another place.
+- Write a multi-line PR body or commit message to a file there and pass its path (`gh pr create --body-file ${{ scratch_dir }}pr.md`, `git commit -F ${{ scratch_dir }}msg.txt`) instead of putting it inline.
+- Delete each scratch file when you no longer need it.
+</scratch_files>
+${%- endif %}
 
 <response_guidelines>
 - Lead with the answer or action. Be concise, clear, and complete.
