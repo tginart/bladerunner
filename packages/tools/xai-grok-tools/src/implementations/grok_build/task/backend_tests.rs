@@ -542,6 +542,29 @@ async fn channel_backend_describe_returns_unavailable_when_responder_dropped() {
     handle.await.unwrap();
 }
 
+/// A coordinator that answers after a few seconds must not fail the spawn.
+/// The old 2 s ceiling turned a busy coordinator into ValidationUnavailable.
+#[tokio::test(start_paused = true)]
+async fn channel_backend_validate_type_waits_out_a_busy_coordinator() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+    let backend = ChannelBackend::new(tx);
+
+    let coordinator = tokio::spawn(async move {
+        let Some(SubagentEvent::ValidateType(req)) = rx.recv().await else {
+            panic!("expected a ValidateType request");
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let _ = req.respond_to.send(SubagentValidateTypeOutcome::Ok);
+    });
+
+    let outcome = backend.validate_type("explore", "p").await;
+    assert!(
+        matches!(outcome, SubagentValidateTypeOutcome::Ok),
+        "a 5 s reply must beat the validate timeout, got {outcome:?}"
+    );
+    coordinator.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn channel_backend_describe_returns_unavailable_on_timeout() {
     use super::super::types::SubagentDescribeOutcome;
@@ -557,7 +580,7 @@ async fn channel_backend_describe_returns_unavailable_on_timeout() {
 
     let describe =
         tokio::spawn(async move { backend.describe_subagent_type("explore", None, "p").await });
-    tokio::time::advance(VALIDATE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
+    tokio::time::advance(DESCRIBE_TYPE_TIMEOUT + std::time::Duration::from_millis(1)).await;
     assert!(matches!(
         describe.await.unwrap(),
         SubagentDescribeOutcome::Unavailable

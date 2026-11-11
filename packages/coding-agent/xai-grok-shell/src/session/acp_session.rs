@@ -155,6 +155,9 @@ mod transient_retry;
 #[path = "acp_session_impl/length_salvage.rs"]
 mod length_salvage;
 use transient_retry::*;
+#[path = "acp_session_impl/rate_limit_waits.rs"]
+mod rate_limit_waits;
+pub(crate) use rate_limit_waits::{SubagentSampling, new_subagent_sampling_gate};
 #[path = "acp_session_impl/tool_dispatch.rs"]
 mod tool_dispatch;
 use tool_dispatch::*;

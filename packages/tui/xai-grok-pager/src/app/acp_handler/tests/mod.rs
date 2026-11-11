@@ -2142,6 +2142,7 @@ mod interjection;
 mod session_routing;
 mod plugins;
 mod subagents;
+mod deferred_finishes;
 mod goals;
 mod interactions;
 mod background_tasks;

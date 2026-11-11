@@ -1979,3 +1979,93 @@ fn mouse_reporting_toggle_sticky_survives_subagent_esc_to_parent() {
 
     reset_mouse_capture_enabled(true);
 }
+
+/// Open a subagent overlay on the test agent: a running child view keyed by
+/// `child_sid`, with the parent's turn also running and the child listed as
+/// a running subagent (so a root cancel would open the subagent panel).
+fn open_running_subagent_overlay(app: &mut AppView, child_sid: &str) {
+    let mut child = AgentView::new(
+        make_test_agent_session(app, AgentId(1), child_sid),
+        ScrollbackState::new(),
+    );
+    child.session.state = AgentState::TurnRunning;
+    let parent = app.agents.get_mut(&AgentId(0)).unwrap();
+    parent.session.state = AgentState::TurnRunning;
+    parent
+        .subagent_sessions
+        .insert(child_sid.into(), make_test_subagent(child_sid, "sa-1"));
+    parent
+        .subagent_views
+        .insert(child_sid.to_owned(), Box::new(child));
+    parent.active_subagent = Some(child_sid.to_owned());
+}
+
+/// Ctrl+C / [stop] in a subagent overlay kills the visible child through the
+/// parent. A `session/cancel` for the child id would not reach the shell's
+/// child session, and the root turn must keep running.
+#[test]
+fn cancel_turn_in_subagent_overlay_kills_the_child() {
+    let mut app = test_app_with_agent();
+    open_running_subagent_overlay(&mut app, "child-sid");
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::KillSubagent { session_id, subagent_id }]
+                if subagent_id == "sa-1" && session_id.0.as_ref() != "child-sid"
+        ),
+        "the kill must go to the parent session for sa-1, got {effects:?}"
+    );
+    let parent = &app.agents[&AgentId(0)];
+    assert!(parent.session.state.is_turn_running());
+    assert!(parent.cancel_turn_view.is_none());
+    assert!(parent.subagent_sessions["child-sid"].pending_kill);
+}
+
+/// In the overlay of a finished child, Ctrl+C has nothing to stop and must
+/// not cancel the root turn that the overlay hides.
+#[test]
+fn cancel_turn_in_finished_subagent_overlay_does_nothing() {
+    let mut app = test_app_with_agent();
+    open_running_subagent_overlay(&mut app, "child-sid");
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .subagent_sessions
+        .get_mut("child-sid")
+        .unwrap()
+        .finished = true;
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+
+    assert!(effects.is_empty(), "got {effects:?}");
+    let parent = &app.agents[&AgentId(0)];
+    assert!(parent.session.state.is_turn_running());
+    assert!(parent.cancel_turn_view.is_none());
+}
+
+/// A focused running subagent with no loaded view has no overlay to cancel
+/// through, so the cancel kills that subagent instead of the root turn.
+#[test]
+fn cancel_turn_on_focused_subagent_without_view_kills_it() {
+    let mut app = test_app_with_agent();
+    open_running_subagent_overlay(&mut app, "child-sid");
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .subagent_views
+        .clear();
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::KillSubagent { subagent_id, .. }] if subagent_id == "sa-1"
+        ),
+        "got {effects:?}"
+    );
+    assert!(app.agents[&AgentId(0)].session.state.is_turn_running());
+}

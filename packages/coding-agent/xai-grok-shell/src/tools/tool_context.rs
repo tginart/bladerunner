@@ -222,6 +222,9 @@ pub struct ToolContext {
     pub blocking_wait_depth: Arc<BlockingWaitState>,
     pub task_output_token_budget: Option<TaskOutputTokenBudget>,
     pub(crate) sampler_retry_only_before_output: bool,
+    /// Sampling gate and 429 wait budget of a subagent child. `None` for a
+    /// main session, which neither waits on 429 nor takes a sampling slot.
+    pub(crate) subagent_sampling: Option<crate::session::SubagentSampling>,
     /// This session's child-process reaper, set at session spawn; `None` for
     /// contexts without one (subagents, defaults). Spawn sites enroll children
     /// into it; enrolled children are killed when the session closes.
@@ -313,6 +316,7 @@ impl ToolContext {
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
             sampler_retry_only_before_output: false,
+            subagent_sampling: None,
             process_scope: None,
         }
     }
@@ -407,6 +411,7 @@ mod tests {
                 blocking_wait_depth: Arc::new(BlockingWaitState::new()),
                 task_output_token_budget: None,
                 sampler_retry_only_before_output: false,
+                subagent_sampling: None,
                 process_scope: None,
             }
         }

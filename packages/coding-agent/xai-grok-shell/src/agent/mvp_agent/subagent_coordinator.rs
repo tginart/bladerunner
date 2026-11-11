@@ -451,10 +451,6 @@ impl MvpAgent {
         let parent_model_agent_type =
             config::find_model_by_id(&available_models, parent_model_id.0.as_ref())
                 .map(|e| e.info.agent_type.clone());
-        let ask_user_question_enabled = parent_handle
-            .as_ref()
-            .map(|h| h.ask_user_question_enabled)
-            .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value);
         let parent_non_interactive = parent_handle
             .as_ref()
             .map(|h| h.non_interactive)
@@ -551,12 +547,15 @@ impl MvpAgent {
             write_file_enabled: self.cfg.borrow().resolve_write_file().value,
             goal_enabled: self.cfg.borrow().resolve_goal().value,
             background_workflows_enabled: self.cfg.borrow().resolve_workflows().value,
-            ask_user_question_enabled,
+            // A child runs without a user at its terminal: its question would
+            // block the child, or pop up out of context in the parent's UI.
+            ask_user_question_enabled: false,
             parent_non_interactive,
             parent_cmd_tx: parent_cmd_tx.clone(),
             agent_bus: parent_handle
                 .as_ref()
                 .and_then(|h| h.tool_context.agent_bus.clone()),
+            subagent_sampling_gate: self.subagent_sampling_gate.clone(),
             parent_session_info: parent_handle.as_ref().map(|h| crate::session::info::Info {
                 id: parent_sid.clone(),
                 cwd: h.info.cwd.clone(),

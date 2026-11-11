@@ -38,7 +38,10 @@ fn single_successful_completion_with_poll_tool() {
     assert!(result.contains("12.3s"));
     assert!(result.contains("5 tool calls"));
     assert!(result.contains("abc-123"));
-    assert!(result.contains("get_task_output"));
+    assert!(
+        result.contains("response:\nthe answer for abc-123"),
+        "a short output is inlined even with a polling tool: {result}"
+    );
 }
 
 #[test]
@@ -66,10 +69,10 @@ fn multiple_completions_batched_with_poll_tool() {
     ];
     let result = format_between_turn_completions(&completions, Some("get_task_output"));
     assert!(result.starts_with("While you were idle, 3 background subagents completed:\n"));
-    // All three entries should appear
-    assert!(result.contains("subagent_id: a."));
-    assert!(result.contains("subagent_id: b."));
-    assert!(result.contains("subagent_id: c."));
+    // All three entries should appear, each with its output inline.
+    assert!(result.contains("subagent_id: a\n  response:\nthe answer for a"));
+    assert!(result.contains("subagent_id: b\n  response:\nthe answer for b"));
+    assert!(result.contains("subagent_id: c\n  response:\nthe answer for c"));
 }
 
 #[test]

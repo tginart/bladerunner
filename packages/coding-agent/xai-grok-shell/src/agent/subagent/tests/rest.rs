@@ -625,21 +625,59 @@ fn retained_worktree_overrides_snapshot_cleanup() {
     }
 }
 
-/// Subagent spawns carry concrete ask_user_question timeout params (the
-/// session-level config follows the child) while bash stays on tool
-/// defaults. Tier precedence itself is pinned by the resolver's own
-/// tests; asserting concrete values here would read the host's disk
-/// layers and flake on configured dev machines.
+/// A child resolves bash params from the parent's `[toolset.bash]` and
+/// remote settings, so it keeps the parent's timeout, auto-background and
+/// foreground ceiling instead of the tool-server defaults.
 #[test]
-fn subagent_tool_params_carry_ask_user_question_timeouts() {
+fn subagent_tool_params_inherit_parent_bash_settings() {
+    let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
+    let mut cfg = crate::agent::config::Config::default();
+    cfg.toolset.bash.timeout_secs = Some(42.0);
+    cfg.toolset.bash.max_timeout_secs = Some(900.0);
+    cfg.toolset.bash.foreground_block_budget_ms = Some(0);
+    ctx.agent_config = Some(cfg);
+    ctx.remote_settings = Some(crate::util::config::RemoteSettings {
+        auto_background_on_timeout: Some(false),
+        ..Default::default()
+    });
+    let bash = ctx
+        .resolve_tool_params_json()
+        .bash
+        .expect("children must receive the parent's bash params");
+    assert_eq!(bash.get("timeout_secs"), Some(&serde_json::json!(42.0)));
+    assert_eq!(bash.get("max_timeout_secs"), Some(&serde_json::json!(900.0)));
+    assert_eq!(
+        bash.get("foreground_block_budget_ms"),
+        Some(&serde_json::json!(0))
+    );
+    assert_eq!(
+        bash.get("auto_background_on_timeout"),
+        Some(&serde_json::json!(false)),
+        "the remote auto-background fallback must reach the child"
+    );
+}
+
+/// Without a parent config, a child still gets the production bash ceiling,
+/// not the tool-server's 5 min default.
+#[test]
+fn subagent_tool_params_default_bash_uses_production_ceiling() {
+    let mut ctx = ctx_with_toggle(std::collections::HashMap::new());
+    ctx.agent_config = None;
+    let bash = ctx.resolve_tool_params_json().bash.unwrap();
+    assert_eq!(
+        bash.get("max_timeout_secs"),
+        Some(&serde_json::json!(
+            crate::tools::config::PRODUCTION_MAX_TIMEOUT_SECS
+        ))
+    );
+}
+
+/// A child has no ask_user_question tool, so its spawn carries no params
+/// for that tool.
+#[test]
+fn subagent_tool_params_omit_ask_user_question() {
     let ctx = ctx_with_toggle(std::collections::HashMap::new());
-    let params = ctx.resolve_tool_params_json();
-    assert!(params.bash.is_none(), "bash must stay on tool defaults");
-    let ask = params
-        .ask_user_question
-        .expect("subagents must receive resolved ask_user_question params");
-    assert!(ask.get("timeout_enabled").is_some_and(|v| v.is_boolean()));
-    assert!(ask.get("timeout_secs").is_some_and(|v| v.is_u64()));
+    assert!(ctx.resolve_tool_params_json().ask_user_question.is_none());
 }
 /// End-to-end glue: gate ON + a worktree present runs the completion
 /// sequence (snapshot → persist ref to meta.json → remove) and verifies the
@@ -1797,21 +1835,21 @@ fn resume_model_pinning_overrides_default_resolution() {
     let no_pin = source_model.as_deref() == Some(resolved_same);
     assert!(no_pin, "same model — no pinning needed");
 }
+/// Resume admits a transcript up to 95% of the window, under the
+/// auto-compact threshold. 210k of 256k (82%) was refused by the old 80%
+/// guard; it now resumes. A transcript past the threshold is still refused.
 #[test]
 fn resume_window_safety_rejects_instead_of_swapping() {
-    let estimated_tokens: u64 = 100_000;
-    let child_window: u64 = 256_000;
-    const SAFE_RESUME_PERCENT: u64 = 80;
-    let threshold = child_window * SAFE_RESUME_PERCENT / 100;
+    let window = super::super::resume_window::ResumeWindowPolicy {
+        context_window: 256_000,
+        auto_compact_threshold_percent: 90,
+    };
+    assert!(window.fits(100_000), "100k of 256k must resume");
+    assert!(window.fits(210_000), "210k of 256k (82%) must resume now");
     assert!(
-            estimated_tokens <= threshold,
-            "100k tokens should be within 80% of 256k window"
-        );
-    let large_transcript: u64 = 210_000;
-    assert!(
-            large_transcript > threshold,
-            "210k tokens exceeds 80% of 256k window — resume should be rejected"
-        );
+        !window.fits(240_000),
+        "240k of 256k is past the 90% threshold; resume must be refused"
+    );
 }
 #[test]
 fn provenance_carries_resumed_from() {

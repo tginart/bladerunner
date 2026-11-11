@@ -45,6 +45,7 @@ use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod handle_request;
+mod resume_window;
 pub(crate) use handle_request::run_shell_child;
 /// How the child session's initial context was bootstrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,8 +192,8 @@ pub(crate) struct SubagentSpawnContext {
     /// Whether goal mode (`/goal`) is enabled.
     pub goal_enabled: bool,
     pub background_workflows_enabled: bool,
-    /// Whether the `ask_user_question` tool is exposed to this subagent,
-    /// inherited from the parent session (see `build_subagent_spawn_context`).
+    /// Whether the `ask_user_question` tool is exposed to this subagent.
+    /// `build_subagent_spawn_context` always sets it to `false`.
     pub ask_user_question_enabled: bool,
     /// Whether the parent session is non-interactive (headless `-p` / SDK),
     /// copied onto the child's `StartupHints` so its ask_user_question also
@@ -205,6 +206,8 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_cmd_tx: Option<mpsc::UnboundedSender<SessionCommand>>,
     /// Root-parent peer bus for `agent_hub` (shared Arc with Main + siblings).
     pub agent_bus: Option<xai_grok_tools::implementations::grok_build::AgentBusResource>,
+    /// Process-wide gate on concurrent subagent model requests.
+    pub subagent_sampling_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// Parent session info — used to locate parent session directory.
     pub parent_session_info: Option<SessionInfo>,
     /// Subagent roles config for role-based config layering.
@@ -429,23 +432,24 @@ impl SubagentSpawnContext {
         !request.runtime_overrides.retain_worktree
             && self.resolve_subagent_worktree_snapshot_enabled()
     }
-    /// Per-tool params for the child's spawn. The ask_user_question timeout is
-    /// session-level config, so it is resolved from the same tiers as the
-    /// parent (requirements/env/user/managed from disk; remote from the
-    /// parent's snapshot) and follows the session into subagents. Bash stays
-    /// on tool defaults, as before that knob existed.
+    /// Per-tool params for the child's spawn.
+    ///
+    /// Bash resolves from the parent's `[toolset.bash]` config and remote
+    /// settings, the same way the parent session does. Without this, a child
+    /// fell back to the tool-server defaults: a 5 min foreground ceiling and
+    /// the parent's timeout and auto-background choices ignored. A child has
+    /// no ask_user_question tool, so it gets no params for that tool.
     pub(crate) fn resolve_tool_params_json(
         &self,
     ) -> crate::session::agent_rebuild::ResolvedToolParamsJson {
-        let params = crate::util::config::resolve_ask_user_question_params_from_disk(
-            self.remote_settings.as_ref(),
-        );
+        let bash_config = self
+            .agent_config
+            .as_ref()
+            .map(|cfg| cfg.toolset.bash.clone())
+            .unwrap_or_default();
         crate::session::agent_rebuild::ResolvedToolParamsJson {
-            bash: None,
-            ask_user_question: match serde_json::to_value(params) {
-                Ok(serde_json::Value::Object(map)) => Some(map),
-                _ => None,
-            },
+            bash: Some(bash_config.to_bash_params_json_with_remote(self.remote_settings.as_ref())),
+            ask_user_question: None,
         }
     }
 }
@@ -1515,15 +1519,21 @@ async fn bootstrap_initial_context(
                     }
                 };
                 let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&conversation);
-                const SAFE_RESUME_PERCENT: u64 = 80;
-                let threshold = child_context_window * SAFE_RESUME_PERCENT / 100;
-                if estimated_tokens > threshold {
+                let window = resume_window::ResumeWindowPolicy {
+                    context_window: child_context_window,
+                    auto_compact_threshold_percent: ctx
+                        .resolve_auto_compact_threshold_percent(effective_model_id),
+                };
+                if !window.fits(estimated_tokens) {
                     return BootstrapInitialContext::ResumeAbort(format!(
                         "Cannot resume from subagent '{}': source transcript \
-                         (~{estimated_tokens} tokens) exceeds {SAFE_RESUME_PERCENT}% of \
-                         the model's context window ({child_context_window} tokens). \
-                         The source conversation is too large for the current model.",
+                         (~{estimated_tokens} tokens) exceeds the resume limit \
+                         ({} of {child_context_window} tokens, under the {}% \
+                         auto-compact threshold). Compact the source first, or \
+                         resume on a model with a larger context window.",
                         source.subagent_id,
+                        window.token_limit(),
+                        window.auto_compact_threshold_percent,
                     ));
                 }
                 tracing::info!(
@@ -3282,12 +3292,14 @@ async fn await_subagent_turn_or_cancellation(
 }
 /// Fallback for cancelled/errored paths where TurnDeltaSnapshot is unavailable.
 async fn signals_snapshot_counts(child_handle: &SessionHandle) -> (u32, u32) {
-    child_handle
-        .signals_handle
-        .snapshot()
-        .await
-        .map(|s| (s.tool_call_count, s.turn_count))
-        .unwrap_or((0, 0))
+    handle_request::child_actor_query(
+        "SignalsSnapshot",
+        child_handle.signals_handle.snapshot(),
+        None,
+    )
+    .await
+    .map(|s| (s.tool_call_count, s.turn_count))
+    .unwrap_or((0, 0))
 }
 fn cancellation_error_message(
     category: Option<xai_file_utils::events::types::CancellationCategory>,

@@ -471,7 +471,7 @@ impl SubagentBackend for ChannelBackend {
             );
             return SubagentDescribeOutcome::Unavailable;
         }
-        let timeout = validate_type_timeout();
+        let timeout = describe_type_timeout();
         match tokio::time::timeout(timeout, response_rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => {
@@ -494,17 +494,33 @@ impl SubagentBackend for ChannelBackend {
 }
 
 /// Default `validate_type` timeout. Override via [`VALIDATE_TYPE_TIMEOUT_ENV_VAR`].
-pub const VALIDATE_TYPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// A spawn awaits this before it starts, so a short value fails spawns while
+/// the coordinator is busy with other work. A coordinator that has shut down
+/// still fails at once, on the closed channel.
+pub const VALIDATE_TYPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Default `describe_subagent_type` timeout. Override via
+/// [`DESCRIBE_TYPE_TIMEOUT_ENV_VAR`].
+///
+/// Kept short because callers can await one describe per agent type in
+/// series before they fail open, so a long value multiplies into a stall.
+pub const DESCRIBE_TYPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Env-var override for [`VALIDATE_TYPE_TIMEOUT`] (positive milliseconds).
 pub const VALIDATE_TYPE_TIMEOUT_ENV_VAR: &str = "XAI_VALIDATE_TYPE_TIMEOUT_MS";
 
+/// Env-var override for [`DESCRIBE_TYPE_TIMEOUT`] (positive milliseconds).
+pub const DESCRIBE_TYPE_TIMEOUT_ENV_VAR: &str = "XAI_DESCRIBE_TYPE_TIMEOUT_MS";
+
 /// Validation timeout, honoring the env-var override.
 pub fn validate_type_timeout() -> std::time::Duration {
-    let value = std::env::var(VALIDATE_TYPE_TIMEOUT_ENV_VAR).ok();
-    parse_timeout_ms(value.as_deref())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(VALIDATE_TYPE_TIMEOUT)
+    env_duration_or(VALIDATE_TYPE_TIMEOUT_ENV_VAR, VALIDATE_TYPE_TIMEOUT)
+}
+
+/// Describe timeout, honoring the env-var override.
+pub fn describe_type_timeout() -> std::time::Duration {
+    env_duration_or(DESCRIBE_TYPE_TIMEOUT_ENV_VAR, DESCRIBE_TYPE_TIMEOUT)
 }
 
 /// Parse a positive `u64` millisecond value; `None` for unset, invalid, or zero.

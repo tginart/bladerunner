@@ -55,6 +55,19 @@ pub(super) fn dispatch_cancel_turn(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    // A focused subagent (open overlay or selected row) owns [stop] and
+    // Ctrl+C. Its session is not in the shell's session registry, so a plain
+    // `session/cancel` for the child id would not reach it. The parent-routed
+    // kill does.
+    match focused_subagent(app, id) {
+        Some(FocusedSubagent::Running { subagent_id }) => {
+            return dispatch_kill_subagent(app, subagent_id);
+        }
+        // A finished child's overlay has nothing to stop. The root turn is out
+        // of view, so it must not be cancelled by accident.
+        Some(FocusedSubagent::IdleOverlay) => return vec![],
+        None => {}
+    }
     let ui_pref = effective_cancel_subagents_preference(None, &app.current_ui);
 
     // Scoped agent borrow: extract decisions, then release before `do_cancel_turn`.
@@ -210,6 +223,28 @@ pub(super) fn dispatch_cancel_turn_choice(
 
     effects.extend(do_cancel_turn(app, cancel_subagents));
     effects
+}
+
+/// The subagent that a cancel targets instead of the root turn.
+enum FocusedSubagent {
+    Running { subagent_id: String },
+    IdleOverlay,
+}
+
+/// Find the focused subagent of agent `id`, if any.
+///
+/// A running focused subagent is a kill target, with or without a loaded
+/// view. A finished one counts only while its overlay is open.
+fn focused_subagent(app: &AppView, id: AgentId) -> Option<FocusedSubagent> {
+    let agent = app.agents.get(&id)?;
+    let child_sid = agent.active_subagent.as_ref()?;
+    let info = agent.subagent_sessions.get(child_sid.as_str());
+    if let Some(info) = info.filter(|info| info.is_running()) {
+        let subagent_id = info.subagent_id.to_string();
+        return Some(FocusedSubagent::Running { subagent_id });
+    }
+    let has_overlay = agent.subagent_views.contains_key(child_sid.as_str());
+    has_overlay.then_some(FocusedSubagent::IdleOverlay)
 }
 
 pub(super) fn do_cancel_turn(app: &mut AppView, cancel_subagents: bool) -> Vec<Effect> {

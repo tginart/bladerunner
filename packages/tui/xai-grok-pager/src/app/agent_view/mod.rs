@@ -832,6 +832,10 @@ pub struct AgentView {
     /// xAI-stream sibling of [`Self::last_applied_event_seq`] (see there for
     /// why the highwaters are split). Same drop rule, replay-exempt.
     pub last_applied_xai_event_seq: Option<u64>,
+    /// `SubagentFinished` updates that arrived before their spawn. Applied
+    /// when the spawn arrives; see `crate::app::deferred_subagent_finishes`.
+    pub(crate) deferred_subagent_finishes:
+        crate::app::deferred_subagent_finishes::DeferredSubagentFinishes,
     /// Raw `eventId` of the most recent update APPLIED to this root session —
     /// replay or live, on both the ACP and xAI paths; dropped updates (dedup,
     /// promptId gate, unexpected replay) don't move it. Sent as `_meta.cursor`

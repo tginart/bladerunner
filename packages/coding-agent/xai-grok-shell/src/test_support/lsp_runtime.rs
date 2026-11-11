@@ -93,6 +93,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         parent_non_interactive: false,
         parent_cmd_tx: None,
         agent_bus: None,
+        subagent_sampling_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         parent_session_info: None,
         subagent_roles: HashMap::new(),
         subagent_personas: HashMap::new(),
