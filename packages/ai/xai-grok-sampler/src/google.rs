@@ -732,6 +732,14 @@ impl VertexAdcTokenProvider {
         }
     }
 
+    /// Mint a Google ADC access token.
+    ///
+    /// Purpose: This function gives the bare access token for the
+    /// `Authorization` header.
+    /// Output: The access token without a scheme prefix, or a configuration
+    /// error.
+    /// Note: `gcloud-auth` returns `"Bearer <token>"`. This function removes
+    /// the prefix, because `apply_google_auth_headers` adds it.
     pub async fn token(&self) -> Result<String> {
         let source = self
             .inner
@@ -747,16 +755,25 @@ impl VertexAdcTokenProvider {
                 Ok::<Arc<dyn token_source::TokenSource>, SamplingError>(provider.token_source())
             })
             .await?;
-        source.token().await.map_err(|e| {
+        let token = source.token().await.map_err(|e| {
             tracing::warn!(error = %e, "failed to mint Google ADC token");
             SamplingError::InvalidConfiguration(ADC_TOKEN_MESSAGE)
-        })
+        })?;
+        Ok(strip_bearer_prefix(&token).to_owned())
     }
 }
 
 impl Default for VertexAdcTokenProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn strip_bearer_prefix(token: &str) -> &str {
+    let token = token.trim();
+    match token.split_once(' ') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim_start(),
+        _ => token,
     }
 }
 
@@ -788,6 +805,23 @@ pub fn apply_google_auth_headers(
 mod tests {
     use super::*;
     use xai_grok_sampling_types::{ConversationItem, ReasoningEffort};
+
+    #[test]
+    fn adc_token_is_sent_with_exactly_one_bearer_prefix() {
+        for raw in [
+            "Bearer ya29.abc",
+            "bearer ya29.abc",
+            "ya29.abc",
+            " Bearer  ya29.abc ",
+        ] {
+            let mut headers = HeaderMap::new();
+            apply_google_auth_headers(&mut headers, None, Some(strip_bearer_prefix(raw)));
+            assert_eq!(
+                headers[AUTHORIZATION], "Bearer ya29.abc",
+                "raw token {raw:?}"
+            );
+        }
+    }
 
     #[test]
     fn builds_google_vertex_adc_and_vertex_express_urls_without_query_keys() {
