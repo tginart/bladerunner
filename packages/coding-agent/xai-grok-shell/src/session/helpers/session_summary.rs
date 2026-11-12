@@ -1,5 +1,8 @@
 //! Session title generation via LLM tool call.
 
+use indexmap::IndexMap;
+
+use crate::agent::config::{ModelEntry, find_model_by_id};
 use crate::sampling::{
     Client as OaiCompatClient, ConversationItem, ConversationRequest, ConversationToolChoice,
     ToolSpec,
@@ -51,6 +54,40 @@ fn title_source_text(user_message: &str) -> String {
             .unwrap_or_else(|| base.to_string());
     display.truncate(floor_char_boundary(&display, TITLE_SOURCE_MAX_BYTES));
     display
+}
+
+/// Purpose: This function replaces a Fable title model with a configured Haiku
+/// model. Fable models reject the forced `session_title` tool choice.
+/// Input: The resolved title model id. The model catalog.
+/// Output: The catalog key of a Haiku model, or `model_id` without change.
+/// Method:
+///     1. If `model_id` is not a Fable model, return `model_id`.
+///     2. Find the visible Haiku models in the catalog.
+///     3. Prefer a Haiku model with the same `base_url` and `api_backend`.
+///     4. If not, use the first Haiku model.
+///     5. If there is no Haiku model, return `model_id`.
+/// Note: Step 5 keeps the old result: the request fails and the title falls
+/// back to truncated user text.
+pub(crate) fn resolve_title_model(model_id: &str, models: &IndexMap<String, ModelEntry>) -> String {
+    let fable = find_model_by_id(models, model_id);
+    let wire_model = fable.map_or(model_id, |entry| entry.info.model.as_str());
+    if !_is_model_family(wire_model, "fable") {
+        return model_id.to_owned();
+    }
+    let haikus: Vec<(&String, &ModelEntry)> = models
+        .iter()
+        .filter(|(_, entry)| !entry.info.hidden)
+        .filter(|(_, entry)| _is_model_family(&entry.info.model, "haiku"))
+        .collect();
+    let same_provider = haikus.iter().find(|(_, entry)| {
+        fable.is_some_and(|f| {
+            f.info.base_url == entry.info.base_url && f.info.api_backend == entry.info.api_backend
+        })
+    });
+    match same_provider.or(haikus.first()) {
+        Some((key, _)) => (*key).clone(),
+        None => model_id.to_owned(),
+    }
 }
 
 pub(crate) fn title_fallback_from_user_text(user_message: &str) -> String {
@@ -139,12 +176,123 @@ Just generate the session_title and nothing else"#,
     title_fallback_from_user_text(&clean_message)
 }
 
+fn _is_model_family(wire_model: &str, family: &str) -> bool {
+    wire_model.to_ascii_lowercase().contains(family)
+}
+
 #[cfg(test)]
 mod tests {
+    use indexmap::IndexMap;
+
     use super::{
-        TITLE_SOURCE_MAX_BYTES, strip_system_reminder_blocks, title_fallback_from_user_text,
-        title_source_text,
+        TITLE_SOURCE_MAX_BYTES, resolve_title_model, strip_system_reminder_blocks,
+        title_fallback_from_user_text, title_source_text,
     };
+    use crate::agent::config::{EndpointsConfig, ModelEntry};
+    use crate::sampling::ApiBackend;
+
+    const VERTEX_URL: &str = "https://aiplatform.googleapis.com";
+
+    fn entry(model: &str, base_url: &str, api_backend: ApiBackend) -> ModelEntry {
+        let mut entry = ModelEntry::fallback(model, &EndpointsConfig::default());
+        entry.info.base_url = base_url.to_owned();
+        entry.info.api_backend = api_backend;
+        entry
+    }
+
+    fn catalog(entries: Vec<(&str, ModelEntry)>) -> IndexMap<String, ModelEntry> {
+        entries
+            .into_iter()
+            .map(|(k, e)| (k.to_owned(), e))
+            .collect()
+    }
+
+    #[test]
+    fn fable_title_model_uses_haiku_on_same_provider() {
+        let models = catalog(vec![
+            (
+                "other/claude-haiku-5-5",
+                entry("claude-haiku-5-5", "https://x", ApiBackend::default()),
+            ),
+            (
+                "vertex-claude/claude-fable-5-2",
+                entry("claude-fable-5-2", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+            (
+                "vertex-claude/claude-haiku-5-5",
+                entry("claude-haiku-5-5", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+        ]);
+        assert_eq!(
+            resolve_title_model("vertex-claude/claude-fable-5-2", &models),
+            "vertex-claude/claude-haiku-5-5"
+        );
+    }
+
+    #[test]
+    fn fable_title_model_uses_any_haiku_when_none_on_same_provider() {
+        let models = catalog(vec![
+            (
+                "vertex-claude/claude-fable-5-2",
+                entry("claude-fable-5-2", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+            (
+                "other/claude-haiku-5-5",
+                entry("claude-haiku-5-5", "https://x", ApiBackend::default()),
+            ),
+        ]);
+        assert_eq!(
+            resolve_title_model("vertex-claude/claude-fable-5-2", &models),
+            "other/claude-haiku-5-5"
+        );
+    }
+
+    #[test]
+    fn fable_title_model_without_haiku_is_unchanged() {
+        let mut hidden = entry("claude-haiku-5-5", VERTEX_URL, ApiBackend::VertexMessages);
+        hidden.info.hidden = true;
+        let models = catalog(vec![
+            (
+                "vertex-claude/claude-fable-5-2",
+                entry("claude-fable-5-2", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+            (
+                "vertex-claude/claude-sonnet-5-5",
+                entry("claude-sonnet-5-5", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+            ("vertex-claude/hidden-haiku", hidden),
+        ]);
+        assert_eq!(
+            resolve_title_model("vertex-claude/claude-fable-5-2", &models),
+            "vertex-claude/claude-fable-5-2"
+        );
+        // A Fable slug absent from the catalog also passes through.
+        assert_eq!(
+            resolve_title_model("claude-fable-5-2", &IndexMap::new()),
+            "claude-fable-5-2"
+        );
+    }
+
+    #[test]
+    fn non_fable_title_model_is_unchanged() {
+        let models = catalog(vec![
+            (
+                "vertex-claude/claude-sonnet-5-5",
+                entry("claude-sonnet-5-5", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+            (
+                "vertex-claude/claude-haiku-5-5",
+                entry("claude-haiku-5-5", VERTEX_URL, ApiBackend::VertexMessages),
+            ),
+        ]);
+        for model_id in [
+            "vertex-claude/claude-sonnet-5-5",
+            "vertex-claude/claude-haiku-5-5",
+            "grok-4",
+        ] {
+            assert_eq!(resolve_title_model(model_id, &models), model_id);
+        }
+    }
 
     #[test]
     fn title_source_text_caps_oversized_input() {

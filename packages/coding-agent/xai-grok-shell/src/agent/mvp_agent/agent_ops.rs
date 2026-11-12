@@ -127,9 +127,12 @@ impl MvpAgent {
         &self,
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
-        let slug = self.resolve_session_summary_model();
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
+        let slug = crate::session::helpers::session_summary::resolve_title_model(
+            &self.resolve_session_summary_model(),
+            &models,
+        );
         let endpoints = self.models_manager.endpoints();
         let (disable_api_key_auth, alpha_test_key, client_version) = {
             let cfg = self.cfg.borrow();
