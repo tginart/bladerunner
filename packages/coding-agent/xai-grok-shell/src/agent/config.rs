@@ -49,6 +49,8 @@ pub(crate) fn default_agent_type() -> String {
 pub const CLI_CHAT_PROXY_BASE_URL_DEFAULT: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Default base URL for the public xAI API.
 pub const XAI_API_BASE_URL_DEFAULT: &str = "https://api.x.ai/v1";
+/// Picker platform label for `vertex_messages` models without `platform_name`.
+pub const VERTEX_PLATFORM_NAME_DEFAULT: &str = "Google Vertex AI";
 /// One or more environment variable names that may hold a model API key.
 ///
 /// Serde `untagged`: accepts a string or an array in TOML/JSON.
@@ -5033,8 +5035,7 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.supports_reasoning_effort {
             entry.info.supports_reasoning_effort = v;
-        } else if !entry.info.supports_reasoning_effort
-            && matches!(entry.info.api_backend, ApiBackend::Messages)
+        } else if !entry.info.supports_reasoning_effort && entry.info.api_backend.is_messages_wire()
         {
             entry.info.supports_reasoning_effort = true;
         }
@@ -5161,6 +5162,25 @@ pub struct ModelInfo {
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
 impl ModelInfo {
+    /// Platform label shown beside the model in `/model`.
+    ///
+    /// Purpose: This function gives the label for every model source.
+    /// Output: The trimmed `platform_name`. If it is not set, the default
+    /// label for the backend (only `vertex_messages` has one).
+    /// Note: The default lives here, not in config parsing, so that remote and
+    /// catalog entries get it too.
+    pub fn display_platform_name(&self) -> Option<&str> {
+        let configured = self
+            .platform_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        if configured.is_some() {
+            return configured;
+        }
+        (self.api_backend == ApiBackend::VertexMessages).then_some(VERTEX_PLATFORM_NAME_DEFAULT)
+    }
+
     /// Minimal fallback descriptor for an unknown model slug.
     /// Used when a configured model ID isn't found in presets or remote models.
     pub fn fallback(slug: &str) -> Self {
@@ -5377,11 +5397,17 @@ impl ModelEntry {
         self.auth_provider.as_ref()
     }
     /// `true` when the model has a non-empty `api_key`, an `env_key` that
-    /// resolves to a non-empty value, or a named auth provider.
+    /// resolves to a non-empty value, a named auth provider, or uses
+    /// `vertex_messages` (the sampler authenticates with Google ADC, so no
+    /// Bladerunner login is needed).
     /// Probes `std::env::var` at call time: result is not stable across env
-    /// changes. Never executes a provider command.
+    /// changes. Never executes a provider command, and never checks that ADC
+    /// is set up: a missing ADC fails on the first request with a `gcloud`
+    /// hint.
     pub(crate) fn has_own_credentials(&self) -> bool {
-        self.own_credential().is_some() || self.auth_provider.is_some()
+        self.own_credential().is_some()
+            || self.auth_provider.is_some()
+            || self.info.api_backend == ApiBackend::VertexMessages
     }
 }
 impl std::ops::Deref for ModelEntry {
@@ -6088,7 +6114,9 @@ pub(crate) fn resolve_aux_model_sampling_config(
             None,
             None,
         );
-        if sampler.api_key.is_some() {
+        // Vertex mints its Google ADC bearer per request, so no key is expected.
+        let is_vertex = entry.info.api_backend == ApiBackend::VertexMessages;
+        if sampler.api_key.is_some() || is_vertex {
             return Some(sampler);
         }
         if entry.effective_auth_provider().is_some() {
@@ -6289,8 +6317,12 @@ pub(crate) fn sampling_config_for_model(
     let api_backend = info.api_backend.clone();
     // Custom `api_backend = "codex_responses"` forces the Codex adapter even
     // when the catalog id is not `openai-codex/*` (BYOK reverse proxies).
+    // Custom `api_backend = "vertex_messages"` likewise forces the Vertex
+    // Anthropic adapter for any provider prefix.
     let adapter_kind = if api_backend.uses_codex_dialect() {
         xai_grok_models::AdapterKind::OpenAiCodex
+    } else if api_backend == ApiBackend::VertexMessages {
+        xai_grok_models::AdapterKind::VertexAnthropic
     } else {
         adapter_kind_for_model(model)
     };
@@ -6863,12 +6895,7 @@ pub(crate) fn to_acp_model_info(
                         reasoning_efforts_meta_value(&info.reasoning_efforts),
                     );
                 }
-                if let Some(platform_name) = info
-                    .platform_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                {
+                if let Some(platform_name) = info.display_platform_name() {
                     map.insert(
                         xai_grok_sampling_types::PLATFORM_NAME_META_KEY.to_string(),
                         platform_name.into(),
@@ -7479,6 +7506,35 @@ reasoning_effort = "low"
         assert_eq!(resolved.model, "v9m-rl-learnability-tp8");
         assert_eq!(resolved.base_url, "https://vendor.example/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("vendor-key"));
+    }
+    /// A keyless Vertex aux model keeps its own ADC route: it must not fall
+    /// back to the session model or reroute through the xAI proxy.
+    #[test]
+    fn resolve_aux_model_accepts_keyless_vertex_adc() {
+        let endpoints = EndpointsConfig::default();
+        let mut entry = test_model_entry(
+            "claude-fable-5-2",
+            "https://aiplatform.googleapis.com",
+            None,
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::VertexMessages;
+        let mut catalog = IndexMap::new();
+        catalog.insert("vertex-fable".to_string(), entry);
+        for session_key in [None, Some("session-jwt")] {
+            let resolved = resolve_aux_model_sampling_config(
+                "vertex-fable",
+                &catalog,
+                &endpoints,
+                session_key,
+                false,
+                None,
+                None,
+            )
+            .expect("a Vertex model resolves with Google ADC and no API key");
+            assert_eq!(resolved.base_url, "https://aiplatform.googleapis.com");
+        }
     }
     /// Cold cache falls back to the session model, never the xAI proxy;
     /// warm cache serves the provider token at the provider endpoint.

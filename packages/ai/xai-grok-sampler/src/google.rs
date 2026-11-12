@@ -24,6 +24,11 @@ use crate::types::RequestId;
 
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const VERTEX_EXPRESS_BASE_URL: &str = "https://aiplatform.googleapis.com";
+// ADC failures are configuration errors, not `SamplingError::Auth`: an auth
+// error makes the client show "Run /login", which cannot fix Google ADC.
+// The underlying error goes to the log.
+const ADC_SETUP_MESSAGE: &str = "Google ADC is not set up. Run `gcloud auth application-default login`, or set GOOGLE_APPLICATION_CREDENTIALS to a service account key.";
+const ADC_TOKEN_MESSAGE: &str = "Could not get a Google ADC access token. Run `gcloud auth application-default login` and try again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoogleEndpointKind {
@@ -73,14 +78,9 @@ impl GoogleEndpoint {
                 format!("{base}/v1/publishers/google/models/{}:{suffix}", self.model)
             }
             GoogleEndpointKind::Vertex => {
-                let project = self.project.as_deref().ok_or(SamplingError::InvalidConfiguration(
-                    "Google Vertex requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT when no Vertex API key is configured",
-                ))?;
-                let location = self.location.as_deref().ok_or(SamplingError::InvalidConfiguration(
-                    "Google Vertex requires GOOGLE_CLOUD_LOCATION when no Vertex API key is configured",
-                ))?;
+                let location_path = self.vertex_location_path()?;
                 format!(
-                    "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:{suffix}",
+                    "{base}/{location_path}/publishers/google/models/{}:{suffix}",
                     self.model
                 )
             }
@@ -90,6 +90,25 @@ impl GoogleEndpoint {
         } else {
             Ok(url)
         }
+    }
+
+    /// Purpose: This function makes the Vertex resource path for the project
+    /// and the location.
+    /// Output: `v1/projects/{project}/locations/{location}`, with no leading
+    /// slash, or a configuration error.
+    /// Note: The Gemini route and the Anthropic route on Vertex share this path.
+    /// A Gemini route with a Vertex API key uses the express URL instead.
+    pub fn vertex_location_path(&self) -> Result<String> {
+        let project =
+            non_empty(self.project.as_deref()).ok_or(SamplingError::InvalidConfiguration(
+                "Google Vertex with Google ADC requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT",
+            ))?;
+        let location = non_empty(self.location.as_deref()).ok_or(
+            SamplingError::InvalidConfiguration(
+                "Google Vertex with Google ADC requires GOOGLE_CLOUD_LOCATION, for example `global`",
+            ),
+        )?;
+        Ok(format!("v1/projects/{project}/locations/{location}"))
     }
 
     fn resolved_base_url(&self, vertex_express: bool) -> String {
@@ -722,13 +741,15 @@ impl VertexAdcTokenProvider {
                 let provider = gcloud_auth::token::DefaultTokenSourceProvider::new(config)
                     .await
                     .map_err(|e| {
-                        SamplingError::auth_unknown(format!("failed to initialize Google ADC: {e}"))
+                        tracing::warn!(error = %e, "failed to initialize Google ADC");
+                        SamplingError::InvalidConfiguration(ADC_SETUP_MESSAGE)
                     })?;
                 Ok::<Arc<dyn token_source::TokenSource>, SamplingError>(provider.token_source())
             })
             .await?;
         source.token().await.map_err(|e| {
-            SamplingError::auth_unknown(format!("failed to mint Google ADC token: {e}"))
+            tracing::warn!(error = %e, "failed to mint Google ADC token");
+            SamplingError::InvalidConfiguration(ADC_TOKEN_MESSAGE)
         })
     }
 }
@@ -737,6 +758,10 @@ impl Default for VertexAdcTokenProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 pub fn apply_google_auth_headers(

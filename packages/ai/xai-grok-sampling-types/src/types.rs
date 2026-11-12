@@ -1259,6 +1259,18 @@ pub enum ApiBackend {
     BedrockConverseStream,
     /// Use Pi's native messages protocol (/messages).
     PiMessages,
+    /// Anthropic Messages wire on Google-managed Vertex AI.
+    ///
+    /// Same request/response shapes as [`Self::Messages`], but the sampler
+    /// posts to `publishers/anthropic/models/{model}:streamRawPredict`, moves
+    /// the model id from the body into the URL, adds the body
+    /// `anthropic_version`, strips sampling knobs, and authenticates with
+    /// Google ADC. Project/location come from `GOOGLE_CLOUD_PROJECT` (or
+    /// `GCLOUD_PROJECT`) and `GOOGLE_CLOUD_LOCATION`.
+    ///
+    /// Config aliases: `vertex_messages` (serde default) and `vertex-messages`.
+    #[serde(alias = "vertex-messages")]
+    VertexMessages,
 }
 
 impl ApiBackend {
@@ -1277,6 +1289,11 @@ impl ApiBackend {
         matches!(self, Self::Responses | Self::CodexResponses)
     }
 
+    /// Wire protocol is the Anthropic Messages SSE API (including Vertex).
+    pub fn is_messages_wire(&self) -> bool {
+        matches!(self, Self::Messages | Self::VertexMessages)
+    }
+
     /// Request body must use the ChatGPT Codex Responses dialect.
     pub fn uses_codex_dialect(&self) -> bool {
         matches!(self, Self::CodexResponses)
@@ -1287,7 +1304,7 @@ impl ApiBackend {
         match self {
             Self::ChatCompletions => "chat/completions",
             Self::Responses | Self::CodexResponses => "responses",
-            Self::Messages => "messages",
+            Self::Messages | Self::VertexMessages => "messages",
             Self::GoogleGenerateContent => "models/{model}:generateContent",
             Self::BedrockConverseStream => "model/{model}/converse-stream",
             Self::PiMessages => "messages",
@@ -1296,7 +1313,7 @@ impl ApiBackend {
 
     /// Whether replayed reasoning must be stripped. Only the Messages API rejects thinking blocks sent without a top-level `thinking` config.
     pub fn requires_reasoning_strip(&self) -> bool {
-        matches!(self, Self::Messages)
+        self.is_messages_wire()
     }
 
     /// Whether [`ConversationRequest::prompt_cache_key`] reaches the wire.

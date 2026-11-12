@@ -472,6 +472,54 @@ mod tests {
     }
 
     #[test]
+    fn vertex_messages_defaults_platform_name_unless_set() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model_providers.vertex-claude]
+            base_url = "https://aiplatform.googleapis.com"
+            api_backend = "vertex_messages"
+
+            [model."vertex-claude/claude-fable-5-2"]
+            model = "claude-fable-5-2"
+            model_provider = "vertex-claude"
+
+            [model."vertex-claude/labeled"]
+            model = "claude-haiku-5-5"
+            model_provider = "vertex-claude"
+            platform_name = "MyCorp Vertex"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let platform_name = |key: &str| {
+            resolved
+                .get(key)
+                .expect("model should exist")
+                .info
+                .display_platform_name()
+                .map(str::to_string)
+        };
+        assert_eq!(
+            platform_name("vertex-claude/claude-fable-5-2").as_deref(),
+            Some(crate::agent::config::VERTEX_PLATFORM_NAME_DEFAULT)
+        );
+        assert_eq!(
+            platform_name("vertex-claude/labeled").as_deref(),
+            Some("MyCorp Vertex")
+        );
+        // Google ADC is the credential: a keyless Vertex model must not force
+        // a Bladerunner login.
+        assert!(
+            resolved
+                .get("vertex-claude/claude-fable-5-2")
+                .expect("model should exist")
+                .has_own_credentials()
+        );
+    }
+
+    #[test]
     fn model_provider_inline_auth_registers_synthetic_provider() {
         let raw_config: toml::Value = toml::from_str(
             r#"

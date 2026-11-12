@@ -61,7 +61,7 @@ default = "grok-4.5"
 
 ## Supported API Backends
 
-Bladerunner supports four API backends. Set `api_backend` in your `[model.*]` config to choose which protocol the model uses:
+Bladerunner supports five API backends. Set `api_backend` in your `[model.*]` config to choose which protocol the model uses:
 
 | Value | API | Default |
 |-------|-----|---------|
@@ -69,6 +69,7 @@ Bladerunner supports four API backends. Set `api_backend` in your `[model.*]` co
 | `"responses"` | OpenAI Responses (`/v1/responses`) | |
 | `"codex_responses"` | OpenAI Codex-compatible Responses (`/v1/responses`) | |
 | `"messages"` | Anthropic Messages (`/v1/messages`) | |
+| `"vertex_messages"` | Anthropic Messages on Google Vertex AI (`:streamRawPredict`) | |
 
 When you omit `api_backend`, Bladerunner uses `chat_completions`.
 
@@ -100,7 +101,7 @@ description = "Model description"          # Optional description
 platform_name = "MyCorp"                  # Platform label in the model picker (optional)
 api_key = "sk-..."                        # API key for this provider (optional)
 env_key = "XAI_API_KEY"                   # Env var holding the API key (optional; string or array)
-api_backend = "chat_completions"          # chat_completions, responses, codex_responses, or messages
+api_backend = "chat_completions"          # chat_completions, responses, codex_responses, messages, or vertex_messages
 temperature = 0.7                         # Sampling temperature
 top_p = 0.95                              # Nucleus sampling parameter
 max_completion_tokens = 8192              # Maximum tokens per response
@@ -251,6 +252,50 @@ extra_headers = { "x-api-key" = "sk-ant-...", "anthropic-version" = "2023-06-01"
 ```
 
 The `messages` backend uses the Anthropic Messages protocol. Anthropic authenticates with an `x-api-key` header rather than `Authorization: Bearer`, so pass your key through `extra_headers`, which Bladerunner sends verbatim.
+
+### Claude on Google Vertex AI
+
+Use Claude models served by Google-managed Vertex AI with `vertex_messages`:
+
+```toml
+[model_providers.vertex-claude]
+base_url = "https://aiplatform.googleapis.com"   # global; us multi-region uses https://aiplatform.us.rep.googleapis.com; regions use https://{region}-aiplatform.googleapis.com
+api_backend = "vertex_messages"
+platform_name = "Google Vertex AI"                # optional; this is the default for vertex_messages
+
+[model."vertex-claude/claude-fable-5-2"]
+model_provider = "vertex-claude"
+model = "claude-fable-5-2"
+name = "Claude Fable 5.2 (Vertex)"
+context_window = 1000000
+max_completion_tokens = 128000
+supports_reasoning_effort = true
+reasoning_effort = "high"
+reasoning_efforts = ["low", "medium", "high", "xhigh", "max"]
+```
+
+Set the project and location in the environment:
+
+```bash
+export GOOGLE_CLOUD_PROJECT=my-project   # or GCLOUD_PROJECT
+export GOOGLE_CLOUD_LOCATION=global
+```
+
+The backend uses the Messages request and stream format, with these Vertex changes:
+
+- It posts to `{base_url}/v1/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict`
+  (`:rawPredict` for non-streaming requests).
+- It removes `model` from the body and adds `anthropic_version = "2026-10-21"`.
+- It never sends `temperature`, `top_p`, or `top_k`.
+- It authenticates with Google Application Default Credentials (`gcloud auth application-default login`
+  or a service account) and refreshes the token automatically. Do not set `api_key`; configured keys,
+  `anthropic-version` headers, and `x-grok-*` headers are not sent to Google.
+
+If Google rejects the credential, or ADC is not set up, Bladerunner shows a `gcloud auth application-default login` hint, not `/login`.
+`endpoint_path` is not used: the backend builds the Vertex path from the project, location, and model.
+
+Add the provider prefix to `[models] allowed_models` (for example `"vertex-claude/*"`) if you use an allowlist.
+`vertex-messages` is accepted as an input alias.
 
 ### OpenAI (Chat Completions)
 
