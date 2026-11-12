@@ -17,7 +17,7 @@ GROK_VERSION="$(cat VERSION)" cargo build \
 target/release/bladerunner --version
 ```
 
-Prebuilt beta releases support Apple Silicon macOS.
+Prebuilt beta releases support Apple Silicon macOS and x86_64 Linux (glibc 2.17+).
 
 ## Pull requests
 
