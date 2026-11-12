@@ -30,6 +30,10 @@ use crate::auto_update::{
 const RELEASE_REPO: &str = "tginart/bladerunner";
 const RELEASE_API_BASE: &str = "https://api.github.com/repos/tginart/bladerunner/releases";
 const CHECK_TTL: Duration = Duration::from_secs(30 * 60);
+/// Automatic checks make at most one network attempt per interval, whether the
+/// attempt succeeds or fails. Unauthenticated GitHub API calls are capped at 60
+/// per hour per IP, and a failed check is not cached by `CHECK_TTL`.
+const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -265,6 +269,10 @@ fn state_path() -> PathBuf {
     bladerunner_home().join("update-state.json")
 }
 
+fn check_attempt_path() -> PathBuf {
+    bladerunner_home().join("update-check-attempt")
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -289,6 +297,40 @@ fn state_is_fresh(state: &UpdateState) -> bool {
     };
     let now = now_unix();
     checked <= now && now - checked < CHECK_TTL.as_secs()
+}
+
+/*
+Purpose: This function limits automatic update checks to one network attempt per
+MIN_CHECK_INTERVAL across all Bladerunner processes.
+Input: None.
+Output: true if the caller can make a network check now. false if a recent attempt
+exists.
+Method:
+    1. Read the last attempt time from the attempt file.
+    2. If the attempt is recent, return false.
+    3. If not, write the current time to the attempt file and return true.
+Note: The attempt file is separate from update-state.json, so this function does
+not race with state writes that occur under the update lock. A write failure
+returns true, which is the behavior before this throttle existed.
+*/
+fn claim_automatic_check() -> bool {
+    let path = check_attempt_path();
+    let now = now_unix();
+    let last_attempt = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    if let Some(last) = last_attempt
+        && last <= now
+        && now - last < MIN_CHECK_INTERVAL.as_secs()
+    {
+        return false;
+    }
+    let written = ensure_safe_layout()
+        .and_then(|()| write_state_bytes_atomic(&path, format!("{now}\n").as_bytes()));
+    if let Err(error) = written {
+        tracing::debug!("failed to record Bladerunner update check attempt: {error:#}");
+    }
+    true
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<()> {
@@ -618,7 +660,15 @@ async fn checked_response(response: reqwest::Response, what: &str) -> Result<req
         .await
         .unwrap_or_default();
     let detail = String::from_utf8_lossy(&body);
-    bail!("{what} failed with HTTP {status}: {}", detail.trim());
+    let is_rate_limited = matches!(status.as_u16(), 403 | 429)
+        && detail.to_ascii_lowercase().contains("rate limit");
+    let hint = if is_rate_limited {
+        " (set GITHUB_TOKEN, for example `export GITHUB_TOKEN=$(gh auth token)`, \
+         to raise the GitHub API limit)"
+    } else {
+        ""
+    };
+    bail!("{what} failed with HTTP {status}: {}{hint}", detail.trim());
 }
 
 fn validate_release_asset_url(source: &UpdateSource, url: &str) -> Result<()> {
@@ -2506,7 +2556,7 @@ pub(crate) async fn ensure_latest_on_disk() -> Result<EnsureLatestOutcome> {
             relaunch_needed: relaunch_before,
         });
     }
-    if is_version_cache_fresh() {
+    if is_version_cache_fresh() || !claim_automatic_check() {
         return Ok(EnsureLatestOutcome {
             installed: None,
             relaunch_needed: relaunch_before,
@@ -2572,7 +2622,7 @@ pub(crate) async fn check_update_background() -> BackgroundUpdateCheck {
             download: None,
         };
     }
-    if is_version_cache_fresh() {
+    if is_version_cache_fresh() || !claim_automatic_check() {
         return BackgroundUpdateCheck {
             update: None,
             download: None,
@@ -2638,6 +2688,9 @@ pub(crate) async fn run_update_if_available(
         .await
     {
         tracing::warn!("failed to save Bladerunner auto-update setting: {error}");
+    }
+    if !claim_automatic_check() {
+        return Ok(false);
     }
 
     let candidate = match resolve_candidate(None).await {
