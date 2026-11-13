@@ -24,7 +24,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::auto_update::{
-    BackgroundUpdateCheck, EnsureLatestOutcome, UpdateAvailable, UpdateRunMode, UpdateStatus,
+    BackgroundUpdateCheck, CliUpdateTrigger, EnsureLatestOutcome, UpdateAvailable,
+    UpdateRunMode, UpdateStatus,
 };
 
 const RELEASE_REPO: &str = "tginart/bladerunner";
@@ -304,33 +305,25 @@ Purpose: This function limits automatic update checks to one network attempt per
 MIN_CHECK_INTERVAL across all Bladerunner processes.
 Input: None.
 Output: true if the caller can make a network check now. false if a recent attempt
-exists.
+exists or another process is making its claim at the same time.
 Method:
-    1. Read the last attempt time from the attempt file.
-    2. If the attempt is recent, return false.
-    3. If not, write the current time to the attempt file and return true.
-Note: The attempt file is separate from update-state.json, so this function does
-not race with state writes that occur under the update lock. A write failure
-returns true, which is the behavior before this throttle existed.
+    1. Try to get an exclusive lock on the attempt lock file. Do not wait.
+    2. If another process holds the lock, return false.
+    3. Read the last attempt time. If the attempt is recent, return false.
+    4. If not, write the current time to the attempt file and return true.
+Note: The lock makes the read, check and write one operation, so concurrent
+launches cannot all claim the same interval. The lock is separate from
+update.lock, so a long install does not block a check. An I/O failure returns
+true, which is the behavior before this throttle existed.
 */
 fn claim_automatic_check() -> bool {
-    let path = check_attempt_path();
-    let now = now_unix();
-    let last_attempt = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok());
-    if let Some(last) = last_attempt
-        && last <= now
-        && now - last < MIN_CHECK_INTERVAL.as_secs()
-    {
-        return false;
+    match _try_claim_automatic_check() {
+        Ok(is_claimed) => is_claimed,
+        Err(error) => {
+            tracing::debug!("failed to claim Bladerunner update check slot: {error:#}");
+            true
+        }
     }
-    let written = ensure_safe_layout()
-        .and_then(|()| write_state_bytes_atomic(&path, format!("{now}\n").as_bytes()));
-    if let Err(error) = written {
-        tracing::debug!("failed to record Bladerunner update check attempt: {error:#}");
-    }
-    true
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<()> {
@@ -2671,6 +2664,7 @@ pub(crate) async fn check_update_background() -> BackgroundUpdateCheck {
 pub(crate) async fn run_update_if_available(
     run_mode: UpdateRunMode,
     _interactive: bool,
+    trigger: CliUpdateTrigger,
 ) -> Result<bool> {
     if !automatic_entry_allowed() || is_version_cache_fresh() {
         return Ok(false);
@@ -2689,7 +2683,10 @@ pub(crate) async fn run_update_if_available(
     {
         tracing::warn!("failed to save Bladerunner auto-update setting: {error}");
     }
-    if !claim_automatic_check() {
+    // A user retry (Ctrl+U after a failed background update) must not be
+    // throttled by the automatic attempt that just failed.
+    let is_user_request = matches!(trigger, CliUpdateTrigger::UserCommand);
+    if !is_user_request && !claim_automatic_check() {
         return Ok(false);
     }
 
@@ -3270,6 +3267,40 @@ pub(crate) async fn run_update(
 
 pub(crate) async fn run_install_target(target: Option<&str>) -> Result<()> {
     converge(true, target).await.map(|_| ())
+}
+
+fn _try_claim_automatic_check() -> Result<bool> {
+    ensure_safe_layout()?;
+    let lock_path = bladerunner_home().join("update-check-attempt.lock");
+    reject_symlink(&lock_path, "update check lock")?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    if let Err(error) = lock_file.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Ok(false);
+        }
+        return Err(anyhow::Error::new(error).context(format!("locking {}", lock_path.display())));
+    }
+    let _lock = UpdateLock(lock_file);
+
+    let path = check_attempt_path();
+    let now = now_unix();
+    let last_attempt = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    if let Some(last) = last_attempt
+        && last <= now
+        && now - last < MIN_CHECK_INTERVAL.as_secs()
+    {
+        return Ok(false);
+    }
+    write_state_bytes_atomic(&path, format!("{now}\n").as_bytes())?;
+    Ok(true)
 }
 
 #[cfg(test)]
