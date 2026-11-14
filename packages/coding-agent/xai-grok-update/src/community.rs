@@ -24,12 +24,17 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::auto_update::{
-    BackgroundUpdateCheck, EnsureLatestOutcome, UpdateAvailable, UpdateRunMode, UpdateStatus,
+    BackgroundUpdateCheck, CliUpdateTrigger, EnsureLatestOutcome, UpdateAvailable,
+    UpdateRunMode, UpdateStatus,
 };
 
 const RELEASE_REPO: &str = "tginart/bladerunner";
 const RELEASE_API_BASE: &str = "https://api.github.com/repos/tginart/bladerunner/releases";
 const CHECK_TTL: Duration = Duration::from_secs(30 * 60);
+/// Automatic checks make at most one network attempt per interval, whether the
+/// attempt succeeds or fails. Unauthenticated GitHub API calls are capped at 60
+/// per hour per IP, and a failed check is not cached by `CHECK_TTL`.
+const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -265,6 +270,10 @@ fn state_path() -> PathBuf {
     bladerunner_home().join("update-state.json")
 }
 
+fn check_attempt_path() -> PathBuf {
+    bladerunner_home().join("update-check-attempt")
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -289,6 +298,32 @@ fn state_is_fresh(state: &UpdateState) -> bool {
     };
     let now = now_unix();
     checked <= now && now - checked < CHECK_TTL.as_secs()
+}
+
+/*
+Purpose: This function limits automatic update checks to one network attempt per
+MIN_CHECK_INTERVAL across all Bladerunner processes.
+Input: None.
+Output: true if the caller can make a network check now. false if a recent attempt
+exists or another process is making its claim at the same time.
+Method:
+    1. Try to get an exclusive lock on the attempt lock file. Do not wait.
+    2. If another process holds the lock, return false.
+    3. Read the last attempt time. If the attempt is recent, return false.
+    4. If not, write the current time to the attempt file and return true.
+Note: The lock makes the read, check and write one operation, so concurrent
+launches cannot all claim the same interval. The lock is separate from
+update.lock, so a long install does not block a check. An I/O failure returns
+true, which is the behavior before this throttle existed.
+*/
+fn claim_automatic_check() -> bool {
+    match _try_claim_automatic_check() {
+        Ok(is_claimed) => is_claimed,
+        Err(error) => {
+            tracing::debug!("failed to claim Bladerunner update check slot: {error:#}");
+            true
+        }
+    }
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<()> {
@@ -618,7 +653,15 @@ async fn checked_response(response: reqwest::Response, what: &str) -> Result<req
         .await
         .unwrap_or_default();
     let detail = String::from_utf8_lossy(&body);
-    bail!("{what} failed with HTTP {status}: {}", detail.trim());
+    let is_rate_limited = matches!(status.as_u16(), 403 | 429)
+        && detail.to_ascii_lowercase().contains("rate limit");
+    let hint = if is_rate_limited {
+        " (set GITHUB_TOKEN, for example `export GITHUB_TOKEN=$(gh auth token)`, \
+         to raise the GitHub API limit)"
+    } else {
+        ""
+    };
+    bail!("{what} failed with HTTP {status}: {}{hint}", detail.trim());
 }
 
 fn validate_release_asset_url(source: &UpdateSource, url: &str) -> Result<()> {
@@ -2506,7 +2549,7 @@ pub(crate) async fn ensure_latest_on_disk() -> Result<EnsureLatestOutcome> {
             relaunch_needed: relaunch_before,
         });
     }
-    if is_version_cache_fresh() {
+    if is_version_cache_fresh() || !claim_automatic_check() {
         return Ok(EnsureLatestOutcome {
             installed: None,
             relaunch_needed: relaunch_before,
@@ -2572,7 +2615,7 @@ pub(crate) async fn check_update_background() -> BackgroundUpdateCheck {
             download: None,
         };
     }
-    if is_version_cache_fresh() {
+    if is_version_cache_fresh() || !claim_automatic_check() {
         return BackgroundUpdateCheck {
             update: None,
             download: None,
@@ -2621,6 +2664,7 @@ pub(crate) async fn check_update_background() -> BackgroundUpdateCheck {
 pub(crate) async fn run_update_if_available(
     run_mode: UpdateRunMode,
     _interactive: bool,
+    trigger: CliUpdateTrigger,
 ) -> Result<bool> {
     if !automatic_entry_allowed() || is_version_cache_fresh() {
         return Ok(false);
@@ -2638,6 +2682,12 @@ pub(crate) async fn run_update_if_available(
         .await
     {
         tracing::warn!("failed to save Bladerunner auto-update setting: {error}");
+    }
+    // A user retry (Ctrl+U after a failed background update) must not be
+    // throttled by the automatic attempt that just failed.
+    let is_user_request = matches!(trigger, CliUpdateTrigger::UserCommand);
+    if !is_user_request && !claim_automatic_check() {
+        return Ok(false);
     }
 
     let candidate = match resolve_candidate(None).await {
@@ -3217,6 +3267,40 @@ pub(crate) async fn run_update(
 
 pub(crate) async fn run_install_target(target: Option<&str>) -> Result<()> {
     converge(true, target).await.map(|_| ())
+}
+
+fn _try_claim_automatic_check() -> Result<bool> {
+    ensure_safe_layout()?;
+    let lock_path = bladerunner_home().join("update-check-attempt.lock");
+    reject_symlink(&lock_path, "update check lock")?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    if let Err(error) = lock_file.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Ok(false);
+        }
+        return Err(anyhow::Error::new(error).context(format!("locking {}", lock_path.display())));
+    }
+    let _lock = UpdateLock(lock_file);
+
+    let path = check_attempt_path();
+    let now = now_unix();
+    let last_attempt = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    if let Some(last) = last_attempt
+        && last <= now
+        && now - last < MIN_CHECK_INTERVAL.as_secs()
+    {
+        return Ok(false);
+    }
+    write_state_bytes_atomic(&path, format!("{now}\n").as_bytes())?;
+    Ok(true)
 }
 
 #[cfg(test)]
