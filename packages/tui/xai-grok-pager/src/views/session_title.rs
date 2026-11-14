@@ -15,6 +15,8 @@ use crate::scrollback::block::RenderBlock;
 
 /// Maximum characters of a derived first-prompt title.
 const MAX_TITLE_CHARS: usize = 60;
+/// Maximum characters of the title chip in the agent-view status line.
+const MAX_CHIP_TITLE_CHARS: usize = 40;
 
 /// Derive the display title for an agent (rename > generated title > first-prompt > id).
 ///
@@ -78,6 +80,22 @@ pub(crate) fn rename_source_title_raw(agent: &AgentView) -> Option<&str> {
         }
     }
     None
+}
+
+/// Purpose: Give the title text for the status-line chip of an agent view.
+/// Input: The agent view.
+/// Output: The clean title, or `None` when the session has no real title yet.
+/// Note: The chip uses the same source as [`rename_source_title`]. It does not
+/// use the first-prompt or session-id fallbacks of [`entry_title`].
+pub(crate) fn status_chip_title(agent: &AgentView) -> Option<String> {
+    let raw = rename_source_title_raw(agent)?;
+    let clean = xai_grok_tools::implementations::skills::skill::extract_skill_display_text(raw);
+    let text = sanitize_display_text(clean.as_deref().unwrap_or(raw)).into_owned();
+    if text.chars().count() <= MAX_CHIP_TITLE_CHARS {
+        return Some(text);
+    }
+    let head: String = text.chars().take(MAX_CHIP_TITLE_CHARS - 1).collect();
+    Some(format!("{}\u{2026}", head.trim_end()))
 }
 
 /// Take the first scrollback `UserPrompt` block's text, if any.
@@ -334,6 +352,38 @@ mod tests {
             shown.starts_with("first prompt") || shown.starts_with("session "),
             "entry_title still has synthetic fallbacks: {shown}"
         );
+    }
+
+    // ── status_chip_title ───────────────────────────────────────────
+
+    #[test]
+    fn status_chip_title_none_before_title_arrives() {
+        let mut agent =
+            crate::app::agent_view::test_agent_view(Some("test-session"), "/tmp".into());
+        agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("first prompt text"));
+        assert!(status_chip_title(&agent).is_none());
+    }
+
+    #[test]
+    fn status_chip_title_shows_generated_then_manual_title() {
+        let mut agent =
+            crate::app::agent_view::test_agent_view(Some("test-session"), "/tmp".into());
+        agent.generated_session_title = Some("Generated".into());
+        assert_eq!(status_chip_title(&agent).as_deref(), Some("Generated"));
+        agent.display_name = Some("Manual".into());
+        assert_eq!(status_chip_title(&agent).as_deref(), Some("Manual"));
+    }
+
+    #[test]
+    fn status_chip_title_truncates_long_titles() {
+        let mut agent =
+            crate::app::agent_view::test_agent_view(Some("test-session"), "/tmp".into());
+        agent.generated_session_title = Some("x".repeat(100));
+        let chip = status_chip_title(&agent).unwrap();
+        assert_eq!(chip.chars().count(), MAX_CHIP_TITLE_CHARS);
+        assert!(chip.ends_with('\u{2026}'));
     }
 
     // ── truncate_title ──────────────────────────────────────────────
