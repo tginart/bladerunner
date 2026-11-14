@@ -1676,6 +1676,15 @@ impl AgentView {
             path_offset += shot_width;
             parts.push(Span::styled(shot_text, shot_style));
         }
+        if let Some(title) = crate::views::session_title::status_chip_title(self) {
+            let title_style = Style::default()
+                .fg(theme.text_primary)
+                .bg(theme.bg_base)
+                .add_modifier(ratatui::style::Modifier::BOLD);
+            path_offset += title.width() as u16 + 1;
+            parts.push(Span::styled(title, title_style));
+            parts.push(Span::styled(" ", Style::default().bg(theme.bg_base)));
+        }
         let hub_label = self
             .session
             .session_id
@@ -5223,5 +5232,63 @@ mod feedback_input_tests {
                 "box must leave room below the panel (height {height})\n{screen}"
             );
         }
+    }
+}
+#[cfg(test)]
+mod status_title_chip_tests {
+    use super::super::test_fixtures::make_agent;
+    use super::AgentView;
+    use crate::actions::ActionRegistry;
+    use crate::app::bundle::BundleState;
+    use crate::scrollback::render::ScratchBuffer;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn render_text(agent: &mut AgentView) -> String {
+        let reg = ActionRegistry::defaults();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        let mut scratch = ScratchBuffer::new();
+        agent.draw(
+            area,
+            &mut buf,
+            &reg,
+            &mut scratch,
+            None,
+            false,
+            crate::app::agent_view::BannerSlotParams::none(),
+            &BundleState::default(),
+            false,
+            false,
+            &mut Vec::new(),
+            super::AppRenderParams::default(),
+        );
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    /// The status line shows the generated title once the session has one.
+    #[test]
+    fn status_line_shows_generated_title_chip() {
+        let mut agent = make_agent();
+        assert!(!render_text(&mut agent).contains("Fix flaky login test"));
+        agent.generated_session_title = Some("Fix flaky login test".into());
+        let text = render_text(&mut agent);
+        let cwd = agent.session.cwd.display().to_string();
+        let title_line = text
+            .lines()
+            .find(|l| l.contains("Fix flaky login test"))
+            .unwrap_or_else(|| panic!("title chip missing:\n{text}"));
+        let last_dir = cwd.rsplit('/').next().unwrap_or_default();
+        assert!(
+            title_line.contains(last_dir),
+            "title chip must sit on the cwd status line:\n{text}"
+        );
     }
 }
