@@ -52,6 +52,7 @@ impl AgentView {
             || self.gboom.is_some()
             || self.show_goal_detail
             || self.hub_browser.is_some()
+            || self.file_browser_is_open()
             || self.btw_focused
             || !self.permission_queue.is_empty()
             || self.question_view.is_some()
@@ -80,6 +81,7 @@ impl AgentView {
     /// mirrored checks drift apart.
     pub(crate) fn is_bare_scrollback(&self) -> bool {
         self.active_pane == AgentPane::Scrollback
+            && !self.file_browser_is_open()
             && self.block_viewer.is_none()
             && self.line_viewer.is_none()
             && self.active_modal.is_none()
@@ -104,6 +106,7 @@ impl AgentView {
     #[cfg(feature = "codex-live")]
     pub(crate) fn live_key_intercept_blocked(&self) -> bool {
         !self.no_input_overlay_pending()
+            || self.file_browser_is_open()
             || self.active_modal.is_some()
             || self.extensions_modal.is_some()
             || self.persona_detail.is_some()
@@ -147,6 +150,7 @@ impl AgentView {
     /// (turn/close), video (seek/close), or image (close).
     pub(super) fn modal_owns_input(&self) -> bool {
         self.extensions_modal.is_some()
+            || self.file_browser_is_open()
             || self.active_modal.is_some()
             || self.gboom.is_some()
             || self.video_viewer.is_some()
@@ -190,6 +194,7 @@ impl AgentView {
             && !self.show_goal_detail
             && !self.show_workflows
             && self.hub_browser.is_none()
+            && !self.file_browser_is_open()
             && self.rewind_state.is_none()
             && self.btw_state.is_none()
             && self.jump_state.is_none()
@@ -614,6 +619,9 @@ impl AgentView {
             };
         }
         if let Some(outcome) = self.handle_hub_browser_input(ev) {
+            return outcome;
+        }
+        if let Some(outcome) = self.handle_file_browser_input(ev) {
             return outcome;
         }
         if let Some(outcome) = self.handle_workflows_overlay_input(ev) {

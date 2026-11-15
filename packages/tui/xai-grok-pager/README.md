@@ -56,6 +56,26 @@ src/
 | `Ctrl+G` | Agent screen (full TUI) | Toggle the tasks pane |
 | `Ctrl+G` | Ordinary composer (minimal mode) | Edit the draft externally; use the command-palette entry if the chord is reserved |
 
+## File browser
+
+In the fullscreen TUI, `/files` opens a file tree and read-only preview in the
+conversation area. Click a directory or press Enter to expand it, and click a file
+or press Enter to preview it. Arrow keys navigate; Left/Right collapse and expand.
+Tab cycles from the tree to the preview to the prompt. Narrow terminals show one
+browser pane at a time. The browser starts in the session's working directory.
+
+Use `o` or **Open in Default App** to open the selected file through its OS
+association, `r` to refresh, and `.` to include hidden and ignored files. Text
+previews have syntax colors, line numbers, search (`/`), selection (`v`), and copy
+(`y`). Large previews are truncated; binary and non-UTF-8 files show a notice.
+
+Press `e` or **Edit** to choose Neovim, Vim, or nano from the programs installed
+on your PATH. The editor runs in a child PTY inside the preview pane. Its normal
+keys, including Esc and Ctrl+X, go to the editor. `Ctrl+]` returns focus to the
+tree. Exit the editor normally to reload the read-only preview. Closing Files
+keeps an active editor available when you reopen `/files`; ending the session
+stops its editor process. No editor is required to browse or preview files.
+
 ## Docs
 
 - [Terminal Support & Troubleshooting](docs/user-guide/21-terminal-support.md) — tmux/SSH truecolor, clipboard, mouse, diagnostics, `/doctor`
