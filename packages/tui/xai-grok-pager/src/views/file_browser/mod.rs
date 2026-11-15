@@ -19,6 +19,7 @@ use ratatui::layout::Rect;
 
 use super::file_search::line_viewer::LineViewerState;
 use super::terminal_pane::TerminalPane;
+use crate::clipboard::SystemClipboard;
 use fs::{Entry, Request, Response};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,8 +223,12 @@ impl FileBrowserState {
                     self.preview_pending = false;
                     match result {
                         Ok(data) => {
-                            self.preview =
-                                Some(LineViewerState::from_source_lines(&path, data.lines, None));
+                            let mut preview =
+                                LineViewerState::from_source_lines(&path, data.lines, None);
+                            preview
+                                .list_state
+                                .set_clipboard_provider(Box::new(SystemClipboard));
+                            self.preview = Some(preview);
                             self.preview_notice = data.is_truncated.then(|| {
                                 "Preview truncated; open the file for its full content".into()
                             });

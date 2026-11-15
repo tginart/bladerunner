@@ -5768,8 +5768,10 @@ impl AppView {
             None;
         for agent in self.agents.values_mut() {
             needs_redraw |= agent.edit_hl_tick();
+            needs_redraw |= agent.poll_file_browser();
             for child in agent.subagent_views.values_mut() {
                 needs_redraw |= child.edit_hl_tick();
+                needs_redraw |= child.poll_file_browser();
             }
         }
         if let ActiveView::Agent(id) = self.active_view
@@ -5790,7 +5792,6 @@ impl AppView {
                 needs_redraw |= child_view.poll_scrollback_search();
                 needs_redraw |= child_view.mermaid_tick();
                 needs_redraw |= Self::tick_agent_image_load(child_view);
-                needs_redraw |= child_view.poll_file_browser();
                 needs_redraw |= Self::tick_agent_block_viewer(child_view);
             }
             let spinner_frame_tick =
@@ -5850,7 +5851,6 @@ impl AppView {
             needs_redraw |= agent.tick_drag_autoscroll();
             needs_redraw |= agent.poll_link_modifier();
             needs_redraw |= Self::tick_agent_image_load(agent);
-            needs_redraw |= agent.poll_file_browser();
             needs_redraw |= Self::tick_agent_block_viewer(agent);
             if let Some(ref mut viewer) = agent.video_viewer {
                 needs_redraw |= viewer.tick();
@@ -6091,10 +6091,11 @@ impl AppView {
         }
         if self.agents.values().any(|agent| {
             agent.edit_hl_needs_tick()
+                || agent.file_browser_needs_tick()
                 || agent
                     .subagent_views
                     .values()
-                    .any(|c| c.edit_hl_needs_tick())
+                    .any(|c| c.edit_hl_needs_tick() || c.file_browser_needs_tick())
         }) {
             return TickDemand::Fast;
         }
@@ -6104,7 +6105,6 @@ impl AppView {
                     return TickDemand::None;
                 };
                 let fast = agent.scrollback.needs_animation()
-                    || agent.file_browser_needs_tick()
                     || agent.todo.list_state.needs_tick()
                     || agent.todo.badge_needs_tick()
                     || agent.tasks.needs_tick()
@@ -6169,7 +6169,6 @@ impl AppView {
                                 && child.scrollback.needs_animation())
                             || child.scrollback_search.is_some()
                             || child.block_viewer.is_some()
-                            || child.file_browser_needs_tick()
                             || child.image_viewer.as_ref().is_some_and(|v| v.loading)
                             || child.image_load_rx.is_some()
                             || child.mermaid_needs_tick()

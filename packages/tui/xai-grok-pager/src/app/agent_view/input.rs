@@ -534,6 +534,17 @@ impl AgentView {
             }
             return InputOutcome::Unchanged;
         }
+        if self.file_browser_can_draw()
+            && self
+                .file_browser
+                .as_ref()
+                .is_some_and(|browser| browser.terminal_has_focus())
+        {
+            self.esc_pressed_at = None;
+            if let Some(outcome) = self.handle_file_browser_input(ev) {
+                return outcome;
+            }
+        }
         if self.dismiss_jump_picker_if_suppressed()
             && let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
