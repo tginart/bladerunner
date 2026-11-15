@@ -500,6 +500,13 @@ impl AgentView {
     ///
     /// Positive `lines` = scroll down, negative = scroll up.
     pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
+        if self.file_browser_can_draw()
+            && let Some(browser) = self.file_browser.as_mut()
+            && browser.contains(col, row)
+        {
+            browser.handle_scroll(lines, col, row);
+            return;
+        }
         // The hub browser covers the whole view, like in `handle_input`.
         if let Some(browser) = self.hub_browser.as_mut() {
             browser.handle_scroll(lines, col, row);

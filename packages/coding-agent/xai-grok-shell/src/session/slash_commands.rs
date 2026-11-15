@@ -508,6 +508,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "expand",
     "export",
     "feedback",
+    "files",
     "find",
     "fork",
     "full",
