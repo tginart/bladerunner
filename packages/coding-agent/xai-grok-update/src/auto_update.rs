@@ -743,7 +743,8 @@ pub async fn run_update_if_available(
     #[cfg(feature = "community-build")]
     {
         let _ = update_config;
-        return crate::community::run_update_if_available(run_mode, interactive).await;
+        return crate::community::run_update_if_available(run_mode, interactive, trigger)
+            .await;
     }
 
     let Some(inst) = get_installer().await else {
