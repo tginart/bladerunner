@@ -743,6 +743,19 @@ impl LineViewerState {
     pub fn open(path: &Path, element_id: Option<ElementId>) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let source_lines = build_source_lines(path, &content);
+        Some(Self::from_source_lines(path, source_lines, element_id))
+    }
+
+    /*
+    Purpose: Create a source viewer after a worker applies the syntax colors.
+    Input: A file path, source lines, and an optional prompt element ID.
+    Output: A read-only viewer with its own search and selection state.
+    */
+    pub(crate) fn from_source_lines(
+        path: &Path,
+        source_lines: Vec<SourceLine>,
+        element_id: Option<ElementId>,
+    ) -> Self {
         let lines = source_lines
             .iter()
             .cloned()
@@ -761,7 +774,7 @@ impl LineViewerState {
         };
         let list_state = ListPaneState::new_with_config(WrapMode::Wrap, false, config);
 
-        Some(Self {
+        Self {
             kind: LineViewerKind::FilePreview,
             path: path.to_path_buf(),
             lines,
@@ -783,7 +796,7 @@ impl LineViewerState {
             last_comments: Vec::new(),
             mermaid_after: Vec::new(),
             fullscreen: false,
-        })
+        }
     }
 
     /// Open a file and create the viewer with markdown rendering.
@@ -1184,7 +1197,7 @@ impl LineViewerState {
 // ── Syntax highlighting ─────────────────────────────────────────────────
 
 /// Build syntax-highlighted source lines from file content.
-fn build_source_lines(path: &Path, content: &str) -> Vec<SourceLine> {
+pub(crate) fn build_source_lines(path: &Path, content: &str) -> Vec<SourceLine> {
     let syntect = get_syntect();
     let mut highlighter = syntect.highlight_lines_by_file_path(path);
 

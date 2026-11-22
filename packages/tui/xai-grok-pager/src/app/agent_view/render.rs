@@ -317,6 +317,12 @@ impl AgentView {
         esc_owned_before_agent: bool,
     ) -> ShortcutsBarContent {
         use crate::views::shortcuts_bar::HintItem;
+        if self.file_browser_can_draw()
+            && let Some(browser) = &self.file_browser
+            && browser.focused
+        {
+            return ShortcutsBarContent::Surface(browser.shortcut_hints());
+        }
         match self.key_owner() {
             KeyOwner::LineViewer => self.line_viewer_bar(),
             KeyOwner::BlockViewer => ShortcutsBarContent::Surface(
@@ -2044,9 +2050,18 @@ impl AgentView {
                 }
             }
         }
+        if self.file_browser_can_draw()
+            && let Some(browser) = &mut self.file_browser
+        {
+            browser.render(buf, layout.scrollback);
+            self.frame_occluder_rects.push(layout.scrollback);
+            self.hit_scrollbar.clear();
+            self.hit_sb_copy.clear();
+            self.hit_sb_view.clear();
+        }
         let mut follow_indicator_y: Option<u16> = None;
         let mut response_top_indicator_y: Option<u16> = None;
-        if self.block_viewer.is_none() && !search_active {
+        if self.block_viewer.is_none() && !search_active && !self.file_browser_can_draw() {
             use crate::appearance::FollowIndicator;
             let gap_y = layout.scrollback.y + layout.scrollback.height;
             let gap_x = layout.scrollback.x;
@@ -4683,7 +4698,14 @@ impl AgentView {
                 }
             }
         }
-        let cursor = if self.hub_browser.is_some() {
+        let cursor = if self.file_browser_can_draw()
+            && self
+                .file_browser
+                .as_ref()
+                .is_some_and(|browser| browser.focused)
+        {
+            None
+        } else if self.hub_browser.is_some() {
             // The hub browser covers the prompt and draws its own cursor.
             None
         } else if self.inline_edit.is_some() {

@@ -237,6 +237,38 @@ pub fn open_path(path: &std::path::Path) -> bool {
     }
 }
 
+/// Open a file through its OS association. On Windows this opens the file itself.
+pub fn open_file_in_default_app(path: &std::path::Path) -> bool {
+    #[cfg(any(not(target_os = "windows"), test))]
+    {
+        open_path(path)
+    }
+    #[cfg(all(target_os = "windows", not(test)))]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let verb = to_wide_nul("open");
+        let target: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: Both strings are NUL-terminated and outlive the Win32 call.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        result as usize > 32
+    }
+}
+
 /// Reveal `path` in a new Explorer window with the file selected.
 ///
 /// Uses `raw_arg` so Explorer's required `/select,"<path>"` quoting is passed

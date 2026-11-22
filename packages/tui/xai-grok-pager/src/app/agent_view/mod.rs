@@ -156,6 +156,7 @@ use ratatui::widgets::Widget;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 mod cta;
+mod files;
 mod input;
 pub(crate) use input::ExternalPromptEditorAccess;
 mod hub_overlay;
@@ -974,6 +975,8 @@ pub struct AgentView {
     pub show_goal_detail: bool,
     /// The open hub browser (`/hub open`), if any.
     pub hub_browser: Option<crate::views::hub_browser::HubBrowserState>,
+    /// Local file tree and preview, retained while this session is open.
+    pub(crate) file_browser: Option<crate::views::file_browser::FileBrowserState>,
     /// UTC ms when the current turn started (`turnStartMs` from notification meta).
     /// Used for turn elapsed display.
     pub turn_start_ms: Option<i64>,

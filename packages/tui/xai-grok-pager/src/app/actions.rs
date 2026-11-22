@@ -1102,6 +1102,8 @@ pub enum Action {
     ToggleWorkflows,
     /// Open the side-by-side columns of the latest n-shot run.
     OpenShots,
+    /// Open the local file tree and read-only preview for the active session.
+    OpenFileBrowser,
     /// Open the hub browser on a named hub (or this session's hub), optionally
     /// on a `#channel`.
     OpenHubBrowser {

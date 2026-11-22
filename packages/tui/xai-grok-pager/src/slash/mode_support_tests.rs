@@ -126,6 +126,12 @@ fn mode_specific_builtin_refusals_are_pinned() {
                     .to_string()
             ),
             (
+                "files",
+                "/files isn't available in minimal mode (the file browser needs the fullscreen TUI). \
+                 Run /fullscreen to switch this session."
+                    .to_string()
+            ),
+            (
                 "find",
                 "/find isn't available in minimal mode (minimal has no scrollback pane — \
                  use your terminal's own search). Run /fullscreen to switch this session."
@@ -143,6 +149,12 @@ fn mode_specific_builtin_refusals_are_pinned() {
                     .to_string()
             ),
             ("minimal", "You're already in minimal mode.".to_string()),
+            (
+                "shots",
+                "/shots isn't available in minimal mode (the n-shot columns need fullscreen). \
+                 Run /fullscreen to switch this session."
+                    .to_string()
+            ),
             (
                 "theme",
                 "/theme isn't available in minimal mode \
