@@ -35,7 +35,7 @@
     {
       "path": "Cargo.lock",
       "bytes": 412896,
-      "sha256": "0db889dd2acdfb5527542b65b7aab328dfa1b5335bb98b38ec34c05af785f90c",
+      "sha256": "6a4bbe740c3ce9010bd21bed843ce98b4b10a80feb64693d615482e543860ac6",
       "mode": "0644"
     },
     {
@@ -83,7 +83,7 @@
     {
       "path": "VERSION",
       "bytes": 7,
-      "sha256": "b45949f45253000082f2e3b97248d8bf71be86d593b35db6033a809d759ef48b",
+      "sha256": "d0e515322be087ad49e9f33e6a513ab5607cd94d35ebd3db6deaf98694ac4fa7",
       "mode": "0644"
     },
     {
@@ -3431,7 +3431,7 @@
     {
       "path": "packages/coding-agent/xai-grok-pager-bin/Cargo.toml",
       "bytes": 4451,
-      "sha256": "c222d45284fa1da4d988494fca4e7ddde339738ccbc797f86cd528d0cb589e12",
+      "sha256": "6f657c0d713a1ea62f792bef70164d0c716b048ad9302fe469a0815b298f8290",
       "mode": "0644"
     },
     {
@@ -3599,7 +3599,7 @@
     {
       "path": "packages/coding-agent/xai-grok-shell/Cargo.toml",
       "bytes": 10709,
-      "sha256": "5e76376704fb4cbf89f5ccbd6ccc97d3c23006ab14f51117d47aba84e0ec1f9f",
+      "sha256": "cfbc67d08613607d2e84c84e2d84a3b272e16fcefea00447309487b8c7754055",
       "mode": "0644"
     },
     {
@@ -8825,7 +8825,7 @@
     {
       "path": "packages/platform/xai-grok-version/Cargo.toml",
       "bytes": 221,
-      "sha256": "a5cbdebc7708cf6f5338eb2f7198789315d9cb0a404e6ea4606160bdecde39a7",
+      "sha256": "7cd3e0d100080c007238eb17e3ed3b0f9dea9d4e13a5a03a18e1b1174505ea93",
       "mode": "0644"
     },
     {
@@ -9766,8 +9766,8 @@
     },
     {
       "path": "packages/tools/xai-grok-tools/src/implementations/grok_build/agent_hub/bus.rs",
-      "bytes": 74638,
-      "sha256": "7a872c342aa7fa00c7983bed897ed5f36c937b5074efe90e7d1b65d3d32a26ec",
+      "bytes": 77404,
+      "sha256": "e0a76073eb158440c322d2c5a0c40869dd7ef76f90f60005b00ecfb0a1944bf0",
       "mode": "0644"
     },
     {
@@ -13607,7 +13607,7 @@
     {
       "path": "packages/tui/xai-grok-pager/Cargo.toml",
       "bytes": 11640,
-      "sha256": "b62d53af1a5157485b2ecc0683c3e799fbb850a7d5cfc6724e61529372a4383f",
+      "sha256": "c859bda3230458cfd726c3a3a4688005a7d6d2e773c9acaf115ce3cdd5549b2d",
       "mode": "0644"
     },
     {
