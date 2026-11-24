@@ -56,7 +56,11 @@ fn format_report(status: &Value) -> Result<String> {
 fn describe_machine(machine: &Value) -> String {
     let name = machine["HostName"].as_str().unwrap_or("?");
     let os = machine["OS"].as_str().unwrap_or("?");
-    let state = if machine["Online"] == true { "online " } else { "offline" };
+    let state = if machine["Online"] == true {
+        "online "
+    } else {
+        "offline"
+    };
     let ip = machine["TailscaleIPs"][0].as_str().unwrap_or("");
     format!("  {name:<24} {os:<8} {state}  {ip}")
 }

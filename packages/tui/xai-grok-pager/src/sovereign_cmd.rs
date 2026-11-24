@@ -233,7 +233,9 @@ enum Output {
 async fn list(home: &Path) -> Result<String> {
     let registry = load_registry(home)?;
     if registry.sovereign.is_empty() {
-        return Ok("No sovereigns. Add one with `sovereign add <name> --ssh <host> --dir <path>`.".into());
+        return Ok(
+            "No sovereigns. Add one with `sovereign add <name> --ssh <host> --dir <path>`.".into(),
+        );
     }
     let mut lines = Vec::new();
     for (name, sovereign) in &registry.sovereign {
@@ -258,7 +260,9 @@ fn add(home: &Path, new: NewSovereign, allowed_models: Option<Vec<String>>) -> R
     let preset = find_preset(new.preset)?;
     let sovereign = sovereign_from_preset(preset, &new);
     let mut registry = load_registry(home)?;
-    registry.sovereign.insert(name.to_string(), sovereign.clone());
+    registry
+        .sovereign
+        .insert(name.to_string(), sovereign.clone());
     save_registry(home, &registry)?;
     upsert_model_entry(home, name, preset, &sovereign)?;
     // An empty allowlist already permits every model.
@@ -278,7 +282,11 @@ async fn status(home: &Path, name: Option<&str>) -> Result<String> {
     let mut report = describe(&name, &sovereign, &health);
     if health == Health::Down {
         let reachable = is_ssh_reachable(&sovereign.ssh).await;
-        let host = if reachable { "reachable by ssh" } else { "NOT reachable by ssh" };
+        let host = if reachable {
+            "reachable by ssh"
+        } else {
+            "NOT reachable by ssh"
+        };
         report.push_str(&format!("\n  host {host}"));
     }
     Ok(report)
@@ -317,7 +325,9 @@ fn remove(home: &Path, name: &str) -> Result<String> {
     save_registry(home, &registry)?;
     remove_model_entry(home, &model_key(name, &sovereign.slug))?;
     remove_allowed_pattern(home, &allow_pattern(name))?;
-    Ok(format!("Removed {name}. The server and its files were not touched."))
+    Ok(format!(
+        "Removed {name}. The server and its files were not touched."
+    ))
 }
 
 // ---- pure helpers ----
@@ -444,7 +454,10 @@ fn pick(home: &Path, name: Option<&str>) -> Result<(String, Sovereign)> {
         None if registry.sovereign.len() == 1 => {
             Ok(registry.sovereign.into_iter().next().expect("one entry"))
         }
-        None => bail!("name a sovereign: {:?}", registry.sovereign.keys().collect::<Vec<_>>()),
+        None => bail!(
+            "name a sovereign: {:?}",
+            registry.sovereign.keys().collect::<Vec<_>>()
+        ),
     }
 }
 
@@ -493,7 +506,12 @@ async fn run_remote(sovereign: &Sovereign, remote_command: &str, output: Output)
     }
     let result = command.output().await.context("could not run ssh")?;
     let tail = last_line(&result.stderr).or_else(|| last_line(&result.stdout));
-    check_exit(result.status, remote_command, &sovereign.ssh, tail.as_deref().unwrap_or(""))
+    check_exit(
+        result.status,
+        remote_command,
+        &sovereign.ssh,
+        tail.as_deref().unwrap_or(""),
+    )
 }
 
 /// Copies the recipe's API key into the model entry and the registry.
@@ -516,11 +534,17 @@ async fn read_remote_key(sovereign: &Sovereign) -> Result<Option<String>> {
         .await
         .context("could not run ssh")?;
     if !output.status.success() {
-        bail!("{API_KEY_SCRIPT} failed on {}. Is the server set up?", sovereign.ssh);
+        bail!(
+            "{API_KEY_SCRIPT} failed on {}. Is the server set up?",
+            sovereign.ssh
+        );
     }
     let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if key.chars().any(char::is_whitespace) {
-        bail!("{API_KEY_SCRIPT} on {} did not print a usable API key", sovereign.ssh);
+        bail!(
+            "{API_KEY_SCRIPT} on {} did not print a usable API key",
+            sovereign.ssh
+        );
     }
     Ok((!key.is_empty()).then_some(key))
 }
@@ -539,7 +563,10 @@ fn check_exit(
 
 fn last_line(bytes: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(bytes);
-    text.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string())
+    text.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
 }
 
 async fn wait_until_serving(name: &str, sovereign: &Sovereign) -> Result<String> {
@@ -596,7 +623,10 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 ///
 /// If the config write fails, the registry still lacks the key, so the next `up` fetches it again.
 fn store_api_key(home: &Path, name: &str, sovereign: &Sovereign) -> Result<()> {
-    let key = sovereign.api_key.as_deref().context("no API key to store")?;
+    let key = sovereign
+        .api_key
+        .as_deref()
+        .context("no API key to store")?;
     let mut doc = load_config_doc(home)?;
     let entry = doc
         .get_mut("model")
@@ -606,17 +636,25 @@ fn store_api_key(home: &Path, name: &str, sovereign: &Sovereign) -> Result<()> {
     entry["api_key"] = toml_edit::value(key);
     write_private(&home.join(CONFIG_FILE), &doc.to_string())?;
     let mut registry = load_registry(home)?;
-    registry.sovereign.insert(name.to_string(), sovereign.clone());
+    registry
+        .sovereign
+        .insert(name.to_string(), sovereign.clone());
     save_registry(home, &registry)
 }
 
 fn load_config_doc(home: &Path) -> Result<toml_edit::DocumentMut> {
     let path = home.join(CONFIG_FILE);
     let text = std::fs::read_to_string(&path).unwrap_or_default();
-    text.parse().with_context(|| format!("invalid {}", path.display()))
+    text.parse()
+        .with_context(|| format!("invalid {}", path.display()))
 }
 
-fn upsert_model_entry(home: &Path, name: &str, preset: &Preset, sovereign: &Sovereign) -> Result<()> {
+fn upsert_model_entry(
+    home: &Path,
+    name: &str,
+    preset: &Preset,
+    sovereign: &Sovereign,
+) -> Result<()> {
     let mut doc = load_config_doc(home)?;
     let mut entry = toml_edit::Table::new();
     entry["model"] = toml_edit::value(sovereign.model.as_str());
@@ -634,7 +672,10 @@ fn upsert_model_entry(home: &Path, name: &str, preset: &Preset, sovereign: &Sove
         })
         .as_table_mut()
         .context("`model` in config.toml is not a table")?;
-    models.insert(&model_key(name, &sovereign.slug), toml_edit::Item::Table(entry));
+    models.insert(
+        &model_key(name, &sovereign.slug),
+        toml_edit::Item::Table(entry),
+    );
     let path = home.join(CONFIG_FILE);
     if sovereign.api_key.is_some() {
         return write_private(&path, &doc.to_string());
@@ -714,8 +755,12 @@ mod tests {
     fn commands_are_listed_unless_the_config_hides_them() {
         let parse = |text: &str| toml::from_str::<toml::Value>(text).unwrap();
         assert!(listed_in_config(&parse("")));
-        assert!(listed_in_config(&parse("[sovereign]\nshow_commands = true")));
-        assert!(!listed_in_config(&parse("[sovereign]\nshow_commands = false")));
+        assert!(listed_in_config(&parse(
+            "[sovereign]\nshow_commands = true"
+        )));
+        assert!(!listed_in_config(&parse(
+            "[sovereign]\nshow_commands = false"
+        )));
     }
 
     #[test]
@@ -724,7 +769,10 @@ mod tests {
             default_base_url("user@dgx.example.ts.net", 8888),
             "http://dgx.example.ts.net:8888/v1"
         );
-        assert_eq!(default_base_url("10.0.0.5", 8888), "http://10.0.0.5:8888/v1");
+        assert_eq!(
+            default_base_url("10.0.0.5", 8888),
+            "http://10.0.0.5:8888/v1"
+        );
     }
 
     #[test]
@@ -843,7 +891,10 @@ mod tests {
         let mut registry = load_registry(dir.path()).unwrap();
         let mut sovereign = registry.sovereign.remove("studio").unwrap();
         assert_eq!(sovereign.base_url, "http://studio:8888/v1");
-        assert_eq!((sovereign.start.as_str(), sovereign.stop.as_str()), ("./start.sh", "./stop.sh"));
+        assert_eq!(
+            (sovereign.start.as_str(), sovereign.stop.as_str()),
+            ("./start.sh", "./stop.sh")
+        );
         assert_eq!(sovereign.api_key, None);
 
         sovereign.api_key = Some("mac-secret".into());
@@ -854,7 +905,10 @@ mod tests {
             Some("mac-secret")
         );
         let stored = load_registry(dir.path()).unwrap();
-        assert_eq!(stored.sovereign["studio"].api_key.as_deref(), Some("mac-secret"));
+        assert_eq!(
+            stored.sovereign["studio"].api_key.as_deref(),
+            Some("mac-secret")
+        );
     }
 
     #[test]
@@ -874,7 +928,11 @@ mod tests {
         assert_eq!(mode(&registry_path(dir.path())), 0o600);
 
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let mut sovereign = load_registry(dir.path()).unwrap().sovereign.remove("box").unwrap();
+        let mut sovereign = load_registry(dir.path())
+            .unwrap()
+            .sovereign
+            .remove("box")
+            .unwrap();
         sovereign.api_key = Some("k2".into());
         store_api_key(dir.path(), "box", &sovereign).unwrap();
         assert_eq!(mode(&config), 0o600);
@@ -885,12 +943,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let new = new_sovereign("box", "qwen38-flash-mac-studio", "u@box");
         add(dir.path(), new, None).unwrap();
-        let mut sovereign = load_registry(dir.path()).unwrap().sovereign.remove("box").unwrap();
+        let mut sovereign = load_registry(dir.path())
+            .unwrap()
+            .sovereign
+            .remove("box")
+            .unwrap();
         // The model entry is missing, as when config.toml was edited or restored.
         std::fs::write(dir.path().join(CONFIG_FILE), "").unwrap();
         sovereign.api_key = Some("k".into());
         assert!(store_api_key(dir.path(), "box", &sovereign).is_err());
-        assert_eq!(load_registry(dir.path()).unwrap().sovereign["box"].api_key, None);
+        assert_eq!(
+            load_registry(dir.path()).unwrap().sovereign["box"].api_key,
+            None
+        );
     }
 
     #[test]
@@ -902,7 +967,10 @@ mod tests {
         };
         add(dir.path(), new, None).unwrap();
         let config = load_config_doc(dir.path()).unwrap();
-        assert_eq!(config["model"]["box/qwen-3.8-flash"]["api_key"].as_str(), Some("k1"));
+        assert_eq!(
+            config["model"]["box/qwen-3.8-flash"]["api_key"].as_str(),
+            Some("k1")
+        );
     }
 
     #[tokio::test]

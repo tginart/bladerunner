@@ -27,9 +27,10 @@ pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 /// Soft rate limit: max sends per sender per window.
 const RATE_LIMIT_COUNT: u32 = 20;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-/// Agent-to-agent wakes before a person post or private-hub user turn resets the guard.
+/// Agent-to-agent wakes in one hub, summed over all its agents, before a person post
+/// or a private-hub user turn resets the guard.
 /// It is high because the wake system header tells agents that a reply is optional.
-pub const LOOP_GUARD_WAKES: u32 = 100;
+pub const LOOP_GUARD_WAKES: u32 = 10_000;
 /// Delimiters and text of the system header at the top of every wake.
 const WAKE_SYSTEM_HEADER_OPEN: &str = "<system_header>";
 const WAKE_SYSTEM_HEADER_CLOSE: &str = "</system_header>";
@@ -338,7 +339,7 @@ impl AgentBus {
                     reply_to,
                     images,
                 };
-                post(&hub, &handle, MemberKind::Agent, &draft)
+                post(&hub, &handle, &draft)
             }
             Err(e) => Err(e),
         };
@@ -789,7 +790,7 @@ pub fn post_as_person(
         reply_to: None,
         images,
     };
-    let id = post(hub, &person, MemberKind::Person, &draft)?;
+    let id = post(hub, &person, &draft)?;
     hub.update_meta(|meta| meta.agent_wake_streak = 0)?;
     Ok(id)
 }
@@ -803,10 +804,10 @@ struct Draft<'a> {
 }
 
 /// Purpose: Validate and append one message.
-/// Input: The hub, the sender handle and kind, and the draft.
+/// Input: The hub, the sender handle, and the draft.
 /// Output: The new message id.
 /// Note: Attached images are copied into the hub before the message is written.
-fn post(hub: &Hub, from: &str, from_kind: MemberKind, draft: &Draft<'_>) -> Result<String> {
+fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
     let text = draft.text.trim();
     if text.is_empty() {
         bail!("empty message");
@@ -825,10 +826,7 @@ fn post(hub: &Hub, from: &str, from_kind: MemberKind, draft: &Draft<'_>) -> Resu
         bail!("a message can carry at most {} images", store::MAX_IMAGES);
     }
     let conv = resolve_target(&meta, from, draft.to)?;
-    let mut mentions = store::parse_mentions(text, &meta.members);
-    if from_kind == MemberKind::Agent {
-        mentions.retain(|h| h != HERE_MENTION);
-    }
+    let mentions = store::parse_mentions(text, &meta.members);
     let mut images = Vec::new();
     for path in draft.images {
         images.push(hub.store_image(path)?);
@@ -1893,6 +1891,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_here_mention_reaches_the_other_channel_members() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        bus.send("a", "#general", "@here status?", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(texts(&bus.inbox("b").unwrap()), vec!["@here status?"]);
+        assert!(bus.inbox("a").unwrap().is_empty());
+    }
+
+    #[test]
     fn channels_and_person_posts() {
         let root = tempfile::tempdir().unwrap();
         let bus = session_bus(root.path(), "s1");
@@ -1942,12 +1953,15 @@ mod tests {
         bus.register("b", "b", Some(wake.clone()));
         let hub = bus.lock().hub.clone();
         let targets = vec![("b".to_string(), wake)];
-        for i in 0..(LOOP_GUARD_WAKES + 2) {
+        // Start near the limit, so the test does not send thousands of messages.
+        hub.update_meta(|meta| meta.agent_wake_streak = LOOP_GUARD_WAKES - 3)
+            .unwrap();
+        for i in 0..5 {
             bus.lock().rates.clear();
             bus.send("a", "b", &format!("ping {i}"), None, &[]);
             deliver(&hub, &targets).unwrap();
         }
-        assert_eq!(hits.load(Ordering::SeqCst), LOOP_GUARD_WAKES as usize);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
         assert_eq!(bus.inbox("b").unwrap().len(), 2);
         assert!(bus.view("b").unwrap().paused);
     }
@@ -1965,14 +1979,16 @@ mod tests {
         bus.register("b", "b", Some(wake.clone()));
         let hub = bus.hub();
         let targets = vec![("b".to_string(), wake.clone())];
-        for i in 0..=LOOP_GUARD_WAKES {
+        hub.update_meta(|meta| meta.agent_wake_streak = LOOP_GUARD_WAKES - 1)
+            .unwrap();
+        for i in 0..2 {
             bus.lock().rates.clear();
             bus.send("a", "b", &format!("ping {i}"), None, &[])
                 .into_result()
                 .unwrap();
             deliver(&hub, &targets).unwrap();
         }
-        assert_eq!(hits.load(Ordering::SeqCst), LOOP_GUARD_WAKES as usize);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(bus.view("b").unwrap().paused);
         drop(bus);
 
@@ -1982,7 +1998,7 @@ mod tests {
         resumed.reset_session_loop_guard().unwrap();
         assert!(!resumed.view("b").unwrap().paused);
         deliver(&hub, &targets).unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), LOOP_GUARD_WAKES as usize + 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(resumed.inbox("b").unwrap().is_empty());
     }
 

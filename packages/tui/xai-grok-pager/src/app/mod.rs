@@ -1635,7 +1635,11 @@ pub(crate) fn reassert_terminal_input_modes() {
         if is_mouse_capture_on {
             let _ = execute!(stderr, event::EnableMouseCapture);
         }
-        let _ = execute!(stderr, event::EnableFocusChange, event::EnableBracketedPaste);
+        let _ = execute!(
+            stderr,
+            event::EnableFocusChange,
+            event::EnableBracketedPaste
+        );
     });
 }
 

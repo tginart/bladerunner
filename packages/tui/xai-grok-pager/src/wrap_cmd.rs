@@ -64,7 +64,9 @@ pub fn run(args: &WrapArgs) -> Result<()> {
             Err(e) => {
                 // PTY setup failed; keep the chosen route without our PTY so
                 // the command still works (just without clipboard forwarding).
-                eprintln!("bladerunner wrap: wrapped mode failed, running without PTY wrapping: {e}");
+                eprintln!(
+                    "bladerunner wrap: wrapped mode failed, running without PTY wrapping: {e}"
+                );
                 exec_command(&fallback.program, &fallback.args)
             }
         }

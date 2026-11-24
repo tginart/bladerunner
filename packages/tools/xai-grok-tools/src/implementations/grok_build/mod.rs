@@ -59,6 +59,7 @@ pub use kill_task::{KillTaskTool, KillTerminalCommandTool};
 pub use list_dir::ListDirTool;
 pub use lsp::LspTool;
 pub use monitor::tool::MonitorTool;
+pub use n_shot::{N_SHOT_TOOL_NAME, NShotTool};
 pub use read_audio::{READ_AUDIO_TOOL_NAME, ReadAudioTool};
 pub use read_file::ReadFileTool;
 pub use read_video::{READ_VIDEO_TOOL_NAME, ReadVideoTool};
@@ -80,5 +81,4 @@ pub use video_gen::{
 };
 pub use web_fetch::{WebFetchClient, WebFetchConfig, WebFetchParams, WebFetchTool};
 pub use web_search::WebSearchTool;
-pub use n_shot::{N_SHOT_TOOL_NAME, NShotTool};
 pub use workflow::{WORKFLOW_TOOL_NAME, WorkflowTool};

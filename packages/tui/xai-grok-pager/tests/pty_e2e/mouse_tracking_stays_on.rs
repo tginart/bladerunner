@@ -68,15 +68,29 @@ async fn mouse_tracking_restored_after_pager_child() {
     while Instant::now() < deadline && !marker.exists() {
         harness.update(Duration::from_millis(100));
     }
-    assert!(marker.exists(), "precondition: $PAGER ran\nscreen:\n{}", harness.screen_contents());
+    assert!(
+        marker.exists(),
+        "precondition: $PAGER ran\nscreen:\n{}",
+        harness.screen_contents()
+    );
     harness.update(Duration::from_secs(1));
 
     assert!(
         find_last(harness.raw_output(), b"\x1b[?1003l").is_some(),
         "precondition: the child's reset reached the terminal"
     );
-    assert_mode_on(&harness, MOUSE_ON, MOUSE_OFF, "mouse tracking after the child");
-    assert_mode_on(&harness, PASTE_ON, PASTE_OFF, "bracketed paste after the child");
+    assert_mode_on(
+        &harness,
+        MOUSE_ON,
+        MOUSE_OFF,
+        "mouse tracking after the child",
+    );
+    assert_mode_on(
+        &harness,
+        PASTE_ON,
+        PASTE_OFF,
+        "bracketed paste after the child",
+    );
     assert_mode_on(&harness, ALT_ON, ALT_OFF, "alt screen after the child");
     harness.quit().expect("clean quit");
 }

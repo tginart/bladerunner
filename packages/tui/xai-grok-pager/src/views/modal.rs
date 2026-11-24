@@ -1353,10 +1353,7 @@ mod palette_sharing_tests {
     #[test]
     fn default_palette_omits_share_even_when_enabled() {
         let entries = default_palette_entries(true, &slash(crate::app::ScreenMode::Fullscreen));
-        assert!(
-            !has_share(&entries),
-            "/share stays hidden in Bladerunner"
-        );
+        assert!(!has_share(&entries), "/share stays hidden in Bladerunner");
     }
     #[test]
     fn default_palette_includes_dashboard() {

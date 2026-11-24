@@ -475,7 +475,10 @@ mod tests {
         let desc = kill_task_description(&renderer, None);
 
         assert!(!desc.contains("SIGTERM"), "POSIX detail leaked:\n{desc}");
-        assert!(!desc.contains("Job Object"), "Windows detail leaked:\n{desc}");
+        assert!(
+            !desc.contains("Job Object"),
+            "Windows detail leaked:\n{desc}"
+        );
     }
 
     #[tokio::test]

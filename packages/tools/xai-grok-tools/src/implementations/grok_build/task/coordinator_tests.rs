@@ -1490,7 +1490,10 @@ async fn reparented_nested_child_stays_visible_to_its_spawner() {
     let observed_nested = harness.requests.recv().await.unwrap();
     assert_eq!(observed_nested.parent_session_id, "parent");
     assert_eq!(
-        observed_nested.runtime_overrides.spawner_session_id.as_deref(),
+        observed_nested
+            .runtime_overrides
+            .spawner_session_id
+            .as_deref(),
         Some("outer")
     );
     assert_eq!(harness.started.recv().await.as_deref(), Some("nested"));

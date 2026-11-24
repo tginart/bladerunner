@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn parses_verbs_and_optional_name() {
-        assert_eq!(parse_task("up dgx-spark"), Ok(SovereignTask::Up(Some("dgx-spark".into()))));
+        assert_eq!(
+            parse_task("up dgx-spark"),
+            Ok(SovereignTask::Up(Some("dgx-spark".into())))
+        );
         assert_eq!(parse_task("down"), Ok(SovereignTask::Down(None)));
         assert_eq!(parse_task(""), Ok(SovereignTask::List));
         assert_eq!(parse_task("list"), Ok(SovereignTask::List));

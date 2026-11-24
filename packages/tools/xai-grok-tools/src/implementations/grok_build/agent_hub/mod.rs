@@ -271,7 +271,7 @@ You are always in a hub with Main and the running subagents of this session. A p
 
 Ops:
 - list: members (@handle, label, status) and channels with unread counts
-- send: post to `#channel` or DM `@handle` (plain prose, max 8KiB; optional `images`, absolute paths). `@handle` in a channel post wakes that member.
+- send: post to `#channel` or DM `@handle` (plain prose, max 8KiB; optional `images`, absolute paths). `@handle` in a channel post wakes that member. `@here` in a channel post wakes every member; use it only when all of them must act.
 - inbox: drain your unread DMs and mentions (non-blocking)
 - wait: block until a DM or mention arrives, or timeout_ms (max 30000)
 - read: read a channel after your read cursor (`channel`, optional `limit`, `since`)
