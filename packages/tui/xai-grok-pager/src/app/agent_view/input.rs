@@ -15,7 +15,9 @@ use crate::actions::{ActionId, ActionRegistry, When};
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crate::key;
+use crate::views::goal_detail::GOAL_COMMANDS;
 use crate::views::modal::ActiveModal;
+use crate::views::modal_window::{ModalWindowOutcome, handle_modal_mouse};
 use crate::views::plan_approval_view::PlanApprovalFocus;
 use crossterm::event::{
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -639,34 +641,34 @@ impl AgentView {
             return outcome;
         }
         if self.show_goal_detail && self.goal_state.is_some() {
-            if let Event::Key(key) = ev
-                && key.kind != KeyEventKind::Release
-            {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('g') | KeyCode::Char('q') => {
+            match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('g' | 'q')) {
                         self.show_goal_detail = false;
-                        return InputOutcome::Changed;
                     }
-                    _ => {
-                        return InputOutcome::Changed;
-                    }
+                    return InputOutcome::Changed;
                 }
-            }
-            if let Event::Mouse(mouse) = ev
-                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                && self.hit_goal_close.contains(mouse.column, mouse.row)
-            {
-                self.show_goal_detail = false;
-                return InputOutcome::Changed;
-            }
-            if let Event::Mouse(mouse) = ev
-                && matches!(mouse.kind, MouseEventKind::Moved)
-                && self.hit_goal_close.update_hover(mouse.column, mouse.row)
-            {
-                return InputOutcome::Changed;
-            }
-            if matches!(ev, Event::Mouse(_) | Event::Paste(_)) {
-                return InputOutcome::Changed;
+                Event::Mouse(mouse) => {
+                    match handle_modal_mouse(
+                        &mut self.goal_detail_window,
+                        mouse.kind,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        ModalWindowOutcome::CloseRequested => self.show_goal_detail = false,
+                        ModalWindowOutcome::ShortcutActivated(id) => {
+                            self.show_goal_detail = false;
+                            let command = format!("/goal {}", GOAL_COMMANDS[id]);
+                            return InputOutcome::Action(Action::SendSlashCommandPreservingDraft(
+                                command,
+                            ));
+                        }
+                        _ => {}
+                    }
+                    return InputOutcome::Changed;
+                }
+                Event::Paste(_) => return InputOutcome::Changed,
+                _ => {}
             }
         }
         if self.btw_state.is_some()
