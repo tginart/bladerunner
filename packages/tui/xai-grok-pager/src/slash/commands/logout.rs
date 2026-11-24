@@ -77,7 +77,9 @@ impl SlashCommand for LogoutCommand {
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return CommandResult::Error("Choose `/logout codex` or `/logout palantir-aip`.".into());
+            return CommandResult::Error(
+                "Choose `/logout codex` or `/logout palantir-aip`.".into(),
+            );
         }
 
         let (first, rest) = split_first(trimmed);
@@ -93,7 +95,10 @@ impl SlashCommand for LogoutCommand {
         ) {
             return CommandResult::Action(Action::LogoutOpenAiCodex);
         }
-        if matches!(first.to_ascii_lowercase().as_str(), "palantir-aip" | "palantir" | "foundry" | "aip") {
+        if matches!(
+            first.to_ascii_lowercase().as_str(),
+            "palantir-aip" | "palantir" | "foundry" | "aip"
+        ) {
             return CommandResult::Error("Run `bladerunner logout --palantir-aip` in a terminal to remove the local Foundry token.".into());
         }
         if matches!(

@@ -1833,7 +1833,10 @@ mod web_search_status_tests {
             perplexity_key: "missing".into(),
         };
         let text = format_web_search_status(&status);
-        assert!(text.contains("No Perplexity key, so web search is off"), "{text}");
+        assert!(
+            text.contains("No Perplexity key, so web search is off"),
+            "{text}"
+        );
         assert!(text.contains("running sessions"), "{text}");
         assert!(!text.contains("DuckDuckGo"), "{text}");
     }

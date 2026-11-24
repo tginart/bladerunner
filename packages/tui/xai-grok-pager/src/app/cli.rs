@@ -1581,10 +1581,7 @@ mod tests {
         assert_eq!(args.hub_join_command().as_deref(), Some("/hub join api"));
         assert_eq!(args.initial_prompt(), Some("fix it"));
         let args = PagerArgs::try_parse_from(["grok", "--hub", "api", "--hub-create"]).unwrap();
-        assert_eq!(
-            args.hub_join_command().as_deref(),
-            Some("/hub new api")
-        );
+        assert_eq!(args.hub_join_command().as_deref(), Some("/hub new api"));
         assert!(PagerArgs::try_parse_from(["grok", "--hub-create"]).is_err());
         let args = PagerArgs::try_parse_from(["grok"]).unwrap();
         assert_eq!(args.hub_join_command(), None);

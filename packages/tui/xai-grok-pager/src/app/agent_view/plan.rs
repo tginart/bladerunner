@@ -214,7 +214,14 @@ impl AgentView {
         } else {
             pav.send_approved();
         }
-        self.close_plan_review(pav, if compact_first { "compact-build" } else { "build" });
+        self.close_plan_review(
+            pav,
+            if compact_first {
+                "compact-build"
+            } else {
+                "build"
+            },
+        );
         if let Some(text) = review_comments {
             return InputOutcome::Action(Action::Interject {
                 text,

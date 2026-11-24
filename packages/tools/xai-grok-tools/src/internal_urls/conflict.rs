@@ -138,9 +138,7 @@ impl ConflictRegistry {
 fn find_line_start(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     let mut i = from;
     while i < bytes.len() {
-        if bytes[i..].starts_with(needle)
-            && (i == 0 || bytes[i - 1] == b'\n')
-        {
+        if bytes[i..].starts_with(needle) && (i == 0 || bytes[i - 1] == b'\n') {
             return Some(i);
         }
         i += 1;
@@ -179,7 +177,11 @@ impl std::fmt::Debug for ConflictRegistryResource {
     }
 }
 
-register_resource!("grok_build", "ConflictRegistryResource", ConflictRegistryResource);
+register_resource!(
+    "grok_build",
+    "ConflictRegistryResource",
+    ConflictRegistryResource
+);
 
 /// Apply a write resolution to a conflict id. Returns the updated file bytes
 /// when the on-disk marker still matches the registered block.

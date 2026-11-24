@@ -19,9 +19,8 @@ pub mod doctor_cmd;
 pub mod export_cmd;
 pub(crate) mod fs_size;
 pub mod git_info;
-pub mod hub_status;
 pub mod headless;
-mod signal_streams;
+pub mod hub_status;
 pub mod hyperlink_route;
 pub mod i18n;
 pub mod inline_media_ffmpeg;
@@ -29,11 +28,12 @@ pub mod input;
 pub mod input_log;
 pub mod mcp_cmd;
 pub mod memory_cmd;
-pub mod sovereign_cmd;
-pub mod tailnet;
 pub mod memory_release;
 pub mod memory_trace;
 mod scoped_models;
+mod signal_streams;
+pub mod sovereign_cmd;
+pub mod tailnet;
 // ── Minimal (scrollback-native) mode seam ────────────────────────────────────
 // The *only* minimal-specific surface in this (the "full pager") crate. Both
 // modules are grouped under `src/minimal/` so a full-pager contributor sees one

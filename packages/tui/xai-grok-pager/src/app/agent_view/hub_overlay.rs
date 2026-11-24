@@ -55,6 +55,11 @@ impl AgentView {
             Event::Mouse(mouse) => browser.handle_mouse(mouse.kind, mouse.column, mouse.row),
             _ => HubKeyOutcome::Changed,
         };
+        // A finished drag in the thread copies its text, like the scrollback.
+        if let Some(text) = browser.copy_text.take() {
+            self.copy_to_clipboard(&text);
+        }
+        let browser = self.hub_browser.as_mut()?;
         match outcome {
             HubKeyOutcome::Close => self.hub_browser = None,
             HubKeyOutcome::Changed => {}

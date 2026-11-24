@@ -16,7 +16,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Clear, Widget};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xai_grok_tools::implementations::grok_build::agent_hub::{self, MemberKind, store};
 
 use crate::render::SafeBuf;
@@ -37,6 +37,8 @@ const PAGE_LINES: usize = 10;
 const WHEEL_LINES: i32 = 3;
 /// Columns of the message body indent under a sender header.
 const BODY_INDENT: usize = 2;
+/// Title of the sidebar section that has the DM filter toggle.
+const DM_SECTION: &str = "Direct messages";
 
 /// One row of the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,73 @@ impl HubSnapshot {
     }
 }
 
+/// Which members the "Direct messages" section lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DmFilter {
+    #[default]
+    All,
+    /// Live agents and persons, plus any DM with unread messages.
+    Active,
+}
+
+impl DmFilter {
+    fn toggled(self) -> Self {
+        match self {
+            DmFilter::All => DmFilter::Active,
+            DmFilter::Active => DmFilter::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DmFilter::All => " all ",
+            DmFilter::Active => " active ",
+        }
+    }
+}
+
+/// One end of a feed text selection: a feed line and a display column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FeedPoint {
+    line: usize,
+    col: usize,
+}
+
+/// A text selection in the feed, made with a left drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeedSelection {
+    anchor: FeedPoint,
+    head: FeedPoint,
+    /// True while the left button is down.
+    is_dragging: bool,
+}
+
+impl FeedSelection {
+    /// The endpoints in reading order. Both columns are inclusive.
+    fn ordered(&self) -> (FeedPoint, FeedPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// The selected display columns of `line`, as a half-open range.
+    fn columns_on(&self, line: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered();
+        if line < start.line || line > end.line {
+            return None;
+        }
+        let from = if line == start.line { start.col } else { 0 };
+        let to = if line == end.line {
+            end.col + 1
+        } else {
+            usize::MAX
+        };
+        Some((from, to))
+    }
+}
+
 /// What an input event asks the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubKeyOutcome {
@@ -108,6 +177,15 @@ struct HitAreas {
     feed_scrollbar: Rect,
     /// Lines of the feed in the last frame.
     feed_line_count: usize,
+    /// The feed text area, without the scrollbar.
+    feed: Rect,
+    /// Screen row of the first drawn feed line, and its index in `feed_text`.
+    feed_top: u16,
+    feed_first_line: usize,
+    /// Plain text of every feed line, for drag selection and copy.
+    feed_text: Vec<String>,
+    /// The all/active toggle on the "Direct messages" section row.
+    dm_toggle: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +218,12 @@ pub struct HubBrowserState {
     pub picker: Option<usize>,
     /// A left press on the feed scrollbar holds it until the button is up.
     is_dragging_scrollbar: bool,
+    /// Which members the DM section lists.
+    pub dm_filter: DmFilter,
+    /// The feed text selection. It stays visible until the next click.
+    feed_selection: Option<FeedSelection>,
+    /// Text of the last finished drag. The caller takes it and copies it.
+    pub copy_text: Option<String>,
     hits: HitAreas,
 }
 
@@ -167,6 +251,9 @@ impl HubBrowserState {
             notice: None,
             picker: None,
             is_dragging_scrollbar: false,
+            dm_filter: DmFilter::default(),
+            feed_selection: None,
+            copy_text: None,
             hits: HitAreas::default(),
         };
         let rows = state.rows();
@@ -179,7 +266,7 @@ impl HubBrowserState {
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        sidebar_rows(&self.snapshot, &self.perspective)
+        sidebar_rows(&self.snapshot, &self.perspective, self.dm_filter)
     }
 
     pub fn selected_row(&self) -> Option<Row> {
@@ -196,6 +283,20 @@ impl HubBrowserState {
     pub fn reload(&mut self) -> Result<()> {
         let selected_row = self.selected_row();
         self.reload_snapshot()?;
+        self.reselect(selected_row)
+    }
+
+    /// Purpose: Switch the DM section between all members and active members.
+    /// Input: The browser state.
+    /// Output: Ok, or the feed read error. The selected row stays when it is listed.
+    pub fn toggle_dm_filter(&mut self) -> Result<()> {
+        let selected_row = self.selected_row();
+        self.dm_filter = self.dm_filter.toggled();
+        self.reselect(selected_row)
+    }
+
+    /// Select `selected_row` again in the current rows, or a valid fallback.
+    fn reselect(&mut self, selected_row: Option<Row>) -> Result<()> {
         let rows = self.rows();
         match rows
             .iter()
@@ -208,6 +309,7 @@ impl HubBrowserState {
             None => {
                 self.selected = clamp_selection(&rows, self.selected);
                 self.feed_scroll = 0;
+                self.feed_selection = None;
                 self.load_feed(true)?;
             }
         }
@@ -259,6 +361,7 @@ impl HubBrowserState {
             .position(|row| kept_conv.is_some() && row.conv() == kept_conv)
             .unwrap_or_else(|| clamp_selection(&rows, 0));
         self.feed_scroll = 0;
+        self.feed_selection = None;
         // The unread marker belongs to the member whose view this is.
         self.load_feed(true)
     }
@@ -327,6 +430,11 @@ impl HubBrowserState {
             KeyCode::PageDown => self.feed_scroll = self.feed_scroll.saturating_sub(PAGE_LINES),
             KeyCode::End => self.feed_scroll = 0,
             KeyCode::Char('p') => self.open_picker(),
+            KeyCode::Char('a') => {
+                if let Err(error) = self.toggle_dm_filter() {
+                    tracing::warn!(%error, "hub browser: feed load failed");
+                }
+            }
             KeyCode::Tab | KeyCode::Enter | KeyCode::Char('i') => self.start_compose(),
             _ => {}
         }
@@ -353,17 +461,100 @@ impl HubBrowserState {
                 self.is_dragging_scrollbar = true;
                 self.drag_feed_scrollbar(row);
             }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.picker.is_none() && contains(self.hits.feed, col, row) =>
+            {
+                self.is_dragging_scrollbar = false;
+                let point = self.feed_point_at(col, row);
+                self.feed_selection = Some(FeedSelection {
+                    anchor: point,
+                    head: point,
+                    is_dragging: true,
+                });
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.is_dragging_scrollbar = false;
+                self.feed_selection = None;
                 self.click(col, row);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.is_dragging_scrollbar => {
                 self.drag_feed_scrollbar(row);
             }
-            MouseEventKind::Up(MouseButton::Left) => self.is_dragging_scrollbar = false,
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_feed_selection(col, row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.is_dragging_scrollbar = false;
+                self.finish_feed_selection();
+            }
             _ => {}
         }
         HubKeyOutcome::Changed
+    }
+
+    /// Move the head of an open feed selection to the pointer. A pointer above
+    /// or below the feed scrolls the feed one line, like a terminal selection.
+    fn drag_feed_selection(&mut self, col: u16, row: u16) {
+        let Some(selection) = self.feed_selection else {
+            return;
+        };
+        if !selection.is_dragging {
+            return;
+        }
+        let feed = self.hits.feed;
+        if row < feed.y {
+            self.feed_scroll = self.feed_scroll.saturating_add(1);
+        } else if row >= feed.bottom() {
+            self.feed_scroll = self.feed_scroll.saturating_sub(1);
+        }
+        let head = self.feed_point_at(col, row);
+        self.feed_selection = Some(FeedSelection { head, ..selection });
+    }
+
+    /// Purpose: End a feed drag and keep its text for the caller to copy.
+    /// Input: The browser state.
+    /// Output: None. A drag that covers text sets `copy_text`. A plain click
+    ///     clears the selection.
+    fn finish_feed_selection(&mut self) {
+        let Some(selection) = self.feed_selection else {
+            return;
+        };
+        if !selection.is_dragging {
+            return;
+        }
+        if selection.anchor == selection.head {
+            self.feed_selection = None;
+            return;
+        }
+        self.feed_selection = Some(FeedSelection {
+            is_dragging: false,
+            ..selection
+        });
+        let text = selected_feed_text(&self.hits.feed_text, &selection);
+        if !text.trim().is_empty() {
+            self.copy_text = Some(text);
+        }
+    }
+
+    /// Purpose: Map a screen cell to a feed line and column from the last frame.
+    /// Input: The screen position. It can be outside the feed area.
+    /// Output: The nearest feed point. Rows above the first line map to it,
+    ///     and rows below the last line map to the end of the last line.
+    fn feed_point_at(&self, col: u16, row: u16) -> FeedPoint {
+        let hits = &self.hits;
+        let last_line = hits.feed_text.len().saturating_sub(1);
+        let col = col.saturating_sub(hits.feed.x) as usize;
+        let col = col.min(hits.feed.width.saturating_sub(1) as usize);
+        if row < hits.feed_top {
+            let line = hits.feed_first_line.min(last_line);
+            return FeedPoint { line, col: 0 };
+        }
+        let line = hits.feed_first_line + (row - hits.feed_top) as usize;
+        if line > last_line {
+            return FeedPoint {
+                line: last_line,
+                col: usize::MAX - 1,
+            };
+        }
+        FeedPoint { line, col }
     }
 
     /// Purpose: Apply one mouse-wheel scroll to the thread pane.
@@ -416,6 +607,12 @@ impl HubBrowserState {
         }
         if contains(self.hits.compose, col, row) {
             self.start_compose();
+            return;
+        }
+        if contains(self.hits.dm_toggle, col, row) {
+            if let Err(error) = self.toggle_dm_filter() {
+                tracing::warn!(%error, "hub browser: feed load failed");
+            }
             return;
         }
         if !contains(self.hits.sidebar, col, row) {
@@ -524,6 +721,7 @@ impl HubBrowserState {
     fn select(&mut self, idx: usize) {
         self.selected = idx;
         self.feed_scroll = 0;
+        self.feed_selection = None;
         if let Err(error) = self.load_feed(true) {
             tracing::warn!(%error, "hub browser: feed load failed");
         }
@@ -631,21 +829,38 @@ pub fn load_snapshot(
 }
 
 /// Purpose: Lay out the sidebar rows.
-/// Input: The snapshot and the perspective handle.
+/// Input: The snapshot, the perspective handle, and the DM filter.
 /// Output: The channel rows, then the DM rows of the perspective member.
-pub fn sidebar_rows(snapshot: &HubSnapshot, perspective: &str) -> Vec<Row> {
+/// Note: The active filter keeps a DM with unread messages, so that a message
+///     from an agent that stopped is not hidden.
+pub fn sidebar_rows(snapshot: &HubSnapshot, perspective: &str, dm_filter: DmFilter) -> Vec<Row> {
     let mut rows = vec![Row::Section("Channels")];
     for channel in &snapshot.meta.channels {
         rows.push(Row::Channel(channel.name.clone()));
     }
-    rows.push(Row::Section("Direct messages"));
+    rows.push(Row::Section(DM_SECTION));
     for peer in &snapshot.dm_peers {
-        rows.push(Row::Dm {
-            peer: peer.clone(),
-            conv: store::dm_conv(perspective, peer),
-        });
+        let conv = store::dm_conv(perspective, peer);
+        let is_listed = match dm_filter {
+            DmFilter::All => true,
+            DmFilter::Active => is_active_peer(snapshot, peer) || snapshot.unread(&conv) > 0,
+        };
+        if is_listed {
+            rows.push(Row::Dm {
+                peer: peer.clone(),
+                conv,
+            });
+        }
     }
     rows
+}
+
+/// True when `peer` is a person or a live agent.
+fn is_active_peer(snapshot: &HubSnapshot, peer: &str) -> bool {
+    snapshot
+        .meta
+        .member(peer)
+        .is_some_and(|m| m.kind == MemberKind::Person || m.active)
 }
 
 /// Where a post from the person goes for `row`.
@@ -1047,7 +1262,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, the
             height: 1,
             ..area
         };
-        render_sidebar_row(
+        let toggle = render_sidebar_row(
             buf,
             row_area,
             &rows[idx],
@@ -1055,6 +1270,9 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, the
             state,
             theme,
         );
+        if toggle.width > 0 {
+            state.hits.dm_toggle = toggle;
+        }
         state.hits.rows.push((y, idx));
     }
     let tokens: u64 = state.snapshot.meta.tokens.values().sum();
@@ -1084,6 +1302,7 @@ fn sidebar_screen_rows(rows: &[Row]) -> Vec<Option<usize>> {
     lines
 }
 
+/// Draw one sidebar row. Return the DM filter toggle area, or an empty Rect.
 fn render_sidebar_row(
     buf: &mut Buffer,
     area: Rect,
@@ -1091,7 +1310,7 @@ fn render_sidebar_row(
     is_selected: bool,
     state: &HubBrowserState,
     theme: &Theme,
-) {
+) -> Rect {
     let bg = if is_selected {
         theme.bg_highlight
     } else {
@@ -1105,8 +1324,14 @@ fn render_sidebar_row(
                 .fg(theme.gray_bright)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD);
-            span_at(buf, area.x + 2, area.y, title, style, area.right());
-            return;
+            let mut toggle = Rect::default();
+            let mut title_end = area.right();
+            if *title == DM_SECTION {
+                toggle = render_dm_toggle(buf, area, state.dm_filter, theme);
+                title_end = toggle.x.saturating_sub(1);
+            }
+            span_at(buf, area.x + 2, area.y, title, style, title_end);
+            return toggle;
         }
         Row::Channel(name) => (
             "# ".to_string(),
@@ -1167,6 +1392,24 @@ fn render_sidebar_row(
     let right_x = area.right().saturating_sub(right_text.width() as u16 + 1);
     span_at(buf, x, area.y, &name, name_style, right_x.saturating_sub(1));
     span_at(buf, right_x, area.y, &right_text, right_style, area.right());
+    Rect::default()
+}
+
+/// Draw the all/active chip at the right end of the DM section row.
+fn render_dm_toggle(buf: &mut Buffer, area: Rect, dm_filter: DmFilter, theme: &Theme) -> Rect {
+    let label = dm_filter.label();
+    let width = label.width() as u16;
+    let x = area.right().saturating_sub(width + 1).max(area.x);
+    let style = Style::default()
+        .fg(theme.text_primary)
+        .bg(theme.bg_highlight);
+    span_at(buf, x, area.y, label, style, area.right());
+    Rect {
+        x,
+        y: area.y,
+        width,
+        height: 1,
+    }
 }
 
 fn render_main(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, theme: &Theme) {
@@ -1340,7 +1583,17 @@ fn render_feed(
         for (text, part) in line {
             x = span_at(buf, x, y, text, part_style(*part, theme), area.right());
         }
+        if let Some(selection) = &state.feed_selection {
+            highlight_feed_line(buf, area, y, x, selection.columns_on(start + i), theme);
+        }
     }
+    state.hits.feed = area;
+    state.hits.feed_top = top;
+    state.hits.feed_first_line = start;
+    state.hits.feed_text = lines
+        .iter()
+        .map(|line| line.iter().map(|(text, _)| text.as_str()).collect())
+        .collect();
     if max_scroll > 0 {
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let offset = u16::try_from(max_scroll - state.feed_scroll).unwrap_or(u16::MAX);
@@ -1364,6 +1617,64 @@ fn render_feed(
             .bg(theme.bg_highlight);
         span_at(buf, x, area.bottom() - 1, &hint, style, area.right());
     }
+}
+
+/// Paint the selection band on one drawn feed line. `text_end` is the screen
+/// column after the last character, so the band stops at the text.
+fn highlight_feed_line(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    text_end: u16,
+    columns: Option<(usize, usize)>,
+    theme: &Theme,
+) {
+    let Some((from, to)) = columns else {
+        return;
+    };
+    let from_x = area
+        .x
+        .saturating_add(u16::try_from(from).unwrap_or(u16::MAX));
+    let to_x = area
+        .x
+        .saturating_add(u16::try_from(to).unwrap_or(u16::MAX))
+        .min(text_end);
+    for x in from_x..to_x {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            crate::scrollback::text_selection::apply_selection_highlight(theme, cell);
+        }
+    }
+}
+
+/// Purpose: Read the text that a feed selection covers.
+/// Input: The plain text of every feed line, and the selection.
+/// Output: The selected text. Lines join with `\n`, without trailing spaces.
+fn selected_feed_text(lines: &[String], selection: &FeedSelection) -> String {
+    let (start, end) = selection.ordered();
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate().take(end.line + 1).skip(start.line) {
+        let Some((from, to)) = selection.columns_on(idx) else {
+            continue;
+        };
+        out.push(slice_columns(line, from, to).trim_end().to_string());
+    }
+    out.join("\n")
+}
+
+/// The characters of `text` whose display columns start in `from..to`.
+fn slice_columns(text: &str, from: usize, to: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    for ch in text.chars() {
+        if col >= to {
+            break;
+        }
+        if col >= from {
+            out.push(ch);
+        }
+        col += ch.width().unwrap_or(0);
+    }
+    out
 }
 
 fn empty_feed_text(row: &Row, state: &HubBrowserState) -> String {
@@ -1509,6 +1820,7 @@ fn render_footer(buf: &mut Buffer, bar: Rect, state: &HubBrowserState, theme: &T
             ("↑↓", "conversations"),
             ("Tab", "write"),
             ("p", "perspective"),
+            ("a", "all/active DMs"),
             ("PgUp/PgDn", "scroll"),
             ("Esc", "close hub"),
         ]
@@ -1516,6 +1828,7 @@ fn render_footer(buf: &mut Buffer, bar: Rect, state: &HubBrowserState, theme: &T
         &[
             ("↑↓", "conversations"),
             ("p", "perspective"),
+            ("a", "all/active DMs"),
             ("PgUp/PgDn", "scroll"),
             ("Esc", "close hub"),
         ]
@@ -2110,6 +2423,93 @@ mod tests {
         state.handle_mouse(down, rect.x + 1, rect.y);
         assert_eq!(state.perspective, "back");
         assert!(state.picker.is_none());
+    }
+
+    #[test]
+    fn active_dm_filter_hides_gone_agents_but_keeps_unread_dms() {
+        let (_root, hub) = hub_with_dms();
+        hub.update_meta(|meta| {
+            meta.members
+                .iter_mut()
+                .find(|m| m.handle == "back")
+                .unwrap()
+                .active = false;
+            let mut old = member("old", MemberKind::Agent);
+            old.active = false;
+            meta.members.push(old);
+        })
+        .unwrap();
+        let conv = store::dm_conv("me", "old");
+        hub.append(&message("old", conv, "final report", store::now_ms()))
+            .unwrap();
+        let mut state = open(hub);
+        let all = vec![dm("front", "me"), dm("back", "me"), dm("old", "me")];
+        assert!(state.rows().ends_with(&all));
+
+        state.handle_key(&key(KeyCode::Char('a')));
+        assert_eq!(state.dm_filter, DmFilter::Active);
+        assert!(
+            state
+                .rows()
+                .ends_with(&[dm("front", "me"), dm("old", "me")])
+        );
+        assert!(!state.rows().contains(&dm("back", "me")));
+
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let toggle = state.hits.dm_toggle;
+        assert!(buffer_text(&buf).contains("Direct messages"));
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), toggle.x, toggle.y);
+        assert_eq!(state.dm_filter, DmFilter::All);
+        assert!(state.rows().ends_with(&all));
+    }
+
+    #[test]
+    fn a_drag_in_the_thread_copies_the_selected_text() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let hits = &state.hits;
+        let line = hits
+            .feed_text
+            .iter()
+            .position(|t| t.contains("hello"))
+            .unwrap();
+        let col = hits.feed_text[line].find("hello").unwrap() as u16;
+        let x = hits.feed.x + col;
+        let y = hits.feed_top + (line - hits.feed_first_line) as u16;
+
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        state.handle_mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        assert_eq!(state.copy_text, None, "a click does not copy");
+        assert_eq!(state.feed_selection, None);
+
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        state.handle_mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        state.handle_mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        assert_eq!(state.copy_text.as_deref(), Some("hello"));
+        assert!(
+            state.feed_selection.is_some(),
+            "the selection stays visible"
+        );
+
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), 3, 3);
+        assert_eq!(state.feed_selection, None, "a click elsewhere clears it");
+    }
+
+    #[test]
+    fn selected_feed_text_joins_lines_by_columns() {
+        let lines = vec!["ab cd".to_string(), "  ef  ".to_string(), "gh".to_string()];
+        let selection = FeedSelection {
+            anchor: FeedPoint { line: 2, col: 0 },
+            head: FeedPoint { line: 0, col: 3 },
+            is_dragging: false,
+        };
+        assert_eq!(selected_feed_text(&lines, &selection), "cd\n  ef\ng");
+        assert_eq!(slice_columns("日本語", 2, 4), "本");
     }
 
     fn buffer_text(buf: &Buffer) -> String {

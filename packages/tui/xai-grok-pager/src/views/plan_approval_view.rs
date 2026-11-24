@@ -297,7 +297,10 @@ mod tests {
     fn test_send_compact_approved() {
         let (mut state, mut rx) = make_test_state();
         assert!(state.send_compact_approved());
-        let resp = rx.try_recv().expect("should receive response").expect("should be Ok");
+        let resp = rx
+            .try_recv()
+            .expect("should receive response")
+            .expect("should be Ok");
         let parsed: serde_json::Value = serde_json::from_str(resp.0.get()).unwrap();
         assert_eq!(parsed["outcome"], "compact_approved");
     }

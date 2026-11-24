@@ -478,8 +478,7 @@ pub(super) fn apply_announcements_update(
         managed_config,
         Some(remote),
     );
-    let announcements =
-        app.filter_announcements(xai_grok_announcements::filter_expired(merged));
+    let announcements = app.filter_announcements(xai_grok_announcements::filter_expired(merged));
 
     app.announcement = match app.announcement.as_ref() {
         Some(current) => announcements

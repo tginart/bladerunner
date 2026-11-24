@@ -1741,9 +1741,7 @@ pub fn render_line_viewer(
         let abandon_hovered = viewer.plan_ref().is_some_and(|p| p.abandon_hovered);
         let comment_hovered = viewer.plan_ref().is_some_and(|p| p.comment_hovered);
         let approve_hovered = viewer.plan_ref().is_some_and(|p| p.approve_hovered);
-        let compact_approve_hovered = viewer
-            .plan_ref()
-            .is_some_and(|p| p.compact_approve_hovered);
+        let compact_approve_hovered = viewer.plan_ref().is_some_and(|p| p.compact_approve_hovered);
         let copy_hovered = viewer.plan_ref().is_some_and(|p| p.copy_hovered);
         let is_approval = viewer.feedback_active();
 
@@ -1788,12 +1786,8 @@ pub fn render_line_viewer(
         };
 
         let (compact_w, compact_spans): (u16, Option<Vec<Span>>) = if is_approval {
-            let spans = build_shortcut_button(
-                'x',
-                "compact & accept",
-                compact_approve_hovered,
-                theme,
-            );
+            let spans =
+                build_shortcut_button('x', "compact & accept", compact_approve_hovered, theme);
             let w = spans.iter().map(|s| s.width() as u16).sum();
             (w, Some(spans))
         } else {

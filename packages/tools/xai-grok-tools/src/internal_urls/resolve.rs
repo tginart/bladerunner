@@ -27,7 +27,13 @@ pub struct VirtualRead {
 pub fn apply_line_window(text: &str, offset: Option<i64>, limit: Option<usize>) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     let start = offset
-        .map(|o| if o <= 0 { 0 } else { (o as usize).saturating_sub(1) })
+        .map(|o| {
+            if o <= 0 {
+                0
+            } else {
+                (o as usize).saturating_sub(1)
+            }
+        })
         .unwrap_or(0)
         .min(lines.len());
     let end = match limit {
@@ -72,8 +78,12 @@ fn resolve_agent(id: &str, ctx: &ResolveContext) -> Result<VirtualRead, String> 
         return Err(format!("invalid agent id {id:?}"));
     }
     let dir = subagent_dir(ctx, id);
-    let text = read_subagent_output_text(&dir)
-        .ok_or_else(|| format!("Not found: agent://{id} (no output.json under {})", dir.display()))?;
+    let text = read_subagent_output_text(&dir).ok_or_else(|| {
+        format!(
+            "Not found: agent://{id} (no output.json under {})",
+            dir.display()
+        )
+    })?;
     Ok(VirtualRead {
         display_path: format!("agent://{id}"),
         text,
@@ -282,7 +292,10 @@ fn render_concise_transcript(jsonl: &str) -> String {
             let content = extract_text_content(&v);
             match role {
                 "user" | "User" => {
-                    out.push_str(&format!("**user:** {}\n\n", truncate_one_line(&content, 400)));
+                    out.push_str(&format!(
+                        "**user:** {}\n\n",
+                        truncate_one_line(&content, 400)
+                    ));
                 }
                 "assistant" | "Assistant" => {
                     out.push_str(&format!(
@@ -325,7 +338,10 @@ fn render_concise_transcript(jsonl: &str) -> String {
             match ty {
                 "user" | "User" => {
                     let content = extract_text_content(&v);
-                    out.push_str(&format!("**user:** {}\n\n", truncate_one_line(&content, 400)));
+                    out.push_str(&format!(
+                        "**user:** {}\n\n",
+                        truncate_one_line(&content, 400)
+                    ));
                 }
                 "assistant" | "Assistant" => {
                     let content = extract_text_content(&v);
@@ -335,10 +351,7 @@ fn render_concise_transcript(jsonl: &str) -> String {
                     ));
                 }
                 "tool_result" | "ToolResult" => {
-                    let name = v
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("tool");
+                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                     let content = extract_text_content(&v);
                     out.push_str(&format!(
                         "// result: {name} — {}\n\n",
@@ -387,10 +400,9 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 }
 
 fn resolve_conflict_read(rest: &str, ctx: &ResolveContext) -> Result<VirtualRead, String> {
-    let some_reg = ctx
-        .conflicts
-        .as_ref()
-        .ok_or_else(|| "conflict:// unavailable (ConflictRegistryResource not installed)".to_string())?;
+    let some_reg = ctx.conflicts.as_ref().ok_or_else(|| {
+        "conflict:// unavailable (ConflictRegistryResource not installed)".to_string()
+    })?;
     let reg = some_reg.lock();
 
     let rest = rest.trim();
@@ -437,10 +449,7 @@ fn resolve_conflict_read(rest: &str, ctx: &ResolveContext) -> Result<VirtualRead
             match side {
                 ConflictSide::Ours => c.ours.clone(),
                 ConflictSide::Theirs => c.theirs.clone(),
-                ConflictSide::Base => c
-                    .base
-                    .clone()
-                    .unwrap_or_else(|| "(no base section)".into()),
+                ConflictSide::Base => c.base.clone().unwrap_or_else(|| "(no base section)".into()),
                 ConflictSide::Both => format!("{}{}", c.ours, c.theirs),
             }
         }
@@ -528,9 +537,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             conflicts: Some(reg),
         };
-        let list = resolve_virtual_path("conflict://", &ctx)
-            .unwrap()
-            .unwrap();
+        let list = resolve_virtual_path("conflict://", &ctx).unwrap().unwrap();
         assert!(list.text.contains("conflict://1"));
 
         let ours = resolve_virtual_path("conflict://1/ours", &ctx)

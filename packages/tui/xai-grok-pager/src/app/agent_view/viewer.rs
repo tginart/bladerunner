@@ -621,9 +621,8 @@ impl AgentView {
                 }
                 let compact_approve_hover = compact_approve_area
                     .is_some_and(|a| a.contains((mouse.column, mouse.row).into()));
-                let prev_compact_approve = viewer
-                    .plan_ref()
-                    .is_some_and(|p| p.compact_approve_hovered);
+                let prev_compact_approve =
+                    viewer.plan_ref().is_some_and(|p| p.compact_approve_hovered);
                 if compact_approve_hover != prev_compact_approve {
                     viewer.plan_mut().compact_approve_hovered = compact_approve_hover;
                     changed = true;

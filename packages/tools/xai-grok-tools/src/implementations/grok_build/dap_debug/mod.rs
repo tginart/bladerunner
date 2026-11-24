@@ -38,7 +38,9 @@ pub enum DapDebugOp {
 #[serde(rename_all = "camelCase")]
 pub struct DapDebugInput {
     #[serde(default)]
-    #[schemars(description = "Operation: status (default), launch, attach, control, breakpoints, evaluate")]
+    #[schemars(
+        description = "Operation: status (default), launch, attach, control, breakpoints, evaluate"
+    )]
     pub op: DapDebugOp,
     #[serde(default)]
     #[schemars(description = "Program path or attach target (reserved)")]
@@ -47,7 +49,9 @@ pub struct DapDebugInput {
     #[schemars(description = "Adapter command override, e.g. lldb-dap (reserved)")]
     pub adapter: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Control command when op=control: continue|next|step_in|step_out|pause|disconnect")]
+    #[schemars(
+        description = "Control command when op=control: continue|next|step_in|step_out|pause|disconnect"
+    )]
     pub command: Option<String>,
     #[serde(default)]
     #[schemars(description = "Expression for evaluate (reserved)")]
@@ -153,12 +157,10 @@ impl xai_tool_runtime::Tool for DapDebugTool {
         input: DapDebugInput,
     ) -> Result<DapDebugOutput, xai_tool_runtime::ToolError> {
         let summary = match input.op {
-            DapDebugOp::Status => {
-                "dap_debug is a stub: no DAP adapter process is managed yet. \
+            DapDebugOp::Status => "dap_debug is a stub: no DAP adapter process is managed yet. \
                  Configure [features] dap_debug = true for future enablement; \
                  use a local debugger via the shell for now."
-                    .to_string()
-            }
+                .to_string(),
             DapDebugOp::Launch => format!(
                 "dap_debug launch is not implemented (program={:?}, adapter={:?})",
                 input.program, input.adapter
@@ -171,9 +173,7 @@ impl xai_tool_runtime::Tool for DapDebugTool {
                 "dap_debug control is not implemented (command={:?})",
                 input.command
             ),
-            DapDebugOp::Breakpoints => {
-                "dap_debug breakpoints is not implemented".to_string()
-            }
+            DapDebugOp::Breakpoints => "dap_debug breakpoints is not implemented".to_string(),
             DapDebugOp::Evaluate => format!(
                 "dap_debug evaluate is not implemented (expression={:?})",
                 input.expression

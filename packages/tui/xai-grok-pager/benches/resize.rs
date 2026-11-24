@@ -108,10 +108,7 @@ fn build_session() -> (ScrollbackState, usize) {
         );
         push(
             &mut state,
-            RenderBlock::read(
-                format!("packages/tui/xai-grok-pager/src/mod_{i}.rs"),
-                None,
-            ),
+            RenderBlock::read(format!("packages/tui/xai-grok-pager/src/mod_{i}.rs"), None),
             64,
         );
         let (old, new) = edit_texts(i);

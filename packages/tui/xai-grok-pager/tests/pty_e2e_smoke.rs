@@ -11,8 +11,6 @@ mod common;
 
 #[path = "pty_e2e/agent_response.rs"]
 mod agent_response;
-#[path = "pty_e2e/mouse_tracking_stays_on.rs"]
-mod mouse_tracking_stays_on;
 #[path = "pty_e2e/auto_compact_top_row.rs"]
 mod auto_compact_top_row;
 #[path = "pty_e2e/basename_path_demo_pty.rs"]
@@ -27,6 +25,8 @@ mod feedback_slash_opens_descriptive_pane;
 mod initial_prompt_positional_auto_submits;
 #[path = "pty_e2e/input_echoes_at_idle_prompt.rs"]
 mod input_echoes_at_idle_prompt;
+#[path = "pty_e2e/mouse_tracking_stays_on.rs"]
+mod mouse_tracking_stays_on;
 #[path = "pty_e2e/plan_revise_empty_enter_does_not_approve.rs"]
 mod plan_revise_empty_enter_does_not_approve;
 #[path = "pty_e2e/question_tab_cycles_answers.rs"]

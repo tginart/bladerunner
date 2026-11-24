@@ -710,7 +710,12 @@ fn compute_activity(
             "Compacting…".to_string(),
             false,
         ),
-        (AgentState::TurnRunning, Some(TurnActivity::Retrying { attempt, reason, .. })) => (
+        (
+            AgentState::TurnRunning,
+            Some(TurnActivity::Retrying {
+                attempt, reason, ..
+            }),
+        ) => (
             Style::default().fg(theme.warning),
             retry_label(*attempt, reason),
             false,

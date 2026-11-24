@@ -4590,6 +4590,23 @@ impl AgentView {
         if let Some(browser) = self.hub_browser.as_mut() {
             let covered = crate::views::hub_browser::render_hub_browser(buf, area, browser);
             self.frame_occluder_rects.push(covered);
+            // The hub covers the scrollback toast, so a copy toast goes on its footer.
+            if let Some(msg) = self.active_toast_message()
+                && let Some(toast_text) = fit_toast_text(&msg, covered.width)
+            {
+                let theme = Theme::current();
+                let w = toast_text.chars().count() as u16;
+                let x = covered.right().saturating_sub(w + 1);
+                let y = covered.bottom().saturating_sub(1);
+                for (i, ch) in toast_text.chars().enumerate() {
+                    if let Some(cell) = buf.cell_mut((x + i as u16, y)) {
+                        cell.set_char(ch);
+                        cell.fg = theme.accent_user;
+                        cell.bg = theme.bg_dark;
+                        cell.modifier = ratatui::prelude::Modifier::BOLD;
+                    }
+                }
+            }
         }
         if self.show_workflows {
             // List navigation and later notifications can reveal deferred children too.
