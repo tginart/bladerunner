@@ -651,7 +651,7 @@ impl SlashController {
         let is_recognized = {
             let ctx = self.app_ctx(models);
             self.registry
-                .get(&token.name)
+                .get_for_dispatch(&token.name)
                 .is_some_and(|cmd| command_offered(cmd.as_ref(), &ctx, self.hide_session_scoped))
         };
 
@@ -888,9 +888,11 @@ impl SlashController {
         let hide_session = self.hide_session_scoped;
         tokens
             .into_iter()
+            // Dispatch tier, like the leading-token path: menu-hidden
+            // commands and shell aliases still run, so they still color.
             .filter(|token| {
                 self.registry
-                    .get(&token.name)
+                    .get_for_dispatch(&token.name)
                     .is_some_and(|cmd| command_offered(cmd.as_ref(), &ctx, hide_session))
             })
             .map(|token| token.range)
@@ -3041,6 +3043,37 @@ mod tests {
             "/compact must not be recognized mid-text on the session-less surface"
         );
         assert_eq!(snap.recognized_tokens, helper);
+    }
+
+    #[test]
+    fn shell_builtin_aliases_are_recognized() {
+        // The shell resolves `/cua` and `/yolo` itself, so they run today.
+        // They must also color, at the start and mid-text.
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let alias_meta = |aliases: serde_json::Value| {
+            serde_json::json!({ "aliases": aliases })
+                .as_object()
+                .cloned()
+                .unwrap()
+        };
+        ctrl.registry_mut().set_acp_commands(&[
+            acp::AvailableCommand::new("computer-use".to_string(), "Cua".to_string())
+                .meta(alias_meta(serde_json::json!(["cua"]))),
+            acp::AvailableCommand::new("always-approve".to_string(), "Yolo".to_string())
+                .meta(alias_meta(serde_json::json!(["yolo"]))),
+        ]);
+        let state = SlashState::default();
+        let models = ModelState::default();
+
+        for text in ["/cua on", "/yolo off"] {
+            ctrl.refresh(&state, text, text.len(), &models);
+            assert!(state.snapshot().command_recognized, "{text} not recognized");
+        }
+        let text = "then /cua and /yolo";
+        assert_eq!(
+            ctrl.recognized_token_ranges(text, &models),
+            vec![5..9, 14..19]
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::acp_command::AcpSlashCommand;
+use super::acp_command::{AcpSlashCommand, advertised_aliases};
 use super::command::{CommandProvenance, SlashCommand};
 use super::mode_support::ModeSupport;
 
@@ -134,6 +134,11 @@ pub struct CommandRegistry {
     /// see. Menu-only: hidden from completion but still executable via
     /// [`Self::get_for_dispatch`].
     menu_hidden: HashSet<String>,
+    /// ACP entries that stand for a shell builtin alias (`/cua`, `/yolo`).
+    /// Treated like `menu_hidden`: no dropdown row, but a typed alias
+    /// resolves (and so gets the recognized-command color). Rebuilt on every
+    /// ACP update.
+    acp_aliases: HashSet<String>,
     /// Commands denied for this user (e.g. tier-restricted: `/usage` on the
     /// free / X Basic tiers — see
     /// [`crate::app::app_view::TIER_RESTRICTED_COMMANDS`]).
@@ -190,6 +195,7 @@ impl CommandRegistry {
             triggers: Vec::new(),
             hidden,
             menu_hidden,
+            acp_aliases: HashSet::new(),
             restricted: HashSet::new(),
             available_tools: None,
         };
@@ -217,7 +223,12 @@ impl CommandRegistry {
     /// gate.
     pub fn get(&self, key: &str) -> Option<&Arc<dyn SlashCommand>> {
         self.get_for_dispatch(key)
-            .filter(|cmd| !self.menu_hidden.contains(cmd.name()))
+            .filter(|cmd| !self.is_menu_only(cmd.name()))
+    }
+
+    /// True for commands that resolve by name but get no completion row.
+    fn is_menu_only(&self, name: &str) -> bool {
+        self.menu_hidden.contains(name) || self.acp_aliases.contains(name)
     }
 
     /// Look up a command by canonical name or alias for EXECUTION of a
@@ -542,6 +553,24 @@ impl CommandRegistry {
             self.commands.push(Arc::new(AcpSlashCommand::from(acp_cmd)));
             self.sources.push(CommandSource::Acp);
         }
+
+        // Aliases go last so a real command name always wins a clash. They
+        // register even when the canonical name is a pager builtin
+        // (`/yolo` -> shell `always-approve`): today a typed alias passes
+        // through to the shell, and this keeps that behavior.
+        self.acp_aliases.clear();
+        for acp_cmd in commands {
+            for alias in advertised_aliases(acp_cmd) {
+                let key = alias.to_lowercase();
+                if is_reserved(&key) || !claimed.insert(key) {
+                    continue;
+                }
+                let command = AcpSlashCommand::alias_of(acp_cmd, &alias);
+                self.commands.push(Arc::new(command));
+                self.sources.push(CommandSource::Acp);
+                self.acp_aliases.insert(alias);
+            }
+        }
     }
 
     /// Regenerate trigger list and key-to-index map from the current commands.
@@ -573,7 +602,7 @@ impl CommandRegistry {
             // Menu-hidden commands keep their key entries (so
             // `get_for_dispatch()` resolves a typed invocation) but emit no
             // triggers — the inverse of the restricted trade-off below.
-            let menu_only = self.menu_hidden.contains(canonical);
+            let menu_only = self.is_menu_only(canonical);
 
             // Restricted commands (per-user deny list, e.g. tier
             // restrictions) deliberately stay listed: they keep their
@@ -744,6 +773,39 @@ mod tests {
         assert_eq!(registry.command_count(), 1);
         assert!(registry.get("exit").is_some());
         assert!(registry.get("flush").is_none());
+    }
+
+    #[test]
+    fn acp_aliases_dispatch_without_menu_rows() {
+        let builtin: Arc<dyn SlashCommand> = Arc::new(DummyCommand {
+            name: "exit",
+            aliases: &["quit"],
+        });
+        let mut registry = CommandRegistry::new(vec![builtin]);
+        let meta = serde_json::json!({ "aliases": ["cua", "quit", "flush"] });
+        let acp_cmds = vec![
+            agent_client_protocol::AvailableCommand::new(
+                "computer-use".to_string(),
+                "Cua".to_string(),
+            )
+            .meta(meta.as_object().cloned()),
+            agent_client_protocol::AvailableCommand::new(
+                "flush".to_string(),
+                "Flush memory".to_string(),
+            ),
+        ];
+        registry.set_acp_commands(&acp_cmds);
+
+        let cua = registry.get_for_dispatch("cua").expect("alias dispatches");
+        assert_eq!(cua.name(), "cua", "passes `/cua` through verbatim");
+        assert!(registry.get("cua").is_none(), "alias is menu-only");
+        assert!(!registry.triggers().iter().any(|t| t.match_text == "cua"));
+        // Builtin keys and real command names win over an alias.
+        assert_eq!(registry.get("quit").unwrap().name(), "exit");
+        assert_eq!(registry.get("flush").unwrap().name(), "flush");
+
+        registry.set_acp_commands(&[]);
+        assert!(registry.get_for_dispatch("cua").is_none());
     }
 
     #[test]
