@@ -19,7 +19,12 @@ use crate::theme::Theme;
 use crate::views::agent_status::{
     active_phase_label, classifier_attempts_label, format_tokens_compact,
 };
+use crate::views::modal_window::{
+    ModalWindowState, Shortcut, render_modal_shortcuts, shortcuts_rows_needed,
+};
 use crate::views::progress_bar::progress_bar_spans;
+
+pub(crate) const GOAL_COMMANDS: [&str; 4] = ["resume", "pause", "status", "clear"];
 
 /// Maximum todo items displayed in the modal before truncation.
 const MAX_TODO_DISPLAY: usize = 15;
@@ -419,7 +424,7 @@ pub fn goal_detail_area(screen: Rect, goal: &GoalDisplayState, todos: &[TodoItem
     //      capped at MAX_MODEL_DISPLAY + optional "+N more")
     //   5  completion review (if classifier activity): blank + header + 3 lines
     //   3  recent history (if last_event present): blank + header + event line
-    //   1  commands hint
+    //   N  footer rows (shortcuts wrap on narrow screens)
     let has_budget = goal.token_budget.is_some_and(|b| b > 0);
     let budget_bar = if has_budget { 1u16 } else { 0 };
     let recovery_hint = if goal.status.is_paused()
@@ -508,7 +513,7 @@ pub fn goal_detail_area(screen: Rect, goal: &GoalDisplayState, todos: &[TodoItem
         + per_model_lines
         + completion_review_lines
         + history_lines
-        + 1;
+        + shortcuts_rows_needed(&goal_shortcuts(), inner_w);
     let v_margin = 2u16;
     let h = content_h.min(screen.height.saturating_sub(v_margin * 2));
 
@@ -526,7 +531,7 @@ pub fn goal_detail_area(screen: Rect, goal: &GoalDisplayState, todos: &[TodoItem
 /// - Todo progress list
 /// - Active subagent metrics
 /// - Recent event history
-/// - Available commands hint
+/// - Goal command shortcuts
 #[allow(clippy::too_many_arguments)]
 pub fn render_goal_detail(
     buf: &mut Buffer,
@@ -536,12 +541,13 @@ pub fn render_goal_detail(
     tick: usize,
     context_used: Option<u64>,
     active_subagent_tokens: u64,
-    close_hovered: bool,
-) -> Option<Rect> {
-    let theme = Theme::current();
+    window: &mut ModalWindowState,
+) {
     if area.width < 20 || area.height < 6 {
-        return None;
+        *window = ModalWindowState::default();
+        return;
     }
+    let theme = Theme::current();
 
     // Clear the popup area.
     let clear_style = Style::default().bg(theme.bg_base);
@@ -561,7 +567,7 @@ pub fn render_goal_detail(
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(border_style)
         .style(Style::default().bg(theme.bg_base));
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     ratatui::widgets::Widget::render(block, area, buf);
 
     // Close button geometry is needed up-front so the title can be budgeted
@@ -610,7 +616,7 @@ pub fn render_goal_detail(
         title_cols as u16,
     );
 
-    let close_style = if close_hovered {
+    let close_style = if window.close_hovered {
         Style::default()
             .fg(theme.text_primary)
             .bg(theme.bg_base)
@@ -624,11 +630,19 @@ pub fn render_goal_detail(
         &Span::styled(close_text, close_style),
         close_w,
     );
-    let close_rect = Rect::new(close_x, area.y, close_w, 1);
+    window.close_button_rect = Some(Rect::new(close_x, area.y, close_w, 1));
 
-    let mut y = inner.y;
     let x = inner.x + 1;
     let w = inner.width.saturating_sub(2);
+    let shortcuts = goal_shortcuts();
+    // Reserve the footer before drawing details that can fill a short terminal.
+    let footer_height = shortcuts_rows_needed(&shortcuts, w).min(inner.height - 1);
+    inner.height -= footer_height;
+    let footer = Rect::new(x, inner.bottom(), w, footer_height);
+    window.shortcut_hits =
+        render_modal_shortcuts(buf, footer, &shortcuts, window.hovered_shortcut, &theme);
+
+    let mut y = inner.y;
 
     // ── Status line ──
     let (status_text, status_color, phase_text) = status_label(goal);
@@ -652,7 +666,7 @@ pub fn render_goal_detail(
     y += 1;
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     if goal.status.is_paused() {
@@ -681,13 +695,8 @@ pub fn render_goal_detail(
             w,
         );
         y += 1;
-
-        if y >= inner.y + inner.height {
-            return Some(close_rect);
-        }
     }
 
-    //
     if (goal.status.is_paused()
         || matches!(
             goal.status,
@@ -698,7 +707,7 @@ pub fn render_goal_detail(
         let formatted = format_pause_reason(msg);
         for line in wrap_pause_message_lines(&formatted, w) {
             if y >= inner.y + inner.height {
-                return Some(close_rect);
+                return;
             }
             buf.set_line_safe(
                 x,
@@ -708,6 +717,9 @@ pub fn render_goal_detail(
             );
             y += 1;
         }
+    }
+    if y >= inner.bottom() {
+        return;
     }
 
     // ── Budget / tokens line with optional progress bar ──
@@ -752,7 +764,7 @@ pub fn render_goal_detail(
     y += 1;
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     // Progress bar — only when a budget is set.
@@ -774,14 +786,14 @@ pub fn render_goal_detail(
     }
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     // ── Blank separator ──
     y += 1;
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     // ── Progress section (todo items) ──
@@ -811,8 +823,10 @@ pub fn render_goal_detail(
         y += 1;
 
         let display_count = todos.len().min(MAX_TODO_DISPLAY);
+        let has_overflow = todos.len() > display_count;
+        let items_bottom = inner.bottom() - u16::from(has_overflow);
         for item in &todos[..display_count] {
-            if y >= inner.y + inner.height.saturating_sub(1) {
+            if y >= items_bottom {
                 break;
             }
             let (icon, icon_color) = match item.status {
@@ -834,8 +848,8 @@ pub fn render_goal_detail(
             buf.set_line_safe(x, y, &Line::from(spans), w);
             y += 1;
         }
-        if todos.len() > MAX_TODO_DISPLAY {
-            let remaining = todos.len() - MAX_TODO_DISPLAY;
+        if has_overflow && y < inner.bottom() {
+            let remaining = todos.len() - display_count;
             buf.set_line_safe(
                 x,
                 y,
@@ -850,7 +864,7 @@ pub fn render_goal_detail(
     }
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     // ── Active subagent metrics (with a leading blank separator) ──
@@ -858,7 +872,7 @@ pub fn render_goal_detail(
         // Leading blank — budgeted in `subagent_lines` (renders only with the block).
         y += 1;
         if y >= inner.y + inner.height {
-            return Some(close_rect);
+            return;
         }
         let mut subagent_spans = vec![
             Span::styled(
@@ -921,7 +935,7 @@ pub fn render_goal_detail(
             use unicode_width::UnicodeWidthStr;
             for (model_id, tokens) in goal.live_tokens_by_model.iter().take(MAX_MODEL_DISPLAY) {
                 if y >= inner.y + inner.height {
-                    return Some(close_rect);
+                    return;
                 }
                 let tokens_str = format_tokens_compact((*tokens).min(i64::MAX as u64) as i64);
                 // Budget the model id to the columns left after the "  "
@@ -959,7 +973,7 @@ pub fn render_goal_detail(
     }
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     // ── Completion review (only when classifier has run at least once) ──
@@ -967,7 +981,7 @@ pub fn render_goal_detail(
         // Blank separator.
         y += 1;
         if y >= inner.y + inner.height {
-            return Some(close_rect);
+            return;
         }
 
         buf.set_line_safe(
@@ -1049,7 +1063,7 @@ pub fn render_goal_detail(
     }
 
     if y >= inner.y + inner.height {
-        return Some(close_rect);
+        return;
     }
 
     // ── Recent history (with a leading blank separator) ──
@@ -1057,7 +1071,7 @@ pub fn render_goal_detail(
         // Leading blank — budgeted in `history_lines` (renders only with the block).
         y += 1;
         if y >= inner.y + inner.height {
-            return Some(close_rect);
+            return;
         }
         buf.set_line_safe(
             x,
@@ -1092,25 +1106,28 @@ pub fn render_goal_detail(
                 Span::styled(label, Style::default().fg(theme.text_secondary)),
             ];
             buf.set_line_safe(x, y, &Line::from(spans), w);
-            y += 1;
         }
     }
+}
 
-    // ── Commands hint ──
-    if y < inner.y + inner.height {
-        let hint_style = Style::default().fg(theme.gray_dim);
-        let hint = if matches!(
-            goal.status,
-            GoalDisplayStatus::Failed | GoalDisplayStatus::Interrupted
-        ) {
-            rust_i18n::t!("goal.footer.closed")
-        } else {
-            rust_i18n::t!("goal.footer.active")
-        };
-        buf.set_line_safe(x, y, &Line::from(Span::styled(hint, hint_style)), w);
-    }
-
-    Some(close_rect)
+fn goal_shortcuts() -> Vec<Shortcut<'static>> {
+    let close_hint = Shortcut {
+        label: rust_i18n::t!("footer.esc_close"),
+        clickable: false,
+        id: 0,
+    };
+    std::iter::once(close_hint)
+        .chain(
+            GOAL_COMMANDS
+                .iter()
+                .enumerate()
+                .map(|(id, &command)| Shortcut {
+                    label: command.into(),
+                    clickable: true,
+                    id,
+                }),
+        )
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1139,19 @@ mod tests {
     use super::*;
     use crate::app::agent::{GoalDisplayPhase, GoalDisplayState, GoalDisplayStatus};
     use ratatui::layout::Rect;
+
+    fn render(buf: &mut Buffer, area: Rect, goal: &GoalDisplayState, todos: &[TodoItem]) {
+        render_goal_detail(
+            buf,
+            area,
+            goal,
+            todos,
+            0,
+            None,
+            0,
+            &mut ModalWindowState::default(),
+        );
+    }
 
     fn make_goal() -> GoalDisplayState {
         GoalDisplayState {
@@ -1234,7 +1264,7 @@ mod tests {
         let screen = Rect::new(0, 0, 100, 40);
         let mut buf = ratatui::buffer::Buffer::empty(screen);
         let area = goal_detail_area(screen, goal, &[]);
-        render_goal_detail(&mut buf, area, goal, &[], 0, None, 0, false);
+        render(&mut buf, area, goal, &[]);
         let mut s = String::new();
         for y in 0..screen.height {
             for x in 0..screen.width {
@@ -1405,7 +1435,7 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(screen);
         let goal = make_goal();
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
     }
 
     #[test]
@@ -1414,7 +1444,7 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         let goal = make_goal();
         // Should not panic, just bail early.
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
     }
 
     #[test]
@@ -1459,7 +1489,7 @@ mod tests {
         let mut goal = make_goal();
         goal.token_budget = None;
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
     }
 
     #[test]
@@ -1473,7 +1503,7 @@ mod tests {
         goal.current_deliverable_title = None;
         goal.deliverables.clear();
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
     }
 
     #[test]
@@ -1487,7 +1517,7 @@ mod tests {
         goal.live_turn_count = None;
         goal.live_tool_call_count = None;
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
     }
 
     #[test]
@@ -1500,7 +1530,7 @@ mod tests {
         goal.current_deliverable_id = None;
         goal.current_subagent_role = None;
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
     }
 
     /// Count rendered rows whose text contains `needle`. Each line in
@@ -1764,7 +1794,7 @@ mod tests {
         let mut goal = make_goal();
         goal.status = GoalDisplayStatus::UserPaused;
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
 
         let text = buffer_text(&buf);
         assert!(text.contains("type /goal resume to continue"));
@@ -1776,25 +1806,34 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(screen);
         let goal = make_goal();
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
 
         let text = buffer_text(&buf);
         assert!(!text.contains("type /goal resume to continue"));
     }
 
     #[test]
-    fn commands_hint_includes_resume() {
-        let screen = Rect::new(0, 0, 100, 30);
-        let mut buf = ratatui::buffer::Buffer::empty(screen);
-        let goal = make_goal();
-        let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+    fn goal_detail_keeps_all_commands_visible_in_a_short_narrow_popup() {
+        let area = Rect::new(2, 2, 20, 6);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, 10));
+        let mut goal = make_goal();
+        goal.status = GoalDisplayStatus::UserPaused;
+        let mut window = ModalWindowState::default();
 
-        let text = buffer_text(&buf);
-        assert!(
-            text.contains("/goal resume"),
-            "commands hint should advertise /goal resume, got:\n{text}"
-        );
+        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, &mut window);
+
+        let hits: Vec<_> = window
+            .shortcut_hits
+            .iter()
+            .filter(|hit| hit.clickable)
+            .collect();
+        assert_eq!(hits.len(), GOAL_COMMANDS.len());
+        for (hit, command) in hits.into_iter().zip(GOAL_COMMANDS) {
+            let text: String = (hit.rect.left()..hit.rect.right())
+                .map(|column| buf[(column, hit.rect.y)].symbol())
+                .collect();
+            assert_eq!(text, command);
+        }
     }
 
     #[test]
@@ -1805,7 +1844,7 @@ mod tests {
         goal.status = GoalDisplayStatus::InfraPaused;
         goal.pause_message = Some("Turn failed: upstream unavailable".into());
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
 
         let text = buffer_text(&buf);
         assert!(
@@ -1830,7 +1869,7 @@ mod tests {
         goal.status = GoalDisplayStatus::Blocked;
         goal.pause_message = Some("no windows sdk".into());
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
 
         let text = buffer_text(&buf);
         assert!(
@@ -1858,7 +1897,7 @@ mod tests {
         goal.status = GoalDisplayStatus::Blocked;
         goal.pause_message = None;
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
 
         let text = buffer_text(&buf);
         assert!(
@@ -1885,7 +1924,7 @@ mod tests {
             goal.status = status;
             goal.pause_message = Some("stale reason".into());
             let area = goal_detail_area(screen, &goal, &[]);
-            render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+            render(&mut buf, area, &goal, &[]);
 
             let text = buffer_text(&buf);
             assert!(
@@ -1907,7 +1946,7 @@ mod tests {
         goal.status = GoalDisplayStatus::Blocked;
         goal.pause_message = Some("no windows sdk".into());
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
 
         let text = buffer_text(&buf);
         let hint_pos = text
@@ -2072,7 +2111,7 @@ mod tests {
             make_todo("Cancelled task", TodoStatus::Cancelled),
         ];
         let area = goal_detail_area(screen, &goal, &todos);
-        render_goal_detail(&mut buf, area, &goal, &todos, 0, None, 0, false);
+        render(&mut buf, area, &goal, &todos);
 
         let text = buffer_text(&buf);
         assert!(text.contains("Progress:"), "must render progress header");
@@ -2094,7 +2133,7 @@ mod tests {
             make_todo("skip", TodoStatus::Cancelled),
         ];
         let area = goal_detail_area(screen, &goal, &todos);
-        render_goal_detail(&mut buf, area, &goal, &todos, 0, None, 0, false);
+        render(&mut buf, area, &goal, &todos);
 
         let text = buffer_text(&buf);
         // Completed = ✓, InProgress = ▶, Pending = □, Cancelled = ✗
@@ -2114,7 +2153,7 @@ mod tests {
             .map(|i| make_todo(&format!("Task {i}"), TodoStatus::Pending))
             .collect();
         let area = goal_detail_area(screen, &goal, &todos);
-        render_goal_detail(&mut buf, area, &goal, &todos, 0, None, 0, false);
+        render(&mut buf, area, &goal, &todos);
 
         let text = buffer_text(&buf);
         assert!(
@@ -2202,7 +2241,7 @@ mod tests {
         let screen = Rect::new(0, 0, 100, 40);
         let mut buf = ratatui::buffer::Buffer::empty(screen);
         let area = goal_detail_area(screen, &goal, &[]);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
         let text = buffer_text(&buf);
         assert!(
             !text.contains(&"宽".repeat(120)),
@@ -2240,10 +2279,10 @@ mod tests {
 
         let area = goal_detail_area(screen, &goal, &[]);
         let mut buf = ratatui::buffer::Buffer::empty(screen);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
         let text = buffer_text(&buf);
         assert!(
-            text.contains("Esc: close"),
+            text.contains("Esc close"),
             "commands hint must render (not clipped) with no subagent/history, got:\n{text}"
         );
     }
@@ -2505,9 +2544,9 @@ mod tests {
         goal.live_turn_count = None;
         let area = goal_detail_area(screen, &goal, &[]);
         let mut buf = ratatui::buffer::Buffer::empty(screen);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
         assert!(
-            buffer_text(&buf).contains("Esc: close"),
+            buffer_text(&buf).contains("Esc close"),
             "commands hint must render for a just-spawned subagent"
         );
     }
@@ -2530,8 +2569,8 @@ mod tests {
         // And it renders fully alongside the commands hint (no clip).
         let area = goal_detail_area(screen, &goal, &[]);
         let mut buf = ratatui::buffer::Buffer::empty(screen);
-        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, false);
+        render(&mut buf, area, &goal, &[]);
         let t = buffer_text(&buf);
-        assert!(t.contains("Completion review:") && t.contains("Esc: close"));
+        assert!(t.contains("Completion review:") && t.contains("Esc close"));
     }
 }

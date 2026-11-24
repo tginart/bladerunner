@@ -2806,6 +2806,65 @@ fn palette_dispatch_preserves_prompt_draft() {
 }
 
 #[test]
+fn goal_detail_buttons_submit_commands_and_keep_the_draft() {
+    use crate::app::agent::{GoalDisplayState, GoalDisplayStatus};
+    use crate::app::app_view::InputOutcome;
+    use crate::views::goal_detail::{goal_detail_area, render_goal_detail};
+    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{buffer::Buffer, layout::Rect};
+
+    for (id, command) in ["/goal resume", "/goal pause", "/goal status", "/goal clear"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut app = test_app_with_agent();
+        let agent_id = AgentId(0);
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        let mut goal = GoalDisplayState::test_stub();
+        goal.status = GoalDisplayStatus::Complete;
+        agent.prompt.set_text("unfinished draft");
+        agent.goal_state = Some(goal.clone());
+        agent.show_goal_detail = true;
+
+        let screen = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(screen);
+        let area = goal_detail_area(screen, &goal, &[]);
+        let window = &mut agent.goal_detail_window;
+        render_goal_detail(&mut buf, area, &goal, &[], 0, None, 0, window);
+        let hit = window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.clickable && hit.id == id)
+            .unwrap();
+        let (column, row, shortcut_idx) = (hit.rect.x, hit.rect.y, hit.shortcuts_idx);
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        app.handle_input(&mouse(MouseEventKind::Moved));
+        assert_eq!(
+            app.agents[&agent_id].goal_detail_window.hovered_shortcut,
+            Some(shortcut_idx)
+        );
+        let InputOutcome::Action(action) =
+            app.handle_input(&mouse(MouseEventKind::Down(MouseButton::Left)))
+        else {
+            panic!("click on {command} did not produce an action");
+        };
+        let effects = dispatch(action, &mut app);
+
+        assert!(matches!(effects.as_slice(), [Effect::SendPrompt { text, .. }] if text == command));
+        assert!(!app.agents[&agent_id].show_goal_detail);
+        assert_eq!(app.agents[&agent_id].prompt.text(), "unfinished draft");
+    }
+}
+
+#[test]
 fn slash_compact_with_context_enqueues_command() {
     let mut app = test_app_with_agent();
     let effects = dispatch(

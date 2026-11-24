@@ -541,8 +541,6 @@ mod tests {
         "goal.event.worker_completed",
         "goal.event.worker_failed",
         "goal.event.worker_started",
-        "goal.footer.active",
-        "goal.footer.closed",
         "goal.hint.failed",
         "goal.hint.paused",
         "goal.last_verdict",

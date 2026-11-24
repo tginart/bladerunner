@@ -4574,7 +4574,7 @@ impl AgentView {
                 .filter(|s| !s.finished && s.workflow_run_id.is_none())
                 .filter_map(|s| s.tokens_used)
                 .sum();
-            let close_rect = crate::views::goal_detail::render_goal_detail(
+            crate::views::goal_detail::render_goal_detail(
                 buf,
                 overlay_rect,
                 goal,
@@ -4582,10 +4582,11 @@ impl AgentView {
                 tick,
                 self.context_state.as_ref().map(|c| c.used),
                 active_subagent_tokens,
-                self.hit_goal_close.hovered,
+                &mut self.goal_detail_window,
             );
-            self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
+        } else {
+            self.goal_detail_window = Default::default();
         }
         if let Some(browser) = self.hub_browser.as_mut() {
             let covered = crate::views::hub_browser::render_hub_browser(buf, area, browser);

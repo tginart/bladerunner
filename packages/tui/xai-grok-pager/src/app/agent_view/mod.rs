@@ -1146,7 +1146,7 @@ pub struct AgentView {
     pub hit_catalog_close: HitArea,
     pub hit_bg_status: HitArea,
     pub hit_goal_status: HitArea,
-    pub hit_goal_close: HitArea,
+    pub(crate) goal_detail_window: crate::views::modal_window::ModalWindowState,
     pub hit_bg_button: HitArea,
     #[allow(dead_code)]
     pub(crate) last_bg_click: Option<Instant>,
