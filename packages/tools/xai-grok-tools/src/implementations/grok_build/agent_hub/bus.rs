@@ -826,7 +826,10 @@ fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
         bail!("a message can carry at most {} images", store::MAX_IMAGES);
     }
     let conv = resolve_target(&meta, from, draft.to)?;
-    let mentions = store::parse_mentions(text, &meta.members);
+    let mut mentions = store::parse_mentions(text, &meta.members);
+    if alerts_all(&meta, from, &conv) && !mentions.iter().any(|h| h == HERE_MENTION) {
+        mentions.push(HERE_MENTION.to_string());
+    }
     let mut images = Vec::new();
     for path in draft.images {
         images.push(hub.store_image(path)?);
@@ -843,6 +846,17 @@ fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
     };
     hub.append(&message)?;
     Ok(message.id)
+}
+
+/// Purpose: Decide if a post gets an implicit `@here`.
+/// Input: The hub metadata, the sender handle, and the conversation key.
+/// Output: True for a person's channel post when the hub setting is on.
+/// Note: A DM already wakes its recipient, so a DM never needs `@here`.
+fn alerts_all(meta: &HubMeta, from: &str, conv: &str) -> bool {
+    let is_person = meta
+        .member(from)
+        .is_some_and(|m| m.kind == MemberKind::Person);
+    meta.person_posts_alert_all && is_person && conv.starts_with('#')
 }
 
 fn resolve_target(meta: &HubMeta, from: &str, to: &str) -> Result<String> {
@@ -1657,6 +1671,9 @@ mod tests {
             texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
             vec!["@here-2 hello"]
         );
+        // Turn off the implicit @here, so this checks only mention parsing.
+        hub.update_meta(|meta| meta.person_posts_alert_all = false)
+            .unwrap();
         post_as_person(&hub, &person, "#general", "@here-2 just one", &[]).unwrap();
         assert_eq!(
             texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
@@ -1901,6 +1918,53 @@ mod tests {
             .unwrap();
         assert_eq!(texts(&bus.inbox("b").unwrap()), vec!["@here status?"]);
         assert!(bus.inbox("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn person_channel_posts_wake_everyone_unless_turned_off() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "lead", true).unwrap();
+        bus.post_as_person("tony", "#general", "status, everyone?", &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["status, everyone?"]
+        );
+
+        let hub = bus.hub();
+        hub.update_meta(|meta| meta.person_posts_alert_all = false)
+            .unwrap();
+        bus.post_as_person("tony", "#general", "just a note", &[])
+            .into_result()
+            .unwrap();
+        bus.post_as_person("tony", "#general", "@lead you only", &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            texts(&bus.inbox(MAIN_PEER_ID).unwrap()),
+            vec!["@lead you only"]
+        );
+    }
+
+    #[test]
+    fn agent_channel_posts_do_not_get_an_implicit_here() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        bus.send("a", "#general", "plain note", None, &[])
+            .into_result()
+            .unwrap();
+        assert!(bus.inbox("b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn hub_meta_without_the_setting_defaults_to_on() {
+        let meta: HubMeta = serde_json::from_str(r#"{"name":"h","created_ms":0}"#).unwrap();
+        assert!(meta.person_posts_alert_all);
     }
 
     #[test]

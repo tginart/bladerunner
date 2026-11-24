@@ -13,7 +13,7 @@ use xai_grok_tools::implementations::grok_build::agent_hub::{
 
 use crate::util::grok_home::grok_home;
 
-const USAGE: &str = "Usage: /hub [list | new <name> [as @handle] | join <name> [as @handle] | leave | open [name] [#channel] | channel <#name> [purpose] | post <#channel|@handle> <text> [--image <path>]... | archive <name>]";
+const USAGE: &str = "Usage: /hub [list | new <name> [as @handle] | join <name> [as @handle] | leave | open [name] [#channel] | channel <#name> [purpose] | post <#channel|@handle> <text> [--image <path>]... | here [on|off] | archive <name>]";
 /// Content-chunk meta key that marks a `/hub` reply. Its value is the card title.
 pub const HUB_CARD_META_KEY: &str = "hubCard";
 /// Messages that `/hub open` shows.
@@ -300,6 +300,7 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
                 Err(reason) => bail!("{reason}"),
             }
         }
+        "here" => set_person_alerts(bus, rest),
         "archive" => {
             if rest.is_empty() {
                 bail!("{USAGE}");
@@ -312,6 +313,27 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
         }
         _ => bail!("{USAGE}"),
     }
+}
+
+/// Purpose: Show or change whether person channel posts wake every member.
+/// Input: The session's bus and `on`, `off`, or nothing to show the setting.
+/// Output: A line that states the setting.
+fn set_person_alerts(bus: &AgentBus, arg: &str) -> Result<String> {
+    let hub = bus.hub();
+    let is_on = match arg {
+        "" => hub.meta()?.person_posts_alert_all,
+        "on" | "off" => {
+            let is_on = arg == "on";
+            hub.update_meta(|meta| meta.person_posts_alert_all = is_on)?;
+            is_on
+        }
+        _ => bail!("{USAGE}"),
+    };
+    Ok(if is_on {
+        "Person posts in a channel wake every member, as `@here` does. Use `/hub here off` to wake only the `@handle`s they name.".to_string()
+    } else {
+        "Person posts in a channel wake only the `@handle`s they name, or everyone with `@here`. Use `/hub here on` to wake every member.".to_string()
+    })
 }
 
 fn status(bus: &AgentBus) -> Result<String> {
@@ -787,6 +809,30 @@ mod tests {
             Some("hub \u{b7} private \u{b7} 1 unread")
         );
         assert_eq!(status_label_in(root.path(), "s2"), None);
+    }
+
+    #[test]
+    fn here_command_toggles_person_alerts() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "s1");
+        dispatch(&bus, "new team", "lead").unwrap();
+        assert!(
+            dispatch(&bus, "here", "x")
+                .unwrap()
+                .contains("wake every member")
+        );
+        assert!(
+            dispatch(&bus, "here off", "x")
+                .unwrap()
+                .contains("wake only")
+        );
+        assert!(!bus.hub().meta().unwrap().person_posts_alert_all);
+        dispatch(&bus, "post #general no mention", "x").unwrap();
+        assert!(bus.inbox(MAIN_PEER_ID).unwrap().is_empty());
+        dispatch(&bus, "here on", "x").unwrap();
+        dispatch(&bus, "post #general now everyone", "x").unwrap();
+        assert_eq!(bus.inbox(MAIN_PEER_ID).unwrap().len(), 1);
+        assert!(dispatch(&bus, "here maybe", "x").is_err());
     }
 
     #[test]
