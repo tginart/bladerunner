@@ -98,6 +98,14 @@ pub struct HubMeta {
     /// `#channel` or [`DM_TOKENS_KEY`].
     #[serde(default)]
     pub tokens: BTreeMap<String, u64>,
+    /// When true, a person's channel post wakes every member, as `@here` does.
+    /// Hubs saved before this field existed load with the default, true.
+    #[serde(default = "default_true")]
+    pub person_posts_alert_all: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl HubMeta {
@@ -377,6 +385,7 @@ impl Hub {
             members: Vec::new(),
             agent_wake_streak: 0,
             tokens: BTreeMap::new(),
+            person_posts_alert_all: true,
         };
         let _lock = self.lock()?;
         if !self.dir.join(META_FILE).exists() {
@@ -947,6 +956,7 @@ mod tests {
             members,
             agent_wake_streak: 0,
             tokens: BTreeMap::new(),
+            person_posts_alert_all: true,
         };
         assert_eq!(unique_handle(&meta, "backend", Some("other")), "backend-2");
         assert_eq!(
@@ -1071,6 +1081,7 @@ mod tests {
             members: vec![member],
             agent_wake_streak: 0,
             tokens: BTreeMap::new(),
+            person_posts_alert_all: true,
         };
         assert_eq!(unique_handle(&meta, "backend", Some("other")), "backend");
     }
