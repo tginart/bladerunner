@@ -316,16 +316,25 @@ impl SessionActor {
             self.persist_announcement_state().await;
             return;
         };
+        if self.push_or_queue_reminder(item) {
+            self.persist_announcement_state().await;
+        }
+    }
+    /// Purpose: Add a reminder to the conversation without a split of a running turn.
+    /// Input: The reminder item.
+    /// Output: `true` when the item went into the conversation now. `false` when
+    ///     it waits in `pending_skill_reminders` for the next safe point.
+    pub(super) fn push_or_queue_reminder(&self, item: ConversationItem) -> bool {
         let turn_running = self.current_prompt_id.lock().map_or_else(
             |poisoned| poisoned.into_inner().is_some(),
             |guard| guard.is_some(),
         );
         if turn_running {
             self.pending_skill_reminders.lock().push(item);
-        } else {
-            self.chat_state_handle.push_user_message(item);
-            self.persist_announcement_state().await;
+            return false;
         }
+        self.chat_state_handle.push_user_message(item);
+        true
     }
     pub(super) async fn flush_pending_skill_reminders(&self) {
         let activation = self.plan_mode.lock().take_pending_activation();

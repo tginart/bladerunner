@@ -772,7 +772,8 @@ pub(crate) struct SessionActor {
     /// Skill-announcement reminders that arrived while a turn was running,
     /// flushed at the same safe points as `pending_interjections` plus on
     /// cancel/idle. The flush also delivers the plan tracker's buffered
-    /// mid-turn activation reminder (see `activate_plan_mode_mid_turn`).
+    /// mid-turn activation reminder (see `activate_plan_mode_mid_turn`). Hub
+    /// membership notices from `/hub` wait here too.
     pub(crate) pending_skill_reminders: Mutex<Vec<ConversationItem>>,
     /// Idle flush timeout: `None` = disabled, `Some(duration)` = flush after inactivity.
     pub(crate) idle_flush_timeout: Option<std::time::Duration>,
