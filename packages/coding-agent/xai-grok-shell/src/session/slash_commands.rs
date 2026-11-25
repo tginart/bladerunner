@@ -767,15 +767,12 @@ pub(super) fn available_commands(
             + catalog.workflows.len()
             + wasm_commands.len(),
     );
-    commands.extend(catalog.builtins.iter().map(|builtin| {
-        acp::AvailableCommand::new(builtin.name.to_string(), builtin.description.to_string()).input(
-            builtin.argument_hint.map(|hint| {
-                acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                    hint.to_string(),
-                ))
-            }),
-        )
-    }));
+    commands.extend(
+        catalog
+            .builtins
+            .iter()
+            .map(|builtin| builtin_available_command(builtin)),
+    );
     commands.extend(catalog.skills.iter().map(|command| {
         let skill = command.skill;
         let mut meta_map = serde_json::Map::new();
@@ -867,16 +864,30 @@ pub(crate) fn builtin_commands(availability: CommandAvailability) -> Vec<acp::Av
     BUILTIN_COMMANDS
         .iter()
         .filter(|cmd| availability.allows(cmd.gate))
-        .map(|cmd| {
-            acp::AvailableCommand::new(cmd.name.to_string(), cmd.description.to_string()).input(
-                cmd.argument_hint.map(|hint| {
-                    acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                        hint.to_string(),
-                    ))
-                }),
-            )
-        })
+        .map(builtin_available_command)
         .collect()
+}
+/// Purpose: Make the ACP `AvailableCommand` for one shell builtin.
+/// Input: The builtin command.
+/// Output: The command with its argument hint and, if it has aliases,
+///     `_meta.aliases`.
+/// Note: ACP has no alias field. The pager reads `_meta.aliases` so that a
+///     typed alias (`/cua`, `/mem`) is recognized and colored like its command.
+fn builtin_available_command(builtin: &BuiltinCommand) -> acp::AvailableCommand {
+    let hint = builtin.argument_hint.map(|hint| {
+        acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
+            hint.to_string(),
+        ))
+    });
+    let command =
+        acp::AvailableCommand::new(builtin.name.to_string(), builtin.description.to_string())
+            .input(hint);
+    if builtin.aliases.is_empty() {
+        return command;
+    }
+    let mut meta = acp::Meta::new();
+    meta.insert("aliases".to_owned(), serde_json::json!(builtin.aliases));
+    command.meta(meta)
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2676,6 +2687,10 @@ mod tests {
         assert!(builtin.input.is_some());
         let flush = commands.iter().find(|c| c.name == "flush").unwrap();
         assert!(flush.input.is_none());
+        assert!(flush.meta.is_none(), "no aliases means no meta");
+        let cua = commands.iter().find(|c| c.name == "computer-use").unwrap();
+        let aliases = cua.meta.as_ref().and_then(|m| m.get("aliases"));
+        assert_eq!(aliases, Some(&serde_json::json!(["cua"])));
         let skill = commands.iter().find(|c| c.name == "commit").unwrap();
         assert_eq!(skill.description, "Short: commit");
         let meta = skill.meta.as_ref().expect("skill meta");
