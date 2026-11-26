@@ -736,13 +736,11 @@ impl AgentView {
                         InputOutcome::Changed
                     }
                     Some(AgentPane::Scrollback) => {
+                        self.set_active_pane(AgentPane::Scrollback, false);
                         if self.block_viewer.is_some() {
-                            self.set_active_pane(AgentPane::Scrollback, false);
                             self.handle_block_viewer_mouse(mouse);
                             return InputOutcome::Changed;
                         }
-                        self.set_active_pane(AgentPane::Prompt, false);
-                        self.btw_focused = false;
                         self.persistent_text_selection = None;
                         self.table_selection_geometry = None;
                         self.selection_created_at = None;
@@ -838,17 +836,15 @@ impl AgentView {
                     };
                 }
                 let had_pending_text_drag = self.pending_text_drag.take().is_some();
-                let had_pending_block_drag = self.pending_block_drag.take().is_some();
+                let _had_pending_block_drag = self.pending_block_drag.take().is_some();
                 if let Some((lc, lr, target)) = self.pending_link_click.take()
                     && mouse.column == lc
                     && mouse.row == lr
                 {
                     return InputOutcome::Action(Action::OpenLink(target));
                 }
-                let mut handled_scrollback_click = false;
-                if self.block_viewer.is_none() {
+                if self.active_pane == AgentPane::Scrollback {
                     if let Some((click_col, click_row)) = self.pending_scrollback_click.take() {
-                        handled_scrollback_click = true;
                         let now = Instant::now();
                         if is_text_selection_on_double_click() {
                             let exact_text_hit = self
@@ -1001,12 +997,7 @@ impl AgentView {
                         self.pane_areas.todo,
                     );
                 }
-                if self.active_pane == AgentPane::Prompt
-                    && !handled_scrollback_click
-                    && !had_pending_text_drag
-                    && !had_pending_block_drag
-                    && !had_deferred_press
-                {
+                if self.active_pane == AgentPane::Prompt && !had_deferred_press {
                     let event = self.prompt.handle_mouse(mouse);
                     if matches!(event, PromptEvent::Edited)
                         && let Some(eff) = self.notify_suggestion_text_changed()
@@ -1776,11 +1767,11 @@ mod tests {
         assert_eq!(agent.prompt.textarea.text(), text);
     }
 
-    /// Clicking non-interactive background (margins, above-prompt strip, or
-    /// scrollback area) brings and keeps focus on the prompt text input, and
+    /// Clicking non-interactive background (margins or above-prompt strip)
+    /// focuses the prompt, a scrollback click still focuses the scrollback, and
     /// bare Esc from the prompt dismisses any active scrollback text selection.
     #[test]
-    fn background_and_scrollback_clicks_focus_prompt() {
+    fn background_clicks_focus_prompt() {
         use crate::actions::ActionRegistry;
         use crate::app::agent_view::test_fixtures::make_agent;
         use crate::scrollback::text_selection::{
@@ -1818,10 +1809,11 @@ mod tests {
         click_at(&mut agent, 10, 16);
         assert_eq!(agent.active_pane, AgentPane::Prompt);
 
-        // 3. Clicking scrollback area from Scrollback focuses Prompt.
-        agent.active_pane = AgentPane::Scrollback;
+        // 3. Clicking the scrollback pane from Prompt focuses Scrollback.
+        agent.active_pane = AgentPane::Prompt;
         click_at(&mut agent, 10, 5);
-        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert_eq!(agent.active_pane, AgentPane::Scrollback);
+        agent.active_pane = AgentPane::Prompt;
 
         // 4. Bare Esc while Prompt is focused dismisses active scrollback selection.
         agent.persistent_text_selection = Some(PersistentTextSelection {
