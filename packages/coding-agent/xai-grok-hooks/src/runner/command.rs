@@ -269,10 +269,17 @@ pub async fn run_command_hook(
             let stdout = truncate_output(&output.stdout);
             let stderr = truncate_output(&output.stderr);
 
+            // Log the first line only for a failed run, so successful hooks
+            // do not write hook-authored text on every run.
             if !stderr.is_empty() {
                 tracing::debug!(
                     hook_name = %spec.name,
                     stderr_bytes = stderr.len(),
+                    stderr_first_line = if exit_code != 0 {
+                        stderr_first_line(&stderr).unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
                     "hook stderr output captured"
                 );
             }
@@ -300,11 +307,16 @@ pub async fn run_command_hook(
                         return (HookRunnerResult::Success, elapsed);
                     }
                     (
-                        HookRunnerResult::Failed(format!("exit code {exit_code}")),
+                        HookRunnerResult::Failed(append_stderr_line(
+                            &format!("exit code {exit_code}"),
+                            &stderr,
+                        )),
                         elapsed,
                     )
                 }
-                GateKind::Tool => parse_blocking_result(&stdout, exit_code, &spec.name, elapsed),
+                GateKind::Tool => {
+                    parse_blocking_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
+                }
                 GateKind::Stop => {
                     parse_stop_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
                 }
@@ -473,9 +485,40 @@ fn find_local_shell_assignments(command_str: &str) -> std::collections::HashSet<
     names
 }
 
-/// Parse the result of a blocking hook from stdout and exit code.
+/// Cap for the stderr excerpt in deny reasons and failure messages. One huge
+/// line (capture allows 64 KB) must not flood the model message or the logs.
+const MAX_STDERR_LINE_CHARS: usize = 256;
+
+/// Purpose: This function gets the hook's feedback line from stderr.
+/// Input: The captured stderr text.
+/// Output: The first non-empty trimmed line, capped at MAX_STDERR_LINE_CHARS
+/// with an ellipsis. `None` when stderr has no text.
+/// Note: Stop blocks keep the full stderr, because it is model-facing
+/// instruction text (see `parse_stop_result`).
+fn stderr_first_line(stderr: &str) -> Option<String> {
+    let line = stderr.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= MAX_STDERR_LINE_CHARS {
+        return Some(line.to_string());
+    }
+    let mut capped: String = line.chars().take(MAX_STDERR_LINE_CHARS).collect();
+    capped.push('\u{2026}');
+    Some(capped)
+}
+
+/// Append the first stderr line to a failure message (`"exit code 1: <line>"`).
+fn append_stderr_line(message: &str, stderr: &str) -> String {
+    match stderr_first_line(stderr) {
+        Some(line) => format!("{message}: {line}"),
+        None => message.to_string(),
+    }
+}
+
+/// Parse the result of a blocking hook from stdout, stderr and exit code.
+/// On exit 2 with no JSON reason, the first stderr line is the deny reason.
+/// Other non-zero exit codes carry that line in the failure message.
 fn parse_blocking_result(
     stdout: &str,
+    stderr: &str,
     exit_code: i32,
     hook_name: &str,
     elapsed: Duration,
@@ -487,7 +530,7 @@ fn parse_blocking_result(
     };
 
     if let Some(output) = json_decision {
-        match gate_json_to_result(output, hook_name) {
+        match gate_json_to_result(output, hook_name, stderr_first_line(stderr).as_deref()) {
             Ok(HookRunnerResult::Decision(HookDecision::Deny { reason, hook_name })) => {
                 // A JSON deny is honored on any exit code (fail-safe).
                 if exit_code != GATE_EXIT_CODE && exit_code != 0 {
@@ -520,7 +563,12 @@ fn parse_blocking_result(
             }
             Ok(_) => unreachable!("gate parser only returns decisions or rewrites"),
             // Unknown decision value: failure so typos surface.
-            Err(err) => return (HookRunnerResult::Failed(err), elapsed),
+            Err(err) => {
+                return (
+                    HookRunnerResult::Failed(append_stderr_line(&err, stderr)),
+                    elapsed,
+                );
+            }
         }
     }
 
@@ -528,14 +576,17 @@ fn parse_blocking_result(
         0 => (HookRunnerResult::Decision(HookDecision::Allow), elapsed),
         GATE_EXIT_CODE => (
             HookRunnerResult::Decision(HookDecision::Deny {
-                reason: format!("denied by hook '{hook_name}' (exit code {GATE_EXIT_CODE})"),
+                reason: stderr_first_line(stderr).unwrap_or_else(|| {
+                    format!("denied by hook '{hook_name}' (exit code {GATE_EXIT_CODE})")
+                }),
                 hook_name: hook_name.to_string(),
             }),
             elapsed,
         ),
         _ => (
-            HookRunnerResult::Failed(format!(
-                "hook '{hook_name}' failed with exit code {exit_code}"
+            HookRunnerResult::Failed(append_stderr_line(
+                &format!("hook '{hook_name}' failed with exit code {exit_code}"),
+                stderr,
             )),
             elapsed,
         ),
@@ -602,8 +653,9 @@ fn parse_stop_result(
             )
         }
         _ => (
-            HookRunnerResult::Failed(format!(
-                "hook '{hook_name}' failed with exit code {exit_code}"
+            HookRunnerResult::Failed(append_stderr_line(
+                &format!("hook '{hook_name}' failed with exit code {exit_code}"),
+                stderr,
             )),
             elapsed,
         ),
@@ -645,7 +697,7 @@ mod tests {
     #[test]
     fn parse_json_decision() {
         let (allow, _) =
-            parse_blocking_result(r#"{"decision":"allow"}"#, 0, "test", Duration::ZERO);
+            parse_blocking_result(r#"{"decision":"allow"}"#, "", 0, "test", Duration::ZERO);
         assert!(matches!(
             allow,
             HookRunnerResult::Decision(HookDecision::Allow)
@@ -653,6 +705,7 @@ mod tests {
 
         let (deny, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"bad command"}"#,
+            "",
             2,
             "test",
             Duration::ZERO,
@@ -665,7 +718,7 @@ mod tests {
         }
 
         let (deny_no_reason, _) =
-            parse_blocking_result(r#"{"decision":"deny"}"#, 2, "my-hook", Duration::ZERO);
+            parse_blocking_result(r#"{"decision":"deny"}"#, "", 2, "my-hook", Duration::ZERO);
         match deny_no_reason {
             HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
                 assert!(reason.contains("my-hook"));
@@ -674,7 +727,7 @@ mod tests {
         }
 
         let (unknown, _) =
-            parse_blocking_result(r#"{"decision":"maybe"}"#, 0, "test", Duration::ZERO);
+            parse_blocking_result(r#"{"decision":"maybe"}"#, "", 0, "test", Duration::ZERO);
         assert!(matches!(unknown, HookRunnerResult::Failed(_)));
     }
 
@@ -683,7 +736,7 @@ mod tests {
         for (stdout, code, expect_allow) in
             [("", 0, true), ("not json at all", 0, true), ("", 2, false)]
         {
-            let (result, _) = parse_blocking_result(stdout, code, "test", Duration::ZERO);
+            let (result, _) = parse_blocking_result(stdout, "", code, "test", Duration::ZERO);
             if expect_allow {
                 assert!(matches!(
                     result,
@@ -696,14 +749,80 @@ mod tests {
                 ));
             }
         }
-        let (fail, _) = parse_blocking_result("", 1, "test", Duration::ZERO);
+        let (fail, _) = parse_blocking_result("", "", 1, "test", Duration::ZERO);
         assert!(matches!(fail, HookRunnerResult::Failed(_)));
+    }
+
+    /// Failure results and exit-2 deny reasons carry the first stderr line.
+    #[test]
+    fn blocking_result_surfaces_stderr() {
+        let deny_reason = |result: HookRunnerResult| match result {
+            HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => reason,
+            other => panic!("expected Deny, got {other:?}"),
+        };
+
+        let (deny, _) = parse_blocking_result(
+            "",
+            "  \nrejected by policy\nmore\n",
+            2,
+            "test",
+            Duration::ZERO,
+        );
+        assert_eq!(deny_reason(deny), "rejected by policy");
+
+        let (fail, _) = parse_blocking_result("", "config missing\n", 1, "test", Duration::ZERO);
+        match fail {
+            HookRunnerResult::Failed(error) => assert!(
+                error.contains("exit code 1") && error.contains("config missing"),
+                "failure must carry exit code and stderr text, got: {error}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // A JSON deny with a blank reason also falls back to stderr.
+        let (json_deny, _) = parse_blocking_result(
+            r#"{"decision":"deny","reason":"  "}"#,
+            "quota exceeded\n",
+            0,
+            "test",
+            Duration::ZERO,
+        );
+        assert_eq!(deny_reason(json_deny), "quota exceeded");
+
+        let (unknown, _) = parse_blocking_result(
+            r#"{"decision":"maybe"}"#,
+            "config missing\n",
+            1,
+            "test",
+            Duration::ZERO,
+        );
+        match unknown {
+            HookRunnerResult::Failed(error) => assert!(
+                error.contains("maybe") && error.contains("config missing"),
+                "got: {error}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// One huge stderr line is capped on a char boundary with an ellipsis.
+    #[test]
+    fn stderr_line_is_capped() {
+        let long = "é".repeat(MAX_STDERR_LINE_CHARS + 50);
+        let capped = stderr_first_line(&long).expect("non-empty line");
+        assert_eq!(capped.chars().count(), MAX_STDERR_LINE_CHARS + 1);
+        assert!(capped.ends_with('\u{2026}'));
+
+        let exact = "x".repeat(MAX_STDERR_LINE_CHARS);
+        assert_eq!(stderr_first_line(&exact).as_deref(), Some(exact.as_str()));
+        assert_eq!(stderr_first_line(" \n\t\n"), None);
     }
 
     #[test]
     fn json_decision_vs_exit_code() {
         let (deny, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"nope"}"#,
+            "",
             0,
             "test",
             Duration::ZERO,
@@ -714,7 +833,7 @@ mod tests {
         ));
 
         let (blocked, _) =
-            parse_blocking_result(r#"{"decision":"allow"}"#, 2, "test", Duration::ZERO);
+            parse_blocking_result(r#"{"decision":"allow"}"#, "", 2, "test", Duration::ZERO);
         assert!(matches!(
             blocked,
             HookRunnerResult::Decision(HookDecision::Deny { .. })
@@ -1000,6 +1119,19 @@ mod tests {
         assert!(
             matches!(&result, HookRunnerResult::Failed(msg) if msg.contains("timed out")),
             "expected a timeout failure, got {result:?}"
+        );
+    }
+
+    /// The observe path reports `exit code N: <first stderr line>`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn observe_failure_carries_stderr_line() {
+        let spec = make_shell_spec("echo 'disk full' >&2; exit 1");
+        let (result, _) =
+            run_command_hook(&spec, &make_envelope(), &make_ctx(), GateKind::Observe).await;
+        assert!(
+            matches!(&result, HookRunnerResult::Failed(msg) if msg == "exit code 1: disk full"),
+            "got {result:?}"
         );
     }
 
