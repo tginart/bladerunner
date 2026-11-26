@@ -5944,6 +5944,10 @@ impl AppView {
         matches!(self.active_view, ActiveView::Agent(id)
             if self.agents.get(&id).is_some_and(|a| a.gboom.is_some()))
     }
+    /// Whether an agent view saw a left press and no release yet.
+    pub(crate) fn is_left_mouse_down(&self) -> bool {
+        self.agents.values().any(|agent| agent.left_mouse_down)
+    }
     /// Un-latch held movement on every open `/gboom` game.
     ///
     /// In release-aware (Kitty) mode a key stays latched until its release

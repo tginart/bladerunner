@@ -320,6 +320,9 @@ fn suspend_for_child(
     Ok(moved_cursor)
 }
 
+/// Minimum time between two automatic re-sends of the terminal input modes.
+const INPUT_MODE_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Coalesces draw requests, gates in-flight frames, and owns draw cadence.
 #[derive(Debug)]
 struct Presenter {
@@ -328,6 +331,7 @@ struct Presenter {
     in_flight_target: Option<u64>,
     last_draw_at: Instant,
     draw_scheduled_at: Option<Instant>,
+    last_input_mode_reassert_at: Instant,
 }
 
 impl Presenter {
@@ -338,6 +342,7 @@ impl Presenter {
             in_flight_target: None,
             last_draw_at: Instant::now(),
             draw_scheduled_at: None,
+            last_input_mode_reassert_at: Instant::now(),
         }
     }
 
@@ -405,8 +410,32 @@ impl Presenter {
             || sync.queued(),
         );
         if drew {
-            self.mark_drawn(Instant::now());
+            let now = Instant::now();
+            self.mark_drawn(now);
+            // A press in flight stays untouched: some terminals drop their
+            // button state when a mouse mode is set again.
+            if !app.is_left_mouse_down() && self.take_input_mode_reassert(now) {
+                crate::app::reassert_terminal_input_modes();
+            }
         }
+    }
+
+    /*
+    Purpose: This function tells the caller when to send the terminal input modes again.
+    Input: The time of the frame that the caller drew.
+    Output: True if INPUT_MODE_REASSERT_INTERVAL passed since the last true result.
+    Note: A true result starts the interval again. The pager cannot read the mode
+        state of the terminal, and Apple Terminal sends no focus reports. Thus
+        the pager sends the modes again with a drawn frame. An idle pager draws no
+        frame, so it adds no terminal output.
+    */
+    fn take_input_mode_reassert(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_input_mode_reassert_at);
+        if elapsed < INPUT_MODE_REASSERT_INTERVAL {
+            return false;
+        }
+        self.last_input_mode_reassert_at = now;
+        true
     }
 
     fn request_presentation(
@@ -5135,6 +5164,23 @@ mod tests {
         assert!(presenter.try_present(1, |_| draws += 1, || 2));
         assert_eq!(draws, 2);
         assert_eq!(presenter.in_flight_target, Some(2));
+    }
+
+    #[test]
+    fn presenter_reasserts_input_modes_once_per_interval() {
+        let start = Instant::now();
+        let mut presenter = Presenter {
+            last_input_mode_reassert_at: start,
+            ..Presenter::new()
+        };
+
+        let before_interval = start + INPUT_MODE_REASSERT_INTERVAL / 2;
+        assert!(!presenter.take_input_mode_reassert(before_interval));
+
+        let after_interval = start + INPUT_MODE_REASSERT_INTERVAL;
+        assert!(presenter.take_input_mode_reassert(after_interval));
+        assert!(!presenter.take_input_mode_reassert(after_interval + Duration::from_millis(1)));
+        assert!(presenter.take_input_mode_reassert(after_interval + INPUT_MODE_REASSERT_INTERVAL));
     }
 
     #[test]
