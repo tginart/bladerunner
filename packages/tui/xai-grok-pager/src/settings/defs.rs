@@ -1325,22 +1325,26 @@ pub fn default_settings() -> Vec<SettingMeta> {
         },
         // SHARED: `[ui].show_inference_speed` + process-wide cache. Default OFF.
         // Hidden in minimal mode, which has no status bar to host the chip.
+        // The TTFT readout is disabled for now (see the commented-out chip in
+        // `agent_view/render.rs`), so its copy and keywords are commented out.
         SettingMeta {
             key: "show_inference_speed",
             category: SettingCategory::Appearance,
             owner: SettingOwner::Shared,
             label: "Show inference speed",
-            description: "Show tokens per second and time to first token (TTFT) of the \
-                          latest model response in the status bar.",
+            // description: "Show tokens per second and time to first token (TTFT) of the \
+            //               latest model response in the status bar.",
+            description: "Show tokens per second next to the turn status while the model \
+                          responds, and after \"Worked for\" when the turn ends.",
             keywords: &[
                 "inference",
                 "speed",
                 "tokens",
                 "tok/s",
                 "throughput",
-                "ttft",
-                "latency",
-                "first token",
+                // "ttft",
+                // "latency",
+                // "first token",
                 "metrics",
                 "performance",
             ],

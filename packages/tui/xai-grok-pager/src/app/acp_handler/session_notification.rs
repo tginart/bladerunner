@@ -1197,12 +1197,18 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         XaiSessionUpdate::ResponseCompleted {
             ttft_ms,
             tokens_per_sec,
+            usage,
             ..
         } => {
             // Replayed history is not a live measurement; keep the chip empty.
             if meta.is_replay || agent.session.loading_replay {
                 false
             } else {
+                if let (Some(usage), Some(tokens_per_sec)) = (usage.as_ref(), tokens_per_sec) {
+                    agent
+                        .turn_speed
+                        .record_response(usage.output_tokens, tokens_per_sec);
+                }
                 agent.inference_speed =
                     crate::views::agent_status::InferenceSpeed::new(ttft_ms, tokens_per_sec);
                 crate::appearance::cache::load_show_inference_speed()

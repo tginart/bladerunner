@@ -85,6 +85,7 @@ mod session_load_barrier;
 pub mod signal_handler;
 mod startup_failure;
 mod turn_completion;
+pub(crate) mod turn_speed;
 mod xt_filter;
 pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
 pub use cli::{

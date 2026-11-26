@@ -621,8 +621,8 @@ pub enum Action {
     /// where hook notifications arrive) and persists to `[ui].hooks_muted`
     /// via `Effect::PersistSetting`.
     SetHooksMuted(bool),
-    /// Set whether the status bar shows the latest model response's tok/s and
-    /// TTFT. SHARED-owned: updates the process-wide cache (read at render)
+    /// Set whether the turn status row and the "Worked for" marker show the
+    /// model's tok/s (the TTFT readout is disabled for now). SHARED-owned: updates the process-wide cache (read at render)
     /// and persists to `[ui].show_inference_speed` via `Effect::PersistSetting`.
     SetShowInferenceSpeed(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.

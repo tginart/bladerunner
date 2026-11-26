@@ -450,6 +450,16 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         plan_mode_modal_refresh_needed |=
                             detect_plan_mode_change(&notif.request.update, agent);
 
+                        // Feed the live tok/s readout from fresh stream text only.
+                        if !meta.is_replay && !agent.session.loading_replay {
+                            let stream_chars = stream_text_chars(&notif.request.update);
+                            if stream_chars > 0 {
+                                agent
+                                    .turn_speed
+                                    .record_stream_chars(stream_chars, std::time::Instant::now());
+                            }
+                        }
+
                         let had_activity_before = agent.session.tracker.activity().is_some();
                         let update = notif.request.update;
                         let user_echo = matches!(update, acp::SessionUpdate::UserMessageChunk(_));
@@ -882,6 +892,20 @@ fn handle_ext_method(ext: xai_acp_lib::AcpArgs<acp::ExtRequest>, app: &mut AppVi
                 .ok();
             false
         }
+    }
+}
+
+/// The number of characters of model output text in a stream update. Zero for
+/// an update that is not a message chunk or a thought chunk with text.
+fn stream_text_chars(update: &acp::SessionUpdate) -> usize {
+    let chunk = match update {
+        acp::SessionUpdate::AgentMessageChunk(chunk)
+        | acp::SessionUpdate::AgentThoughtChunk(chunk) => chunk,
+        _ => return 0,
+    };
+    match &chunk.content {
+        acp::ContentBlock::Text(text) => text.text.chars().count(),
+        _ => 0,
     }
 }
 
