@@ -1426,15 +1426,14 @@ fn scan_links(text: &str) -> Vec<(Range<usize>, LinkTarget)> {
 }
 
 /// The byte index where display column `col` starts, or the text end.
+/// Note: The width is the string width of the prefix, as the link scanner
+///     counts it. A sum of char widths differs for emoji ZWJ sequences.
 fn byte_at_col(text: &str, col: u16) -> Option<usize> {
-    let mut used = 0usize;
-    for (idx, c) in text.char_indices() {
-        if used >= col as usize {
-            return Some(idx);
-        }
-        used += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-    }
-    (used >= col as usize).then_some(text.len())
+    let col = usize::from(col);
+    text.char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(text.len()))
+        .find(|idx| text[..*idx].width() >= col)
 }
 
 /// Purpose: Find where a feed span points.
@@ -3665,5 +3664,13 @@ mod tests {
         assert_eq!(picker_viewport_top(0, 6, 6, 10), 1);
         // Fewer members than rows always start at the top.
         assert_eq!(picker_viewport_top(3, 1, 6, 4), 0);
+    }
+
+    #[test]
+    fn links_after_emoji_sequences_keep_their_text() {
+        let text = "👩‍💻👩‍💻👩‍💻 see https://x.io/a now";
+        let links = scan_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(&text[links[0].0.clone()], "https://x.io/a");
     }
 }
