@@ -1990,6 +1990,58 @@ async fn agent_rebuild_republishes_the_configured_cutoff() {
         .await;
 }
 
+/// Purpose: Verify that a zero-turn harness rebuild keeps hub membership notices.
+/// Input: Join and leave notices, and an obsolete skill reminder.
+/// Output: Each notice remains once, and the obsolete skill reminder is absent.
+#[tokio::test]
+async fn agent_rebuild_preserves_hub_membership_notices() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use xai_grok_tools::implementations::grok_build::agent_hub::{
+                AgentBus, MAIN_PEER_ID, parse_membership_notice,
+            };
+
+            let root = tempfile::tempdir().unwrap();
+            let bus = AgentBus::new(root.path().to_path_buf(), "rebuild").unwrap();
+            bus.register(MAIN_PEER_ID, "main", None);
+            let join = crate::session::hub::run_command(&bus, "new api as backend", "main")
+                .agent_notice
+                .expect("join notice");
+            let leave = crate::session::hub::run_command(&bus, "leave", "main")
+                .agent_notice
+                .expect("leave notice");
+            let (actor, _rx) = build_actor().await;
+            let mut expected = Vec::new();
+            for notice in [join, leave] {
+                expected.push(notice.clone());
+                actor.push_or_queue_reminder(ConversationItem::system_reminder(notice));
+                actor.push_or_queue_reminder(ConversationItem::system_reminder(
+                    "<system-reminder>obsolete skill baseline</system-reminder>",
+                ));
+                actor
+                    .handle_rebuild_agent_for_definition(
+                        xai_grok_agent::AgentDefinition::default_grok_build(),
+                    )
+                    .await
+                    .expect("zero-turn rebuild should succeed");
+                let conversation = actor.chat_state_handle.get_conversation().await;
+                let notices: Vec<_> = conversation
+                    .iter()
+                    .map(ConversationItem::text_content)
+                    .filter(|text| parse_membership_notice(text).is_some())
+                    .collect();
+                assert_eq!(notices, expected);
+                assert!(
+                    conversation
+                        .iter()
+                        .all(|item| { !item.text_content().contains("obsolete skill baseline") })
+                );
+            }
+        })
+        .await;
+}
+
 /// A spawned subagent is seeded via `SetToolOverrides` before its first prompt. The seed must
 /// publish the inheritance cell immediately, with no turn run, so the child's own subagents read
 /// the inherited cutoff regardless of turn timing.

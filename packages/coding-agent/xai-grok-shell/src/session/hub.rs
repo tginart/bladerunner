@@ -7,8 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use xai_grok_sampling_types::conversation::{ConversationItem, SyntheticReason};
 use xai_grok_tools::implementations::grok_build::agent_hub::{
-    AgentBus, HubView, MemberKind, ensure_person, person_handle_in, store,
+    AgentBus, HubView, MAIN_PEER_ID, MemberKind, ensure_person, format_join_notice,
+    format_leave_notice, parse_membership_notice, person_handle_in, store,
 };
 
 use crate::util::grok_home::grok_home;
@@ -115,13 +117,18 @@ pub struct HubReply {
     pub title: String,
     /// The card body, in markdown.
     pub markdown: String,
+    /// A system header for Main's next turn, when the command moved the
+    /// session into or out of a named hub.
+    pub agent_notice: Option<String>,
 }
 
 /// Purpose: Run one `/hub` command for the person at the keyboard.
 /// Input: The session's bus, the command arguments, and the default handle.
-/// Output: The reply to show the person.
+/// Output: The reply to show the person, and a notice for Main when the
+///     command changed Main's hub or handle.
 pub fn run_command(bus: &AgentBus, args: &str, default_handle: &str) -> HubReply {
     let args = args.trim();
+    let before = membership(bus);
     let markdown = match dispatch(bus, args, default_handle) {
         Ok(text) => text,
         Err(e) => format!("/hub: {e}"),
@@ -134,7 +141,83 @@ pub fn run_command(bus: &AgentBus, args: &str, default_handle: &str) -> HubReply
     } else {
         bus.hub_name()
     };
-    HubReply { title, markdown }
+    HubReply {
+        title,
+        markdown,
+        agent_notice: membership_notice(bus, &before),
+    }
+}
+
+/// Main's hub name and handle, or no handle when Main is not registered.
+fn membership(bus: &AgentBus) -> (String, Option<String>) {
+    let handle = bus.view(MAIN_PEER_ID).ok().map(|view| view.handle);
+    (bus.hub_name(), handle)
+}
+
+/// Purpose: Build the notice that tells Main about a change of hub membership.
+/// Input: The bus, and Main's hub name and handle before the command.
+/// Output: A join notice, a leave notice, or `None` when nothing changed.
+fn membership_notice(bus: &AgentBus, before: &(String, Option<String>)) -> Option<String> {
+    if membership(bus) == *before {
+        return None;
+    }
+    if bus.is_session_hub() {
+        return Some(format_leave_notice(&before.0));
+    }
+    join_notice(bus)
+}
+
+/// Purpose: Correct a hub notice in a loaded conversation that is no longer true.
+/// Input: The bus after the session connects, and the loaded conversation.
+/// Output: A fresh notice when the last join or leave notice names another hub
+///     or handle than Main has now. `None` when no notice exists or it is true.
+/// Note: A fork copies the parent's join notice but joins as `<handle>-fork`.
+///     A fork that does not inherit the hub keeps a notice for a hub it left.
+pub fn stale_notice_correction(
+    bus: &AgentBus,
+    conversation: &[ConversationItem],
+) -> Option<String> {
+    let stated = last_membership_notice(conversation)?;
+    let current = if bus.is_session_hub() {
+        None
+    } else {
+        Some((bus.hub_name(), bus.view(MAIN_PEER_ID).ok()?.handle))
+    };
+    if stated == current {
+        return None;
+    }
+    match (current, stated) {
+        (Some(_), _) => join_notice(bus),
+        (None, Some((left, _))) => Some(format_leave_notice(&left)),
+        (None, None) => None,
+    }
+}
+
+/// The hub and handle that the last join or leave notice states.
+fn last_membership_notice(conversation: &[ConversationItem]) -> Option<Option<(String, String)>> {
+    for item in conversation.iter().rev() {
+        let ConversationItem::User(user) = item else {
+            continue;
+        };
+        if user.synthetic_reason != Some(SyntheticReason::SystemReminder) {
+            continue;
+        }
+        if let Some(stated) = parse_membership_notice(&item.text_content()) {
+            return Some(stated);
+        }
+    }
+    None
+}
+
+/// The join notice for Main's current hub, or `None` when Main has no view.
+fn join_notice(bus: &AgentBus) -> Option<String> {
+    match bus.view(MAIN_PEER_ID) {
+        Ok(view) => Some(format_join_notice(&view)),
+        Err(error) => {
+            tracing::warn!(%error, "agent_hub: could not build the join notice");
+            None
+        }
+    }
 }
 
 /// The hub state that the TUI status bar shows for one session.
@@ -437,9 +520,7 @@ fn status(bus: &AgentBus) -> Result<String> {
             "Not in a named hub. Main and its subagents share a private hub: `/hub open` shows it, and `/hub channel` and `/hub post` work in it.\n\n{hubs}\n\nUse `/hub join <name>` or `/hub new <name>`."
         ));
     }
-    Ok(format_view(&bus.view(
-        xai_grok_tools::implementations::grok_build::MAIN_PEER_ID,
-    )?))
+    Ok(format_view(&bus.view(MAIN_PEER_ID)?))
 }
 
 fn format_view(view: &HubView) -> String {
@@ -610,7 +691,6 @@ fn parse_name_and_handle(rest: &str) -> Result<(String, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xai_grok_tools::implementations::grok_build::MAIN_PEER_ID;
 
     fn bus_in(root: &std::path::Path, sid: &str) -> AgentBus {
         let bus = AgentBus::new(root.to_path_buf(), sid).unwrap();
@@ -622,6 +702,64 @@ mod tests {
     fn default_handles() {
         assert_eq!(default_handle("My Repo!"), "my-repo");
         assert_eq!(default_handle("***"), "agent");
+    }
+
+    #[test]
+    fn membership_changes_make_agent_notices() {
+        let root = tempfile::tempdir().unwrap();
+        let other = bus_in(root.path(), "s2");
+        let reply = run_command(&other, "new api", "front");
+        let notice = reply.agent_notice.expect("join notice");
+        assert!(notice.contains("into hub api. You are @front."), "{notice}");
+        assert!(notice.contains("Other members: none"), "{notice}");
+
+        let bus = bus_in(root.path(), "s1");
+        let reply = run_command(&bus, "join api as backend", "x");
+        let notice = reply.agent_notice.expect("join notice");
+        assert!(notice.starts_with("<system_header>\n"), "{notice}");
+        assert!(notice.contains("You are @backend."), "{notice}");
+        assert!(notice.contains("Other members: @front (agent)"), "{notice}");
+        assert!(notice.contains("Channels: #general"), "{notice}");
+
+        assert_eq!(run_command(&bus, "channel #tasks", "x").agent_notice, None);
+        assert_eq!(
+            run_command(&bus, "join api as backend", "x").agent_notice,
+            None
+        );
+        assert_eq!(run_command(&bus, "join nope", "x").agent_notice, None);
+
+        let notice = run_command(&bus, "leave", "x")
+            .agent_notice
+            .expect("leave notice");
+        assert!(notice.contains("out of hub api."), "{notice}");
+    }
+
+    #[test]
+    fn stale_notices_are_corrected_on_load() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = bus_in(root.path(), "parent");
+        let notice = run_command(&parent, "new api as backend", "x")
+            .agent_notice
+            .expect("join notice");
+        let conversation = vec![ConversationItem::system_reminder(notice)];
+        assert_eq!(stale_notice_correction(&parent, &conversation), None);
+        assert_eq!(stale_notice_correction(&parent, &[]), None);
+
+        inherit_membership_in(root.path(), "parent", "child").unwrap();
+        let child = connect_in(root.path().to_path_buf(), "child").unwrap();
+        child.register(MAIN_PEER_ID, "main", None);
+        let fix = stale_notice_correction(&child, &conversation).expect("fork notice");
+        assert!(
+            fix.contains("into hub api. You are @backend-fork."),
+            "{fix}"
+        );
+        assert!(fix.contains("@backend (agent)"), "{fix}");
+
+        let shot = bus_in(root.path(), "shot");
+        let fix = stale_notice_correction(&shot, &conversation).expect("leave notice");
+        assert!(fix.contains("out of hub api."), "{fix}");
+        let left = vec![ConversationItem::system_reminder(fix)];
+        assert_eq!(stale_notice_correction(&shot, &left), None);
     }
 
     #[test]

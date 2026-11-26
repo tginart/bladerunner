@@ -38,6 +38,11 @@ impl SessionActor {
                 );
                 self.send_slash_command_output_with_meta(&reply.markdown, Some(chunk_meta))
                     .await;
+                // The card is for the person only. Main learns of a hub change on
+                // its next turn, and the notice does not wake it.
+                if let Some(notice) = reply.agent_notice {
+                    self.push_or_queue_reminder(ConversationItem::system_reminder(notice));
+                }
                 ok_end_turn(0, None)
             }
             BuiltinAction::Compact { user_context } => {
@@ -1106,6 +1111,7 @@ impl SessionActor {
             return crate::session::hub::HubReply {
                 title: "hub".to_string(),
                 markdown: "/hub: hubs are not available in this session.".to_string(),
+                agent_notice: None,
             };
         };
         let bus = bus.bus().clone();
@@ -1121,6 +1127,7 @@ impl SessionActor {
         .unwrap_or_else(|e| crate::session::hub::HubReply {
             title: "hub".to_string(),
             markdown: format!("/hub: {e}"),
+            agent_notice: None,
         })
     }
 }
