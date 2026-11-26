@@ -72,17 +72,21 @@ impl SessionActor {
         &self,
         conversation: &mut Vec<ConversationItem>,
     ) -> Option<xai_grok_tools::types::skill_discovery_tracker::SkillUpdateEffects> {
+        use xai_grok_tools::implementations::grok_build::agent_hub::parse_membership_notice;
+
         let bridge = self.agent.borrow().tool_bridge().clone();
         let is_cursor = self.is_cursor_harness();
         if is_cursor {
             bridge.set_skill_listing_xml_format(true).await;
         }
+        // Hub notices use the same reminder tag but are not part of the skill baseline.
         conversation.retain(|item| {
             !matches!(
                 item,
                 ConversationItem::User(u)
                     if u.synthetic_reason
                         == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                        && parse_membership_notice(&item.text_content()).is_none()
             )
         });
         let effects = bridge.apply_pending_skill_update().await?;
