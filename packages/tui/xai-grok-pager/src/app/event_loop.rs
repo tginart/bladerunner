@@ -2653,6 +2653,7 @@ pub(crate) async fn run(
             }
 
             _ = crate::hub_status::label_changed().notified() => {
+                announce_hub_mentions(&mut app);
                 presenter.request(false);
             }
 
@@ -4329,6 +4330,51 @@ fn process_effects(
         }
     }
     false
+}
+
+/// Purpose: Tell the person about new hub messages that mention or DM them.
+/// Input: The app.
+/// Output: None. Each new mention shows a toast and a terminal notification.
+///     A hub that is open in the hub browser shows the message there, so
+///     its mentions are not announced again.
+fn announce_hub_mentions(app: &mut AppView) {
+    for new in crate::hub_status::take_new_mentions() {
+        let is_open = app.agents.values().any(|agent| {
+            agent
+                .hub_browser
+                .as_ref()
+                .is_some_and(|browser| browser.hub.name() == new.hub)
+        });
+        if is_open {
+            continue;
+        }
+        let mention = &new.mention;
+        let preview = mention_preview(&mention.text);
+        let place = if mention.place == "DM" {
+            "a DM".to_string()
+        } else {
+            mention.place.clone()
+        };
+        app.show_toast(&format!("@{} in {place}: {preview}", mention.from));
+        app.notification_service
+            .notify(crate::notifications::NotificationEvent {
+                kind: crate::notifications::NotificationEventKind::HubMention,
+                title: format!("@{} in {place}", mention.from),
+                body: preview,
+                session_id: None,
+            });
+    }
+}
+
+/// The first line of a message, cut to 80 characters.
+fn mention_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let line = text.lines().next().unwrap_or_default().trim();
+    let mut preview: String = line.chars().take(MAX_CHARS).collect();
+    if line.chars().count() > MAX_CHARS {
+        preview.push('…');
+    }
+    preview
 }
 
 #[cfg(test)]

@@ -73,9 +73,9 @@ use super::session::lifecycle::{
     dispatch_trust_folder, open_delete_current_session_question, open_new_session_question,
 };
 use super::session::load::{
-    dispatch_cycle_session_source_filter, dispatch_load_session, dispatch_pick_content_session,
-    dispatch_pick_content_session_in_worktree, dispatch_pick_session,
-    dispatch_pick_session_in_worktree, dispatch_session_picker_closed,
+    dispatch_cycle_session_source_filter, dispatch_focus_hub_member, dispatch_load_session,
+    dispatch_pick_content_session, dispatch_pick_content_session_in_worktree,
+    dispatch_pick_session, dispatch_pick_session_in_worktree, dispatch_session_picker_closed,
     dispatch_show_session_picker, dispatch_trigger_deep_search, session_picker_entry_matches,
     session_picker_external_filter_active,
 };
@@ -391,6 +391,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::DismissClaudeImport => dispatch_dismiss_claude_import(app),
         Action::LoadSession(session_id, session_cwd, chat_kind) => {
             dispatch_load_session(app, session_id, session_cwd, chat_kind)
+        }
+        Action::FocusHubMember { session_id, handle } => {
+            dispatch_focus_hub_member(app, session_id, handle)
         }
         Action::NewSessionWithId(session_id) => dispatch_new_session_with_id(app, session_id),
         Action::StartupForkSession {

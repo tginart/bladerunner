@@ -19,7 +19,8 @@ use tokio::sync::Notify;
 
 use super::AGENT_HUB_MODEL_NAME;
 use super::store::{
-    self, Channel, Cursors, HERE_MENTION, Hub, HubMeta, Member, MemberKind, Message,
+    self, Activity, Channel, Cursors, HERE_MENTION, Hub, HubMeta, Member, MemberKind, Message,
+    Presence,
 };
 
 /// Soft cap on message body size (UTF-8 bytes).
@@ -114,6 +115,44 @@ struct LocalPeer {
     wake: Option<PeerWakeFn>,
     /// Open `wait` calls. The watcher does not wake a peer that waits.
     waiting: u32,
+    /// True while a turn runs.
+    is_turn_running: bool,
+    /// Open prompts that wait for a person (permission, question, plan).
+    needs_input: u32,
+    /// The prompt of the last turn that a person or a parent started.
+    task: Option<String>,
+    /// The presence in the file, so an unchanged state is not written again.
+    published: Option<(Activity, Option<String>)>,
+}
+
+impl LocalPeer {
+    fn new(label: String, handle: String, wake: Option<PeerWakeFn>) -> Self {
+        Self {
+            label,
+            handle,
+            status: PeerStatus::Running,
+            wake,
+            waiting: 0,
+            is_turn_running: false,
+            needs_input: 0,
+            task: None,
+            published: None,
+        }
+    }
+
+    /// The activity that the presence file shows. Prompts for a person win,
+    /// then waits, then the turn state.
+    fn activity(&self) -> Activity {
+        if self.needs_input > 0 {
+            Activity::NeedsInput
+        } else if self.waiting > 0 {
+            Activity::Waiting
+        } else if self.is_turn_running {
+            Activity::Working
+        } else {
+            Activity::Idle
+        }
+    }
 }
 
 struct RateWindow {
@@ -235,18 +274,79 @@ impl AgentBus {
             if id == MAIN_PEER_ID {
                 g.main_handle = handle.clone();
             }
-            g.peers.insert(
-                id,
-                LocalPeer {
-                    label,
-                    handle,
-                    status: PeerStatus::Running,
-                    wake,
-                    waiting: 0,
-                },
-            );
+            match g.peers.get_mut(&id) {
+                Some(peer) => {
+                    peer.label = label;
+                    peer.handle = handle;
+                    peer.status = PeerStatus::Running;
+                    peer.wake = wake;
+                    peer.published = None;
+                }
+                None => {
+                    g.peers.insert(id, LocalPeer::new(label, handle, wake));
+                }
+            }
         }
         self.start_watcher();
+    }
+
+    /// Purpose: Report that a turn of a local peer started.
+    /// Input: The peer id, and the turn prompt when a person or a parent
+    ///     agent sent it. A wake turn passes None and keeps the old task.
+    /// Output: None. The presence file shows `working`.
+    pub fn turn_started(&self, id: &str, task: Option<&str>) {
+        self.change_peer(id, |peer| {
+            peer.is_turn_running = true;
+            if let Some(task) = task.and_then(task_summary) {
+                peer.task = Some(task);
+            }
+        });
+    }
+
+    /// Report that a turn of a local peer ended. The presence shows `idle`.
+    pub fn turn_ended(&self, id: &str) {
+        self.change_peer(id, |peer| peer.is_turn_running = false);
+    }
+
+    /// Purpose: Mark a local peer as blocked on a person while a prompt is open.
+    /// Input: The peer id.
+    /// Output: A guard. The presence shows `needs_input` until every guard drops.
+    pub fn input_guard(&self, id: &str) -> InputGuard {
+        self.change_peer(id, |peer| peer.needs_input += 1);
+        InputGuard {
+            bus: self.clone(),
+            id: id.to_string(),
+        }
+    }
+
+    /// Purpose: Change the state of one local peer and save its presence.
+    /// Input: The peer id and the change.
+    /// Output: None. The file is written only when the shown presence changes.
+    ///     A write error is logged, because presence is only a display aid.
+    fn change_peer(&self, id: &str, change: impl FnOnce(&mut LocalPeer)) {
+        let update = {
+            let mut g = self.lock();
+            let hub = g.hub.clone();
+            let Some(peer) = g.peers.get_mut(id) else {
+                return;
+            };
+            change(peer);
+            let shown = (peer.activity(), peer.task.clone());
+            if peer.published.as_ref() == Some(&shown) {
+                return;
+            }
+            peer.published = Some(shown.clone());
+            (hub, peer.handle.clone(), shown)
+        };
+        let (hub, handle, (activity, task)) = update;
+        let presence = Presence {
+            activity,
+            since_ms: store::now_ms(),
+            task,
+        };
+        if let Err(error) = hub.save_presence(&handle, &presence) {
+            tracing::warn!(%error, %handle, "agent_hub: could not save presence");
+        }
     }
 
     /// Mark a peer gone. Its member entry stays, marked inactive.
@@ -559,8 +659,16 @@ impl AgentBus {
         })?;
         g.main_handle = main_handle;
         g.hub = hub;
+        let ids: Vec<String> = handles.keys().cloned().collect();
         for (id, handle) in handles {
-            g.peers.get_mut(&id).expect("peer listed above").handle = handle;
+            let peer = g.peers.get_mut(&id).expect("peer listed above");
+            peer.handle = handle;
+            // The new hub has no presence file for this peer yet.
+            peer.published = None;
+        }
+        drop(g);
+        for id in ids {
+            self.change_peer(&id, |_| {});
         }
         Ok(())
     }
@@ -652,9 +760,7 @@ struct WaitingGuard<'a> {
 
 impl<'a> WaitingGuard<'a> {
     fn new(bus: &'a AgentBus, id: &str) -> Self {
-        if let Some(peer) = bus.lock().peers.get_mut(id) {
-            peer.waiting += 1;
-        }
+        bus.change_peer(id, |peer| peer.waiting += 1);
         Self {
             bus,
             id: id.to_string(),
@@ -664,10 +770,38 @@ impl<'a> WaitingGuard<'a> {
 
 impl Drop for WaitingGuard<'_> {
     fn drop(&mut self) {
-        if let Some(peer) = self.bus.lock().peers.get_mut(&self.id) {
-            peer.waiting = peer.waiting.saturating_sub(1);
-        }
+        self.bus.change_peer(&self.id, |peer| {
+            peer.waiting = peer.waiting.saturating_sub(1)
+        });
     }
+}
+
+/// Marks a local peer as `needs_input` until it is dropped. See
+/// [`AgentBus::input_guard`].
+pub struct InputGuard {
+    bus: AgentBus,
+    id: String,
+}
+
+impl Drop for InputGuard {
+    fn drop(&mut self) {
+        self.bus.change_peer(&self.id, |peer| {
+            peer.needs_input = peer.needs_input.saturating_sub(1);
+        });
+    }
+}
+
+/// The first line of a turn prompt, cut to MAX_TASK_CHARS, or None when empty.
+fn task_summary(prompt: &str) -> Option<String> {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut task: String = line.chars().take(store::MAX_TASK_CHARS).collect();
+    if line.chars().count() > store::MAX_TASK_CHARS {
+        task.push('…');
+    }
+    Some(task)
 }
 
 /// Purpose: Deliver new DMs and mentions to local peers until the bus is dropped.
@@ -1220,6 +1354,62 @@ mod tests {
 
     fn texts(messages: &[Message]) -> Vec<&str> {
         messages.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn presence_follows_turns_waits_and_prompts_for_a_person() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let activity = || hub.presence(&handle).map(|p| p.activity);
+        assert_eq!(activity(), None, "no report before the first turn");
+        bus.turn_started(MAIN_PEER_ID, Some("\n  fix the login bug\nmore detail"));
+        assert_eq!(activity(), Some(Activity::Working));
+        assert_eq!(
+            hub.presence(&handle).unwrap().task.as_deref(),
+            Some("fix the login bug")
+        );
+        {
+            let _guard = bus.input_guard(MAIN_PEER_ID);
+            assert_eq!(activity(), Some(Activity::NeedsInput));
+            let _wait = WaitingGuard::new(&bus, MAIN_PEER_ID);
+            assert_eq!(activity(), Some(Activity::NeedsInput), "a prompt wins");
+        }
+        assert_eq!(activity(), Some(Activity::Working));
+        bus.turn_ended(MAIN_PEER_ID);
+        bus.turn_started(MAIN_PEER_ID, None);
+        assert_eq!(
+            hub.presence(&handle).unwrap().task.as_deref(),
+            Some("fix the login bug"),
+            "a wake turn keeps the task"
+        );
+        bus.turn_ended(MAIN_PEER_ID);
+        assert_eq!(activity(), Some(Activity::Idle));
+        assert_eq!(hub.presences().len(), 1);
+    }
+
+    #[test]
+    fn an_unchanged_presence_is_not_written_again() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.turn_started(MAIN_PEER_ID, Some("task"));
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let first = bus.hub().presence(&handle).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        bus.turn_started(MAIN_PEER_ID, Some("task"));
+        assert_eq!(bus.hub().presence(&handle).unwrap(), first);
+    }
+
+    #[test]
+    fn task_summary_keeps_the_first_line_and_caps_its_length() {
+        assert_eq!(task_summary("  \n"), None);
+        let long = "x".repeat(store::MAX_TASK_CHARS + 5);
+        let task = task_summary(&long).unwrap();
+        assert_eq!(task.chars().count(), store::MAX_TASK_CHARS + 1);
+        assert!(task.ends_with('…'));
     }
 
     #[test]

@@ -143,6 +143,13 @@ pub enum Action {
     /// load effect; under `--chat`, local Build disk rows are refused in
     /// dispatch (never coerced).
     LoadSession(String, Option<std::path::PathBuf>, bool),
+    /// Show the session of a hub member when this window has it open. A
+    /// session that is not open here gets a toast, never a load, because
+    /// another process can run it.
+    FocusHubMember {
+        session_id: String,
+        handle: String,
+    },
     /// Welcome Local workspace ACK confirmed (y); write ack + start session.
     #[cfg(feature = "local-workspace")]
     ConfirmWelcomeLocalWorkspaceAck,

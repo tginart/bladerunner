@@ -81,6 +81,8 @@ pub struct HubSnapshot {
     pub unread_counts: BTreeMap<String, usize>,
     /// Read cursor of the perspective member per conversation key.
     pub read: BTreeMap<String, usize>,
+    /// What each agent reported that it does now, by handle.
+    pub presences: BTreeMap<String, store::Presence>,
 }
 
 impl HubSnapshot {
@@ -171,6 +173,10 @@ pub enum HubKeyOutcome {
     },
     /// Open a URL or a file from the feed.
     OpenLink(LinkTarget),
+    /// Show the session of a member.
+    GoToMember(String),
+    /// Stop the running turn of a member.
+    StopMember(String),
 }
 
 /// What a clickable feed span points to.
@@ -203,6 +209,8 @@ enum HoverKey {
     Compose,
     /// A footer hint, by its index.
     Hint(usize),
+    HeaderGo,
+    HeaderStop,
 }
 
 /// Screen areas of the last frame, for mouse hits.
@@ -234,6 +242,9 @@ struct HitAreas {
     /// Screen area and key of each footer hint. A hint with no single key
     /// is not clickable.
     footer_hints: Vec<(Rect, Option<KeyShortcut>)>,
+    /// The "go to session" and "stop" buttons of a DM header.
+    header_go: Rect,
+    header_stop: Rect,
 }
 
 /// Purpose: Hold the hub browser state for one perspective.
@@ -280,6 +291,8 @@ pub struct HubBrowserState {
     pointer: Option<(u16, u16)>,
     /// The element under the pointer in the last frame.
     hover: Option<HoverKey>,
+    /// A member that one more `x` (or stop click) stops.
+    pending_stop: Option<String>,
     hits: HitAreas,
 }
 
@@ -313,6 +326,7 @@ impl HubBrowserState {
             copy_text: None,
             pointer: None,
             hover: None,
+            pending_stop: None,
             hits: HitAreas::default(),
         };
         let rows = state.rows();
@@ -480,7 +494,18 @@ impl HubBrowserState {
             return self.handle_compose_key(key);
         }
         let rows = self.rows();
+        let pending_stop = self.pending_stop.take();
         match key.code {
+            KeyCode::Char('g') => {
+                if let Some(peer) = self.selected_agent_peer() {
+                    return HubKeyOutcome::GoToMember(peer);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(peer) = self.selected_agent_peer() {
+                    return self.request_stop(peer, pending_stop);
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => return HubKeyOutcome::Close,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(&rows, -1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(&rows, 1),
@@ -622,6 +647,12 @@ impl HubBrowserState {
         }
         if contains(hits.chip, col, row) {
             return Some(HoverKey::Chip);
+        }
+        if contains(hits.header_go, col, row) {
+            return Some(HoverKey::HeaderGo);
+        }
+        if contains(hits.header_stop, col, row) {
+            return Some(HoverKey::HeaderStop);
         }
         if contains(hits.dm_toggle, col, row) {
             return Some(HoverKey::DmToggle);
@@ -796,6 +827,29 @@ impl HubBrowserState {
         self.feed_scroll = feed_scroll_for_cell(cell, bar.height, self.hits.feed_line_count);
     }
 
+    /// The peer of the selected DM when it is a live agent, the target of
+    /// the member actions.
+    fn selected_agent_peer(&self) -> Option<String> {
+        let Some(Row::Dm { peer, .. }) = self.selected_row() else {
+            return None;
+        };
+        let member = self.snapshot.meta.member(&peer)?;
+        (member.kind == MemberKind::Agent && member.active).then_some(peer)
+    }
+
+    /// Purpose: Stop a member on the second request, so one slip cannot stop it.
+    /// Input: The member handle and the member of the last request, if any.
+    /// Output: `StopMember` on the second request in a row. Otherwise a notice.
+    fn request_stop(&mut self, peer: String, pending: Option<String>) -> HubKeyOutcome {
+        if pending.as_deref() == Some(peer.as_str()) {
+            self.notice = None;
+            return HubKeyOutcome::StopMember(peer);
+        }
+        self.notice = Some(format!("Press x again to stop @{peer}."));
+        self.pending_stop = Some(peer);
+        HubKeyOutcome::Changed
+    }
+
     fn click(&mut self, col: u16, row: u16) -> HubKeyOutcome {
         let hint_key = self
             .hits
@@ -806,6 +860,17 @@ impl HubBrowserState {
         if let Some(key) = hint_key {
             // A click on a footer hint is the same as a press of its key.
             return self.handle_key(&key.to_key_event());
+        }
+        let pending_stop = self.pending_stop.take();
+        if self.picker.is_none()
+            && let Some(peer) = self.selected_agent_peer()
+        {
+            if contains(self.hits.header_go, col, row) {
+                return HubKeyOutcome::GoToMember(peer);
+            }
+            if contains(self.hits.header_stop, col, row) {
+                return self.request_stop(peer, pending_stop);
+            }
         }
         self.click_area(col, row);
         HubKeyOutcome::Changed
@@ -1053,6 +1118,7 @@ pub fn load_snapshot(
         dm_peers,
         unread_counts,
         read,
+        presences: hub.presences(),
     })
 }
 
@@ -1673,25 +1739,17 @@ fn render_sidebar_row(
             String::new(),
         ),
         Row::Dm { peer, .. } => {
-            let member = snapshot.meta.member(peer);
-            let is_person = member.is_some_and(|m| m.kind == MemberKind::Person);
-            let is_live = member.is_some_and(|m| m.active);
-            let (dot, color) = match (is_person, is_live) {
-                (true, _) => ("◆ ", theme.accent_plan),
-                (false, true) => ("● ", theme.accent_success),
-                (false, false) => ("○ ", theme.gray),
-            };
-            let label = match member {
-                Some(m) if m.kind == MemberKind::Agent => m.label.clone(),
-                Some(_) if *peer == state.person => "you".to_string(),
-                Some(_) => "person".to_string(),
-                None => "left".to_string(),
+            let member_state = member_state(snapshot, peer, store::now_ms(), theme);
+            let word = if *peer == state.person {
+                "you".to_string()
+            } else {
+                member_state.word
             };
             (
-                dot.to_string(),
-                Style::default().fg(color).bg(bg),
+                member_state.glyph.to_string(),
+                Style::default().fg(member_state.color).bg(bg),
                 peer.clone(),
-                label,
+                word,
             )
         }
     };
@@ -1720,7 +1778,15 @@ fn render_sidebar_row(
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        (right, Style::default().fg(theme.gray).bg(bg))
+        let needs_you = matches!(row, Row::Dm { peer, .. }
+            if snapshot.presences.get(peer).is_some_and(|p| p.activity == store::Activity::NeedsInput)
+                && snapshot.meta.member(peer).is_some_and(|m| m.active));
+        let fg = if needs_you {
+            theme.accent_error
+        } else {
+            theme.gray
+        };
+        (right, Style::default().fg(fg).bg(bg))
     };
     let right_x = area.right().saturating_sub(right_text.width() as u16 + 1);
     span_at(buf, x, area.y, &name, name_style, right_x.saturating_sub(1));
@@ -1830,10 +1896,15 @@ fn render_conversation_header(
     buf: &mut Buffer,
     area: Rect,
     row: &Row,
-    state: &HubBrowserState,
+    state: &mut HubBrowserState,
     theme: &Theme,
 ) {
     let y = area.y + 1;
+    let buttons_x = render_member_buttons(buf, area, state, theme);
+    let area = Rect {
+        width: buttons_x.saturating_sub(area.x),
+        ..area
+    };
     let title_style = Style::default()
         .fg(theme.text_primary)
         .add_modifier(Modifier::BOLD);
@@ -1851,13 +1922,7 @@ fn render_conversation_header(
             (format!("# {name}"), purpose)
         }
         Row::Dm { peer, .. } => {
-            let member = state.snapshot.meta.member(peer);
-            let status = match member {
-                Some(m) if m.kind == MemberKind::Person => "person".to_string(),
-                Some(m) if m.active => format!("{} · live", m.label),
-                Some(m) => format!("{} · gone", m.label),
-                None => "left the hub".to_string(),
-            };
+            let status = member_summary(&state.snapshot, peer, theme);
             let detail = if state.is_person_view() {
                 status
             } else {
@@ -1985,6 +2050,7 @@ fn render_feed(
             );
         }
     }
+    render_member_tooltip(buf, area, state, theme);
     state.hits.feed = area;
     state.hits.feed_top = top;
     state.hits.feed_first_line = start;
@@ -2226,6 +2292,10 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
     if state.is_person_view() {
         hints.push(HintItem::new(key!(Tab), "write"));
     }
+    if state.selected_agent_peer().is_some() {
+        hints.push(HintItem::new(key!('g'), "go to session"));
+        hints.push(HintItem::new(key!('x'), "stop"));
+    }
     hints.extend([
         HintItem::new(key!('p'), "perspective"),
         HintItem::new(key!('a'), "all/active DMs"),
@@ -2347,12 +2417,176 @@ fn picker_label(handle: &str, state: &HubBrowserState) -> (String, String) {
         return ("You".to_string(), format!("@{handle}"));
     }
     let detail = match state.snapshot.meta.member(handle) {
-        Some(m) if m.kind == MemberKind::Person => "person".to_string(),
-        Some(m) if m.active => format!("{} · live", m.label),
-        Some(m) => format!("{} · gone", m.label),
+        Some(_) => member_summary(&state.snapshot, handle, &Theme::current()),
         None => String::new(),
     };
     (format!("@{handle}"), detail)
+}
+
+/// How the browser shows what a member does.
+struct MemberState {
+    glyph: &'static str,
+    color: Color,
+    /// Such as `working 3m`, `idle 12m`, `needs you`, or `gone`.
+    word: String,
+    task: Option<String>,
+}
+
+/// Purpose: Describe a member for the sidebar, the header, and tooltips.
+/// Input: The snapshot, the handle, the time now, and the theme.
+/// Output: The status glyph, its color, a short status word, and the task.
+/// Note: A member that is not live is `gone`, whatever its last presence says.
+fn member_state(snapshot: &HubSnapshot, handle: &str, now_ms: u64, theme: &Theme) -> MemberState {
+    let Some(member) = snapshot.meta.member(handle) else {
+        return MemberState {
+            glyph: "○ ",
+            color: theme.gray,
+            word: "left".to_string(),
+            task: None,
+        };
+    };
+    if member.kind == MemberKind::Person {
+        return MemberState {
+            glyph: "◆ ",
+            color: theme.accent_plan,
+            word: "person".to_string(),
+            task: None,
+        };
+    }
+    let presence = snapshot.presences.get(handle);
+    let task = presence.and_then(|p| p.task.clone());
+    if !member.active {
+        return MemberState {
+            glyph: "○ ",
+            color: theme.gray,
+            word: "gone".to_string(),
+            task,
+        };
+    }
+    let Some(presence) = presence else {
+        return MemberState {
+            glyph: "● ",
+            color: theme.accent_success,
+            word: "live".to_string(),
+            task,
+        };
+    };
+    let age = age_label(now_ms.saturating_sub(presence.since_ms));
+    let (glyph, color, word) = match presence.activity {
+        store::Activity::Working => ("● ", theme.running, format!("working {age}")),
+        store::Activity::Idle => ("● ", theme.accent_success, format!("idle {age}")),
+        store::Activity::Waiting => ("◌ ", theme.accent_verify, "waiting".to_string()),
+        store::Activity::NeedsInput => ("● ", theme.accent_error, "needs you".to_string()),
+    };
+    MemberState {
+        glyph,
+        color,
+        word,
+        task,
+    }
+}
+
+/// One line about a member: its label, status, and task.
+fn member_summary(snapshot: &HubSnapshot, handle: &str, theme: &Theme) -> String {
+    let member_state = member_state(snapshot, handle, store::now_ms(), theme);
+    let mut summary = match snapshot.meta.member(handle) {
+        Some(member) if member.kind == MemberKind::Agent => {
+            format!("{} · {}", member.label, member_state.word)
+        }
+        Some(_) => member_state.word,
+        None => "left the hub".to_string(),
+    };
+    if let Some(task) = member_state.task {
+        summary.push_str(&format!(" · {task}"));
+    }
+    summary
+}
+
+/// A short age, such as `now`, `40s`, `3m`, `2h`, or `5d`.
+fn age_label(age_ms: u64) -> String {
+    let secs = age_ms / 1000;
+    match secs {
+        0..=4 => "now".to_string(),
+        5..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// Purpose: Draw the member action buttons at the right of a DM header.
+/// Input: The buffer, the header area, the state, and the theme.
+/// Output: The x of the first button, or the area right edge with no buttons.
+fn render_member_buttons(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &mut HubBrowserState,
+    theme: &Theme,
+) -> u16 {
+    if state.selected_agent_peer().is_none() {
+        return area.right();
+    }
+    let y = area.y + 1;
+    let stop_label = "[stop]";
+    let go_label = "[go to session]";
+    let stop_x = area.right().saturating_sub(stop_label.width() as u16);
+    let go_x = stop_x.saturating_sub(go_label.width() as u16 + 1);
+    if go_x <= area.x + 10 {
+        return area.right();
+    }
+    for (x, label, hover, is_stop) in [
+        (go_x, go_label, HoverKey::HeaderGo, false),
+        (stop_x, stop_label, HoverKey::HeaderStop, true),
+    ] {
+        let mut style = Style::default().fg(if is_stop {
+            theme.accent_error
+        } else {
+            theme.command
+        });
+        if state.hover == Some(hover) {
+            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        }
+        span_at(buf, x, y, label, style, area.right());
+    }
+    state.hits.header_go = Rect::new(go_x, y, go_label.width() as u16, 1);
+    state.hits.header_stop = Rect::new(stop_x, y, stop_label.width() as u16, 1);
+    go_x.saturating_sub(1)
+}
+
+/// Purpose: Draw a one-line card about the member under the pointer.
+/// Input: The buffer, the feed area, and the state.
+/// Output: None. The card sits under the hovered span, or above it on the
+///     last feed line.
+fn render_member_tooltip(buf: &mut Buffer, area: Rect, state: &HubBrowserState, theme: &Theme) {
+    let Some((px, py)) = state.pointer else {
+        return;
+    };
+    let Some(span) = state
+        .hits
+        .feed_spans
+        .iter()
+        .find(|span| span.row == py && span.cols.contains(&px))
+    else {
+        return;
+    };
+    let SpanTarget::Member(handle) = &span.target else {
+        return;
+    };
+    let text = format!(
+        " @{handle} · {} ",
+        member_summary(&state.snapshot, handle, theme)
+    );
+    let y = if span.row + 1 < area.bottom() {
+        span.row + 1
+    } else {
+        span.row.saturating_sub(1)
+    };
+    let width = (text.width() as u16).min(area.width);
+    let x = span.cols.start.min(area.right().saturating_sub(width));
+    let style = Style::default()
+        .fg(theme.text_primary)
+        .bg(theme.bg_highlight);
+    span_at(buf, x, y, &text, style, x + width);
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -3472,5 +3706,111 @@ mod tests {
         let (x, y) = state.cursor.expect("cursor while composing");
         assert!(contains(state.hits.compose, x, y));
         assert!(buffer_text(&buf).contains("to #general"));
+    }
+
+    fn save_presence(hub: &store::Hub, handle: &str, activity: store::Activity, task: &str) {
+        let presence = store::Presence {
+            activity,
+            since_ms: store::now_ms().saturating_sub(180_000),
+            task: Some(task.to_string()),
+        };
+        hub.save_presence(handle, &presence).unwrap();
+    }
+
+    #[test]
+    fn the_sidebar_and_header_show_what_each_agent_does() {
+        let (_root, hub) = hub_with_dms();
+        save_presence(
+            &hub,
+            "front",
+            store::Activity::Working,
+            "build the login page",
+        );
+        save_presence(&hub, "back", store::Activity::NeedsInput, "migrate the db");
+        let mut state = open(hub);
+        state.select(Some(dm("front", "me")));
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let text = buffer_text(&buf);
+        assert!(text.contains("working 3m"), "{text}");
+        assert!(text.contains("needs you"), "{text}");
+        assert!(text.contains("build the login page"), "{text}");
+        assert!(text.contains("[go to session]"), "{text}");
+        assert!(text.contains("go to session"), "footer hint: {text}");
+    }
+
+    #[test]
+    fn stop_needs_two_presses_and_go_names_the_member() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.select(Some(dm("front", "me")));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Char('g'))),
+            HubKeyOutcome::GoToMember("front".to_string())
+        );
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Char('x'))),
+            HubKeyOutcome::Changed
+        );
+        assert!(state.notice.as_deref().is_some_and(|n| n.contains("again")));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Char('x'))),
+            HubKeyOutcome::StopMember("front".to_string())
+        );
+        state.handle_key(&key(KeyCode::Char('x')));
+        state.handle_key(&key(KeyCode::Down));
+        assert_ne!(
+            state.handle_key(&key(KeyCode::Char('x'))),
+            HubKeyOutcome::StopMember("front".to_string()),
+            "another key in between resets the confirmation"
+        );
+    }
+
+    #[test]
+    fn member_actions_ignore_persons_and_channels() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Char('g'))),
+            HubKeyOutcome::Changed
+        );
+        state.select(Some(dm("me", "me")));
+        assert_eq!(state.selected_agent_peer(), None);
+    }
+
+    #[test]
+    fn hovering_a_handle_shows_a_member_card() {
+        let (root, hub) = hub_with_dms();
+        save_presence(&hub, "front", store::Activity::Idle, "write the docs");
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "ready",
+            store::now_ms(),
+        ))
+        .unwrap();
+        let mut state = open(hub);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        let (x, y) = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render_hub_browser(&mut buf, area, &mut state);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("@front · main · idle 3m · write the docs"),
+            "{text}"
+        );
+        drop(root);
+    }
+
+    #[test]
+    fn age_labels_are_short() {
+        assert_eq!(age_label(1_000), "now");
+        assert_eq!(age_label(42_000), "42s");
+        assert_eq!(age_label(5 * 60_000), "5m");
+        assert_eq!(age_label(3 * 3_600_000), "3h");
+        assert_eq!(age_label(2 * 86_400_000), "2d");
     }
 }

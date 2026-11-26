@@ -4,6 +4,7 @@
 //! - `hub.json`: the hub name, members, channels and the loop-guard streak.
 //! - `channels/<channel>.jsonl` and `dms/<a>__<b>.jsonl`: append-only messages.
 //! - `cursors/<handle>.json`: per-member read and notify positions.
+//! - `presence/<handle>.json`: what each agent does now (working, idle, ...).
 //! - `blobs/`: images attached to messages.
 //! - `hub.lock`: an advisory lock that every write holds.
 //!
@@ -38,6 +39,9 @@ pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 /// Token-count key for all DMs of a hub.
 pub const DM_TOKENS_KEY: &str = "dm";
+const PRESENCE_DIR: &str = "presence";
+/// Longest task text that a presence file keeps, in characters.
+pub const MAX_TASK_CHARS: usize = 120;
 /// Age after which an unused session hub of an ended session is removed.
 const IDLE_SESSION_HUB_MS: u64 = 60 * 60 * 1000;
 
@@ -149,6 +153,42 @@ pub struct Cursors {
     /// Messages already checked for DMs and mentions to deliver.
     #[serde(default)]
     pub notified: BTreeMap<String, usize>,
+}
+
+/// What a live agent does now, as its session reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    /// A turn runs.
+    Working,
+    /// No turn runs.
+    Idle,
+    /// The agent waits in `agent_hub wait` for a message.
+    Waiting,
+    /// A permission prompt, a question, or a plan approval waits for a person.
+    NeedsInput,
+}
+
+impl Activity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activity::Working => "working",
+            Activity::Idle => "idle",
+            Activity::Waiting => "waiting",
+            Activity::NeedsInput => "needs_input",
+        }
+    }
+}
+
+/// The contents of one presence file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Presence {
+    pub activity: Activity,
+    /// When the activity started.
+    pub since_ms: u64,
+    /// The prompt of the last turn that a person or a parent agent started.
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 /// A handle to one hub directory.
@@ -416,6 +456,47 @@ impl Hub {
         };
         let file = format!("{}__{}.jsonl", encode_handle(a), encode_handle(b));
         Ok(self.dir.join("dms").join(file))
+    }
+
+    /// The presence of a member, or None when it has not reported one.
+    /// A presence file that cannot be read counts as none.
+    pub fn presence(&self, handle: &str) -> Option<Presence> {
+        read_json(&self.presence_path(handle)).ok()
+    }
+
+    /// Purpose: Read the presence of every member that reported one.
+    /// Input: The hub.
+    /// Output: Presence by handle. Files that cannot be read are left out.
+    pub fn presences(&self) -> BTreeMap<String, Presence> {
+        let mut out = BTreeMap::new();
+        let Ok(entries) = fs::read_dir(self.dir.join(PRESENCE_DIR)) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if let Ok(presence) = read_json(&path) {
+                out.insert(decode_handle(stem), presence);
+            }
+        }
+        out
+    }
+
+    /// Save the presence of a member. The file is replaced atomically.
+    pub fn save_presence(&self, handle: &str, presence: &Presence) -> Result<()> {
+        create_private_dir(&self.dir.join(PRESENCE_DIR))?;
+        write_json_atomic(&self.presence_path(handle), presence)
+    }
+
+    fn presence_path(&self, handle: &str) -> PathBuf {
+        self.dir
+            .join(PRESENCE_DIR)
+            .join(format!("{}.json", encode_handle(handle)))
     }
 
     fn cursor_path(&self, handle: &str) -> PathBuf {

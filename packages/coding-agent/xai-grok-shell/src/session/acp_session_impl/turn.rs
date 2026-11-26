@@ -363,6 +363,10 @@ impl SessionActor {
         for contributor in self.extension_registry.turn_lifecycle_contributors() {
             contributor.on_turn_start(&turn_start_input).await;
         }
+        self.report_hub_turn_started(
+            &prompt_blocks,
+            super::super::PromptOrigin::from_prompt_id(prompt_id).is_synthetic(),
+        );
         if let Ok(mut pending) = self.rewind_pending_prompt.lock()
             && let Some(prev_text) = pending.take()
         {
@@ -1267,6 +1271,7 @@ impl SessionActor {
                 },
             );
         }
+        self.report_hub_turn_ended();
         match &result {
             Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
                 for contributor in self.extension_registry.turn_lifecycle_contributors() {

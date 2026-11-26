@@ -51,6 +51,22 @@ pub(in crate::app::dispatch) fn dispatch_load_session(
     }
     dispatch_load_session_ungated(app, session_id, session_cwd, chat_kind)
 }
+/// Purpose: Show the session of a hub member if this window has it open.
+/// Input: The app, the member session id, and its handle for the toast.
+/// Output: No effects. The view switches to the agent, or a toast says why not.
+pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
+    app: &mut AppView,
+    session_id: String,
+    handle: String,
+) -> Vec<Effect> {
+    if focus_if_session_already_open(app, &session_id, false).is_none() {
+        app.show_toast(&format!(
+            "@{handle} is not open in this window (session {session_id})."
+        ));
+    }
+    vec![]
+}
+
 /// Clear `session_id` from any existing agent that already owns the given
 /// session, then return a freshly constructed [`acp::SessionId`].
 ///
