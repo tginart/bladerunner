@@ -761,6 +761,17 @@ impl AgentView {
             }
         }
 
+        // Dismiss any active scrollback text selection on bare Esc before
+        // falling through to the agent-level Esc policy (cancel/clear/rewind).
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self.persistent_text_selection.take().is_some()
+        {
+            self.table_selection_geometry = None;
+            self.selection_created_at = None;
+            return InputOutcome::Changed;
+        }
+
         // 4. Structural keys declined by the widget. Tab leaves the prompt only
         //    when this registry exposes the scrollback surface; minimal omits
         //    FocusScrollback, so an otherwise-unclaimed Tab stays with its
