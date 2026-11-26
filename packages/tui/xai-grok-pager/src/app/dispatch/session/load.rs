@@ -51,6 +51,45 @@ pub(in crate::app::dispatch) fn dispatch_load_session(
     }
     dispatch_load_session_ungated(app, session_id, session_cwd, chat_kind)
 }
+/// Purpose: Show the session of a hub member if this window has it open.
+/// Input: The app, the member session id, and its handle for the toast.
+/// Output: No effects. The view switches to the agent, or to the subagent
+///     view of another tab that has it. Otherwise a toast says why not.
+pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
+    app: &mut AppView,
+    session_id: String,
+    handle: String,
+) -> Vec<Effect> {
+    if let Some(id) = focus_if_session_already_open(app, &session_id, false) {
+        // An open hub browser in that tab would cover the session.
+        if let Some(agent) = app.agents.get_mut(&id) {
+            agent.hub_browser = None;
+        }
+        return vec![];
+    }
+    let owner = app
+        .agents
+        .iter()
+        .find(|(_, agent)| agent.subagent_views.contains_key(&session_id))
+        .map(|(id, _)| *id);
+    let Some(owner) = owner else {
+        app.show_toast(&format!(
+            "@{handle} is not open in this window (session {session_id})."
+        ));
+        return vec![];
+    };
+    switch_to_agent(app, owner, SwitchCause::Picker);
+    if let Some(agent) = app.agents.get_mut(&owner) {
+        agent.hub_browser = None;
+        // The child can keep a browser of its own, which would cover it.
+        if let Some(child) = agent.subagent_views.get_mut(&session_id) {
+            child.hub_browser = None;
+        }
+        agent.open_subagent_fullscreen(session_id);
+    }
+    vec![]
+}
+
 /// Clear `session_id` from any existing agent that already owns the given
 /// session, then return a freshly constructed [`acp::SessionId`].
 ///

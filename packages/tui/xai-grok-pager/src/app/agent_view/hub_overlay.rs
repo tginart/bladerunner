@@ -72,6 +72,8 @@ impl AgentView {
             HubKeyOutcome::OpenLink(target) => {
                 return Some(InputOutcome::Action(Action::OpenLink(target)));
             }
+            HubKeyOutcome::GoToMember(handle) => return Some(self.go_to_hub_member(&handle)),
+            HubKeyOutcome::StopMember(handle) => return Some(self.stop_hub_member(&handle)),
             HubKeyOutcome::Post { to, text } => {
                 let result =
                     agent_hub::post_as_person(&browser.hub, browser.person_name(), &to, &text, &[]);
@@ -83,6 +85,77 @@ impl AgentView {
             }
         }
         Some(InputOutcome::Changed)
+    }
+
+    /// Purpose: Show the session of a hub member.
+    /// Input: The member handle.
+    /// Output: The outcome. A subagent of this view opens full screen, this
+    ///     session closes the hub, and another session goes to the app to focus.
+    fn go_to_hub_member(&mut self, handle: &str) -> InputOutcome {
+        let Some(session_id) = self.hub_member_session(handle) else {
+            return InputOutcome::Changed;
+        };
+        if let Some(child) = self.subagent_views.get_mut(&session_id) {
+            // The child can keep a browser of its own, which would cover it.
+            child.hub_browser = None;
+            self.hub_browser = None;
+            self.open_subagent_fullscreen(session_id);
+            return InputOutcome::Changed;
+        }
+        if self.is_own_session(&session_id) {
+            self.hub_browser = None;
+            return InputOutcome::Changed;
+        }
+        InputOutcome::Action(Action::FocusHubMember {
+            session_id,
+            handle: handle.to_string(),
+        })
+    }
+
+    /// Purpose: Stop the running turn of a hub member.
+    /// Input: The member handle.
+    /// Output: A cancel for this session or a kill for one of its subagents.
+    ///     Other sessions only get a notice, because their turns run elsewhere.
+    fn stop_hub_member(&mut self, handle: &str) -> InputOutcome {
+        let Some(session_id) = self.hub_member_session(handle) else {
+            return InputOutcome::Changed;
+        };
+        if self.subagent_views.contains_key(&session_id) {
+            return InputOutcome::Action(Action::KillSubagent(session_id));
+        }
+        if self.is_own_session(&session_id) {
+            // The cancel can open a chooser for running subagents, and the
+            // browser would cover it and take its keys.
+            self.hub_browser = None;
+            return InputOutcome::Action(Action::CancelTurn);
+        }
+        if let Some(browser) = self.hub_browser.as_mut() {
+            browser.notice = Some(format!(
+                "@{handle} runs in another session. Stop it from that session."
+            ));
+        }
+        InputOutcome::Changed
+    }
+
+    /// The session id of a member, or a notice in the browser when it has none.
+    fn hub_member_session(&mut self, handle: &str) -> Option<String> {
+        let browser = self.hub_browser.as_mut()?;
+        let session_id = browser
+            .snapshot
+            .meta
+            .member(handle)
+            .and_then(|member| member.session_id.clone());
+        if session_id.is_none() {
+            browser.notice = Some(format!("@{handle} has no session."));
+        }
+        session_id
+    }
+
+    fn is_own_session(&self, session_id: &str) -> bool {
+        self.session
+            .session_id
+            .as_ref()
+            .is_some_and(|sid| &*sid.0 == session_id)
     }
 
     fn load_hub_browser(
@@ -258,5 +331,38 @@ mod tests {
         view.handle_hub_browser_input(&key_event(KeyCode::Enter));
         assert!(view.hub_browser.as_ref().unwrap().composer.is_empty());
         assert_eq!(bus.inbox(MAIN_PEER_ID).unwrap()[0].text, "please check");
+    }
+
+    #[test]
+    fn member_actions_on_this_session_cancel_or_close_and_others_focus() {
+        let (_root, mut view, bus) = browser_with_agent();
+        view.session.session_id = Some(agent_client_protocol::SessionId::new("root"));
+        assert!(matches!(
+            view.stop_hub_member("worker"),
+            InputOutcome::Action(Action::CancelTurn)
+        ));
+        assert!(matches!(
+            view.go_to_hub_member("worker"),
+            InputOutcome::Changed
+        ));
+        assert!(
+            view.hub_browser.is_none(),
+            "going to this session closes the hub"
+        );
+        view.session.session_id = Some(agent_client_protocol::SessionId::new("other"));
+        view.hub_browser = Some(HubBrowserState::open(bus.hub(), "me", None).unwrap());
+        match view.go_to_hub_member("worker") {
+            InputOutcome::Action(Action::FocusHubMember { session_id, handle }) => {
+                assert_eq!(session_id, "root");
+                assert_eq!(handle, "worker");
+            }
+            other => panic!("expected a focus action, got {other:?}"),
+        }
+        assert!(matches!(
+            view.stop_hub_member("worker"),
+            InputOutcome::Changed
+        ));
+        let notice = view.hub_browser.as_ref().unwrap().notice.clone();
+        assert!(notice.is_some_and(|n| n.contains("another session")));
     }
 }

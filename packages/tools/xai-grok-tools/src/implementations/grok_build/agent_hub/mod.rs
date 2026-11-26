@@ -12,7 +12,8 @@ pub use bus::{
     MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, ensure_person,
     format_messages, image_paths, mark_read, parse_delivery, person_handle_in, post_as_person,
 };
-pub use store::{Member, MemberKind, Message};
+pub use bus::{InputGuard, TurnGuard};
+pub use store::{Activity, Member, MemberKind, Message, Presence};
 
 use std::path::PathBuf;
 
@@ -126,7 +127,11 @@ impl AgentHubInput {
 pub struct AgentHubPeerRow {
     pub id: String,
     pub label: String,
+    /// `gone` for a member that left, or the activity of a live agent.
     pub status: String,
+    /// The prompt of the last turn that a person or a parent agent started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,18 +398,36 @@ impl xai_tool_runtime::Tool for AgentHubTool {
     }
 }
 
+/// The status word of a member for `list`: `gone` for a member that left,
+/// the reported activity of a live agent, or `running` for a live person or
+/// an agent that has not reported yet.
+fn peer_status(member: &Member, presence: Option<&Presence>) -> String {
+    if !member.is_live() {
+        return "gone".to_string();
+    }
+    match (member.kind, presence) {
+        (MemberKind::Agent, Some(presence)) => presence.activity.as_str().to_string(),
+        _ => "running".to_string(),
+    }
+}
+
 fn run_list(bus: &AgentBus, self_id: &str) -> anyhow::Result<AgentHubOutput> {
     let view = bus.view(self_id)?;
+    let presences = bus.hub().presences();
     let peers: Vec<AgentHubPeerRow> = view
         .members
         .iter()
-        .map(|m| AgentHubPeerRow {
-            id: m.handle.clone(),
-            label: match m.kind {
-                MemberKind::Person => "person".to_string(),
-                MemberKind::Agent => m.label.clone(),
-            },
-            status: if m.is_live() { "running" } else { "gone" }.to_string(),
+        .map(|m| {
+            let presence = presences.get(&m.handle);
+            AgentHubPeerRow {
+                id: m.handle.clone(),
+                label: match m.kind {
+                    MemberKind::Person => "person".to_string(),
+                    MemberKind::Agent => m.label.clone(),
+                },
+                status: peer_status(m, presence),
+                task: presence.and_then(|p| p.task.clone()),
+            }
         })
         .collect();
     let channels: Vec<AgentHubChannelRow> = view
@@ -514,6 +537,9 @@ impl AgentHubOutput {
         if let Some(peers) = &self.peers {
             for p in peers {
                 out.push_str(&format!("\n- @{} [{}] status={}", p.id, p.label, p.status));
+                if let Some(task) = &p.task {
+                    out.push_str(&format!(" task={task:?}"));
+                }
             }
         }
         if let Some(channels) = &self.channels {

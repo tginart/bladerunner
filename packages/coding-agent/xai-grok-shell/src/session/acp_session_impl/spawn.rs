@@ -2121,6 +2121,7 @@ pub(crate) async fn spawn_session_actor(
                             tool_call_id.clone(),
                             crate::session::pending_interaction::PendingKind::Question,
                         );
+                    let _hub_input_guard = session_for_hooks.hub_input_guard();
                     tokio::select! {
                         biased;
                         () = request.result_tx.closed() => {
