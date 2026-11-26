@@ -320,6 +320,25 @@ mod tests {
         assert!(!text.contains("conversation marker"), "{text}");
     }
 
+    #[test]
+    fn a_modal_frame_leaves_no_stale_footer_hints() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = crate::test_util::make_agent_view(None, root.path().to_str().unwrap());
+        agent.open_file_browser();
+        render_text(&mut agent);
+        assert!(!agent.surface_hint_hits.is_empty());
+        agent.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
+            entries: crate::views::modal::default_palette_entries(
+                agent.sharing_enabled,
+                &agent.prompt.slash_controller,
+            ),
+            state: crate::views::picker::PickerState::input_active(),
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+        render_text(&mut agent);
+        assert!(agent.surface_hint_hits.is_empty());
+    }
+
     fn render_text(agent: &mut AgentView) -> String {
         let area = ratatui::layout::Rect::new(0, 0, 100, 30);
         let mut buf = ratatui::buffer::Buffer::empty(area);

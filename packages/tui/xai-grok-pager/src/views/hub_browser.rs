@@ -1564,6 +1564,8 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     state.cursor = None;
     if area.width < 30 || area.height < 10 {
         state.feed_selection = None;
+        // No popup is drawn, so no key may pick a candidate.
+        state.composer.close_popup();
         Clear.render(area, buf);
         fill(buf, area, Style::default().bg(theme.bg_base));
         let text = "Make the terminal larger to show the hub.";
@@ -1886,7 +1888,10 @@ fn render_main(
         return;
     };
     render_conversation_header(buf, inner, &row, state, theme);
-    let compose_rows = compose_rows(state, inner.width);
+    // The post box never covers the header: the 3 header rows and the
+    // notice row. The text scrolls inside a short box.
+    let max_compose_rows = inner.height.saturating_sub(4).max(3);
+    let compose_rows = compose_rows(state, inner.width).min(max_compose_rows);
     let compose_y = inner.bottom().saturating_sub(compose_rows + 1);
     let feed = Rect {
         y: inner.y + 3,
@@ -3880,6 +3885,47 @@ mod tests {
         assert_eq!(age_label(5 * 60_000), "5m");
         assert_eq!(age_label(3 * 3_600_000), "3h");
         assert_eq!(age_label(2 * 86_400_000), "2d");
+    }
+
+    #[test]
+    fn a_tall_draft_in_a_short_terminal_does_not_cover_the_header() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("1\n2\n3\n4\n5\n6");
+        let area = Rect::new(0, 0, 100, 10);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        assert!(
+            state.hits.compose.y >= state.hits.main.y + 3,
+            "post box {:?} under the header of {:?}",
+            state.hits.compose,
+            state.hits.main
+        );
+        assert!(state.hits.compose.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn a_completion_popup_shows_every_candidate_that_keys_can_pick() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_key(&key(KeyCode::Char('@')));
+        assert!(state.composer.is_completing());
+        for height in [8, 12, 30] {
+            let area = Rect::new(0, 0, 100, height);
+            let mut buf = Buffer::empty(area);
+            render_hub_browser(&mut buf, area, &mut state);
+            if state.composer.is_completing() {
+                assert_eq!(
+                    state.composer.popup_row_count(),
+                    state.composer.completion_items().len(),
+                    "height {height}"
+                );
+            }
+            state.handle_key(&key(KeyCode::Backspace));
+            state.handle_key(&key(KeyCode::Char('@')));
+        }
     }
 
     #[test]

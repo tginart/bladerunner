@@ -76,8 +76,11 @@ pub struct HubComposer {
 
 impl Default for HubComposer {
     fn default() -> Self {
+        // Copy, cut, and paste use the system clipboard, as in the prompt.
+        let mut textarea = TextArea::new();
+        textarea.set_clipboard_provider(Box::new(crate::clipboard::SystemClipboard));
         Self {
-            textarea: TextArea::new(),
+            textarea,
             textarea_state: TextAreaState::default(),
             history: Vec::new(),
             history_idx: None,
@@ -107,6 +110,23 @@ impl HubComposer {
 
     pub fn is_completing(&self) -> bool {
         self.completion.is_some()
+    }
+
+    /// Close the completion popup. The next edit can open it again.
+    pub fn close_popup(&mut self) {
+        self.completion = None;
+        self.popup_rows.clear();
+        self.hovered_row = None;
+    }
+
+    #[cfg(test)]
+    pub fn completion_items(&self) -> &[String] {
+        self.completion.as_ref().map_or(&[], |c| c.items.as_slice())
+    }
+
+    #[cfg(test)]
+    pub fn popup_row_count(&self) -> usize {
+        self.popup_rows.len()
     }
 
     /// Purpose: Forget the draft after a post and keep the post in history.
@@ -253,9 +273,22 @@ impl HubComposer {
     /// Output: None. The popup rows become mouse targets.
     pub fn render_popup(&mut self, buf: &mut Buffer, compose: Rect, bounds: Rect, theme: &Theme) {
         self.popup_rows.clear();
-        let Some(completion) = &self.completion else {
+        let Some(completion) = self.completion.as_mut() else {
             return;
         };
+        // Keys must never pick a candidate that the person cannot see. So the
+        // popup keeps only the rows that fit, or closes when none fit.
+        let room = compose.y.saturating_sub(bounds.y);
+        if room < 3 {
+            self.completion = None;
+            return;
+        }
+        let max_items = usize::from(room - 2);
+        if completion.items.len() > max_items {
+            completion.items.truncate(max_items);
+            completion.selected = completion.selected.min(max_items - 1);
+        }
+        let completion = &*completion;
         let rows = completion.items.len() as u16;
         let width = completion
             .items
