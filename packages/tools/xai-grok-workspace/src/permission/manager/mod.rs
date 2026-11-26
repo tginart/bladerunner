@@ -2016,6 +2016,20 @@ fn spawn_permission_manager_with_pin(
                                     // finding (or fail-closed gate Ask) follows the
                                     // ordinary Auto denial semantics: deny within
                                     // the budget, then escalate to a prompt.
+                                    // A top-level agent with a UI asks at once, so
+                                    // the user can override a wrong block. Subagents
+                                    // and UI-less clients deny and continue.
+                                    ClassifierVerdict::Block
+                                        if request_subagent_type.is_none()
+                                            && client_type.can_present_permission_prompt() =>
+                                    {
+                                        tracing::info!(
+                                            tool = %tool_name,
+                                            "auto mode: classifier blocked — prompting user"
+                                        );
+                                        auto_forced_prompt = true;
+                                        auto_prompt_reason = Some(reasons::AUTO_CLASSIFIER_DENY);
+                                    }
                                     ClassifierVerdict::Block
                                         if auto_consecutive_denials
                                             < AUTO_DENY_CONSECUTIVE_LIMIT
@@ -5146,11 +5160,13 @@ mod tests {
                 mgr.set_classifier(Some(clf));
 
                 let bash = || AccessKind::Bash("bash -c \"$X\"".into());
+                // A subagent keeps deny-and-continue; a top-level agent prompts at once.
+                let subagent = || Some("general".to_string());
                 // Exhaust the consecutive budget: each Block denies within budget.
                 for _ in 0..AUTO_DENY_CONSECUTIVE_LIMIT {
                     let d = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        mgr.request(bash(), tool_call(), None, None, None),
+                        mgr.request(bash(), tool_call(), None, subagent(), None),
                     )
                     .await
                     .expect("in-budget deny resolves");
@@ -5161,7 +5177,14 @@ mod tests {
                 let expected_tool_id = update.tool_call_id.to_string();
                 let resolution = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    mgr.request_with_path_context_resolved(bash(), update, None, None, None, None),
+                    mgr.request_with_path_context_resolved(
+                        bash(),
+                        update,
+                        None,
+                        None,
+                        subagent(),
+                        None,
+                    ),
                 )
                 .await
                 .expect("escalated prompt resolves");
@@ -9555,6 +9578,78 @@ mod tests {
             .await;
     }
 
+    /// A top-level agent on a client with a UI gets a card on the first
+    /// classifier Block. A subagent, or a client with no UI, denies and continues.
+    #[tokio::test]
+    async fn auto_classifier_first_block_prompts_only_top_level_ui_agents() {
+        use crate::permission::auto_mode::ClassifierVerdict;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cases = [
+                    (ClientType::GrokPager, None, true),
+                    (ClientType::GrokPager, Some("general"), false),
+                    (ClientType::Generic, None, false),
+                ];
+                for (client_type, subagent_type, expects_prompt) in cases {
+                    let label = format!("{client_type:?} subagent={subagent_type:?}");
+                    let tmp = tempfile::tempdir().unwrap();
+                    let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                    let client = RecordingClient::default();
+                    let prompts = client.prompts.clone();
+                    let (mgr, _e) = manager_with_recording_client(&cwd, None, client, client_type);
+                    mgr.set_auto_mode(true);
+                    let (clf, _seen) = capturing_classifier(ClassifierVerdict::Block);
+                    mgr.set_classifier(Some(clf));
+
+                    let resolution = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        mgr.request_with_path_context_resolved(
+                            AccessKind::MCPTool {
+                                name: "test_server__do_thing".into(),
+                                input: serde_json::Value::Null,
+                            },
+                            tool_call(),
+                            None,
+                            None,
+                            subagent_type.map(String::from),
+                            None,
+                        ),
+                    )
+                    .await
+                    .expect("classifier-block request must resolve, not hang");
+                    let event = resolution.event.expect("actor path returns an event");
+
+                    assert_eq!(
+                        prompts.borrow().len(),
+                        usize::from(expects_prompt),
+                        "{label}"
+                    );
+                    assert_eq!(event.user_prompted, expects_prompt, "{label}");
+                    if expects_prompt {
+                        // The recording client answers reject-once.
+                        assert!(
+                            matches!(resolution.decision, Decision::Reject(_)),
+                            "{label}: {:?}",
+                            resolution.decision
+                        );
+                        assert_eq!(
+                            event.decision_reason.as_deref(),
+                            Some(reasons::AUTO_CLASSIFIER_DENY),
+                            "{label}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(resolution.decision, Decision::PolicyDeny(_)),
+                            "{label}: {:?}",
+                            resolution.decision
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn auto_classifier_block_denies_then_escalates_to_prompt() {
         use crate::permission::auto_mode::LlmPermissionClassifier;
@@ -9585,7 +9680,8 @@ mod tests {
                             },
                             tool_call(),
                             None,
-                            None,
+                            // A subagent: a top-level agent prompts on the first block.
+                            Some("general".into()),
                             None,
                         ),
                     )
@@ -10083,7 +10179,8 @@ mod tests {
                         AccessKind::Bash("rm -rf /tmp/foo".into()),
                         tool_call(),
                         None,
-                        None,
+                        // A subagent: a top-level agent prompts on the first block.
+                        Some("general".into()),
                         None,
                     ),
                 )
