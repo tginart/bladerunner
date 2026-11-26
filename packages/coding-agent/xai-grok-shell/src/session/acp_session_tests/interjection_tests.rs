@@ -146,6 +146,67 @@ async fn drain_multiple_interjections_pushes_one_user_message_each_in_order() {
         .await;
 }
 
+/// A hub wake that lands mid-turn persists its wake text, not the user
+/// interjection envelope. A resume parses the chunk back into a hub card;
+/// with the envelope it would show a user prompt.
+#[tokio::test]
+async fn drain_persists_hub_wake_without_user_envelope() {
+    use xai_grok_tools::implementations::grok_build::agent_hub::parse_delivery;
+
+    const WAKE: &str = "<system_header>\nA reply is optional.\n</system_header>\n\
+                        [message_agents · hub team] 1 message(s).\n\
+                        --- DM · from @backend · id=m1 ---\nthe build is green";
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            for text in [WAKE, "please also add tests"] {
+                actor.pending_interjections.push(PendingInterjection {
+                    text: text.to_string(),
+                    attachments: vec![],
+                });
+            }
+            assert!(actor.drain_pending_interjections().await);
+
+            let mut persisted = Vec::new();
+            while let Ok(msg) = persistence_rx.try_recv() {
+                if let PersistenceMsg::Update(SessionUpdate::Acp(notification)) = msg
+                    && let acp::SessionUpdate::UserMessageChunk(chunk) = notification.update
+                    && let acp::ContentBlock::Text(text) = chunk.content
+                {
+                    persisted.push(text.text);
+                }
+            }
+            assert_eq!(persisted.len(), 2, "{persisted:?}");
+            assert_eq!(persisted[0], WAKE);
+            assert!(parse_delivery(&persisted[0]).is_some());
+            assert!(
+                persisted[1].contains("<user_query>\nplease also add tests\n</user_query>"),
+                "a user interjection keeps its envelope, got: {}",
+                persisted[1]
+            );
+
+            // The model still gets the same envelope as before.
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let model_texts: Vec<String> = conversation
+                .iter()
+                .filter(|item| matches!(item, ConversationItem::User(_)))
+                .map(|item| item.text_content())
+                .collect();
+            assert!(
+                model_texts
+                    .iter()
+                    .any(|text| text.contains("<user_query>\n<system_header>")),
+                "{model_texts:?}"
+            );
+        })
+        .await;
+}
+
 /// Draining with an empty buffer reports false and leaves the conversation
 /// untouched. The turn loop's checkpoint gates rely on this.
 #[tokio::test]

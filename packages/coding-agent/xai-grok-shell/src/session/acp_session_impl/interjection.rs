@@ -3,6 +3,7 @@
 //! synthetic-user-message injector the permission-panel followup path reuses.
 
 use super::*;
+use xai_grok_tools::implementations::grok_build::agent_hub::parse_delivery;
 
 // Buffer, entry type, and formatting live in the shared
 // xai-interjection-core crate so the server-side agent loop can adopt the
@@ -326,6 +327,10 @@ impl SessionActor {
             let sanitized =
                 crate::session::placeholder_images::strip_paths_from_image_placeholders(text);
             let skill_information = self.interjection_skill_information(&sanitized).await;
+            // A hub wake is not a message from the user. Its persisted chunk
+            // keeps the wake text, so that a resume shows the hub card and
+            // not a user prompt with the interjection envelope.
+            let hub_wake = parse_delivery(&sanitized).map(|_| sanitized.clone());
             let mut wrapped = format_interjection(sanitized);
             let images = self
                 .prepare_interjection_images(&mut wrapped, attachments)
@@ -348,7 +353,8 @@ impl SessionActor {
             for img in &images {
                 item.add_image(pick_user_image_url(img));
             }
-            self.inject_synthetic_user_message(&wrapped, item, false, &images)
+            let persisted_text = hub_wake.as_deref().unwrap_or(&wrapped);
+            self.inject_synthetic_user_message(persisted_text, item, false, &images)
                 .await;
             tracing::info!("Injected mid-turn interjection as standalone synthetic user message");
         }
