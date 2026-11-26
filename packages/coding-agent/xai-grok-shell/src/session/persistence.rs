@@ -1315,6 +1315,26 @@ impl Summary {
         )
     }
 
+    /// Purpose: This function finds an unused session that the TUI opened and
+    /// the user never used.
+    /// Output: True when the session has 0 messages, a blank title, and no fork
+    /// provenance.
+    /// Note: A worktree stamp does not exempt a session. A fork does, through
+    /// `session_kind == "fork"`, `parent_session_id` or `forked_at`, because a
+    /// worktree fork keeps the kind `worktree`.
+    pub fn is_unused_optimistic_husk(&self) -> bool {
+        let is_fork = matches!(self.session_kind.as_deref(), Some("fork"))
+            || self
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+            || self.forked_at.is_some();
+        if is_fork {
+            return false;
+        }
+        self.num_messages == 0 && self.display_title().trim().is_empty()
+    }
+
     /// Preferred display title: `generated_title` if non-empty, else `session_summary`.
     pub fn display_title(&self) -> &str {
         self.generated_title
@@ -1405,6 +1425,42 @@ mod is_hidden_tests {
         assert!(!summary_with_kind(None).is_hidden());
         assert!(!summary_with_kind(Some("fork")).is_hidden());
         assert!(!summary_with_kind(Some("worktree")).is_hidden());
+    }
+
+    #[test]
+    fn unused_husk_is_untitled_empty_and_not_a_fork() {
+        let mut husk = summary_with_kind(Some("worktree"));
+        husk.num_messages = 0;
+        husk.generated_title = None;
+        husk.session_summary = String::new();
+        husk.parent_session_id = None;
+        husk.forked_at = None;
+        assert!(
+            husk.is_unused_optimistic_husk(),
+            "a worktree stamp alone does not exempt an empty session"
+        );
+
+        let mut used = husk.clone();
+        used.num_messages = 1;
+        assert!(!used.is_unused_optimistic_husk());
+
+        let mut titled = husk.clone();
+        titled.generated_title = Some("Fix the build".into());
+        assert!(!titled.is_unused_optimistic_husk());
+
+        let mut worktree_fork = husk.clone();
+        worktree_fork.parent_session_id = Some("parent".into());
+        assert!(!worktree_fork.is_unused_optimistic_husk());
+
+        let mut forked = husk.clone();
+        forked.forked_at = Some(Utc::now());
+        assert!(!forked.is_unused_optimistic_husk());
+
+        let mut empty_parent = husk.clone();
+        empty_parent.parent_session_id = Some(String::new());
+        assert!(empty_parent.is_unused_optimistic_husk());
+
+        assert!(!summary_with_kind(Some("fork")).is_unused_optimistic_husk());
     }
 
     #[test]
