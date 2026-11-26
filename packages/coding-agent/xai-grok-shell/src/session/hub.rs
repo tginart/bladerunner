@@ -7,9 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use xai_grok_sampling_types::conversation::{ConversationItem, SyntheticReason};
 use xai_grok_tools::implementations::grok_build::agent_hub::{
     AgentBus, HubView, MAIN_PEER_ID, MemberKind, ensure_person, format_join_notice,
-    format_leave_notice, person_handle_in, store,
+    format_leave_notice, parse_membership_notice, person_handle_in, store,
 };
 
 use crate::util::grok_home::grok_home;
@@ -163,6 +164,53 @@ fn membership_notice(bus: &AgentBus, before: &(String, Option<String>)) -> Optio
     if bus.is_session_hub() {
         return Some(format_leave_notice(&before.0));
     }
+    join_notice(bus)
+}
+
+/// Purpose: Correct a hub notice in a loaded conversation that is no longer true.
+/// Input: The bus after the session connects, and the loaded conversation.
+/// Output: A fresh notice when the last join or leave notice names another hub
+///     or handle than Main has now. `None` when no notice exists or it is true.
+/// Note: A fork copies the parent's join notice but joins as `<handle>-fork`.
+///     A fork that does not inherit the hub keeps a notice for a hub it left.
+pub fn stale_notice_correction(
+    bus: &AgentBus,
+    conversation: &[ConversationItem],
+) -> Option<String> {
+    let stated = last_membership_notice(conversation)?;
+    let current = if bus.is_session_hub() {
+        None
+    } else {
+        Some((bus.hub_name(), bus.view(MAIN_PEER_ID).ok()?.handle))
+    };
+    if stated == current {
+        return None;
+    }
+    match (current, stated) {
+        (Some(_), _) => join_notice(bus),
+        (None, Some((left, _))) => Some(format_leave_notice(&left)),
+        (None, None) => None,
+    }
+}
+
+/// The hub and handle that the last join or leave notice states.
+fn last_membership_notice(conversation: &[ConversationItem]) -> Option<Option<(String, String)>> {
+    for item in conversation.iter().rev() {
+        let ConversationItem::User(user) = item else {
+            continue;
+        };
+        if user.synthetic_reason != Some(SyntheticReason::SystemReminder) {
+            continue;
+        }
+        if let Some(stated) = parse_membership_notice(&item.text_content()) {
+            return Some(stated);
+        }
+    }
+    None
+}
+
+/// The join notice for Main's current hub, or `None` when Main has no view.
+fn join_notice(bus: &AgentBus) -> Option<String> {
     match bus.view(MAIN_PEER_ID) {
         Ok(view) => Some(format_join_notice(&view)),
         Err(error) => {
@@ -590,6 +638,34 @@ mod tests {
             .agent_notice
             .expect("leave notice");
         assert!(notice.contains("out of hub api."), "{notice}");
+    }
+
+    #[test]
+    fn stale_notices_are_corrected_on_load() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = bus_in(root.path(), "parent");
+        let notice = run_command(&parent, "new api as backend", "x")
+            .agent_notice
+            .expect("join notice");
+        let conversation = vec![ConversationItem::system_reminder(notice)];
+        assert_eq!(stale_notice_correction(&parent, &conversation), None);
+        assert_eq!(stale_notice_correction(&parent, &[]), None);
+
+        inherit_membership_in(root.path(), "parent", "child").unwrap();
+        let child = connect_in(root.path().to_path_buf(), "child").unwrap();
+        child.register(MAIN_PEER_ID, "main", None);
+        let fix = stale_notice_correction(&child, &conversation).expect("fork notice");
+        assert!(
+            fix.contains("into hub api. You are @backend-fork."),
+            "{fix}"
+        );
+        assert!(fix.contains("@backend (agent)"), "{fix}");
+
+        let shot = bus_in(root.path(), "shot");
+        let fix = stale_notice_correction(&shot, &conversation).expect("leave notice");
+        assert!(fix.contains("out of hub api."), "{fix}");
+        let left = vec![ConversationItem::system_reminder(fix)];
+        assert_eq!(stale_notice_correction(&shot, &left), None);
     }
 
     #[test]

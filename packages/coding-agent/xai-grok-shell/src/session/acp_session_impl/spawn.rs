@@ -1177,6 +1177,14 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
+    // A fork copies the parent's hub notice but joins with its own handle.
+    if !startup_hints.is_subagent
+        && let Some(bus_res) = tool_context.agent_bus.as_ref()
+        && let Some(notice) =
+            crate::session::hub::stale_notice_correction(bus_res.bus(), &conversation)
+    {
+        conversation.push(ConversationItem::system_reminder(notice));
+    }
     persist_chat_history_jsonl_sync(&session_info, &conversation);
     chat_state_handle.replace_conversation(conversation);
     let feedback_client = feedback_proxy_url.map(|base_url| {
