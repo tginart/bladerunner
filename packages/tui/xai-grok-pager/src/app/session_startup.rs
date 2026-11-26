@@ -773,9 +773,13 @@ pub fn effective_fork_new_cwd(process_cwd: &str, parent_cwd: Option<&Path>) -> S
         .unwrap_or_else(|| process_cwd.to_string())
 }
 /// Resolve most-recent session id for cwd, or error.
+///
+/// Skips unused sessions that the TUI opened and the user never used, so
+/// `-c` does not attach an empty session (upstream 1.0.25).
 async fn most_recent_session_id(cwd: &str) -> anyhow::Result<(String, Option<String>)> {
     let summaries = xai_grok_shell::session::persistence::list_summaries(Some(cwd)).await?;
-    let first = summaries.first().ok_or_else(|| {
+    let first = summaries.iter().find(|s| !s.is_unused_optimistic_husk());
+    let first = first.ok_or_else(|| {
         anyhow::anyhow!(
             "No session found for current directory. \
              Use 'grok' to start a new session."

@@ -417,6 +417,37 @@ impl AgentViewLayout {
         ));
         outer_block.inner(area).width
     }
+    /// Columns of the scrollbar / timeline gutter that sit right of `scrollback`.
+    pub fn scrollbar_gutter(&self) -> u16 {
+        (self.scrollbar_x + 1).saturating_sub(self.scrollback.right())
+    }
+    /*
+    Purpose: Move the conversation into a part of the scrollback area.
+    Input: A rectangle inside the current scrollback area.
+    Output: The scrollback, content, scrollbar, and rail fields for that rectangle.
+    Note: The scrollbar and the rail keep their offset from the right edge.
+    */
+    pub fn confine_scrollback(&mut self, conversation: Rect) {
+        // Edge checks, not `Rect::contains`: an empty rectangle contains no
+        // position, but a zero-size conversation is still a valid result.
+        assert!(
+            conversation.x >= self.scrollback.x
+                && conversation.y >= self.scrollback.y
+                && conversation.right() <= self.scrollback.right()
+                && conversation.bottom() <= self.scrollback.bottom(),
+            "conversation {conversation:?} must be inside {:?}",
+            self.scrollback
+        );
+        let right_shift = self.scrollback.right() - conversation.right();
+        let content_right = self.scrollback_content.right() - right_shift;
+        self.scrollbar_x -= right_shift;
+        self.timeline_x = self.timeline_x.saturating_sub(right_shift);
+        self.scrollback = conversation;
+        self.scrollback_content = Rect {
+            width: content_right.saturating_sub(conversation.x),
+            ..conversation
+        };
+    }
     /// Convert to PaneAreas for mouse hit-testing.
     pub fn pane_areas(&self) -> PaneAreas {
         PaneAreas {

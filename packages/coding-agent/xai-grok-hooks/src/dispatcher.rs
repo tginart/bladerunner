@@ -160,7 +160,7 @@ pub async fn dispatch_pre_tool_use(
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    error = %err,
+                    hook_failure = %err,
                     "hook failed; ignoring (fail-open)"
                 );
                 run_results.push(HookRunResult::Failed {
@@ -361,7 +361,7 @@ pub async fn dispatch_stop(
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    error = %err,
+                    hook_failure = %err,
                     "stop hook failed; ignoring (fail-open)"
                 );
                 out.results.push(HookRunResult::Failed {
@@ -441,7 +441,7 @@ pub async fn dispatch_non_blocking(
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    error = %err,
+                    hook_failure = %err,
                     "hook failed"
                 );
                 results.push(HookRunResult::Failed {

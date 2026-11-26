@@ -5,6 +5,7 @@ Output: View state and explicit requests for host actions.
 */
 
 mod fs;
+mod layout;
 mod render;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,7 @@ use super::file_search::line_viewer::LineViewerState;
 use super::terminal_pane::TerminalPane;
 use crate::clipboard::SystemClipboard;
 use fs::{Entry, Request, Response};
+pub(crate) use layout::{BrowserLayout, split_area};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
@@ -76,6 +78,7 @@ struct HitAreas {
     edit: Rect,
     refresh: Rect,
     show_all: Rect,
+    layout: Rect,
     close: Rect,
     editor_choices: [Rect; 3],
 }
@@ -89,6 +92,7 @@ pub struct FileBrowserState {
     pub(crate) visible: bool,
     pub(crate) focused: bool,
     root: PathBuf,
+    layout: BrowserLayout,
     focus: Focus,
     show_all: bool,
     expanded: HashSet<PathBuf>,
@@ -132,6 +136,7 @@ impl FileBrowserState {
             visible: true,
             focused: true,
             root: root.to_path_buf(),
+            layout: BrowserLayout::default(),
             focus: Focus::Tree,
             show_all: false,
             expanded: HashSet::from([root.to_path_buf()]),
@@ -163,6 +168,15 @@ impl FileBrowserState {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn layout(&self) -> BrowserLayout {
+        self.layout
+    }
+
+    fn cycle_layout(&mut self) {
+        self.layout = self.layout.next();
+        self.notice = Some(format!("Files layout: {}", self.layout.label()));
     }
 
     pub(crate) fn needs_tick(&self) -> bool {
@@ -290,6 +304,10 @@ impl FileBrowserState {
             }
             return BrowserAction::FocusPrompt;
         }
+        if crate::key!('L').matches(key) {
+            self.cycle_layout();
+            return BrowserAction::Changed;
+        }
         if key.modifiers.is_empty() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => return BrowserAction::Close,
@@ -337,6 +355,10 @@ impl FileBrowserState {
             self.focused = true;
             if self.hits.close.contains(point) {
                 return BrowserAction::Close;
+            }
+            if self.hits.layout.contains(point) {
+                self.cycle_layout();
+                return BrowserAction::Changed;
             }
             if self.editor_choice.is_some() {
                 if let Some(index) = self
@@ -510,6 +532,7 @@ impl FileBrowserState {
             HintItem::new(crate::key!(Tab), "next pane"),
             HintItem::new(crate::key!('e'), "edit"),
             HintItem::new(crate::key!('o'), "default app"),
+            HintItem::new(crate::key!('L'), "layout"),
             HintItem::new(crate::key!(Esc), "close files"),
         ]
     }
