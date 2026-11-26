@@ -740,7 +740,8 @@ async fn compaction_reseed_carries_provider_overhead() {
         ConversationItem::system("sys"),
         ConversationItem::user("summary ".repeat(500)),
     ];
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let total = h.handle.get_total_tokens().await;
     let estimate_only = 1_000u64;
@@ -768,7 +769,8 @@ async fn compaction_reseed_scales_overhead_down_with_deleted_content() {
     let compacted = vec![ConversationItem::user("z".repeat(12_000))];
     let compacted_estimate = crate::estimate_conversation_tokens(&compacted);
     assert_eq!(compacted_estimate, 3_000);
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let total = h.handle.get_total_tokens().await;
     assert_eq!(total, 6_525, "expected ratio-scaled overhead, got {total}");
@@ -794,7 +796,8 @@ async fn compaction_reseed_excludes_post_response_deltas_from_overhead() {
         .push_tool_result(ConversationItem::tool_result("c1", "z".repeat(100_000)));
 
     let compacted = vec![ConversationItem::user("s".repeat(2_000))];
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let total = h.handle.get_total_tokens().await;
     assert_eq!(
@@ -840,7 +843,8 @@ async fn compaction_overhead_unaffected_by_pruning_after_last_response() {
         ConversationItem::user("z".repeat(8_000)),
     ];
     let compacted_estimate = crate::estimate_conversation_tokens(&compacted);
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let total = h.handle.get_total_tokens().await;
     let expected = (compacted_estimate as f64
@@ -870,7 +874,8 @@ async fn restore_snapshot_preserves_frozen_estimate_for_overhead() {
 
     let compacted = vec![ConversationItem::user("z".repeat(400))];
     let compacted_estimate = crate::estimate_conversation_tokens(&compacted);
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let expected =
         (compacted_estimate as f64 * (provider_total as f64 / frozen as f64)).round() as u64;
@@ -897,7 +902,8 @@ async fn restore_snapshot_without_frozen_estimate_falls_back_to_recompute() {
 
     let compacted = vec![ConversationItem::user("z".repeat(400))];
     let compacted_estimate = crate::estimate_conversation_tokens(&compacted);
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let total = h.handle.get_total_tokens().await;
     let expected =
@@ -914,7 +920,8 @@ async fn compaction_reseed_without_provider_count_matches_plain_estimate() {
     h.handle.push_user_message(ConversationItem::user("hello"));
 
     let compacted = vec![ConversationItem::user("w".repeat(8000))];
-    h.handle.replace_conversation_for_compaction(compacted);
+    h.handle
+        .replace_conversation_for_compaction(compacted, None);
 
     let total = h.handle.get_total_tokens().await;
     assert_eq!(
@@ -1109,6 +1116,101 @@ async fn replace_system_head_inserts_when_absent() {
     assert_eq!(conv.len(), 2, "inserts System at head, keeps the user turn");
     assert!(matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "sys"));
     assert!(matches!(conv[1], ConversationItem::User(_)));
+}
+
+/// A model switch that rewrites the head while a compaction runs must survive
+/// the compaction's replace. The compacted history still carries the head that
+/// compaction read at its start.
+#[tokio::test]
+async fn compaction_replace_keeps_head_rewritten_during_compaction() {
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("old model prompt"),
+        ConversationItem::user("long history"),
+        ConversationItem::assistant("long answer"),
+    ]);
+    let changed = h.handle.replace_system_head("new model prompt").await;
+    assert_eq!(changed, Some(true));
+    h.handle.replace_conversation_for_compaction(
+        vec![
+            ConversationItem::system("old model prompt"),
+            ConversationItem::user("summary"),
+        ],
+        Some("old model prompt"),
+    );
+    let conv = h.handle.get_conversation().await;
+    assert_eq!(conv.len(), 2, "the compacted history must land");
+    assert!(
+        matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "new model prompt")
+    );
+}
+
+/// The reverse order: a head swap after the compaction's replace acts on the
+/// compacted history and does not bring the old history back.
+#[tokio::test]
+async fn head_swap_after_compaction_replace_keeps_compacted_history() {
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("old model prompt"),
+        ConversationItem::user("long history"),
+        ConversationItem::assistant("long answer"),
+    ]);
+    h.handle.replace_conversation_for_compaction(
+        vec![
+            ConversationItem::system("old model prompt"),
+            ConversationItem::user("summary"),
+        ],
+        Some("old model prompt"),
+    );
+    let changed = h.handle.replace_system_head("new model prompt").await;
+    assert_eq!(changed, Some(true));
+    let conv = h.handle.get_conversation().await;
+    assert_eq!(
+        conv.len(),
+        2,
+        "the head swap must not restore the old history"
+    );
+    assert!(
+        matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "new model prompt")
+    );
+}
+
+/// A head in `items` that differs from `built_from_system` was set on purpose
+/// by the caller, so the actor keeps it even when the live head also changed.
+#[tokio::test]
+async fn compaction_replace_keeps_caller_head_when_caller_changed_it() {
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("live prompt"),
+        ConversationItem::user("hi"),
+    ]);
+    h.handle.replace_conversation_for_compaction(
+        vec![
+            ConversationItem::system("caller prompt"),
+            ConversationItem::user("summary"),
+        ],
+        Some("start prompt"),
+    );
+    let conv = h.handle.get_conversation().await;
+    assert!(
+        matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "caller prompt")
+    );
+}
+
+/// With no head change during compaction, the compacted head lands as given.
+#[tokio::test]
+async fn compaction_replace_uses_given_head_when_live_head_unchanged() {
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("prompt\n"),
+        ConversationItem::user("hi"),
+    ]);
+    h.handle.replace_conversation_for_compaction(
+        vec![
+            ConversationItem::system("prompt"),
+            ConversationItem::user("summary"),
+        ],
+        Some("prompt"),
+    );
+    let conv = h.handle.get_conversation().await;
+    assert!(matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "prompt"));
+    assert!(matches!(&conv[1], ConversationItem::User(_)));
 }
 
 /// Lost-update safety: an item pushed just before the head swap survives, because
@@ -2728,7 +2830,7 @@ async fn turn_capture_survives_compaction_and_flags_it() {
         .push_assistant_response(ConversationItem::assistant("a1"));
 
     h.handle
-        .replace_conversation_for_compaction(vec![ConversationItem::system("compacted")]);
+        .replace_conversation_for_compaction(vec![ConversationItem::system("compacted")], None);
 
     h.handle.push_user_message(ConversationItem::user("q2"));
 
@@ -3841,10 +3943,13 @@ async fn sampling_config_survives_compaction_replacement() {
 
     // Simulate compaction: replace conversation with compacted history.
     // The compacted history has system + user summary, NO AssistantItem.
-    h.handle.replace_conversation_for_compaction(vec![
-        ConversationItem::system("You are a helpful assistant."),
-        ConversationItem::user("Compaction summary: user asked to fix a bug..."),
-    ]);
+    h.handle.replace_conversation_for_compaction(
+        vec![
+            ConversationItem::system("You are a helpful assistant."),
+            ConversationItem::user("Compaction summary: user asked to fix a bug..."),
+        ],
+        None,
+    );
 
     // Post-compaction: SamplingConfig MUST be preserved.
     let post = h.handle.get_sampling_config().await.unwrap();
@@ -3931,10 +4036,13 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
     );
 
     // Compaction replaces conversation — no AssistantItem in compacted history.
-    h.handle.replace_conversation_for_compaction(vec![
-        ConversationItem::system("sys"),
-        ConversationItem::user("compacted summary"),
-    ]);
+    h.handle.replace_conversation_for_compaction(
+        vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("compacted summary"),
+        ],
+        None,
+    );
 
     // Metadata gone.
     let meta = h.handle.get_last_model_metadata().await;

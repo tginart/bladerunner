@@ -193,19 +193,34 @@ impl ChatStateHandle {
 
     /// Replace conversation history.
     pub fn replace_conversation(&self, items: Vec<ConversationItem>) {
-        self.send_replace(items, false);
+        self.send_replace(items, false, None);
     }
 
     /// Replace conversation history for compaction.
     /// Sets `compaction_occurred` on the active turn capture.
-    pub fn replace_conversation_for_compaction(&self, items: Vec<ConversationItem>) {
-        self.send_replace(items, true);
+    ///
+    /// `built_from_system` is the system prompt that compaction read at its
+    /// start. A compaction runs for seconds, and a model switch can rewrite
+    /// the head in that time. The actor keeps that newer head instead of the
+    /// stale one in `items`. Pass `None` to replace the conversation as given.
+    pub fn replace_conversation_for_compaction(
+        &self,
+        items: Vec<ConversationItem>,
+        built_from_system: Option<&str>,
+    ) {
+        self.send_replace(items, true, built_from_system.map(std::sync::Arc::from));
     }
 
-    fn send_replace(&self, items: Vec<ConversationItem>, is_compaction: bool) {
+    fn send_replace(
+        &self,
+        items: Vec<ConversationItem>,
+        is_compaction: bool,
+        built_from_system: Option<std::sync::Arc<str>>,
+    ) {
         let _ = self.cmd_tx.send(ChatStateCommand::ReplaceConversation {
             items,
             is_compaction,
+            built_from_system,
         });
     }
 

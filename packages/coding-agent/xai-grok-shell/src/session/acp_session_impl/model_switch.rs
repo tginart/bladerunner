@@ -83,21 +83,26 @@ impl SessionActor {
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
         if apply_prompt_override && !skip_prompt_rewrite {
-            let mut conversation = self.chat_state_handle.get_conversation().await;
-            for item in conversation.iter_mut() {
-                if let ConversationItem::System(sys) = item {
-                    if use_concise {
-                        sys.content = std::sync::Arc::<str>::from(
-                            xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT,
-                        );
-                    } else {
-                        sys.content =
-                            std::sync::Arc::<str>::from(self.agent.borrow().system_prompt());
-                    }
-                    break;
-                }
+            let system_prompt = if use_concise {
+                String::from(xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT)
+            } else {
+                String::from(self.agent.borrow().system_prompt())
+            };
+            // Swap the head inside the chat-state actor. A read-modify-write of
+            // the whole conversation here would undo a compaction that lands
+            // between the read and the write.
+            if self
+                .chat_state_handle
+                .replace_system_head(&system_prompt)
+                .await
+                .is_none()
+            {
+                tracing::error!(
+                    session_id = %self.session_info.id.0,
+                    model_id = %model_id.0,
+                    "handle_set_session_model: chat-state actor unavailable; prompt not rewritten"
+                );
             }
-            self.chat_state_handle.replace_conversation(conversation);
         } else if !apply_prompt_override {
             tracing::info!(
                 session_id = %self.session_info.id.0,

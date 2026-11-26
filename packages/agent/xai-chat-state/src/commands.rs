@@ -131,9 +131,14 @@ pub enum ChatStateCommand {
     RecordTurnStart { timestamp_ms: i64 },
 
     /// Replace conversation history.
+    ///
+    /// `built_from_system` is the system prompt the caller read before it built
+    /// `items`. If the live head changed since then, the actor keeps the live
+    /// head. `None` replaces the conversation as given.
     ReplaceConversation {
         items: Vec<ConversationItem>,
         is_compaction: bool,
+        built_from_system: Option<std::sync::Arc<str>>,
     },
 
     /// Remove the images with these URLs from the conversation and rewrite the
@@ -438,6 +443,7 @@ mod tests {
         let _ = ChatStateCommand::ReplaceConversation {
             items: vec![],
             is_compaction: false,
+            built_from_system: None,
         };
         let _ = ChatStateCommand::CachePromptText {
             text: "prompt".to_string(),

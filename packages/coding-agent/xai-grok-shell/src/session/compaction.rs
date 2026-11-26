@@ -1156,6 +1156,9 @@ impl SessionActor {
                     .data("Compaction failed: no system message in conversation history"));
             }
         };
+        // Compaction builds the new history from this copy of the system
+        // prompt. A model switch can rewrite the live head before the replace.
+        let system_prompt_at_start = system_message.text_content();
         if simplified_messages.is_empty() {
             tracing::error!(
                 session_id = %self.session_info.id.0,
@@ -1271,8 +1274,10 @@ impl SessionActor {
                         .await
                     };
                     let new_len = compacted_history.len();
-                    self.chat_state_handle
-                        .replace_conversation_for_compaction(compacted_history);
+                    self.chat_state_handle.replace_conversation_for_compaction(
+                        compacted_history,
+                        Some(&system_prompt_at_start),
+                    );
                     if self.startup_hints.inherited_prefix_len.is_some() {
                         let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
                         let suppression = if xai_token_estimation::exceeds_threshold(
@@ -2035,8 +2040,10 @@ impl SessionActor {
             .await
         };
         let new_len = compacted_history.len();
-        self.chat_state_handle
-            .replace_conversation_for_compaction(compacted_history);
+        self.chat_state_handle.replace_conversation_for_compaction(
+            compacted_history,
+            Some(&system_prompt_at_start),
+        );
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(
@@ -4224,7 +4231,7 @@ mod inline_auto_compact_flow_tests {
                     let new_len = compacted.len();
                     actor
                         .chat_state_handle
-                        .replace_conversation_for_compaction(compacted);
+                        .replace_conversation_for_compaction(compacted, None);
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     actor
                         .last_idle_flush_conversation_len

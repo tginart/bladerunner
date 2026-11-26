@@ -491,6 +491,33 @@ impl ChatStateActor {
         });
     }
 
+    /// Purpose: Keep a system head that changed while the caller built `items`.
+    /// Input: The new conversation. The system prompt that the caller read
+    /// before it built the new conversation.
+    /// Output: None. The function changes the head of `items` in place.
+    /// Method:
+    ///     1. If the live head is not a `System` message, do nothing.
+    ///     2. If the live head is equal to `built_from`, do nothing.
+    ///     3. If the head of `items` is not equal to `built_from`, do nothing.
+    ///        The caller set that head on purpose.
+    ///     4. If not, copy the live head content into the head of `items`.
+    pub(super) fn keep_live_system_head(&self, items: &mut [ConversationItem], built_from: &str) {
+        use crate::conversation_util::canonical_system_prompt_eq;
+        let Some(ConversationItem::System(live)) = self.state.conversation.first() else {
+            return;
+        };
+        if canonical_system_prompt_eq(live.content.as_ref(), built_from) {
+            return;
+        }
+        let Some(ConversationItem::System(incoming)) = items.first_mut() else {
+            return;
+        };
+        if !canonical_system_prompt_eq(incoming.content.as_ref(), built_from) {
+            return;
+        }
+        incoming.content = live.content.clone();
+    }
+
     /// Atomically swap the leading `System` message with `prompt` (or insert one
     /// if absent), persisting when changed. Runs inside the actor's command loop
     /// so it serializes with turn pushes — no lost-update race on a mid-turn

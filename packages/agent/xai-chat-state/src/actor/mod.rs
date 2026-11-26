@@ -217,9 +217,13 @@ impl ChatStateActor {
                 self.state.turn_start_ms = Some(timestamp_ms);
             }
             ChatStateCommand::ReplaceConversation {
-                items,
+                mut items,
                 is_compaction,
+                built_from_system,
             } => {
+                if let Some(built_from) = built_from_system {
+                    self.keep_live_system_head(&mut items, &built_from);
+                }
                 self.replace_conversation(items, is_compaction);
             }
             ChatStateCommand::StripConversationImages { urls, reply } => {
