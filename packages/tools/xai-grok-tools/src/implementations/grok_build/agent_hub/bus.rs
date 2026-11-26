@@ -308,6 +308,18 @@ impl AgentBus {
         self.change_peer(id, |peer| peer.is_turn_running = false);
     }
 
+    /// Purpose: Mark a local peer as working for the life of one turn.
+    /// Input: The peer id and the task, as for `turn_started`.
+    /// Output: A guard. The presence shows `idle` again when it drops, also
+    ///     when the turn ends early or with an error.
+    pub fn turn_guard(&self, id: &str, task: Option<&str>) -> TurnGuard {
+        self.turn_started(id, task);
+        TurnGuard {
+            bus: self.clone(),
+            id: id.to_string(),
+        }
+    }
+
     /// Purpose: Mark a local peer as blocked on a person while a prompt is open.
     /// Input: The peer id.
     /// Output: A guard. The presence shows `needs_input` until every guard drops.
@@ -323,29 +335,32 @@ impl AgentBus {
     /// Input: The peer id and the change.
     /// Output: None. The file is written only when the shown presence changes.
     ///     A write error is logged, because presence is only a display aid.
+    /// Note: The write runs under the bus lock. Two changes of one peer from
+    ///     two threads therefore cannot write out of order or at the same time.
     fn change_peer(&self, id: &str, change: impl FnOnce(&mut LocalPeer)) {
-        let update = {
-            let mut g = self.lock();
-            let hub = g.hub.clone();
-            let Some(peer) = g.peers.get_mut(id) else {
-                return;
-            };
-            change(peer);
-            let shown = (peer.activity(), peer.task.clone());
-            if peer.published.as_ref() == Some(&shown) {
-                return;
-            }
-            peer.published = Some(shown.clone());
-            (hub, peer.handle.clone(), shown)
+        let mut g = self.lock();
+        let hub = g.hub.clone();
+        let Some(peer) = g.peers.get_mut(id) else {
+            return;
         };
-        let (hub, handle, (activity, task)) = update;
+        change(peer);
+        let shown = (peer.activity(), peer.task.clone());
+        if peer.published.as_ref() == Some(&shown) {
+            return;
+        }
         let presence = Presence {
-            activity,
+            activity: shown.0,
             since_ms: store::now_ms(),
-            task,
+            task: shown.1.clone(),
         };
-        if let Err(error) = hub.save_presence(&handle, &presence) {
-            tracing::warn!(%error, %handle, "agent_hub: could not save presence");
+        match hub.save_presence(&peer.handle, &presence) {
+            Ok(()) => peer.published = Some(shown),
+            // The next change tries the write again.
+            Err(error) => {
+                peer.published = None;
+                let handle = &peer.handle;
+                tracing::warn!(%error, %handle, "agent_hub: could not save presence");
+            }
         }
     }
 
@@ -790,6 +805,19 @@ impl Drop for InputGuard {
         self.bus.change_peer(&self.id, |peer| {
             peer.needs_input = peer.needs_input.saturating_sub(1);
         });
+    }
+}
+
+/// Marks a local peer as `working` until it is dropped. See
+/// [`AgentBus::turn_guard`].
+pub struct TurnGuard {
+    bus: AgentBus,
+    id: String,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.bus.turn_ended(&self.id);
     }
 }
 
@@ -1579,6 +1607,22 @@ mod tests {
         bus.turn_ended(MAIN_PEER_ID);
         assert_eq!(activity(), Some(Activity::Idle));
         assert_eq!(hub.presences().len(), 1);
+    }
+
+    #[test]
+    fn a_turn_guard_shows_idle_on_every_exit_path() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let early_return = || -> Option<()> {
+            let _turn = bus.turn_guard(MAIN_PEER_ID, Some("/status"));
+            assert_eq!(hub.presence(&handle).unwrap().activity, Activity::Working);
+            None
+        };
+        assert_eq!(early_return(), None);
+        assert_eq!(hub.presence(&handle).unwrap().activity, Activity::Idle);
     }
 
     #[test]

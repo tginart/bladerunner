@@ -320,14 +320,19 @@ impl HubComposer {
         match key.code {
             KeyCode::Up => completion.selected = completion.selected.saturating_sub(1),
             KeyCode::Down => completion.selected = (completion.selected + 1).min(last),
-            KeyCode::Tab | KeyCode::Enter => self.accept_completion(),
+            // Shift+Enter and Alt+Enter stay newlines, as without the popup.
+            KeyCode::Tab => self.accept_completion(),
+            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => self.accept_completion(),
             KeyCode::Esc => self.completion = None,
             _ => return None,
         }
         Some(ComposerKey::Edited)
     }
 
-    /// Replace the word at the cursor with the selected candidate and a space.
+    /// Purpose: Replace the word at the cursor with the selected candidate.
+    /// Input: None. The open popup and the draft.
+    /// Output: None. The whole word changes, also the part after the cursor.
+    ///     A space follows the candidate, and the cursor goes after the space.
     fn accept_completion(&mut self) {
         let Some(completion) = self.completion.take() else {
             return;
@@ -335,12 +340,20 @@ impl HubComposer {
         let Some(item) = completion.items.get(completion.selected) else {
             return;
         };
+        let text = self.textarea.text();
         let cursor = self.textarea.cursor();
-        let replacement = format!("{item} ");
+        let end = text[cursor..]
+            .find(|c: char| !is_name_char(c))
+            .map_or(text.len(), |offset| cursor + offset);
+        let has_space_after = text[end..].starts_with(char::is_whitespace);
+        let replacement = if has_space_after {
+            item.clone()
+        } else {
+            format!("{item} ")
+        };
         self.textarea
-            .replace_range(completion.start..cursor, &replacement);
-        self.textarea
-            .set_cursor(completion.start + replacement.len());
+            .replace_range(completion.start..end, &replacement);
+        self.textarea.set_cursor(completion.start + item.len() + 1);
     }
 
     /// Open, update, or close the popup for the word at the cursor.
@@ -372,12 +385,26 @@ impl HubComposer {
         });
     }
 
+    /// True when the cursor is on the top displayed row. A wrapped paragraph
+    /// has more than one row.
     fn is_cursor_on_first_line(&self) -> bool {
-        !self.textarea.text()[..self.textarea.cursor()].contains('\n')
+        match self.cursor_visual_row() {
+            Some((row, _)) => row == 0,
+            None => !self.textarea.text()[..self.textarea.cursor()].contains('\n'),
+        }
     }
 
+    /// True when the cursor is on the bottom displayed row.
     fn is_cursor_on_last_line(&self) -> bool {
-        !self.textarea.text()[self.textarea.cursor()..].contains('\n')
+        match self.cursor_visual_row() {
+            Some((row, count)) => row + 1 == count,
+            None => !self.textarea.text()[self.textarea.cursor()..].contains('\n'),
+        }
+    }
+
+    /// The displayed row of the cursor and the row count, after the first draw.
+    fn cursor_visual_row(&self) -> Option<(usize, usize)> {
+        self.textarea.cursor_visual_row(self.last_text_area?)
     }
 
     /// Show the next older sent post. Returns false when there is none.
@@ -561,5 +588,51 @@ mod tests {
         let mut composer = HubComposer::default();
         composer.paste("a\r\nb", &names());
         assert_eq!(composer.text(), "a\nb");
+    }
+
+    #[test]
+    fn a_completion_inside_a_word_replaces_the_whole_word() {
+        let names = names();
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "@front ok", &names);
+        for _ in 0..6 {
+            press(&mut composer, KeyCode::Left, &names);
+        }
+        assert!(composer.is_completing(), "the cursor is after @fr");
+        press(&mut composer, KeyCode::Tab, &names);
+        assert_eq!(composer.text(), "@front ok");
+        type_text(&mut composer, "x", &names);
+        assert_eq!(composer.text(), "@front xok");
+    }
+
+    #[test]
+    fn modified_enter_adds_a_newline_while_the_popup_is_open() {
+        let names = names();
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "ask @fr", &names);
+        assert!(composer.is_completing());
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        composer.handle_key(&shift_enter, &names);
+        assert_eq!(composer.text(), "ask @fr\n");
+    }
+
+    #[test]
+    fn up_moves_through_wrapped_rows_before_the_history() {
+        let names = names();
+        let mut composer = HubComposer::default();
+        composer.finish_send("old post");
+        composer.last_text_area = Some(Rect::new(0, 0, 12, MAX_TEXT_ROWS));
+        type_text(&mut composer, "one two three four five six", &names);
+        let (row, count) = composer.cursor_visual_row().expect("rows");
+        assert!(
+            count > 1 && row + 1 == count,
+            "the draft wraps: {row}/{count}"
+        );
+        press(&mut composer, KeyCode::Up, &names);
+        assert_eq!(composer.text(), "one two three four five six");
+        for _ in 0..count {
+            press(&mut composer, KeyCode::Up, &names);
+        }
+        assert_eq!(composer.text(), "old post");
     }
 }

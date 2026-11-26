@@ -363,7 +363,7 @@ impl SessionActor {
         for contributor in self.extension_registry.turn_lifecycle_contributors() {
             contributor.on_turn_start(&turn_start_input).await;
         }
-        self.report_hub_turn_started(
+        let hub_turn = self.hub_turn_guard(
             &prompt_blocks,
             super::super::PromptOrigin::from_prompt_id(prompt_id).is_synthetic(),
         );
@@ -1271,7 +1271,7 @@ impl SessionActor {
                 },
             );
         }
-        self.report_hub_turn_ended();
+        drop(hub_turn);
         match &result {
             Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
                 for contributor in self.extension_registry.turn_lifecycle_contributors() {
