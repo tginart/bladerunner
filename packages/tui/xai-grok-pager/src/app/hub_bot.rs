@@ -65,13 +65,20 @@ pub(super) fn finish_answer(
         return vec![];
     };
     agent.hub_bot_children.remove(&request.child_id);
-    if let Some(browser) = agent.hub_browser.as_mut()
-        && browser.hub.dir() == hub.dir()
+    let Some(is_thinking) = agent
+        .hub_browser
+        .as_ref()
+        .map(|browser| agent.is_bot_thinking_in(&browser.hub))
+    else {
+        return vec![];
+    };
+    let browser = agent.hub_browser.as_mut().expect("checked above");
+    // The open browser can show another hub, which has its own questions.
+    browser.is_bot_thinking = is_thinking;
+    if browser.hub.dir() == hub.dir()
+        && let Err(error) = browser.reload()
     {
-        browser.is_bot_thinking = false;
-        if let Err(error) = browser.reload() {
-            tracing::warn!(%error, "hub browser: reload failed");
-        }
+        tracing::warn!(%error, "hub browser: reload failed");
     }
     vec![]
 }
@@ -93,7 +100,7 @@ fn answer_text(response: Result<AskResponse, String>) -> String {
 fn is_bot_child(app: &AppView, child_id: &str) -> bool {
     app.agents
         .values()
-        .any(|agent| agent.hub_bot_children.contains(child_id))
+        .any(|agent| agent.hub_bot_children.contains_key(child_id))
 }
 
 /// Drop the streamed updates of a hub-bot run. They are not transcript content.

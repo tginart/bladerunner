@@ -558,6 +558,19 @@ impl Hub {
 ///     contains the query, ignoring case. Every channel and DM is searched.
 ///     No cursor moves.
 pub fn search(hub: &Hub, query: &str, limit: usize) -> Result<Vec<Message>> {
+    search_where(hub, query, limit, |_| true)
+}
+
+/// Purpose: Find the messages of a hub that contain a query and pass a filter.
+/// Input: The hub, the query, the maximum count, and the filter.
+/// Output: As `search`. A message that the filter refuses does not count
+///     toward `limit`.
+pub fn search_where(
+    hub: &Hub,
+    query: &str,
+    limit: usize,
+    keep: impl Fn(&Message) -> bool,
+) -> Result<Vec<Message>> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Ok(Vec::new());
@@ -566,7 +579,7 @@ pub fn search(hub: &Hub, query: &str, limit: usize) -> Result<Vec<Message>> {
     for message in recent_messages(hub, None, usize::MAX)?.into_iter().rev() {
         let is_hit = message.text.to_lowercase().contains(&query)
             || format!("@{}", message.from).to_lowercase().contains(&query);
-        if is_hit {
+        if is_hit && keep(&message) {
             hits.push(message);
             if hits.len() == limit {
                 break;

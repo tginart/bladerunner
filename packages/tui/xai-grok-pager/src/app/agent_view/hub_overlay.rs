@@ -20,7 +20,7 @@ impl AgentView {
         match self.load_hub_browser(hub, channel) {
             Ok(mut browser) => {
                 browser.composer.set_history(self.hub_post_history.clone());
-                browser.is_bot_thinking = !self.hub_bot_children.is_empty();
+                browser.is_bot_thinking = self.is_bot_thinking_in(&browser.hub);
                 self.hub_browser = Some(browser);
                 self.show_goal_detail = false;
                 self.show_workflows = false;
@@ -140,8 +140,14 @@ impl AgentView {
             question: text.to_string(),
         };
         let hub = browser.hub.clone();
-        self.hub_bot_children.insert(request.child_id.clone());
+        self.hub_bot_children
+            .insert(request.child_id.clone(), hub.dir().to_path_buf());
         InputOutcome::Action(Action::AskHubBot { hub, request })
+    }
+
+    /// True while a hub-bot question about `hub` runs.
+    pub(crate) fn is_bot_thinking_in(&self, hub: &store::Hub) -> bool {
+        self.hub_bot_children.values().any(|dir| dir == hub.dir())
     }
 
     /// Purpose: Show the session of a hub member.
@@ -369,13 +375,25 @@ mod tests {
         assert_eq!(request.person, "me");
         assert_eq!(request.session_id, "root");
         assert_eq!(request.previous_child_id, None);
-        assert!(view.hub_bot_children.contains(&request.child_id));
+        assert!(view.hub_bot_children.contains_key(&request.child_id));
         let browser = view.hub_browser.as_ref().unwrap();
         assert!(browser.is_bot_thinking);
         assert!(browser.composer.is_empty());
         assert_eq!(browser.feed.last().unwrap().text, "who works on login?");
         let again = view.handle_hub_browser_input(&key_event(KeyCode::Tab));
         assert!(matches!(again, Some(InputOutcome::Changed)));
+    }
+
+    #[test]
+    fn a_question_in_one_hub_does_not_mark_another_hub_thinking() {
+        let (root, mut view, bus) = browser_with_agent();
+        view.hub_bot_children
+            .insert("child".to_string(), bus.hub().dir().to_path_buf());
+        assert!(view.is_bot_thinking_in(&bus.hub()));
+        let other = store::Hub::create(root.path(), "other").unwrap();
+        assert!(!view.is_bot_thinking_in(&other));
+        view.hub_bot_children.remove("child");
+        assert!(!view.is_bot_thinking_in(&bus.hub()));
     }
 
     fn key_event(code: KeyCode) -> Event {

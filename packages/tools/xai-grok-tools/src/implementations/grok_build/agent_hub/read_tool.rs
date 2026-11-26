@@ -233,12 +233,8 @@ fn member_label(member: &Member) -> &str {
 }
 
 fn search(hub: &Hub, query: &str, limit: usize) -> Result<String> {
-    // Ask for more than `limit`, because the bot's own DMs are dropped.
-    let hits: Vec<Message> = store::search(hub, query, limit * 2)?
-        .into_iter()
-        .filter(|m| !is_bot_conv(&m.conv))
-        .take(limit)
-        .collect();
+    // The bot's own DMs drop out before the limit, so they hide no other hit.
+    let hits = store::search_where(hub, query, limit, |m| !is_bot_conv(&m.conv))?;
     if hits.is_empty() {
         return Ok(format!("No messages contain {query:?}."));
     }
@@ -349,6 +345,24 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[test]
+    fn newer_bot_dm_matches_do_not_hide_older_channel_posts() {
+        let (root, hub) = hub_with_messages();
+        for _ in 0..5 {
+            super::super::ask_bot(&hub, "me", "login again?").unwrap();
+        }
+        let text = read_hub(
+            root.path(),
+            &HubReadInput {
+                query: Some("login".to_string()),
+                limit: Some(2),
+                ..input(HubReadOp::Search)
+            },
+        )
+        .unwrap();
+        assert!(text.contains("who owns the login page?"), "{text}");
     }
 
     #[test]
