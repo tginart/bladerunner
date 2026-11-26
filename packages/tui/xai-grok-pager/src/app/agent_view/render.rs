@@ -901,6 +901,9 @@ impl AgentView {
             #[cfg(feature = "codex-live")]
             live_visualizer,
         } = app_params;
+        // The bar sets its hit areas again below. A frame without the bar,
+        // such as a modal or a full-screen subagent, must leave no stale hits.
+        self.surface_hint_hits.clear();
         self.scrollback.begin_frame();
         self.in_dashboard_overlay = in_dashboard_overlay;
         self.overlay_can_cycle = overlay_can_cycle;
@@ -3577,7 +3580,6 @@ impl AgentView {
             };
             return (cursor, crate::terminal::overlay::clear().map(Into::into));
         }
-        self.surface_hint_hits.clear();
         match self.shortcuts_bar_content(registry, esc_owned_before_agent) {
             ShortcutsBarContent::Hidden => {}
             ShortcutsBarContent::Surface(hints) => {
