@@ -553,7 +553,7 @@ pub struct ThinkingConfig {
     /// How much to blend markdown colors with background (0.0-1.0).
     /// 0.8 means 80% original color, 20% background.
     pub bg_blend: f32,
-    /// Number of visual lines to show in truncated mode (before and after ellipsis).
+    /// Number of trailing visual lines to show in truncated mode.
     pub truncated_lines: u16,
     /// Whether the accent line animates (traveling wave) while thinking is active.
     pub animate: bool,
