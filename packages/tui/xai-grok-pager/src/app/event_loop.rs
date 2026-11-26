@@ -4340,9 +4340,16 @@ fn process_effects(
 ///     a hidden tab does not count, because the person cannot see it.
 fn announce_hub_mentions(app: &mut AppView) {
     for new in crate::hub_status::take_new_mentions() {
-        let is_shown = app
-            .active_agent()
-            .and_then(|agent| agent.hub_browser.as_ref())
+        // A full-screen subagent draws itself, with its own hub browser.
+        let shown = app.active_agent().map(|agent| {
+            agent
+                .active_subagent
+                .as_ref()
+                .and_then(|sid| agent.subagent_views.get(sid))
+                .map_or(agent, |child| &**child)
+        });
+        let is_shown = shown
+            .and_then(|view| view.hub_browser.as_ref())
             .is_some_and(|browser| browser.hub.name() == new.hub);
         if is_shown {
             continue;

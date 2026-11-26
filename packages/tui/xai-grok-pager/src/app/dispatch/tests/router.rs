@@ -2237,10 +2237,17 @@ fn focus_hub_member_opens_a_subagent_of_another_tab() {
     let session = make_test_agent_session(&app, other, "other-root");
     let mut view = AgentView::new(session, ScrollbackState::new());
     let child = make_test_agent_session(&app, AgentId(2), "child-sid");
-    view.subagent_views.insert(
-        "child-sid".to_string(),
-        Box::new(AgentView::new(child, ScrollbackState::new())),
-    );
+    let mut child_view = AgentView::new(child, ScrollbackState::new());
+    let hubs = tempfile::tempdir().unwrap();
+    let hub = xai_grok_tools::implementations::grok_build::agent_hub::store::Hub::create(
+        hubs.path(),
+        "demo",
+    )
+    .unwrap();
+    child_view.hub_browser =
+        Some(crate::views::hub_browser::HubBrowserState::open(hub, "me", None).unwrap());
+    view.subagent_views
+        .insert("child-sid".to_string(), Box::new(child_view));
     app.agents.insert(other, view);
     super::super::session::load::dispatch_focus_hub_member(
         &mut app,
@@ -2251,6 +2258,12 @@ fn focus_hub_member_opens_a_subagent_of_another_tab() {
     assert_eq!(
         app.agents[&other].active_subagent.as_deref(),
         Some("child-sid")
+    );
+    assert!(
+        app.agents[&other].subagent_views["child-sid"]
+            .hub_browser
+            .is_none(),
+        "the child's own browser must not cover it"
     );
 }
 /// Launch-time blocked `--yolo` in the TUI: the one-shot notice is

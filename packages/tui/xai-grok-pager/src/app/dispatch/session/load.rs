@@ -81,6 +81,10 @@ pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
     switch_to_agent(app, owner, SwitchCause::Picker);
     if let Some(agent) = app.agents.get_mut(&owner) {
         agent.hub_browser = None;
+        // The child can keep a browser of its own, which would cover it.
+        if let Some(child) = agent.subagent_views.get_mut(&session_id) {
+            child.hub_browser = None;
+        }
         agent.open_subagent_fullscreen(session_id);
     }
     vec![]
