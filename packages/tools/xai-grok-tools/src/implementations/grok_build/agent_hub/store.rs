@@ -506,6 +506,30 @@ impl Hub {
     }
 }
 
+/// Purpose: Find the messages of a hub that contain a query.
+/// Input: The hub, the query, and the maximum count.
+/// Output: Up to `limit` messages, newest first, whose text or sender
+///     contains the query, ignoring case. Every channel and DM is searched.
+///     No cursor moves.
+pub fn search(hub: &Hub, query: &str, limit: usize) -> Result<Vec<Message>> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for message in recent_messages(hub, None, usize::MAX)?.into_iter().rev() {
+        let is_hit = message.text.to_lowercase().contains(&query)
+            || format!("@{}", message.from).to_lowercase().contains(&query);
+        if is_hit {
+            hits.push(message);
+            if hits.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(hits)
+}
+
 /// Purpose: Read the latest messages of a hub for a person to look at.
 /// Input: The hub, an optional channel (all channels and DMs when `None`),
 ///     and the maximum count.

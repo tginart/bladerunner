@@ -77,11 +77,17 @@ impl AgentView {
             HubKeyOutcome::Post { to, text } => {
                 let result =
                     agent_hub::post_as_person(&browser.hub, browser.person_name(), &to, &text, &[]);
-                // The post can reserve a new person handle, so read it before the notice.
-                if let Err(error) = browser.reload() {
-                    tracing::warn!(%error, "hub browser: reload failed");
-                }
-                browser.finish_post(&to, result);
+                finish_hub_post(browser, &to, result);
+            }
+            HubKeyOutcome::Reply { to, text, reply_to } => {
+                let result = agent_hub::reply_as_person(
+                    &browser.hub,
+                    browser.person_name(),
+                    &to,
+                    &text,
+                    &reply_to,
+                );
+                finish_hub_post(browser, &to, result);
             }
         }
         Some(InputOutcome::Changed)
@@ -179,6 +185,15 @@ impl AgentView {
             .context("the session has not started yet")?;
         open_hub_of_session(root, &session_id.0)
     }
+}
+
+/// Read the hub again after a post, then show the post result.
+fn finish_hub_post(browser: &mut HubBrowserState, to: &str, result: anyhow::Result<String>) {
+    // The post can reserve a new person handle, so read it before the notice.
+    if let Err(error) = browser.reload() {
+        tracing::warn!(%error, "hub browser: reload failed");
+    }
+    browser.finish_post(to, result);
 }
 
 /// Purpose: Open the hub of a session for the browser.

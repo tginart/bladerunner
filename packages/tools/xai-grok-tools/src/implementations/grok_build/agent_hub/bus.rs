@@ -539,7 +539,9 @@ impl AgentBus {
         let mut messages = hub.messages(&conv, start)?;
         let remaining = messages.len().saturating_sub(limit);
         messages.truncate(limit);
-        cursors.read.insert(conv, start + messages.len());
+        // A read of old messages with `since` must not move the cursor back.
+        let read = cursors.read.entry(conv).or_default();
+        *read = (*read).max(start + messages.len());
         hub.save_cursors(&handle, &cursors)?;
         drop(cursor_lock);
         record_tokens(&hub, &messages)?;
@@ -952,11 +954,45 @@ pub fn post_as_person(
     text: &str,
     images: &[PathBuf],
 ) -> Result<String> {
+    post_person_draft(hub, person, to, text, images, None)
+}
+
+/// Purpose: Post a reply of the person to one message.
+/// Input: The hub, the person name, the destination, the text, and the id
+///     of the parent message.
+/// Output: The new message id, or an error when the parent is not in the
+///     destination conversation.
+pub fn reply_as_person(
+    hub: &Hub,
+    person: &str,
+    to: &str,
+    text: &str,
+    reply_to: &str,
+) -> Result<String> {
+    post_person_draft(hub, person, to, text, &[], Some(reply_to))
+}
+
+fn post_person_draft(
+    hub: &Hub,
+    person: &str,
+    to: &str,
+    text: &str,
+    images: &[PathBuf],
+    reply_to: Option<&str>,
+) -> Result<String> {
     let person = ensure_person(hub, person)?;
+    // A thread lives in one conversation, so the browser can show it. Agents
+    // may still point a DM reply at a channel message.
+    if let Some(parent) = reply_to {
+        let conv = resolve_target(&hub.meta()?, &person, to)?;
+        if !hub.messages(&conv, 0)?.iter().any(|m| m.id == parent) {
+            bail!("reply_to {parent:?} is not a message in {}", to.trim());
+        }
+    }
     let draft = Draft {
         to,
         text,
-        reply_to: None,
+        reply_to,
         images,
     };
     let id = post(hub, &person, &draft)?;
@@ -1080,8 +1116,13 @@ pub fn format_messages(hub: &Hub, meta: &HubMeta, messages: &[Message]) -> Strin
         } else {
             ""
         };
+        let reply = m
+            .reply_to
+            .as_deref()
+            .map(|parent| format!(" · reply_to={parent}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "\n--- {conv} · from @{}{person} · id={} ---\n{}",
+            "\n--- {conv} · from @{}{person} · id={}{reply} ---\n{}",
             m.from, m.id, m.text
         ));
         for image in &m.images {
@@ -1389,6 +1430,54 @@ mod tests {
 
     fn texts(messages: &[Message]) -> Vec<&str> {
         messages.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn person_replies_need_a_parent_in_the_same_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        let parent = post_as_person(&hub, "me", "#general", "plan?", &[]).unwrap();
+        let reply = reply_as_person(&hub, "me", "#general", "yes", &parent).unwrap();
+        let messages = hub.messages("#general", 0).unwrap();
+        let reply = messages.iter().find(|m| m.id == reply).unwrap();
+        assert_eq!(reply.reply_to.as_deref(), Some(parent.as_str()));
+        let error = reply_as_person(&hub, "me", "#general", "x", "nope").unwrap_err();
+        assert!(error.to_string().contains("reply_to"), "{error}");
+        let meta = hub.meta().unwrap();
+        let frame = format_messages(&hub, &meta, std::slice::from_ref(reply));
+        assert!(frame.contains(&format!("reply_to={parent}")), "{frame}");
+        assert_eq!(parse_delivery(&frame).unwrap().messages[0].text, "yes");
+    }
+
+    #[test]
+    fn read_with_since_never_moves_the_cursor_back() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        for text in ["a", "b", "c"] {
+            post_as_person(&hub, "me", "#general", text, &[]).unwrap();
+        }
+        bus.read(MAIN_PEER_ID, "general", 10, None).unwrap();
+        let (old, _) = bus.read(MAIN_PEER_ID, "general", 1, Some(0)).unwrap();
+        assert_eq!(texts(&old), vec!["a"]);
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        assert_eq!(hub.cursors(&handle).unwrap().read.get("#general"), Some(&3));
+    }
+
+    #[test]
+    fn search_finds_text_and_senders_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        post_as_person(&hub, "me", "#general", "Deploy the API", &[]).unwrap();
+        post_as_person(&hub, "me", "#general", "unrelated", &[]).unwrap();
+        post_as_person(&hub, "me", "@me", "api docs too", &[]).unwrap_or_default();
+        post_as_person(&hub, "me", "#general", "api again", &[]).unwrap();
+        let hits = store::search(&hub, "API", 10).unwrap();
+        assert_eq!(texts(&hits)[..2], ["api again", "Deploy the API"]);
+        assert_eq!(store::search(&hub, "api", 1).unwrap().len(), 1);
+        assert_eq!(store::search(&hub, "@me", 10).unwrap().len(), 3);
+        assert!(store::search(&hub, "  ", 10).unwrap().is_empty());
     }
 
     #[test]
