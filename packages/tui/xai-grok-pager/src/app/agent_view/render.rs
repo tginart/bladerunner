@@ -901,6 +901,9 @@ impl AgentView {
             #[cfg(feature = "codex-live")]
             live_visualizer,
         } = app_params;
+        // The bar sets its hit areas again below. A frame without the bar,
+        // such as a modal or a full-screen subagent, must leave no stale hits.
+        self.surface_hint_hits.clear();
         self.scrollback.begin_frame();
         self.in_dashboard_overlay = in_dashboard_overlay;
         self.overlay_can_cycle = overlay_can_cycle;
@@ -3580,9 +3583,23 @@ impl AgentView {
         match self.shortcuts_bar_content(registry, esc_owned_before_agent) {
             ShortcutsBarContent::Hidden => {}
             ShortcutsBarContent::Surface(hints) => {
-                ShortcutsBar::new(&hints)
+                let is_pending = pending_hint.is_some();
+                let rects = ShortcutsBar::new(&hints)
                     .with_pending(pending_hint)
-                    .render(layout.shortcuts, buf);
+                    .with_hovered(self.surface_hint_hover)
+                    .render_with_hits(layout.shortcuts, buf);
+                // A surface bar shows every hint, so the rects line up with `hints`.
+                if !is_pending {
+                    self.surface_hint_hits = hints
+                        .iter()
+                        .zip(rects)
+                        .enumerate()
+                        .filter_map(|(index, (hint, rect))| {
+                            let key = hint.click_key()?;
+                            Some(super::SurfaceHintHit { rect, key, index })
+                        })
+                        .collect();
+                }
             }
             ShortcutsBarContent::Pane(hints) => {
                 let help_hint = registry.find(ActionId::ShortcutsHelp).map(|def| {

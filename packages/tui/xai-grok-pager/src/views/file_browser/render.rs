@@ -264,11 +264,13 @@ Output: Button labels and hit areas for visible buttons.
 fn render_buttons(browser: &mut FileBrowserState, buf: &mut Buffer, area: Rect, theme: &Theme) {
     let mut x = area.x;
     let y = area.bottom() - 1;
+    let pointer = browser.pointer;
     let close_label = "[Close]";
     let mut right = if area.width >= close_label.len() as u16 {
         let close_x = area.right() - close_label.len() as u16;
-        buf.set_string(close_x, y, close_label, Style::default().fg(theme.command));
-        browser.hits.close = Rect::new(close_x, y, close_label.len() as u16, 1);
+        let close = Rect::new(close_x, y, close_label.len() as u16, 1);
+        buf.set_string(close_x, y, close_label, button_style(close, pointer, theme));
+        browser.hits.close = close;
         close_x.saturating_sub(2)
     } else {
         area.right()
@@ -301,8 +303,20 @@ fn render_buttons(browser: &mut FileBrowserState, buf: &mut Buffer, area: Rect, 
         if x + width > right {
             continue;
         }
-        buf.set_string(x, y, label, Style::default().fg(theme.command));
-        *hit = Rect::new(x, y, width, 1);
+        let rect = Rect::new(x, y, width, 1);
+        buf.set_string(x, y, label, button_style(rect, pointer, theme));
+        *hit = rect;
         x += width + 2;
+    }
+}
+
+/// The style of a footer button: underlined and bright under the pointer.
+fn button_style(rect: Rect, pointer: Option<(u16, u16)>, theme: &Theme) -> Style {
+    let style = Style::default().fg(theme.command);
+    match pointer {
+        Some(point) if rect.contains(point.into()) => style
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        _ => style,
     }
 }
