@@ -967,6 +967,8 @@ impl HubBrowserState {
     ///     because a reply here could not point at it.
     pub fn open_thread(&mut self, root: &str) {
         self.stop_compose();
+        let previous_thread = self.thread.clone();
+        let previous_reply = self.reply_to.clone();
         let is_draft_elsewhere = self.is_draft_elsewhere();
         self.thread = Some(root.to_string());
         if !is_draft_elsewhere {
@@ -978,8 +980,14 @@ impl HubBrowserState {
             tracing::warn!(%error, "hub browser: feed load failed");
         }
         if !self.feed.iter().any(|m| m.id == root) {
+            // Put the old state back, so a paused draft keeps its own parent
+            // and never takes the rejected root.
             self.notice = Some("That message is in another conversation.".to_string());
-            self.close_thread();
+            self.thread = previous_thread;
+            self.reply_to = previous_reply;
+            if let Err(error) = self.load_feed(false) {
+                tracing::warn!(%error, "hub browser: feed load failed");
+            }
         }
     }
 
@@ -5147,6 +5155,33 @@ mod tests {
         state.handle_key(&key(KeyCode::Char(']')));
         assert_eq!(state.thread, None);
         assert!(state.feed.iter().any(|m| m.text == "outside"));
+    }
+
+    #[test]
+    fn a_rejected_thread_does_not_give_its_root_to_a_paused_draft() {
+        let (_root, hub) = hub_with_dms();
+        let dm_message = message(
+            "front",
+            store::dm_conv("front", "me"),
+            "in a DM",
+            store::now_ms(),
+        );
+        hub.append(&dm_message).unwrap();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("plain draft");
+        state.handle_key(&key(KeyCode::Esc));
+        state.open_thread(&dm_message.id);
+        assert_eq!(state.thread, None);
+        assert_eq!(state.reply_to, None);
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post {
+                to: "#general".to_string(),
+                text: "plain draft".to_string(),
+            }
+        );
     }
 
     #[test]
