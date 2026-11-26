@@ -18,6 +18,7 @@ pub mod fps_hud;
 pub mod goal_detail;
 pub mod history_search;
 pub mod hub_browser;
+pub mod hub_composer;
 pub mod import_claude_modal;
 pub mod jump;
 pub mod list_pane;

@@ -18,7 +18,8 @@ impl AgentView {
     /// scrollback instead.
     pub(crate) fn open_hub_browser(&mut self, hub: Option<&str>, channel: Option<&str>) {
         match self.load_hub_browser(hub, channel) {
-            Ok(browser) => {
+            Ok(mut browser) => {
+                browser.composer.set_history(self.hub_post_history.clone());
                 self.hub_browser = Some(browser);
                 self.show_goal_detail = false;
                 self.show_workflows = false;
@@ -62,7 +63,10 @@ impl AgentView {
         }
         let browser = self.hub_browser.as_mut()?;
         match outcome {
-            HubKeyOutcome::Close => self.hub_browser = None,
+            HubKeyOutcome::Close => {
+                self.hub_post_history = browser.composer.history().to_vec();
+                self.hub_browser = None;
+            }
             HubKeyOutcome::Changed => {}
             HubKeyOutcome::Unchanged => return Some(InputOutcome::Unchanged),
             HubKeyOutcome::OpenLink(target) => {
@@ -220,14 +224,14 @@ mod tests {
         view.handle_hub_browser_input(&Event::Paste(draft.clone()));
         view.handle_hub_browser_input(&key_event(KeyCode::Enter));
         let browser = view.hub_browser.as_mut().unwrap();
-        assert_eq!(browser.draft, draft);
+        assert_eq!(browser.composer.text(), draft);
         assert!(browser.is_composing);
         assert_eq!(browser.post_target().as_deref(), Some("#general"));
         assert!(browser.notice.as_ref().unwrap().starts_with("Not posted:"));
-        browser.draft = "retry".to_string();
+        browser.composer.set_text("retry");
         view.handle_hub_browser_input(&key_event(KeyCode::Enter));
         let browser = view.hub_browser.as_ref().unwrap();
-        assert!(browser.draft.is_empty());
+        assert!(browser.composer.is_empty());
         assert!(browser.notice.as_ref().unwrap().starts_with("Posted to"));
         let messages = bus.hub().messages("#general", 0).unwrap();
         assert_eq!(messages.len(), 1);
@@ -247,12 +251,12 @@ mod tests {
         bus.mark_gone(MAIN_PEER_ID);
         view.handle_hub_browser_input(&key_event(KeyCode::Enter));
         let browser = view.hub_browser.as_ref().unwrap();
-        assert_eq!(browser.draft, "please check");
+        assert_eq!(browser.composer.text(), "please check");
         assert_eq!(browser.post_target().as_deref(), Some("@worker"));
         assert!(browser.notice.as_ref().unwrap().contains("gone"));
         bus.register(MAIN_PEER_ID, "main", None);
         view.handle_hub_browser_input(&key_event(KeyCode::Enter));
-        assert!(view.hub_browser.as_ref().unwrap().draft.is_empty());
+        assert!(view.hub_browser.as_ref().unwrap().composer.is_empty());
         assert_eq!(bus.inbox(MAIN_PEER_ID).unwrap()[0].text, "please check");
     }
 }

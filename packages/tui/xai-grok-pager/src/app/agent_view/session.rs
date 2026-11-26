@@ -188,6 +188,7 @@ impl AgentView {
             last_cleared_goal_id: None,
             show_goal_detail: false,
             hub_browser: None,
+            hub_post_history: Vec::new(),
             file_browser: None,
             turn_start_ms: None,
             turn_start_ms_prompt: None,
