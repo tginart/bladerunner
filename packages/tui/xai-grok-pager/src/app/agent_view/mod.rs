@@ -961,6 +961,9 @@ pub struct AgentView {
     /// Speed of the latest live model response (`ResponseCompleted`). Shown
     /// as a status-bar chip when `[ui].show_inference_speed` is on.
     pub inference_speed: Option<crate::views::agent_status::InferenceSpeed>,
+    /// Output speed of the turn in progress: the live moving average for the
+    /// turn status row and the turn average for the "Worked for" marker.
+    pub(crate) turn_speed: crate::app::turn_speed::TurnSpeedMeter,
     pub workflow_blocks: std::collections::HashMap<String, crate::scrollback::entry::EntryId>,
     pub workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
     pub workflow_run_revisions: std::collections::HashMap<String, u64>,

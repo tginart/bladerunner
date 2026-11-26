@@ -72,3 +72,30 @@ fn replayed_response_completed_is_not_a_live_measurement() {
     assert_eq!(app.agents.get(&AgentId(0)).unwrap().inference_speed, None);
     crate::appearance::cache::set_show_inference_speed(false);
 }
+
+#[test]
+fn response_completed_feeds_the_turn_average() {
+    let mut app = make_app_with_agent("sess-A");
+    for (output_tokens, tokens_per_sec) in [(100, 100.0), (300, 50.0)] {
+        let update = XaiSessionUpdate::ResponseCompleted {
+            message_id: None,
+            stop_reason: None,
+            usage: Some(xai_grok_shell::extensions::notification::ResponseUsage {
+                input_tokens: 0,
+                output_tokens,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            }),
+            signature: None,
+            stop_sequence: None,
+            ttft_ms: None,
+            tokens_per_sec: Some(tokens_per_sec),
+        };
+        handle(make_ext_session_notification("sess-A", update), &mut app);
+    }
+    // 400 tokens in 1s + 6s of decode time.
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let tokens_per_sec = agent.turn_speed.take_turn_tokens_per_sec().unwrap();
+    assert!((tokens_per_sec - 400.0 / 7.0).abs() < 1e-6);
+}

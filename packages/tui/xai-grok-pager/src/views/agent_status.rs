@@ -364,7 +364,7 @@ pub fn inference_speed_line(speed: &InferenceSpeed, theme: &Theme) -> Line<'stat
 }
 
 /// One decimal below 10 tok/s (where it matters), whole numbers above.
-fn format_tokens_per_sec(tps: f64) -> String {
+pub(crate) fn format_tokens_per_sec(tps: f64) -> String {
     if tps < 10.0 {
         format!("{tps:.1}")
     } else {

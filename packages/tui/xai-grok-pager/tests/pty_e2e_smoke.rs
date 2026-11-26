@@ -21,6 +21,8 @@ mod doubled_lines_out_of_band_repro;
 mod embedded_mode_boots_without_hanging_on_blocked_backend;
 #[path = "pty_e2e/feedback_slash_opens_descriptive_pane.rs"]
 mod feedback_slash_opens_descriptive_pane;
+#[path = "pty_e2e/inference_speed_readouts_pty.rs"]
+mod inference_speed_readouts_pty;
 #[path = "pty_e2e/initial_prompt_positional_auto_submits.rs"]
 mod initial_prompt_positional_auto_submits;
 #[path = "pty_e2e/input_echoes_at_idle_prompt.rs"]

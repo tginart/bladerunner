@@ -5,6 +5,7 @@
 //! - Spinner (left, slowed to ~7.5fps)
 //! - Activity label (colored per activity type, truncates if needed)
 //! - Phase timer `Xs` (gray, never truncates)
+//! - Live output speed `· ~42 tok/s` (gray, optional, dropped when it does not fit)
 //! - Queued-send hint `· N queued — Enter to send now` (gray, sendable waits only)
 //! - Fill space
 //! - Turn timer `Xm Ys` and optional token count `⇣Nk` (right-aligned, gray)
@@ -207,6 +208,9 @@ pub struct TurnStatusArgs<'a> {
     pub has_running_execute: bool,
     /// Context-window tokens used, shown as `⇣Nk`.
     pub total_tokens: Option<u64>,
+    /// Live moving average of the output speed, shown after the phase timer
+    /// as `· ~42 tok/s`. The `~` marks an estimate from streamed text.
+    pub live_tokens_per_sec: Option<f64>,
     pub mcp_init_progress: Option<&'a McpInitProgress>,
     pub is_bash_turn: bool,
     pub is_pending_user_input: bool,
@@ -240,6 +244,7 @@ pub fn render_turn_status(
         buttons,
         has_running_execute,
         total_tokens,
+        live_tokens_per_sec,
         mcp_init_progress,
         is_bash_turn,
         is_pending_user_input,
@@ -447,6 +452,17 @@ pub fn render_turn_status(
     };
     let phase_timer_width = phase_timer_str.width();
 
+    // Live output speed, directly after the phase timer.
+    let mut speed_str = live_tokens_per_sec
+        .filter(|tps| tps.is_finite() && *tps > 0.0)
+        .map(|tps| {
+            format!(
+                " \u{00b7} ~{} tok/s",
+                crate::views::agent_status::format_tokens_per_sec(tps)
+            )
+        })
+        .unwrap_or_default();
+
     // Timer style (gray for both phase and turn timers).
     //
     // Right-side elements (turn timer, bg button, cancel button) must set
@@ -471,11 +487,17 @@ pub fn render_turn_status(
     // Available width for activity label (only the label truncates)
     // Layout: spinner + label + phase_timer + queued_hint + gap(1) + turn_timer + cancel
     let min_gap = 1;
-    let available_for_label = (area.width as usize)
+    let mut available_for_label = (area.width as usize)
         .saturating_sub(spinner_width)
         .saturating_sub(phase_timer_width)
         .saturating_sub(min_gap)
         .saturating_sub(right_width);
+    // The speed readout never costs the label any width: drop it instead.
+    if label.width() + speed_str.width() <= available_for_label {
+        available_for_label -= speed_str.width();
+    } else {
+        speed_str.clear();
+    }
 
     // ── Render left side: spinner + label (truncated) + phase_timer + queued_hint ──
     let mut left_spans: Vec<Span<'static>> = Vec::with_capacity(5);
@@ -584,6 +606,10 @@ pub fn render_turn_status(
     // Phase timer (gray, never truncates)
     if !phase_timer_str.is_empty() {
         left_spans.push(Span::styled(phase_timer_str, timer_style));
+    }
+
+    if !speed_str.is_empty() {
+        left_spans.push(Span::styled(speed_str, timer_style));
     }
 
     // After the phase timer, so the elapsed time reads as the wait's, not the hint's.
@@ -1063,6 +1089,7 @@ mod tests {
                 buttons: Some(MouseButtons::default()),
                 has_running_execute: false,
                 total_tokens: None,
+                live_tokens_per_sec: None,
                 mcp_init_progress: None,
                 is_bash_turn: false,
                 is_pending_user_input: false,
@@ -1222,6 +1249,7 @@ mod tests {
             buttons: Some(MouseButtons::default()),
             has_running_execute: false,
             total_tokens: None,
+            live_tokens_per_sec: None,
             mcp_init_progress: None,
             is_bash_turn: false,
             is_pending_user_input: false,
@@ -1232,6 +1260,36 @@ mod tests {
             held_queue: 0,
             held_queue_top_sendable: false,
         }
+    }
+
+    /// Running-turn args that show "Responding…" with a live speed value.
+    fn responding_args<'a>(live_tokens_per_sec: Option<f64>) -> TurnStatusArgs<'a> {
+        TurnStatusArgs {
+            state: &AgentState::TurnRunning,
+            activity: &Some(TurnActivity::Responding),
+            turn_elapsed: Some(Duration::from_secs(3)),
+            live_tokens_per_sec,
+            ..idle_args(Watchers::default())
+        }
+    }
+
+    #[test]
+    fn live_speed_follows_the_responding_label() {
+        let text = render_row_text(responding_args(Some(41.6)), 80);
+        assert!(
+            text.contains("Responding… \u{00b7} ~42 tok/s"),
+            "speed sits directly after the label: {text}"
+        );
+        let text = render_row_text(responding_args(None), 80);
+        assert!(!text.contains("tok/s"), "no value, no readout: {text}");
+    }
+
+    #[test]
+    fn live_speed_drops_before_the_label_truncates() {
+        // 26 cols: room for the label and `3s [stop]`, not for the speed.
+        let text = render_row_text(responding_args(Some(41.6)), 26);
+        assert!(text.contains("Responding…"), "label stays whole: {text}");
+        assert!(!text.contains("tok/s"), "speed is dropped: {text}");
     }
 
     /// Render `args` into a `width`×1 row.

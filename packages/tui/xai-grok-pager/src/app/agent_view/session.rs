@@ -178,6 +178,7 @@ impl AgentView {
             auto_topup: None,
             goal_state: None,
             inference_speed: None,
+            turn_speed: crate::app::turn_speed::TurnSpeedMeter::default(),
             workflow_blocks: std::collections::HashMap::new(),
             workflow_runs: Vec::new(),
             workflow_run_revisions: std::collections::HashMap::new(),
@@ -447,6 +448,7 @@ impl AgentView {
         self.turn_paused_wall = std::time::Duration::ZERO;
         self.turn_start_ms = None;
         self.turn_start_ms_prompt = None;
+        self.turn_speed.reset();
         self.last_active_at = Some(Instant::now());
     }
     /// Absorb a closing/replaced question view's open span into the turn's

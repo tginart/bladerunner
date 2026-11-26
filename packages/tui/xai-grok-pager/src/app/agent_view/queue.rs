@@ -281,9 +281,19 @@ impl AgentView {
         prompt_id: Option<String>,
     ) {
         // The marker keeps its turn's pid for the tail-merge attribution check.
-        let block = crate::scrollback::blocks::SessionEventBlock::with_stop_hooks(
+        let mut block = crate::scrollback::blocks::SessionEventBlock::with_stop_hooks(
             event, stop_hooks, prompt_id,
         );
+        // Always take: every terminal marker ends the turn's measurement.
+        let turn_tokens_per_sec = self.turn_speed.take_turn_tokens_per_sec();
+        if crate::appearance::cache::load_show_inference_speed()
+            && matches!(
+                block.event,
+                crate::scrollback::blocks::SessionEvent::TurnCompleted { .. }
+            )
+        {
+            block.tokens_per_sec = turn_tokens_per_sec;
+        }
         self.scrollback
             .push_block(crate::scrollback::block::RenderBlock::SessionEvent(block));
     }

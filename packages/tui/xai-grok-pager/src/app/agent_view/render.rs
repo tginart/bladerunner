@@ -1518,16 +1518,20 @@ impl AgentView {
             let link_style = Style::default().fg(theme.link_fg).bg(theme.bg_base);
             status.push("link_url", Line::from(Span::styled(display, link_style)));
         }
-        // Leftmost item of the right-aligned group: its width changes every
-        // response, and here that never moves the other chips.
-        if crate::appearance::cache::load_show_inference_speed()
-            && let Some(speed) = self.inference_speed.as_ref()
-        {
-            status.push(
-                "inference_speed",
-                crate::views::agent_status::inference_speed_line(speed, &theme),
-            );
-        }
+        // DISABLED: the top-right `42 tok/s · 380ms TTFT` chip. The tok/s readout
+        // moved to the turn status row (live) and the "Worked for" marker (turn
+        // average). TTFT has no home for now. Kept for a later redesign.
+        //
+        // // Leftmost item of the right-aligned group: its width changes every
+        // // response, and here that never moves the other chips.
+        // if crate::appearance::cache::load_show_inference_speed()
+        //     && let Some(speed) = self.inference_speed.as_ref()
+        // {
+        //     status.push(
+        //         "inference_speed",
+        //         crate::views::agent_status::inference_speed_line(speed, &theme),
+        //     );
+        // }
         let running_count = self.tasks.running_count(
             &self.session.bg_tasks,
             &self.subagent_sessions,
@@ -2371,6 +2375,21 @@ impl AgentView {
                     .is_some_and(|g| g.verifying_completion);
                 let held_queue = self.held_queue_count();
                 let held_queue_top_sendable = self.held_queue_top_sendable();
+                // Only next to "Thinking…" / "Responding…": a value that decays
+                // next to a tool label would read as the tool's speed.
+                let is_streaming = matches!(
+                    activity,
+                    Some(
+                        crate::acp::tracker::TurnActivity::Thinking
+                            | crate::acp::tracker::TurnActivity::Responding
+                    )
+                );
+                let live_tokens_per_sec =
+                    if is_streaming && crate::appearance::cache::load_show_inference_speed() {
+                        self.turn_speed.live_tokens_per_sec(Instant::now())
+                    } else {
+                        None
+                    };
                 let turn_output = turn_status::render_turn_status(
                     buf,
                     turn_area,
@@ -2388,6 +2407,7 @@ impl AgentView {
                         }),
                         has_running_execute,
                         total_tokens: self.context_state.as_ref().map(|c| c.used),
+                        live_tokens_per_sec,
                         mcp_init_progress: self.mcp_init_progress.as_ref(),
                         is_bash_turn: self.bash_turn,
                         is_pending_user_input,

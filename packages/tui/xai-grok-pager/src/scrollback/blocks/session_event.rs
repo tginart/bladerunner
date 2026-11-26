@@ -353,6 +353,9 @@ pub struct SessionEventBlock {
     /// The prompt turn a terminal marker belongs to, when known. Gates
     /// which stop-hook batches may merge into it.
     pub prompt_id: Option<String>,
+    /// Average output speed of the turn, shown after the "Worked for" text.
+    /// `None` when the readout is off or the turn had no measured response.
+    pub tokens_per_sec: Option<f64>,
 }
 
 impl SessionEventBlock {
@@ -362,6 +365,7 @@ impl SessionEventBlock {
             event,
             stop_hooks: Vec::new(),
             prompt_id: None,
+            tokens_per_sec: None,
         }
     }
 
@@ -376,7 +380,21 @@ impl SessionEventBlock {
             event,
             stop_hooks,
             prompt_id,
+            tokens_per_sec: None,
         }
+    }
+
+    /// The marker text: the event message, then the turn speed when present
+    /// (`Worked for 5.0s · 42 tok/s`).
+    fn marker_text(&self) -> String {
+        let mut text = self.event.message();
+        if let Some(tokens_per_sec) = self.tokens_per_sec {
+            text.push_str(&format!(
+                " \u{00b7} {} tok/s",
+                crate::views::agent_status::format_tokens_per_sec(tokens_per_sec)
+            ));
+        }
+        text
     }
 
     /// Whether any attached stop hook actually ran (non-skipped). Gates the
@@ -568,7 +586,7 @@ impl BlockContent for SessionEventBlock {
             theme.muted()
         };
 
-        let text = self.event.message();
+        let text = self.marker_text();
         let wrapped = if text.contains('\n') {
             let input_lines = text
                 .split('\n')
@@ -1204,6 +1222,19 @@ mod tests {
             vec![stop_group("stop")],
             None,
         )
+    }
+
+    #[test]
+    fn turn_marker_shows_speed_after_the_duration() {
+        let mut block = SessionEventBlock::new(SessionEvent::TurnCompleted {
+            elapsed: Some(Duration::from_secs(5)),
+        });
+        assert_eq!(plain(&block.output(&ctx()).lines[0]), "Worked for 5.0s");
+        block.tokens_per_sec = Some(41.6);
+        assert_eq!(
+            plain(&block.output(&ctx()).lines[0]),
+            "Worked for 5.0s \u{00b7} 42 tok/s"
+        );
     }
 
     #[test]
