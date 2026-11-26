@@ -236,9 +236,6 @@ impl MemoryIndex {
         let new_chunks = chunk_markdown(&content, &self.chunk_config);
         let path_str = path.to_string_lossy().to_string();
 
-        // Load existing chunks for this path
-        let existing = self.get_chunks_for_path(&path_str)?;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -247,9 +244,14 @@ impl MemoryIndex {
         let mut result = ReindexResult::default();
         let mut seen_ids = std::collections::HashSet::new();
 
-        // Wrap all mutations in a transaction so partial failures don't leave
-        // the index inconsistent between chunks, FTS, and vec tables.
-        let tx = self.db.transaction()?;
+        // Keep chunks, FTS, and vec mutations in one transaction. IMMEDIATE
+        // takes the write lock before the existing chunks are read, so two
+        // processes cannot both see an empty path and insert the same chunk
+        // ids ("UNIQUE constraint failed: chunks.id").
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = Self::get_chunks_for_path(&tx, &path_str)?;
 
         for (i, chunk) in new_chunks.iter().enumerate() {
             let chunk_id = format!("{}:{}", path_str, i);
@@ -631,13 +633,15 @@ impl MemoryIndex {
     /// previously indexed (idempotent).
     pub fn delete_path(&mut self, path: &Path) -> Result<usize, rusqlite::Error> {
         let path_str = path.to_string_lossy().to_string();
-        let existing = self.get_chunks_for_path(&path_str)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = Self::get_chunks_for_path(&tx, &path_str)?;
 
         if existing.is_empty() {
             return Ok(0);
         }
 
-        let tx = self.db.transaction()?;
         for (chunk_id, record) in &existing {
             // Contentless FTS5 requires the original text for the 'delete' command.
             tx.execute(
@@ -663,11 +667,14 @@ impl MemoryIndex {
     }
 
     /// Get all existing chunks for a path, keyed by chunk ID.
+    ///
+    /// Takes the connection or an open transaction, so a mutating caller reads
+    /// inside the same write transaction that it mutates under.
     fn get_chunks_for_path(
-        &self,
+        connection: &rusqlite::Connection,
         path: &str,
     ) -> Result<HashMap<String, ChunkRecord>, rusqlite::Error> {
-        let mut stmt = self.db.prepare(
+        let mut stmt = connection.prepare(
             "SELECT rowid, id, path, start_line, end_line, text, hash, source, access_count, \
              created_at FROM chunks WHERE path = ?1",
         )?;
@@ -782,6 +789,60 @@ mod tests {
             MemoryIndex::open_or_create(&db_path, storage, MemoryIndexConfig::default(), 1536)
                 .unwrap();
         assert_eq!(idx.embedding_dimensions(), 1536);
+    }
+
+    /// Two connections that index the same new file must wait on the write
+    /// lock, not both insert the same chunk ids.
+    #[test]
+    fn concurrent_reindex_of_same_file_across_connections_is_safe() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let file = tmp.path().join("note.md");
+        std::fs::write(&file, "# Note\n\nShared chunk one.\n\nShared chunk two.\n").unwrap();
+        let workers = 6;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let db_path = db_path.clone();
+            let file = file.clone();
+            let storage = test_storage(&tmp);
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut idx = MemoryIndex::open_or_create(
+                    &db_path,
+                    storage,
+                    MemoryIndexConfig::default(),
+                    1536,
+                )
+                .unwrap();
+                barrier.wait();
+                idx.reindex_file(&file, "workspace").unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let idx = MemoryIndex::open_or_create(
+            &db_path,
+            test_storage(&tmp),
+            MemoryIndexConfig::default(),
+            1536,
+        )
+        .unwrap();
+        let chunks: i64 = idx
+            .db()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE path = ?1",
+                params![file.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fts: i64 = idx
+            .db()
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunks >= 1);
+        assert_eq!(fts, chunks);
     }
 
     fn journal_mode(idx: &MemoryIndex) -> String {

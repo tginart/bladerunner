@@ -1358,6 +1358,25 @@ impl BashTool {
         Some(default_ms.min(budget_ms).max(1))
     }
 
+    /// Purpose: This function gives the foreground wait that the model sees.
+    /// Input: The bash params.
+    /// Output: The wait in whole seconds, or `None` when no short budget applies.
+    /// Note: An unset budget uses the terminal env value or default, as the runtime does.
+    fn advertised_fg_budget_secs(params: &BashParams) -> Option<u64> {
+        if !Self::auto_background_on_timeout_enabled(params) {
+            return None;
+        }
+        let budget_ms = match params.foreground_block_budget_ms {
+            Some(0) => return None,
+            Some(ms) => ms,
+            None => crate::computer::local::terminal::foreground_block_budget_from_env()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        };
+        let wait_ms = budget_ms.min(Self::effective_max_timeout_ms(params)).max(1);
+        Some(wait_ms.div_ceil(1000))
+    }
+
     /// Background retrieval hint naming the get-output tool and its task-ids
     /// param. Kind-wide resolution is correct here: this names *another*
     /// tool's param (the get-output tool), not this bash tool's own schema
@@ -1405,12 +1424,14 @@ impl BashTool {
                     // Background semantics live in the tool-description usage
                     // notes (single copy); the "foreground only" scoping here
                     // keeps the property from contradicting them.
-                    // Keep main-style auto-bg wording (no FG-budget ms advertised).
-                    // Follow-up: surface effective_auto_bg_wait_ms / FG budget here
-                    // once we deliberately change model-facing copy.
+                    let fg_budget_secs = Self::advertised_fg_budget_secs(params);
                     let desc = if !background_enabled {
                         format!(
                             "Optional {timeout_param_name} in milliseconds (max {max_ms}). Default: {default_ms}."
+                        )
+                    } else if let (true, Some(secs)) = (auto_bg, fg_budget_secs) {
+                        format!(
+                            "Optional {timeout_param_name} in milliseconds (max {max_ms}). Default: {default_ms}. A foreground command still running after about {secs}s, or at this deadline if that is sooner, moves to the background (it is not killed) and you receive a task id. Once backgrounded, it is no longer bound by this value."
                         )
                     } else if auto_bg {
                         format!(
@@ -1447,10 +1468,9 @@ impl BashTool {
             Some(desc) => desc,
             None => Self::default_description_template(background_enabled),
         };
-        // Template only interpolates max/default timeout numbers + auto_bg flag.
-        // Do not advertise FG block budget ms here yet (follow-up PR).
         let extras = serde_json::json!({
             "auto_background_on_timeout": auto_bg,
+            "fg_budget_secs": Self::advertised_fg_budget_secs(params),
             "max_timeout_ms": Self::effective_max_timeout_ms(params),
             "default_timeout_ms": Self::effective_default_timeout_ms(params),
             "max_timeout_configured": Self::max_timeout_configured(params),
@@ -1471,13 +1491,17 @@ impl BashTool {
     }
 
     fn default_description_template_enabled() -> &'static str {
-        // NOTE: auto-bg wording is intentionally the historical main copy (no
-        // FG-block-budget ms). Runtime auto-bg uses min(timeout, FG budget);
-        // advertising that wait is a separate description PR.
+        // Runtime auto-bg waits min(timeout, FG budget), so advertise the budget.
         r#"Run a ${% if is_windows %}shell${%- else %}Bash${%- endif %} command and return its output.
 
-- Without an explicit ${{ params.execute.timeout }}, ${% if auto_background_on_timeout %}a foreground command that exceeds ${{ default_timeout_ms | default(120000) }}ms continues in the background and returns a task ID${%- else %}the command stops after ${{ default_timeout_ms | default(120000) }}ms${%- endif %}. A positive timeout, up to ${{ max_timeout_ms | default(300000) }}ms, terminates the command when reached.
-- With `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true`, an omitted or zero timeout runs until stopped.${%- if system_reminders_enabled %} Completion is reported automatically.${%- elif tools.by_kind.background_task_action %} Check it with ${{ tools.by_kind.background_task_action }}.${%- endif %}
+${%- if auto_background_on_timeout and fg_budget_secs %}
+- Foreground commands block this tool for at most about ${{ fg_budget_secs }}s. A command still running then, or at its ${{ params.execute.timeout }} if that is sooner, moves to the background (it is not killed) and returns a task ID. Setting ${{ params.execute.timeout }} never makes this tool wait longer.
+${%- elif auto_background_on_timeout %}
+- A foreground command still running at its ${{ params.execute.timeout }} (default ${{ default_timeout_ms | default(120000) }}ms, up to ${{ max_timeout_ms | default(300000) }}ms) moves to the background (it is not killed) and returns a task ID.
+${%- else %}
+- Without an explicit ${{ params.execute.timeout }}, the command stops after ${{ default_timeout_ms | default(120000) }}ms. A positive timeout, up to ${{ max_timeout_ms | default(300000) }}ms, terminates the command when reached.
+${%- endif %}
+- With `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true`, an omitted or zero timeout runs until stopped, and a positive timeout stops the command when reached.${%- if system_reminders_enabled %} Completion is reported automatically.${%- elif tools.by_kind.background_task_action %} Check it with ${{ tools.by_kind.background_task_action }}.${%- endif %}
 - Output over {max_output_bytes} characters is shortened and includes a path to the complete log.
 ${%- if shell_uses_semicolon %}
   - '&&' is not supported in this shell; chain sequential commands with ';'.
@@ -4199,8 +4223,8 @@ mod tests {
             assert_eq!(BashTool::effective_auto_bg_wait_ms(&params), Some(10_000));
         }
 
-        /// Descriptions already advertise max/default timeout numbers — those
-        /// must track BashParams. Do **not** require FG-budget ms in copy yet.
+        /// Descriptions advertise max/default timeout numbers and the FG
+        /// budget; all of them must track BashParams.
         #[test]
         fn schema_timeout_numbers_track_config() {
             let params = BashParams {
@@ -4222,7 +4246,7 @@ mod tests {
                 schema["properties"]["timeout"]["maximum"].as_u64(),
                 Some(60_000)
             );
-            // Historical auto-bg note only when flag on — no budget ms.
+            // Auto-bg with a finite budget advertises the budget wait.
             let auto = BashParams {
                 auto_background_on_timeout: true,
                 max_timeout_secs: Some(60.0),
@@ -4231,12 +4255,18 @@ mod tests {
             };
             let auto_desc = timeout_desc(&auto);
             assert!(
-                auto_desc.contains("automatically backgrounded"),
-                "auto-bg flag still uses historical copy: {auto_desc}"
+                auto_desc.contains("after about 2s") && auto_desc.contains("not killed"),
+                "auto-bg must advertise the FG budget: {auto_desc}"
             );
+            // A zero budget disables the short wait: only the timeout backgrounds.
+            let no_budget = BashParams {
+                foreground_block_budget_ms: Some(0),
+                ..auto
+            };
+            let no_budget_desc = timeout_desc(&no_budget);
             assert!(
-                !auto_desc.contains("2000") && !auto_desc.contains("FG block"),
-                "must not advertise FG budget ms yet: {auto_desc}"
+                no_budget_desc.contains("automatically backgrounded"),
+                "zero budget keeps the timeout-only copy: {no_budget_desc}"
             );
         }
 
@@ -4870,13 +4900,31 @@ mod tests {
                 .render_with_extra(BashTool::default_description_template_enabled(), &extras)
                 .unwrap();
             assert!(
-                out.contains("Without an explicit max_wait, a foreground command"),
+                out.contains("still running at its max_wait (default"),
                 "renamed timeout must appear:\n{out}"
             );
             assert!(
-                !out.contains("explicit timeout"),
+                !out.contains("its timeout"),
                 "canonical timeout must not remain after rename:\n{out}"
             );
+
+            let budget_extras = serde_json::json!({
+                "auto_background_on_timeout": true,
+                "fg_budget_secs": 15,
+                "is_windows": false,
+                "shell_uses_semicolon": false,
+                "has_unix_utilities": true,
+            });
+            let out = renderer
+                .render_with_extra(BashTool::default_description_template_enabled(), &budget_extras)
+                .unwrap();
+            assert!(
+                out.contains("at most about 15s")
+                    && out.contains("or at its max_wait if that is sooner")
+                    && out.contains("Setting max_wait never"),
+                "FG budget copy must use the renamed timeout:\n{out}"
+            );
+            assert!(!out.contains("120000ms"), "budget copy must not cite the timeout:\n{out}");
         }
 
         #[test]
@@ -4893,7 +4941,7 @@ mod tests {
                 !out.contains("'&&' is not supported"),
                 "must not emit the `;`-chaining note on Unix, got:\n{out}"
             );
-            assert!(out.contains("A positive timeout"));
+            assert!(out.contains("a positive timeout stops the command"));
         }
 
         #[test]
