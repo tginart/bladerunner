@@ -53,16 +53,31 @@ pub(in crate::app::dispatch) fn dispatch_load_session(
 }
 /// Purpose: Show the session of a hub member if this window has it open.
 /// Input: The app, the member session id, and its handle for the toast.
-/// Output: No effects. The view switches to the agent, or a toast says why not.
+/// Output: No effects. The view switches to the agent, or to the subagent
+///     view of another tab that has it. Otherwise a toast says why not.
 pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
     app: &mut AppView,
     session_id: String,
     handle: String,
 ) -> Vec<Effect> {
-    if focus_if_session_already_open(app, &session_id, false).is_none() {
+    if focus_if_session_already_open(app, &session_id, false).is_some() {
+        return vec![];
+    }
+    let owner = app
+        .agents
+        .iter()
+        .find(|(_, agent)| agent.subagent_views.contains_key(&session_id))
+        .map(|(id, _)| *id);
+    let Some(owner) = owner else {
         app.show_toast(&format!(
             "@{handle} is not open in this window (session {session_id})."
         ));
+        return vec![];
+    };
+    switch_to_agent(app, owner, SwitchCause::Picker);
+    if let Some(agent) = app.agents.get_mut(&owner) {
+        agent.hub_browser = None;
+        agent.open_subagent_fullscreen(session_id);
     }
     vec![]
 }
