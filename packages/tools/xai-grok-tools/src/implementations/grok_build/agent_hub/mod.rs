@@ -7,13 +7,13 @@
 mod bus;
 pub mod store;
 
-pub use bus::InputGuard;
 pub use bus::{
     AgentBus, ChannelView, DeliveredMessage, Delivery, HubView, JoinOutcome, LOOP_GUARD_WAKES,
     MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, ensure_person,
     format_messages, image_paths, mark_read, parse_delivery, person_handle_in, post_as_person,
     reply_as_person,
 };
+pub use bus::{InputGuard, TurnGuard};
 pub use store::{Activity, Member, MemberKind, Message, Presence};
 
 use std::path::PathBuf;

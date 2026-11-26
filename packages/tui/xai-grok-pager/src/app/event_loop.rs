@@ -4335,17 +4335,16 @@ fn process_effects(
 /// Purpose: Tell the person about new hub messages that mention or DM them.
 /// Input: The app.
 /// Output: None. Each new mention shows a toast and a terminal notification.
-///     A hub that is open in the hub browser shows the message there, so
-///     its mentions are not announced again.
+///     A hub that the shown view has open in the hub browser shows the
+///     message there, so its mentions are not announced again. A browser in
+///     a hidden tab does not count, because the person cannot see it.
 fn announce_hub_mentions(app: &mut AppView) {
     for new in crate::hub_status::take_new_mentions() {
-        let is_open = app.agents.values().any(|agent| {
-            agent
-                .hub_browser
-                .as_ref()
-                .is_some_and(|browser| browser.hub.name() == new.hub)
-        });
-        if is_open {
+        let is_shown = app
+            .active_agent()
+            .and_then(|agent| agent.hub_browser.as_ref())
+            .is_some_and(|browser| browser.hub.name() == new.hub);
+        if is_shown {
             continue;
         }
         let mention = &new.mention;

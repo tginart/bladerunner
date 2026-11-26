@@ -2228,6 +2228,31 @@ fn regular_allow_once_does_not_trigger_always_approve_persist() {
         "app.default_yolo must remain OFF when the regular AllowOnce option is picked",
     );
 }
+/// "Go to session" on a hub member finds a subagent of another tab: the
+/// view switches to that tab and opens the child.
+#[test]
+fn focus_hub_member_opens_a_subagent_of_another_tab() {
+    let mut app = test_app_with_agent();
+    let other = AgentId(1);
+    let session = make_test_agent_session(&app, other, "other-root");
+    let mut view = AgentView::new(session, ScrollbackState::new());
+    let child = make_test_agent_session(&app, AgentId(2), "child-sid");
+    view.subagent_views.insert(
+        "child-sid".to_string(),
+        Box::new(AgentView::new(child, ScrollbackState::new())),
+    );
+    app.agents.insert(other, view);
+    super::super::session::load::dispatch_focus_hub_member(
+        &mut app,
+        "child-sid".to_string(),
+        "child".to_string(),
+    );
+    assert_eq!(app.active_view, ActiveView::Agent(other));
+    assert_eq!(
+        app.agents[&other].active_subagent.as_deref(),
+        Some("child-sid")
+    );
+}
 /// Launch-time blocked `--yolo` in the TUI: the one-shot notice is
 /// surfaced (toast + durable system line) on the first agent view and
 /// consumed so later switches stay quiet.

@@ -683,6 +683,16 @@ impl TextArea {
         self.wrapped_lines(width).len() as u16
     }
 
+    /// Purpose: Find the wrapped (visual) row of the cursor.
+    /// Input: The screen area of the text.
+    /// Output: The row index of the cursor and the row count, or None when
+    ///     the cursor has no row.
+    pub fn cursor_visual_row(&self, area: Rect) -> Option<(usize, usize)> {
+        let lines = self.wrapped_lines(self.text_width(area));
+        let idx = Self::wrapped_line_index_by_start(&lines, self.cursor())?;
+        Some((idx, lines.len()))
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.cursor_pos_with_state(area, TextAreaState::default())

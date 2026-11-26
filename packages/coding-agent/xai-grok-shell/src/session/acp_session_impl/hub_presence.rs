@@ -3,30 +3,25 @@
 //! The bus writes `presence/<handle>.json` in the hub. This module calls it
 //! at turn start and end, and around prompts that wait for a person.
 
-use xai_grok_tools::implementations::grok_build::agent_hub::InputGuard;
+use xai_grok_tools::implementations::grok_build::agent_hub::{InputGuard, TurnGuard};
 
 use super::*;
 
 impl SessionActor {
-    /// Purpose: Report that a turn started.
+    /// Purpose: Report that a turn started, until the turn ends.
     /// Input: The turn prompt blocks, and whether a wake or a drain started it.
-    /// Output: None. A person or parent prompt becomes the task of the member.
-    pub(super) fn report_hub_turn_started(
+    /// Output: A guard that the turn keeps, or None when the session is in no
+    ///     hub. A person or parent prompt becomes the task of the member.
+    /// Note: The member shows `idle` when the guard drops, on every exit path
+    ///     of the turn: builtin commands and errors too.
+    pub(super) fn hub_turn_guard(
         &self,
         prompt_blocks: &[acp::ContentBlock],
         is_synthetic: bool,
-    ) {
-        let Some((bus, peer)) = self.hub_peer() else {
-            return;
-        };
+    ) -> Option<TurnGuard> {
+        let (bus, peer) = self.hub_peer()?;
         let task = (!is_synthetic).then(|| prompt_text(prompt_blocks));
-        bus.turn_started(peer, task.as_deref());
-    }
-
-    pub(super) fn report_hub_turn_ended(&self) {
-        if let Some((bus, peer)) = self.hub_peer() {
-            bus.turn_ended(peer);
-        }
+        Some(bus.turn_guard(peer, task.as_deref()))
     }
 
     /// A guard that shows the member as `needs_input` while a prompt for a
