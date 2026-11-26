@@ -1174,9 +1174,11 @@ fn contains(rect: Rect, col: u16, row: u16) -> bool {
 /// The style of each part of a feed line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Part {
-    /// An agent name. The number picks the name color.
-    Agent(usize),
-    Person,
+    /// An agent name: the color slot and the full handle. The handle is the
+    /// click target, because a narrow feed can clip the shown name.
+    Agent(usize, String),
+    /// A person name, with the full handle.
+    Person(String),
     Time,
     Text,
     Mention,
@@ -1309,9 +1311,9 @@ fn sender_header(
     names: &FeedNames<'_>,
 ) -> FeedLine {
     let part = if names.persons.contains(&message.from) {
-        Part::Person
+        Part::Person(message.from.clone())
     } else {
-        Part::Agent(name_color_slot(&message.from))
+        Part::Agent(name_color_slot(&message.from), message.from.clone())
     };
     let sender = format!("@{}", message.from);
     let time = format!("  {}", time.format("%-I:%M %p"));
@@ -1450,7 +1452,11 @@ fn byte_at_col(text: &str, boundaries: &[usize], col: u16) -> Option<usize> {
 /// Output: The member, channel, or link target. Plain spans have none.
 fn span_target(text: &str, part: &Part, meta: &store::HubMeta) -> Option<SpanTarget> {
     match part {
-        Part::Agent(_) | Part::Person | Part::Mention => {
+        Part::Agent(_, handle) | Part::Person(handle) => {
+            meta.member(handle)?;
+            Some(SpanTarget::Member(handle.clone()))
+        }
+        Part::Mention => {
             if let Some(name) = text.strip_prefix('#') {
                 return Some(SpanTarget::Channel(name.to_string()));
             }
@@ -2135,10 +2141,10 @@ fn part_style(part: &Part, theme: &Theme) -> Style {
         theme.running,
     ];
     match part {
-        Part::Agent(slot) => Style::default()
+        Part::Agent(slot, _) => Style::default()
             .fg(palette[slot % palette.len()])
             .add_modifier(Modifier::BOLD),
-        Part::Person => Style::default()
+        Part::Person(_) => Style::default()
             .fg(theme.accent_plan)
             .add_modifier(Modifier::BOLD),
         Part::Time => Style::default().fg(theme.gray),
@@ -3283,7 +3289,7 @@ mod tests {
         );
         assert!(plain[4].ends_with(" new"), "{plain:?}");
         assert!(plain[5].starts_with("@me  "));
-        assert!(lines[5][0].1 == Part::Person);
+        assert!(matches!(lines[5][0].1, Part::Person(_)));
         assert!(lines[6].contains(&("@front".to_string(), Part::Mention)));
         assert!(lines[6].contains(&("#general".to_string(), Part::Mention)));
         assert!(plain.iter().any(|line| line.contains(" Today ")));
@@ -3681,5 +3687,37 @@ mod tests {
         let links = scan_links(text);
         assert_eq!(links.len(), 1);
         assert_eq!(&text[links[0].0.clone()], "https://x.io/a");
+    }
+
+    #[test]
+    fn a_clipped_sender_name_opens_the_full_handle() {
+        let from = "backend-architect-2";
+        let msg = message(from, "#general".into(), "hi", 0);
+        let persons = BTreeSet::new();
+        let mentions = BTreeSet::new();
+        let names = FeedNames {
+            persons: &persons,
+            mentions: &mentions,
+        };
+        let today = local_time(0).date_naive();
+        let lines = feed_lines(std::slice::from_ref(&msg), 18, None, &names, today);
+        let (text, part) = lines
+            .iter()
+            .flatten()
+            .find(|(_, part)| matches!(part, Part::Agent(..)))
+            .expect("sender span");
+        assert_ne!(text, &format!("@{from}"), "the name is clipped");
+        let (_root, hub) = hub_with_dms();
+        hub.update_meta(|meta| {
+            meta.members
+                .push(member("backend-architect", MemberKind::Agent));
+            meta.members.push(member(from, MemberKind::Agent));
+        })
+        .unwrap();
+        let meta = hub.meta().unwrap();
+        assert_eq!(
+            span_target(text, part, &meta),
+            Some(SpanTarget::Member(from.to_string()))
+        );
     }
 }
