@@ -101,7 +101,9 @@ impl AgentView {
         let Some(session_id) = self.hub_member_session(handle) else {
             return InputOutcome::Changed;
         };
-        if self.subagent_views.contains_key(&session_id) {
+        if let Some(child) = self.subagent_views.get_mut(&session_id) {
+            // The child can keep a browser of its own, which would cover it.
+            child.hub_browser = None;
             self.hub_browser = None;
             self.open_subagent_fullscreen(session_id);
             return InputOutcome::Changed;
