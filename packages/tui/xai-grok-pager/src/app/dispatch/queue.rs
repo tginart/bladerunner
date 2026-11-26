@@ -568,10 +568,14 @@ pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
 /// swallow the leader's user-echo; when false (bash, or a viewer with no local
 /// text) the echo is the only source and must render. Kept in sync with the
 /// shim's match via a `debug_assert!` there.
+///
+/// A hub wake has no user block: the interjection broadcast already showed it
+/// as a hub card, and it is not a message from the user.
 pub(crate) fn shim_renders_own_user_block(kind: &str, text: Option<&str>) -> bool {
     match kind {
         "bash" => false,
-        _ => text.is_some(),
+        "cron" => text.is_some(),
+        _ => text.is_some_and(|t| !crate::acp::tracker::is_hub_delivery(t)),
     }
 }
 
@@ -873,6 +877,9 @@ pub(crate) fn apply_turn_start_shim(
         }
         "cron" => (text.as_deref().map(RenderBlock::cron_prompt), false),
         _ if multi_segments.is_some() => (None, true),
+        // A hub wake (an `interject-fallback-` turn): its hub card is already
+        // in scrollback, and Ctrl+C has no user text to restore.
+        _ if !shim_renders_own_user_block(kind, text.as_deref()) => (None, false),
         _ => (text.as_deref().map(RenderBlock::user_prompt), true),
     };
 
@@ -1517,6 +1524,38 @@ mod tests {
             }
             other => panic!("expected user bubble, got {other:?}"),
         }
+    }
+
+    /// An idle hub wake runs as an `interject-fallback-` turn. The interjection
+    /// broadcast already painted its hub card, so the shim adds no user bubble.
+    #[test]
+    fn shim_hub_wake_adds_no_user_bubble() {
+        let wake = "<system_header>\nA reply is optional.\n</system_header>\n\
+                    [message_agents · hub team] 1 message(s).\n\
+                    --- DM · from @backend · id=m1 ---\nthe build is green";
+        let mut app = test_app_with_agent();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        let card = crate::acp::tracker::hub_delivery_card(wake).expect("wake parses");
+        agent.scrollback.push_block(card);
+        let before = agent.scrollback.len();
+        apply_turn_start_shim(
+            agent,
+            "interject-fallback-a".into(),
+            Some(wake.into()),
+            "prompt",
+            None,
+        );
+        assert_eq!(agent.scrollback.len(), before);
+        assert!(matches!(
+            agent.scrollback.entry(before - 1).unwrap().block,
+            RenderBlock::HubCard(_)
+        ));
+        assert!(agent.session.state.is_turn_running());
+        assert!(
+            agent.session.in_flight_prompt.is_none(),
+            "a hub wake is not a prompt that Ctrl+C restores"
+        );
+        assert!(!shim_renders_own_user_block("prompt", Some(wake)));
     }
 
     #[test]

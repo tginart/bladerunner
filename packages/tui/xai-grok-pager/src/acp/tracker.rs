@@ -1501,6 +1501,11 @@ fn hub_card_title(chunk: &acp::ContentChunk) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the text of a user turn is a hub wake, which shows as a hub card.
+pub(crate) fn is_hub_delivery(text: &str) -> bool {
+    xai_grok_tools::implementations::grok_build::agent_hub::parse_delivery(text).is_some()
+}
+
 /// A hub card for a user turn that is a hub wake, or `None` for other text.
 pub(crate) fn hub_delivery_card(text: &str) -> Option<RenderBlock> {
     let delivery = xai_grok_tools::implementations::grok_build::agent_hub::parse_delivery(text)?;
