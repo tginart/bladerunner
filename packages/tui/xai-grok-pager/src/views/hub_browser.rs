@@ -31,6 +31,8 @@ use crate::views::shortcuts_bar::{HintItem, ShortcutsBar};
 
 /// Messages that one feed shows.
 const FEED_LIMIT: usize = 300;
+/// Older messages that the feed also shows above a focused old message.
+const FOCUS_CONTEXT: usize = 5;
 /// Widest the sidebar gets.
 const SIDEBAR_MAX_WIDTH: u16 = 30;
 /// Messages from one sender closer than this share one header.
@@ -584,8 +586,7 @@ impl HubBrowserState {
             KeyCode::Char('[') => self.jump_unread(-1),
             KeyCode::Char('r') if self.thread.is_none() => {
                 if let Some(last) = self.feed.last() {
-                    self.reply_to = Some(last.id.clone());
-                    self.start_compose();
+                    self.start_reply(last.id.clone());
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(&rows, -1),
@@ -658,8 +659,11 @@ impl HubBrowserState {
                 self.is_dragging_scrollbar = true;
                 self.drag_feed_scrollbar(row);
             }
+            // The reply chip lies over the feed, and a click on it is a button.
             MouseEventKind::Down(MouseButton::Left)
-                if self.picker.is_none() && contains(self.hits.feed, col, row) =>
+                if self.picker.is_none()
+                    && contains(self.hits.feed, col, row)
+                    && !self.is_on_reply_chip(col, row) =>
             {
                 self.is_dragging_scrollbar = false;
                 let point = self.feed_point_at(col, row);
@@ -735,11 +739,7 @@ impl HubBrowserState {
         if contains(hits.thread_back, col, row) {
             return Some(HoverKey::ThreadBack);
         }
-        if hits
-            .reply_chip
-            .as_ref()
-            .is_some_and(|(rect, _)| contains(*rect, col, row))
-        {
+        if self.is_on_reply_chip(col, row) {
             return Some(HoverKey::ReplyChip);
         }
         if self.search_row_at(col, row).is_some() {
@@ -1065,7 +1065,11 @@ impl HubBrowserState {
                     a.to_string()
                 };
                 let peer = if viewer == a { b } else { a };
-                self.apply_perspective(&viewer);
+                // Select the DM before the feed loads, so no other
+                // conversation is marked read.
+                if let Err(error) = self.show_perspective(&viewer, Some(message.conv.clone())) {
+                    self.notice = Some(format!("Could not load @{viewer}: {error}"));
+                }
                 Some(Row::Dm {
                     peer: peer.to_string(),
                     conv: message.conv.clone(),
@@ -1076,8 +1080,13 @@ impl HubBrowserState {
             return;
         };
         self.select(Some(row));
+        let is_loaded = self.feed.iter().any(|m| m.id == message.id);
         self.focus_message = Some(message.id);
         self.scroll_to_focus = true;
+        // The message is older than the feed window, so load a window with it.
+        if !is_loaded && let Err(error) = self.load_feed(false) {
+            tracing::warn!(%error, "hub browser: feed load failed");
+        }
     }
 
     /// The peer of the selected DM when it is a live agent, the target of
@@ -1103,6 +1112,13 @@ impl HubBrowserState {
         HubKeyOutcome::Changed
     }
 
+    fn is_on_reply_chip(&self, col: u16, row: u16) -> bool {
+        self.hits
+            .reply_chip
+            .as_ref()
+            .is_some_and(|(rect, _)| contains(*rect, col, row))
+    }
+
     fn click(&mut self, col: u16, row: u16) -> HubKeyOutcome {
         let hint_key = self
             .hits
@@ -1125,8 +1141,7 @@ impl HubBrowserState {
         if let Some((rect, id)) = self.hits.reply_chip.clone()
             && contains(rect, col, row)
         {
-            self.reply_to = Some(id);
-            self.start_compose();
+            self.start_reply(id);
             return HubKeyOutcome::Changed;
         }
         if contains(self.hits.thread_back, col, row) {
@@ -1235,6 +1250,24 @@ impl HubBrowserState {
         }
     }
 
+    /// Purpose: Start a reply to a message of the shown conversation.
+    /// Input: The parent message id.
+    /// Output: None. A paused draft for another conversation keeps its
+    ///     destination and gets no parent, because the hub refuses a reply
+    ///     to a message of another conversation. A notice says why.
+    fn start_reply(&mut self, parent_id: String) {
+        let shown = self.selected_row().as_ref().and_then(post_target);
+        if let Some(pinned) = self.compose_target.clone()
+            && !self.composer.is_empty()
+            && Some(&pinned) != shown.as_ref()
+        {
+            self.notice = Some(format!("Send or clear the draft to {pinned} first."));
+            return;
+        }
+        self.reply_to = Some(parent_id);
+        self.start_compose();
+    }
+
     fn start_compose(&mut self) {
         if let Some(target) = self.post_target() {
             self.compose_target = Some(target);
@@ -1307,11 +1340,12 @@ impl HubBrowserState {
         };
         let mut messages = self.hub.messages(&conv, 0)?;
         let total = messages.len();
-        let skip = total.saturating_sub(FEED_LIMIT);
-        let mut feed = messages.split_off(skip);
         if let Some(root) = &self.thread {
-            feed.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
+            // Filter before the limit, so an old root keeps its replies.
+            messages.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
         }
+        let skip = feed_window_start(&messages, self.focus_message.as_deref());
+        let feed = messages.split_off(skip);
         // A drop or replacement can move text under the stored line indices.
         if self.feed_selection.is_some() && !feed.starts_with(&self.feed) {
             self.feed_selection = None;
@@ -1330,7 +1364,8 @@ impl HubBrowserState {
                 .find(|(_, message)| message.from != self.perspective)
                 .map(|(idx, _)| idx);
         }
-        if self.is_person_view() {
+        // A thread shows only some messages, so the conversation stays unread.
+        if self.is_person_view() && self.thread.is_none() {
             let count = total;
             if is_person_member(&self.snapshot.meta, &self.person) {
                 agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
@@ -1341,6 +1376,21 @@ impl HubBrowserState {
             self.snapshot.unread_counts.insert(conv, 0);
         }
         Ok(())
+    }
+}
+
+/// Purpose: Find the first message that the feed shows.
+/// Input: The messages of the conversation, oldest first, and the focused
+///     message id, if any.
+/// Output: The index of the first of the last FEED_LIMIT messages. A focused
+///     message before that window moves the start back to show it, with a
+///     few messages of context.
+fn feed_window_start(messages: &[store::Message], focus: Option<&str>) -> usize {
+    let skip = messages.len().saturating_sub(FEED_LIMIT);
+    let focus_idx = focus.and_then(|id| messages.iter().position(|m| m.id == id));
+    match focus_idx {
+        Some(idx) => skip.min(idx.saturating_sub(FOCUS_CONTEXT)),
+        None => skip,
     }
 }
 
@@ -4665,6 +4715,93 @@ mod tests {
             state.handle_key(&key(KeyCode::Esc)),
             HubKeyOutcome::Changed,
             "the third Esc closes the hub"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_reply_chip_starts_a_reply() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        let mut state = open(hub);
+        render(&mut state);
+        let (x, y) = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        let (rect, id) = state.hits.reply_chip.clone().expect("chip on hover");
+        assert_eq!(id, parent_id);
+        click(&mut state, (rect.x + 1, rect.y));
+        assert!(state.is_composing);
+        assert_eq!(state.reply_to.as_deref(), Some(parent_id.as_str()));
+        assert!(state.feed_selection.is_none(), "no text selection starts");
+    }
+
+    #[test]
+    fn r_keeps_a_paused_draft_for_another_conversation() {
+        let (_root, hub, _) = hub_with_thread();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("draft");
+        state.handle_key(&key(KeyCode::Esc));
+        state.select(Some(dm("front", "me")));
+        state.handle_key(&key(KeyCode::Char('r')));
+        assert_eq!(state.reply_to, None);
+        assert_eq!(state.post_target().as_deref(), Some("#general"));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("#general")),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn a_thread_view_does_not_mark_its_conversation_read() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        let mut state = open(hub.clone());
+        state.open_thread(&parent_id);
+        let read_before = hub.cursors("me").unwrap().read.get("#general").copied();
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "unrelated",
+            store::now_ms(),
+        ))
+        .unwrap();
+        state.reload().unwrap();
+        assert_eq!(state.feed.len(), 2, "the thread only");
+        let read_after = hub.cursors("me").unwrap().read.get("#general").copied();
+        assert_eq!(read_after, read_before);
+        assert_eq!(state.snapshot.unread("#general"), 1);
+    }
+
+    #[test]
+    fn a_search_hit_older_than_the_feed_window_is_loaded() {
+        let (_root, hub) = hub_with_dms();
+        let old = message("front", "#general".to_string(), "needle", store::now_ms());
+        hub.append(&old).unwrap();
+        for i in 0..FEED_LIMIT + 10 {
+            let text = format!("filler {i}");
+            hub.append(&message(
+                "back",
+                "#general".to_string(),
+                &text,
+                store::now_ms(),
+            ))
+            .unwrap();
+        }
+        let mut state = open(hub);
+        assert!(state.feed.iter().all(|m| m.id != old.id));
+        state.handle_key(&key(KeyCode::Char('/')));
+        for c in "needle".chars() {
+            state.handle_key(&key(KeyCode::Char(c)));
+        }
+        state.handle_key(&key(KeyCode::Enter));
+        assert_eq!(state.focus_message.as_deref(), Some(old.id.as_str()));
+        assert!(state.feed.iter().any(|m| m.id == old.id));
+        assert_eq!(
+            state.feed.last().map(|m| m.text.as_str()),
+            Some("filler 309")
         );
     }
 
