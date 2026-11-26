@@ -336,10 +336,12 @@ fn parse_http_blocking_result(
     }
 
     match serde_json::from_str::<super::GateHookJson>(response_text) {
-        Ok(output) => match super::gate_json_to_result(output, hook_name) {
-            Ok(result) => result,
-            Err(err) => HookRunnerResult::Failed(err),
-        },
+        Ok(output) => {
+            match super::gate_json_to_result(output, hook_name, /* fallback_reason */ None) {
+                Ok(result) => result,
+                Err(err) => HookRunnerResult::Failed(err),
+            }
+        }
         Err(e) => {
             if status.is_success() {
                 tracing::warn!(

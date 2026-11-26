@@ -61,6 +61,7 @@ pub(crate) struct PreToolSpecificOutput {
 pub(crate) fn gate_json_to_result(
     mut json: GateHookJson,
     hook_name: &str,
+    fallback_reason: Option<&str>,
 ) -> Result<HookRunnerResult, String> {
     let mut updated = json.updated_input.take();
     if let Some(specific) = json.hook_specific_output.take() {
@@ -87,7 +88,7 @@ pub(crate) fn gate_json_to_result(
             return Err("pre-tool output is missing a decision".into());
         }
     }
-    let decision = gate_json_to_decision(json, hook_name)?;
+    let decision = gate_json_to_decision(json, hook_name, fallback_reason)?;
     match (decision, updated) {
         (HookDecision::Allow, Some(value)) if value.is_object() => {
             Ok(HookRunnerResult::Rewrite(value))
@@ -99,14 +100,21 @@ pub(crate) fn gate_json_to_result(
 
 /// Interpret a [`GateHookJson`] as a [`HookDecision`]. An unknown decision value
 /// is an error so typos surface instead of failing open.
+///
+/// `fallback_reason` is the deny message when the JSON has no usable reason.
+/// Command hooks pass the first stderr line. HTTP hooks have no stderr and
+/// pass `None`.
 pub(crate) fn gate_json_to_decision(
     json: GateHookJson,
     hook_name: &str,
+    fallback_reason: Option<&str>,
 ) -> Result<HookDecision, String> {
     match json.decision.as_str() {
         "deny" => Ok(HookDecision::Deny {
             reason: json
                 .reason
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| fallback_reason.map(str::to_string))
                 .unwrap_or_else(|| format!("denied by hook '{hook_name}'")),
             hook_name: hook_name.to_string(),
         }),
@@ -197,7 +205,7 @@ mod rewrite_tests {
     use super::*;
     use serde_json::json;
     fn parse(value: serde_json::Value) -> Result<HookRunnerResult, String> {
-        gate_json_to_result(serde_json::from_value(value).unwrap(), "fixture")
+        gate_json_to_result(serde_json::from_value(value).unwrap(), "fixture", None)
     }
     #[test]
     fn supported_rewrite_protocols_and_deny_precedence() {
