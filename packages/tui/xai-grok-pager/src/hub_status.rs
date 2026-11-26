@@ -4,7 +4,7 @@
 //! thread and cached per session, like [`crate::git_info`]. A refresh that
 //! changes a label signals [`label_changed`], so an idle TUI redraws.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,9 +25,11 @@ const HUB_LABEL_CACHE_MAX: usize = 64;
 /// Signalled when a refresh changes a cached label.
 static HUB_LABEL_CHANGED: LazyLock<Notify> = LazyLock::new(Notify::new);
 
-/// Newest mention time already seen, per hub name. A hub that is seen for the
-/// first time records its newest mention, so old mentions do not alert.
-static MENTION_HIGH_WATER: LazyLock<Mutex<HashMap<String, u64>>> =
+/// Ids of the unread mentions already seen, per hub name. A hub that is seen
+/// for the first time records its mentions, so old mentions do not alert.
+/// Note: These are ids, not times. A mention can become visible after a newer
+///     one, because a sender takes its time stamp before the append lock.
+static SEEN_MENTIONS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// New mentions that wait for the event loop to show them.
@@ -118,36 +120,89 @@ fn spawn_refresh(session_id: String) {
     });
 }
 
+/// Purpose: Find the unread mentions of a hub that the last refresh did not see.
+/// Input: The seen mention ids per hub, and the hub status of one session.
+/// Output: The new mentions, oldest first. The seen ids become the ids of the
+///     status, so the set stays as small as the unread mentions.
+fn new_mentions(
+    seen: &mut HashMap<String, HashSet<String>>,
+    status: &xai_grok_shell::session::hub::HubStatus,
+) -> Vec<NewMention> {
+    let ids: HashSet<String> = status.mentions.iter().map(|m| m.id.clone()).collect();
+    let Some(old) = seen.insert(status.hub.clone(), ids) else {
+        return Vec::new();
+    };
+    status
+        .mentions
+        .iter()
+        .filter(|mention| !old.contains(&mention.id))
+        .map(|mention| NewMention {
+            hub: status.hub.clone(),
+            mention: mention.clone(),
+        })
+        .collect()
+}
+
 /// Purpose: Queue the mentions of a hub that are newer than the last refresh.
 /// Input: The hub status of one session.
 /// Output: True when the queue got a mention.
 /// Note: Two sessions in one hub share its high-water mark, so a mention
 ///     alerts once.
 fn queue_new_mentions(status: &xai_grok_shell::session::hub::HubStatus) -> bool {
-    let newest = status.mentions.iter().map(|m| m.ts_unix_ms).max();
-    let Ok(mut high_water) = MENTION_HIGH_WATER.lock() else {
+    let Ok(mut seen) = SEEN_MENTIONS.lock() else {
         return false;
     };
-    let Some(seen) = high_water.get(&status.hub).copied() else {
-        high_water.insert(status.hub.clone(), newest.unwrap_or(0));
-        return false;
-    };
-    let fresh: Vec<NewMention> = status
-        .mentions
-        .iter()
-        .filter(|mention| mention.ts_unix_ms > seen)
-        .map(|mention| NewMention {
-            hub: status.hub.clone(),
-            mention: mention.clone(),
-        })
-        .collect();
+    let fresh = new_mentions(&mut seen, status);
+    drop(seen);
     if fresh.is_empty() {
         return false;
     }
-    high_water.insert(status.hub.clone(), newest.unwrap_or(seen));
-    drop(high_water);
     if let Ok(mut queue) = NEW_MENTIONS.lock() {
         queue.extend(fresh);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_grok_shell::session::hub::{HubMention, HubStatus};
+
+    fn mention(id: &str, ts_unix_ms: u64) -> HubMention {
+        HubMention {
+            id: id.to_string(),
+            from: "front".to_string(),
+            place: "DM".to_string(),
+            text: "ping".to_string(),
+            ts_unix_ms,
+        }
+    }
+
+    fn status(mentions: Vec<HubMention>) -> HubStatus {
+        HubStatus {
+            label: String::new(),
+            hub: "api".to_string(),
+            mentions,
+        }
+    }
+
+    #[test]
+    fn a_mention_that_shows_up_after_a_newer_one_still_alerts() {
+        let mut seen = HashMap::new();
+        assert!(new_mentions(&mut seen, &status(vec![mention("old", 1)])).is_empty());
+        let fresh = new_mentions(
+            &mut seen,
+            &status(vec![mention("old", 1), mention("b", 30)]),
+        );
+        assert_eq!(fresh.len(), 1);
+        // "a" has an older time stamp than "b" but became visible later.
+        let late = status(vec![mention("old", 1), mention("a", 20), mention("b", 30)]);
+        let fresh = new_mentions(&mut seen, &late);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].mention.id, "a");
+        assert!(
+            new_mentions(&mut seen, &late).is_empty(),
+            "each alerts once"
+        );
+    }
 }

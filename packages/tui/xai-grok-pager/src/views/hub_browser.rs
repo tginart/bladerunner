@@ -960,15 +960,26 @@ impl HubBrowserState {
         self.feed_scroll = feed_scroll_for_cell(cell, bar.height, self.hits.feed_line_count);
     }
 
-    /// Show only the thread of `root` in the selected conversation.
+    /// Purpose: Show only the thread of `root` in the selected conversation.
+    /// Input: The root message id.
+    /// Output: None. A root in another conversation (an agent can reply
+    ///     across conversations) opens no thread, and a notice says so,
+    ///     because a reply here could not point at it.
     pub fn open_thread(&mut self, root: &str) {
         self.stop_compose();
+        let is_draft_elsewhere = self.is_draft_elsewhere();
         self.thread = Some(root.to_string());
-        self.reply_to = None;
+        if !is_draft_elsewhere {
+            self.reply_to = None;
+        }
         self.feed_scroll = 0;
         self.feed_selection = None;
         if let Err(error) = self.load_feed(false) {
             tracing::warn!(%error, "hub browser: feed load failed");
+        }
+        if !self.feed.iter().any(|m| m.id == root) {
+            self.notice = Some("That message is in another conversation.".to_string());
+            self.close_thread();
         }
     }
 
@@ -1063,6 +1074,11 @@ impl HubBrowserState {
         else {
             return;
         };
+        // A thread filter would hide a result from the same conversation.
+        if self.selected_row().and_then(|row| row.conv()).as_deref() == Some(message.conv.as_str())
+        {
+            self.thread = None;
+        }
         let row = match store::split_dm_conv(&message.conv) {
             None => message
                 .conv
@@ -1142,6 +1158,11 @@ impl HubBrowserState {
         }
         if self.show_help {
             self.show_help = false;
+            return HubKeyOutcome::Changed;
+        }
+        // The open picker lies over the search results and gets the click.
+        if self.picker.is_some() {
+            self.click_area(col, row);
             return HubKeyOutcome::Changed;
         }
         if let Some(id) = self.search_row_at(col, row) {
@@ -1252,6 +1273,26 @@ impl HubBrowserState {
         }
     }
 
+    /// True when a paused draft is pinned to another conversation than the
+    /// shown one. Then `reply_to` is the parent of that draft.
+    fn is_draft_elsewhere(&self) -> bool {
+        let shown = self.selected_row().as_ref().and_then(post_target);
+        !self.composer.is_empty()
+            && self
+                .compose_target
+                .as_ref()
+                .is_some_and(|pinned| Some(pinned) != shown.as_ref())
+    }
+
+    /// The parent of the draft: the pinned parent of a draft for another
+    /// conversation, or else the open thread or the chosen reply.
+    fn draft_parent(&self) -> Option<String> {
+        if self.is_draft_elsewhere() {
+            return self.reply_to.clone();
+        }
+        self.thread.clone().or_else(|| self.reply_to.clone())
+    }
+
     /// Leave the post box. An empty draft releases its destination.
     fn stop_compose(&mut self) {
         self.is_composing = false;
@@ -1296,7 +1337,7 @@ impl HubBrowserState {
             ComposerKey::Send => {
                 let text = self.composer.text().trim().to_string();
                 if let (false, Some(to)) = (text.is_empty(), self.post_target()) {
-                    return match self.thread.clone().or_else(|| self.reply_to.clone()) {
+                    return match self.draft_parent() {
                         Some(reply_to) => HubKeyOutcome::Reply { to, text, reply_to },
                         None => HubKeyOutcome::Post { to, text },
                     };
@@ -1329,8 +1370,16 @@ impl HubBrowserState {
 
     fn set_selected(&mut self, row: Option<Row>) -> Result<()> {
         if row != self.selected {
-            self.thread = None;
-            self.reply_to = None;
+            // A paused draft keeps its parent in `reply_to`: the thread root or
+            // the reply of the shown conversation. A draft that is already
+            // pinned elsewhere keeps the parent that it has.
+            let thread = self.thread.take();
+            let has_paused_draft = !self.composer.is_empty() && self.compose_target.is_some();
+            if !has_paused_draft {
+                self.reply_to = None;
+            } else if !self.is_draft_elsewhere() {
+                self.reply_to = thread.or_else(|| self.reply_to.take());
+            }
             self.focus_message = None;
         }
         self.selected = row;
@@ -1997,6 +2046,8 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     state.cursor = None;
     if area.width < 30 || area.height < 10 {
         state.feed_selection = None;
+        // No popup is drawn, so no key may pick a candidate.
+        state.composer.close_popup();
         Clear.render(area, buf);
         fill(buf, area, Style::default().bg(theme.bg_base));
         let text = "Make the terminal larger to show the hub.";
@@ -2326,7 +2377,10 @@ fn render_main(
         return;
     };
     render_conversation_header(buf, inner, &row, state, theme);
-    let compose_rows = compose_rows(state, inner.width);
+    // The post box never covers the header: the 3 header rows and the
+    // notice row. The text scrolls inside a short box.
+    let max_compose_rows = inner.height.saturating_sub(4).max(3);
+    let compose_rows = compose_rows(state, inner.width).min(max_compose_rows);
     let compose_y = inner.bottom().saturating_sub(compose_rows + 1);
     let feed = Rect {
         y: inner.y + 3,
@@ -2756,10 +2810,8 @@ fn render_compose(
         .or_else(|| post_target(row))
         .unwrap_or_default();
     let replying_to = state
-        .thread
-        .as_ref()
-        .or(state.reply_to.as_ref())
-        .and_then(|id| state.feed.iter().find(|m| m.id == *id))
+        .draft_parent()
+        .and_then(|id| state.feed.iter().find(|m| m.id == id))
         .map(|parent| parent.from.clone());
     let title = match replying_to {
         _ if state.is_bot_dm() && state.is_bot_thinking => " hub-bot is thinking… ".to_string(),
@@ -4846,6 +4898,115 @@ mod tests {
     }
 
     #[test]
+    fn a_search_hit_in_the_same_conversation_leaves_the_thread() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "unrelated note",
+            store::now_ms(),
+        ))
+        .unwrap();
+        let mut state = open(hub);
+        state.open_thread(&parent_id);
+        state.handle_key(&key(KeyCode::Char('/')));
+        for c in "unrelated".chars() {
+            state.handle_key(&key(KeyCode::Char(c)));
+        }
+        state.handle_key(&key(KeyCode::Enter));
+        assert_eq!(state.thread, None);
+        assert!(state.feed.iter().any(|m| m.text == "unrelated note"));
+    }
+
+    #[test]
+    fn a_paused_draft_keeps_its_reply_parent_in_another_conversation() {
+        let (_root, hub, _) = hub_with_thread();
+        let mut state = open(hub);
+        let newest = state.feed.last().unwrap().id.clone();
+        state.handle_key(&key(KeyCode::Char('r')));
+        state.handle_paste("agreed");
+        state.handle_key(&key(KeyCode::Esc));
+        state.select(Some(dm("front", "me")));
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Reply {
+                to: "#general".to_string(),
+                text: "agreed".to_string(),
+                reply_to: newest,
+            }
+        );
+    }
+
+    #[test]
+    fn a_paused_draft_sent_from_another_thread_takes_no_parent_from_it() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        let mut state = open(hub);
+        state.select(Some(dm("front", "me")));
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("dm draft");
+        state.handle_key(&key(KeyCode::Esc));
+        state.select(Some(Row::Channel("general".to_string())));
+        state.open_thread(&parent_id);
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post {
+                to: "@front".to_string(),
+                text: "dm draft".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_quote_of_another_conversation_opens_no_thread() {
+        let (_root, hub) = hub_with_dms();
+        let dm_message = message(
+            "front",
+            store::dm_conv("front", "me"),
+            "in a DM",
+            store::now_ms(),
+        );
+        hub.append(&dm_message).unwrap();
+        let mut reply = message("back", "#general".to_string(), "cross", store::now_ms());
+        reply.reply_to = Some(dm_message.id.clone());
+        hub.append(&reply).unwrap();
+        let mut state = open(hub);
+        state.open_thread(&dm_message.id);
+        assert_eq!(state.thread, None);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("another conversation"))
+        );
+    }
+
+    #[test]
+    fn the_open_picker_gets_clicks_over_search_results() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Char('/')));
+        for c in "e".chars() {
+            state.handle_key(&key(KeyCode::Char(c)));
+        }
+        render(&mut state);
+        state.open_picker();
+        render(&mut state);
+        let search_ys: Vec<u16> = state.hits.search_rows.iter().map(|(y, _)| *y).collect();
+        let (rect, handle) = state
+            .hits
+            .picker
+            .iter()
+            .find(|(rect, _)| search_ys.contains(&rect.y))
+            .cloned()
+            .expect("a picker row over a search row");
+        click(&mut state, (rect.x + 1, rect.y));
+        assert_eq!(state.perspective, handle);
+        assert!(state.picker.is_none());
+    }
+
+    #[test]
     fn search_finds_a_dm_and_enter_opens_it_at_the_message() {
         let (_root, hub) = hub_with_dms();
         let mut state = open(hub);
@@ -4957,6 +5118,47 @@ mod tests {
         state.is_bot_thinking = true;
         let text = buffer_text(&render(&mut state));
         assert!(text.contains("hub-bot is thinking"), "{text}");
+    }
+
+    #[test]
+    fn a_tall_draft_in_a_short_terminal_does_not_cover_the_header() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("1\n2\n3\n4\n5\n6");
+        let area = Rect::new(0, 0, 100, 10);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        assert!(
+            state.hits.compose.y >= state.hits.main.y + 3,
+            "post box {:?} under the header of {:?}",
+            state.hits.compose,
+            state.hits.main
+        );
+        assert!(state.hits.compose.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn a_completion_popup_shows_every_candidate_that_keys_can_pick() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_key(&key(KeyCode::Char('@')));
+        assert!(state.composer.is_completing());
+        for height in [8, 12, 30] {
+            let area = Rect::new(0, 0, 100, height);
+            let mut buf = Buffer::empty(area);
+            render_hub_browser(&mut buf, area, &mut state);
+            if state.composer.is_completing() {
+                assert_eq!(
+                    state.composer.popup_row_count(),
+                    state.composer.completion_items().len(),
+                    "height {height}"
+                );
+            }
+            state.handle_key(&key(KeyCode::Backspace));
+            state.handle_key(&key(KeyCode::Char('@')));
+        }
     }
 
     #[test]
