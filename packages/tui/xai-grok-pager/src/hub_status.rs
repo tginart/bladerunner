@@ -25,7 +25,7 @@ const HUB_LABEL_CACHE_MAX: usize = 64;
 /// Signalled when a refresh changes a cached label.
 static HUB_LABEL_CHANGED: LazyLock<Notify> = LazyLock::new(Notify::new);
 
-/// Ids of the unread mentions already seen, per hub name. A hub that is seen
+/// Ids of the mentions already seen, per hub name. A hub that is seen
 /// for the first time records its mentions, so old mentions do not alert.
 /// Note: These are ids, not times. A mention can become visible after a newer
 ///     one, because a sender takes its time stamp before the append lock.
@@ -122,25 +122,29 @@ fn spawn_refresh(session_id: String) {
 
 /// Purpose: Find the unread mentions of a hub that the last refresh did not see.
 /// Input: The seen mention ids per hub, and the hub status of one session.
-/// Output: The new mentions, oldest first. The seen ids become the ids of the
-///     status, so the set stays as small as the unread mentions.
+/// Output: The new mentions, oldest first. Their ids join the seen ids.
+/// Note: The seen ids only grow. Refreshes of two sessions in one hub can
+///     finish out of order, and an older status must not erase an announced
+///     id. The set grows by one id per mention, which is small.
 fn new_mentions(
     seen: &mut HashMap<String, HashSet<String>>,
     status: &xai_grok_shell::session::hub::HubStatus,
 ) -> Vec<NewMention> {
-    let ids: HashSet<String> = status.mentions.iter().map(|m| m.id.clone()).collect();
-    let Some(old) = seen.insert(status.hub.clone(), ids) else {
+    let ids = status.mentions.iter().map(|m| m.id.clone());
+    let Some(known) = seen.get_mut(&status.hub) else {
+        seen.insert(status.hub.clone(), ids.collect());
         return Vec::new();
     };
-    status
-        .mentions
-        .iter()
-        .filter(|mention| !old.contains(&mention.id))
-        .map(|mention| NewMention {
-            hub: status.hub.clone(),
-            mention: mention.clone(),
-        })
-        .collect()
+    let mut fresh = Vec::new();
+    for mention in &status.mentions {
+        if known.insert(mention.id.clone()) {
+            fresh.push(NewMention {
+                hub: status.hub.clone(),
+                mention: mention.clone(),
+            });
+        }
+    }
+    fresh
 }
 
 /// Purpose: Queue the mentions of a hub that are newer than the last refresh.
@@ -204,5 +208,8 @@ mod tests {
             new_mentions(&mut seen, &late).is_empty(),
             "each alerts once"
         );
+        // An older snapshot finishes last; it must not erase "a" and "b".
+        assert!(new_mentions(&mut seen, &status(vec![mention("old", 1)])).is_empty());
+        assert!(new_mentions(&mut seen, &late).is_empty(), "no second alert");
     }
 }

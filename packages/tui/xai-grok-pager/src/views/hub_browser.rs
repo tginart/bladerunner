@@ -619,6 +619,12 @@ impl HubBrowserState {
         if self.is_composing {
             let names = self.completion_names();
             self.composer.paste(text, &names);
+            return;
+        }
+        if let Some(search) = self.search.as_mut() {
+            // The query is one line, so newlines become spaces.
+            search.query.push_str(&text.replace(['\r', '\n'], " "));
+            self.refresh_search();
         }
     }
 
@@ -663,14 +669,18 @@ impl HubBrowserState {
             MouseEventKind::ScrollUp => self.handle_scroll(-WHEEL_LINES, col, row),
             MouseEventKind::ScrollDown => self.handle_scroll(WHEEL_LINES, col, row),
             MouseEventKind::Down(MouseButton::Left)
-                if self.picker.is_none() && contains(self.hits.feed_scrollbar, col, row) =>
+                if self.picker.is_none()
+                    && !self.show_help
+                    && contains(self.hits.feed_scrollbar, col, row) =>
             {
                 self.is_dragging_scrollbar = true;
                 self.drag_feed_scrollbar(row);
             }
             // The reply chip lies over the feed, and a click on it is a button.
+            // The help overlay lies over the feed, and a click only closes it.
             MouseEventKind::Down(MouseButton::Left)
                 if self.picker.is_none()
+                    && !self.show_help
                     && contains(self.hits.feed, col, row)
                     && !self.is_on_reply_chip(col, row) =>
             {
@@ -984,7 +994,12 @@ impl HubBrowserState {
     }
 
     fn close_thread(&mut self) {
-        self.thread = None;
+        let thread = self.thread.take();
+        // A paused draft in the thread stays a reply to its root.
+        if !self.composer.is_empty() && self.compose_target.is_some() && !self.is_draft_elsewhere()
+        {
+            self.reply_to = thread.or_else(|| self.reply_to.take());
+        }
         self.feed_scroll = 0;
         self.feed_selection = None;
         if let Err(error) = self.load_feed(false) {
@@ -1022,7 +1037,13 @@ impl HubBrowserState {
         };
         let last = search.results.len().saturating_sub(1);
         match key.code {
-            KeyCode::Esc => self.search = None,
+            KeyCode::Esc => {
+                // The conversation shows again, so its new messages are read now.
+                self.search = None;
+                if let Err(error) = self.load_feed(false) {
+                    tracing::warn!(%error, "hub browser: feed load failed");
+                }
+            }
             KeyCode::Up => search.selected = search.selected.saturating_sub(1),
             KeyCode::Down => search.selected = (search.selected + 1).min(last),
             KeyCode::Enter => {
@@ -1404,7 +1425,14 @@ impl HubBrowserState {
             messages.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
         }
         let skip = feed_window_start(&messages, self.focus_message.as_deref());
-        let feed = messages.split_off(skip);
+        let mut feed = messages.split_off(skip);
+        // A thread longer than the window still shows its root first.
+        if let Some(root) = &self.thread
+            && !feed.iter().any(|m| m.id == *root)
+            && let Some(root) = messages.into_iter().find(|m| m.id == *root)
+        {
+            feed.insert(0, root);
+        }
         // A drop or replacement can move text under the stored line indices.
         if self.feed_selection.is_some() && !feed.starts_with(&self.feed) {
             self.feed_selection = None;
@@ -1424,7 +1452,9 @@ impl HubBrowserState {
                 .map(|(idx, _)| idx);
         }
         // A thread shows only some messages, so the conversation stays unread.
-        if self.is_person_view() && self.thread.is_none() {
+        // A thread or a search shows only part or none of the conversation,
+        // so the conversation stays unread.
+        if self.is_person_view() && self.thread.is_none() && self.search.is_none() {
             let count = total;
             if is_person_member(&self.snapshot.meta, &self.person) {
                 agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
@@ -1972,15 +2002,14 @@ fn scan_links(text: &str) -> Vec<(Range<usize>, LinkTarget)> {
 }
 
 /// The byte index where display column `col` starts, or the text end.
+/// Note: The width is the string width of the prefix, as the link scanner
+///     counts it. A sum of char widths differs for emoji ZWJ sequences.
 fn byte_at_col(text: &str, col: u16) -> Option<usize> {
-    let mut used = 0usize;
-    for (idx, c) in text.char_indices() {
-        if used >= col as usize {
-            return Some(idx);
-        }
-        used += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-    }
-    (used >= col as usize).then_some(text.len())
+    let col = usize::from(col);
+    text.char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(text.len()))
+        .find(|idx| text[..*idx].width() >= col)
 }
 
 /// Purpose: Find where a feed span points.
@@ -5007,6 +5036,89 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_thread_draft_stays_a_reply_after_the_thread_closes() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        let mut state = open(hub);
+        state.open_thread(&parent_id);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("late reply");
+        state.handle_key(&key(KeyCode::Esc));
+        state.handle_key(&key(KeyCode::Esc));
+        assert_eq!(state.thread, None);
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Reply {
+                to: "#general".to_string(),
+                text: "late reply".to_string(),
+                reply_to: parent_id,
+            }
+        );
+    }
+
+    #[test]
+    fn a_thread_longer_than_the_window_keeps_its_root() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        for i in 0..FEED_LIMIT + 5 {
+            let mut reply = message(
+                "back",
+                "#general".to_string(),
+                &format!("r{i}"),
+                store::now_ms(),
+            );
+            reply.reply_to = Some(parent_id.clone());
+            hub.append(&reply).unwrap();
+        }
+        let mut state = open(hub);
+        state.open_thread(&parent_id);
+        assert_eq!(state.thread.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(state.feed[0].id, parent_id);
+    }
+
+    #[test]
+    fn a_click_over_the_help_only_closes_it() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let cell = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        state.handle_key(&key(KeyCode::Char('?')));
+        render(&mut state);
+        click(&mut state, cell);
+        assert!(!state.show_help);
+        assert_eq!(
+            state.selected_row(),
+            Some(Row::Channel("general".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_message_that_arrives_during_search_stays_unread_until_search_closes() {
+        let (_root, hub, _) = hub_with_thread();
+        let mut state = open(hub.clone());
+        state.handle_key(&key(KeyCode::Char('/')));
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "new",
+            store::now_ms(),
+        ))
+        .unwrap();
+        state.reload().unwrap();
+        assert_eq!(state.snapshot.unread("#general"), 1);
+        state.handle_key(&key(KeyCode::Esc));
+        assert_eq!(state.snapshot.unread("#general"), 0);
+    }
+
+    #[test]
+    fn a_paste_goes_into_the_search_query() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Char('/')));
+        state.handle_paste("status");
+        let search = state.search.as_ref().unwrap();
+        assert_eq!(search.query, "status");
+        assert!(!search.results.is_empty());
+    }
+
+    #[test]
     fn search_finds_a_dm_and_enter_opens_it_at_the_message() {
         let (_root, hub) = hub_with_dms();
         let mut state = open(hub);
@@ -5238,5 +5350,13 @@ mod tests {
         assert_eq!(picker_viewport_top(0, 6, 6, 10), 1);
         // Fewer members than rows always start at the top.
         assert_eq!(picker_viewport_top(3, 1, 6, 4), 0);
+    }
+
+    #[test]
+    fn links_after_emoji_sequences_keep_their_text() {
+        let text = "👩‍💻👩‍💻👩‍💻 see https://x.io/a now";
+        let links = scan_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(&text[links[0].0.clone()], "https://x.io/a");
     }
 }
