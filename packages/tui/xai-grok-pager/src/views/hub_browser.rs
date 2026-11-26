@@ -307,6 +307,9 @@ pub struct HubBrowserState {
     pub cursor: Option<(u16, u16)>,
     /// A draft keeps its destination even if the selected row disappears.
     compose_target: Option<String>,
+    /// The parent of a nonempty draft, fixed when the draft starts: `Some(None)`
+    /// for a top-level post. Browsing threads later does not change it.
+    pinned_parent: Option<Option<String>>,
     /// Feed lines scrolled up from the newest message.
     pub feed_scroll: usize,
     /// Result of the last post, shown over the post box.
@@ -367,6 +370,7 @@ impl HubBrowserState {
             is_composing: false,
             cursor: None,
             compose_target: None,
+            pinned_parent: None,
             feed_scroll: 0,
             notice: None,
             picker: None,
@@ -472,6 +476,7 @@ impl HubBrowserState {
                 self.composer.finish_send(&posted);
                 self.compose_target = None;
                 self.reply_to = None;
+                self.pinned_parent = None;
                 format!("Posted to {to} as @{}.", self.person)
             }
             Err(error) => format!("Not posted: {error}"),
@@ -586,7 +591,11 @@ impl HubBrowserState {
                     return self.request_stop(peer, pending_stop);
                 }
             }
-            KeyCode::Esc if self.reply_to.is_some() => self.reply_to = None,
+            KeyCode::Esc if self.reply_to.is_some() => {
+                // Dropping the reply also drops it from the draft.
+                self.reply_to = None;
+                self.pinned_parent = None;
+            }
             KeyCode::Esc if self.thread.is_some() => self.close_thread(),
             KeyCode::Esc | KeyCode::Char('q') => return HubKeyOutcome::Close,
             KeyCode::Char('/') => self.search = Some(HubSearch::default()),
@@ -619,6 +628,7 @@ impl HubBrowserState {
         if self.is_composing {
             let names = self.completion_names();
             self.composer.paste(text, &names);
+            self.sync_pinned_parent();
             return;
         }
         if let Some(search) = self.search.as_mut() {
@@ -1321,9 +1331,28 @@ impl HubBrowserState {
                 .is_some_and(|pinned| Some(pinned) != shown.as_ref())
     }
 
-    /// The parent of the draft: the pinned parent of a draft for another
-    /// conversation, or else the open thread or the chosen reply.
+    /// The parent of the draft: the parent fixed when a nonempty draft
+    /// started, or else the parent that the shown view implies.
     fn draft_parent(&self) -> Option<String> {
+        match &self.pinned_parent {
+            Some(parent) if !self.composer.is_empty() => parent.clone(),
+            _ => self.live_parent(),
+        }
+    }
+
+    /// Fix the parent when the draft gets its first text, and release it
+    /// when the draft is empty again.
+    fn sync_pinned_parent(&mut self) {
+        if self.composer.is_empty() {
+            self.pinned_parent = None;
+        } else if self.pinned_parent.is_none() {
+            self.pinned_parent = Some(self.live_parent());
+        }
+    }
+
+    /// The parent that the shown view implies: the parent of a draft for
+    /// another conversation, or else the open thread or the chosen reply.
+    fn live_parent(&self) -> Option<String> {
         if self.is_draft_elsewhere() {
             return self.reply_to.clone();
         }
@@ -1351,6 +1380,10 @@ impl HubBrowserState {
         {
             self.notice = Some(format!("Send or clear the draft to {pinned} first."));
             return;
+        }
+        // An explicit reply changes the parent of a draft that has text.
+        if !self.composer.is_empty() {
+            self.pinned_parent = Some(Some(parent_id.clone()));
         }
         self.reply_to = Some(parent_id);
         self.start_compose();
@@ -1380,7 +1413,7 @@ impl HubBrowserState {
                     };
                 }
             }
-            ComposerKey::Edited => {}
+            ComposerKey::Edited => self.sync_pinned_parent(),
         }
         HubKeyOutcome::Changed
     }
@@ -5220,6 +5253,56 @@ mod tests {
             HubKeyOutcome::Post {
                 to: "#general".to_string(),
                 text: "plain draft".to_string(),
+            }
+        );
+    }
+
+    /// `hub_with_thread` plus a second #general root with one reply.
+    fn hub_with_two_threads() -> (tempfile::TempDir, store::Hub, String, String) {
+        let (root, hub, first) = hub_with_thread();
+        let second = message("back", "#general".to_string(), "deploy?", store::now_ms());
+        let mut reply = message("front", "#general".to_string(), "friday", store::now_ms());
+        reply.reply_to = Some(second.id.clone());
+        hub.append(&second).unwrap();
+        hub.append(&reply).unwrap();
+        (root, hub, first, second.id)
+    }
+
+    #[test]
+    fn browsing_another_thread_keeps_the_parent_of_a_paused_draft() {
+        let (_root, hub, first, second) = hub_with_two_threads();
+        let mut state = open(hub);
+        state.open_thread(&first);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("for the first");
+        state.handle_key(&key(KeyCode::Esc));
+        state.handle_key(&key(KeyCode::Esc));
+        state.open_thread(&second);
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Reply {
+                to: "#general".to_string(),
+                text: "for the first".to_string(),
+                reply_to: first,
+            }
+        );
+    }
+
+    #[test]
+    fn browsing_a_thread_keeps_a_paused_post_top_level() {
+        let (_root, hub, first, _) = hub_with_two_threads();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("plain post");
+        state.handle_key(&key(KeyCode::Esc));
+        state.open_thread(&first);
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post {
+                to: "#general".to_string(),
+                text: "plain post".to_string(),
             }
         );
     }
