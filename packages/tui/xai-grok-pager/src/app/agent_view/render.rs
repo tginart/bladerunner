@@ -4747,9 +4747,9 @@ impl AgentView {
                 .is_some_and(|browser| browser.focused)
         {
             None
-        } else if self.hub_browser.is_some() {
-            // The hub browser covers the prompt and draws its own cursor.
-            None
+        } else if let Some(browser) = &self.hub_browser {
+            // The hub browser covers the prompt. Its post box has the cursor.
+            browser.cursor
         } else if self.inline_edit.is_some() {
             inline_edit_cursor
         } else {

@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use anyhow::Result;
 use chrono::{DateTime, Local, NaiveDate};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -26,14 +26,13 @@ use crate::render::osc8::{LinkOverlay, LinkTarget, scan_lines_for_url_overlays};
 use crate::render::scrollbar::{ScrollbarClickResult, render_scrollbar, scrollbar_click_to_offset};
 use crate::scrollback::types::{col_past_grapheme, grapheme_cells_at, slice_display_cols};
 use crate::theme::Theme;
+use crate::views::hub_composer::{CompletionNames, ComposerKey, HubComposer};
 use crate::views::shortcuts_bar::{HintItem, ShortcutsBar};
 
 /// Messages that one feed shows.
 const FEED_LIMIT: usize = 300;
 /// Widest the sidebar gets.
 const SIDEBAR_MAX_WIDTH: u16 = 30;
-/// Rows of the post box: top border, text, bottom border.
-const COMPOSE_ROWS: u16 = 3;
 /// Messages from one sender closer than this share one header.
 const GROUP_GAP_MS: u64 = 5 * 60 * 1000;
 /// Feed lines that PgUp and PgDn scroll.
@@ -239,7 +238,7 @@ struct HitAreas {
 
 /// Purpose: Hold the hub browser state for one perspective.
 /// Note: A row keeps its identity when the sidebar filter changes its index.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HubBrowserState {
     pub hub: store::Hub,
     /// The name of the person at the keyboard, before it becomes a handle.
@@ -257,8 +256,10 @@ pub struct HubBrowserState {
     /// Feed index of the first message that the perspective member had not read.
     pub first_unread: Option<usize>,
     selected: Option<Row>,
-    pub draft: String,
+    pub composer: HubComposer,
     pub is_composing: bool,
+    /// The terminal cursor cell of the post box in the last frame.
+    pub cursor: Option<(u16, u16)>,
     /// A draft keeps its destination even if the selected row disappears.
     compose_target: Option<String>,
     /// Feed lines scrolled up from the newest message.
@@ -302,8 +303,9 @@ impl HubBrowserState {
             feed: Vec::new(),
             first_unread: None,
             selected: None,
-            draft: String::new(),
+            composer: HubComposer::default(),
             is_composing: false,
+            cursor: None,
             compose_target: None,
             feed_scroll: 0,
             notice: None,
@@ -392,7 +394,9 @@ impl HubBrowserState {
     pub fn finish_post(&mut self, to: &str, result: Result<String>) {
         self.notice = Some(match result {
             Ok(_) => {
-                self.draft.clear();
+                let posted = self.composer.text().trim().to_string();
+                self.composer.finish_send(&posted);
+                self.compose_target = None;
                 format!("Posted to {to} as @{}.", self.person)
             }
             Err(error) => format!("Not posted: {error}"),
@@ -509,7 +513,24 @@ impl HubBrowserState {
 
     pub fn handle_paste(&mut self, text: &str) {
         if self.is_composing {
-            self.draft.push_str(&text.replace(['\r', '\n'], " "));
+            let names = self.completion_names();
+            self.composer.paste(text, &names);
+        }
+    }
+
+    /// The handles and channels that the post box completes.
+    fn completion_names(&self) -> CompletionNames {
+        let meta = &self.snapshot.meta;
+        let mut handles: Vec<String> = meta
+            .members
+            .iter()
+            .filter(|member| member.handle != self.person)
+            .map(|member| member.handle.clone())
+            .collect();
+        handles.push(store::HERE_MENTION.to_string());
+        CompletionNames {
+            handles,
+            channels: meta.channels.iter().map(|c| c.name.clone()).collect(),
         }
     }
 
@@ -519,8 +540,22 @@ impl HubBrowserState {
     /// Note: The hit areas come from the last frame.
     pub fn handle_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> HubKeyOutcome {
         self.pointer = Some((col, row));
+        if self.is_composing && self.composer.popup_contains(col, row) {
+            return match self.composer.handle_mouse(kind, col, row) {
+                true => HubKeyOutcome::Changed,
+                false => HubKeyOutcome::Unchanged,
+            };
+        }
         match kind {
-            MouseEventKind::Moved => return self.update_hover(col, row),
+            MouseEventKind::Moved => {
+                // Leaving the popup can clear its hover row.
+                let is_popup_changed = self.composer.handle_mouse(kind, col, row);
+                let outcome = self.update_hover(col, row);
+                if is_popup_changed {
+                    return HubKeyOutcome::Changed;
+                }
+                return outcome;
+            }
             MouseEventKind::ScrollUp => self.handle_scroll(-WHEEL_LINES, col, row),
             MouseEventKind::ScrollDown => self.handle_scroll(WHEEL_LINES, col, row),
             MouseEventKind::Down(MouseButton::Left)
@@ -815,6 +850,10 @@ impl HubBrowserState {
         }
         if contains(self.hits.compose, col, row) {
             self.start_compose();
+            if self.is_composing {
+                self.composer
+                    .handle_mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+            }
             return;
         }
         if contains(self.hits.dm_toggle, col, row) {
@@ -873,7 +912,7 @@ impl HubBrowserState {
     /// Leave the post box. An empty draft releases its destination.
     fn stop_compose(&mut self) {
         self.is_composing = false;
-        if self.draft.is_empty() {
+        if self.composer.is_empty() {
             self.compose_target = None;
         }
     }
@@ -890,21 +929,16 @@ impl HubBrowserState {
     /// Input: A key event while the post box has focus.
     /// Output: The next browser action. An empty draft releases its target on exit.
     fn handle_compose_key(&mut self, key: &KeyEvent) -> HubKeyOutcome {
-        match key.code {
-            KeyCode::Esc | KeyCode::Tab => self.stop_compose(),
-            KeyCode::Backspace => {
-                self.draft.pop();
-            }
-            KeyCode::Enter => {
-                let text = self.draft.trim().to_string();
+        let names = self.completion_names();
+        match self.composer.handle_key(key, &names) {
+            ComposerKey::Exit => self.stop_compose(),
+            ComposerKey::Send => {
+                let text = self.composer.text().trim().to_string();
                 if let (false, Some(to)) = (text.is_empty(), self.post_target()) {
                     return HubKeyOutcome::Post { to, text };
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.draft.push(c);
-            }
-            _ => {}
+            ComposerKey::Edited => {}
         }
         HubKeyOutcome::Changed
     }
@@ -1475,8 +1509,11 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     let theme = Theme::current();
     let previous_feed_width = state.hits.feed.width;
     state.hits = HitAreas::default();
+    state.cursor = None;
     if area.width < 30 || area.height < 10 {
         state.feed_selection = None;
+        // No popup is drawn, so no key may pick a candidate.
+        state.composer.close_popup();
         Clear.render(area, buf);
         fill(buf, area, Style::default().bg(theme.bg_base));
         let text = "Make the terminal larger to show the hub.";
@@ -1511,6 +1548,10 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     state.hits.main = main;
     render_main(buf, main, previous_feed_width, state, &theme);
     render_footer(buf, footer, state);
+    if state.is_composing {
+        let compose = state.hits.compose;
+        state.composer.render_popup(buf, compose, main, &theme);
+    }
     if state.picker.is_some() {
         render_picker(buf, area, state, &theme);
     }
@@ -1795,7 +1836,11 @@ fn render_main(
         return;
     };
     render_conversation_header(buf, inner, &row, state, theme);
-    let compose_y = inner.bottom().saturating_sub(COMPOSE_ROWS + 1);
+    // The post box never covers the header: the 3 header rows and the
+    // notice row. The text scrolls inside a short box.
+    let max_compose_rows = inner.height.saturating_sub(4).max(3);
+    let compose_rows = compose_rows(state, inner.width).min(max_compose_rows);
+    let compose_y = inner.bottom().saturating_sub(compose_rows + 1);
     let feed = Rect {
         y: inner.y + 3,
         height: compose_y.saturating_sub(inner.y + 4),
@@ -1829,10 +1874,25 @@ fn render_main(
     }
     let compose = Rect {
         y: compose_y,
-        height: COMPOSE_ROWS,
+        height: compose_rows,
         ..inner
     };
     render_compose(buf, compose, &row, state, theme);
+}
+
+/// Rows of the post box at `width`: the borders and the draft text rows.
+fn compose_rows(state: &HubBrowserState, width: u16) -> u16 {
+    let text_rows = if state.composer.is_empty() || !state.is_person_view() {
+        1
+    } else {
+        state.composer.text_rows(compose_text_width(width))
+    };
+    text_rows + 2
+}
+
+/// Columns of draft text inside a post box of `width`: borders and padding off.
+fn compose_text_width(width: u16) -> u16 {
+    width.saturating_sub(4).max(1)
 }
 
 fn render_conversation_header(
@@ -2101,6 +2161,9 @@ fn part_style(part: &Part, theme: &Theme) -> Style {
     }
 }
 
+/// Purpose: Draw the post box with its destination in the top border.
+/// Input: The buffer, the post box area, the selected row, and the state.
+/// Output: None. The state keeps the post box area and the cursor cell.
 fn render_compose(
     buf: &mut Buffer,
     area: Rect,
@@ -2118,81 +2181,76 @@ fn render_compose(
     };
     let border_style = Style::default().fg(border);
     let inner_w = area.width.saturating_sub(2) as usize;
+    let to = state
+        .post_target()
+        .or_else(|| post_target(row))
+        .unwrap_or_default();
+    let title = if state.is_person_view() && !state.composer.is_empty() {
+        format!(" to {to} ")
+    } else {
+        String::new()
+    };
+    let top_fill = inner_w.saturating_sub(title.width() + 1);
     span_at(
         buf,
         area.x,
         area.y,
-        &format!("╭{}╮", "─".repeat(inner_w)),
+        &format!("╭─{title}{}╮", "─".repeat(top_fill)),
         border_style,
         area.right(),
     );
-    span_at(buf, area.x, area.y + 1, "│", border_style, area.right());
-    span_at(
-        buf,
-        area.right() - 1,
-        area.y + 1,
-        "│",
-        border_style,
-        area.right(),
-    );
+    for y in area.y + 1..area.bottom().saturating_sub(1) {
+        span_at(buf, area.x, y, "│", border_style, area.right());
+        span_at(buf, area.right() - 1, y, "│", border_style, area.right());
+    }
     span_at(
         buf,
         area.x,
-        area.y + 2,
+        area.bottom().saturating_sub(1),
         &format!("╰{}╯", "─".repeat(inner_w)),
         border_style,
         area.right(),
     );
     state.hits.compose = area;
-    let text_w = inner_w.saturating_sub(2);
-    let (text, style) = compose_text(row, state, text_w, theme);
-    span_at(buf, area.x + 2, area.y + 1, &text, style, area.right() - 2);
-}
-
-fn compose_text(
-    row: &Row,
-    state: &HubBrowserState,
-    width: usize,
-    theme: &Theme,
-) -> (String, Style) {
+    let text_area = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: compose_text_width(area.width),
+        height: area.height.saturating_sub(2),
+    };
     if !state.is_person_view() {
         let text = format!(
             "Viewing as @{} · read only · press p to switch back to you",
             state.perspective
         );
-        return (text, theme.muted().add_modifier(Modifier::ITALIC));
-    }
-    let to = state
-        .post_target()
-        .or_else(|| post_target(row))
-        .unwrap_or_default();
-    if state.is_composing {
-        let text = format!("{}█", state.draft);
-        return (
-            tail_to_width(&text, width),
-            Style::default().fg(theme.text_primary),
+        let style = theme.muted().add_modifier(Modifier::ITALIC);
+        span_at(
+            buf,
+            text_area.x,
+            text_area.y,
+            &text,
+            style,
+            text_area.right(),
         );
+        return;
     }
-    if !state.draft.is_empty() {
-        let text = format!("Draft to {to}: {}", state.draft);
-        return (tail_to_width(&text, width), theme.muted());
-    }
-    (format!("Message {to}"), theme.muted())
-}
-
-/// The end of `text` that fits in `width` columns.
-fn tail_to_width(text: &str, width: usize) -> String {
-    let mut out: Vec<char> = Vec::new();
-    let mut used = 0;
-    for c in text.chars().rev() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > width {
-            break;
+    if state.composer.is_empty() {
+        span_at(
+            buf,
+            text_area.x,
+            text_area.y,
+            &format!("Message {to}"),
+            theme.muted(),
+            text_area.right(),
+        );
+        if state.is_composing {
+            state.cursor = Some((text_area.x, text_area.y));
         }
-        used += w;
-        out.push(c);
+        return;
     }
-    out.into_iter().rev().collect()
+    state.cursor = state
+        .composer
+        .render_text(buf, text_area, state.is_composing);
 }
 
 fn render_footer(buf: &mut Buffer, bar: Rect, state: &mut HubBrowserState) {
@@ -2422,7 +2480,7 @@ fn span_at(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, max_x: u1
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2617,9 +2675,13 @@ mod tests {
                 text: "hi all".to_string()
             }
         );
-        assert_eq!(state.draft, "hi all", "the post has not succeeded yet");
+        assert_eq!(
+            state.composer.text(),
+            "hi all",
+            "the post has not succeeded yet"
+        );
         state.finish_post("#general", Ok("message-id".to_string()));
-        assert!(state.draft.is_empty());
+        assert!(state.composer.is_empty());
         state.handle_key(&key(KeyCode::Esc));
         assert_eq!(state.handle_key(&key(KeyCode::Esc)), HubKeyOutcome::Close);
     }
@@ -3457,6 +3519,87 @@ mod tests {
         assert!(spans.contains(&("@front".to_string(), Part::Mention)));
         let text: String = spans.iter().map(|(text, _)| text.as_str()).collect();
         assert_eq!(text, "ask @front about /tmp/a/b.rs or https://x.io");
+    }
+
+    #[test]
+    fn the_post_box_completes_handles_and_sends_multiline_text() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        for c in "hi @fr".chars() {
+            state.handle_key(&key(KeyCode::Char(c)));
+        }
+        assert!(state.composer.is_completing());
+        state.handle_key(&key(KeyCode::Tab));
+        assert!(state.is_composing, "Tab accepts the completion, not exit");
+        state.handle_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        state.handle_key(&key(KeyCode::Char('x')));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Post {
+                to: "#general".to_string(),
+                text: "hi @front \nx".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_post_box_grows_and_sets_the_terminal_cursor_while_composing() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        assert_eq!(state.cursor, None);
+        let one_line = state.hits.compose.height;
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("a\nb\nc");
+        render_hub_browser(&mut buf, area, &mut state);
+        assert_eq!(state.hits.compose.height, one_line + 2);
+        let (x, y) = state.cursor.expect("cursor while composing");
+        assert!(contains(state.hits.compose, x, y));
+        assert!(buffer_text(&buf).contains("to #general"));
+    }
+
+    #[test]
+    fn a_tall_draft_in_a_short_terminal_does_not_cover_the_header() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("1\n2\n3\n4\n5\n6");
+        let area = Rect::new(0, 0, 100, 10);
+        let mut buf = Buffer::empty(area);
+        render_hub_browser(&mut buf, area, &mut state);
+        assert!(
+            state.hits.compose.y >= state.hits.main.y + 3,
+            "post box {:?} under the header of {:?}",
+            state.hits.compose,
+            state.hits.main
+        );
+        assert!(state.hits.compose.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn a_completion_popup_shows_every_candidate_that_keys_can_pick() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_key(&key(KeyCode::Char('@')));
+        assert!(state.composer.is_completing());
+        for height in [8, 12, 30] {
+            let area = Rect::new(0, 0, 100, height);
+            let mut buf = Buffer::empty(area);
+            render_hub_browser(&mut buf, area, &mut state);
+            if state.composer.is_completing() {
+                assert_eq!(
+                    state.composer.popup_row_count(),
+                    state.composer.completion_items().len(),
+                    "height {height}"
+                );
+            }
+            state.handle_key(&key(KeyCode::Backspace));
+            state.handle_key(&key(KeyCode::Char('@')));
+        }
     }
 
     #[test]

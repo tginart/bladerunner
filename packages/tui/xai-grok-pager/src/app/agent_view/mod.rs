@@ -984,6 +984,9 @@ pub struct AgentView {
     pub show_goal_detail: bool,
     /// The open hub browser (`/hub open`), if any.
     pub hub_browser: Option<crate::views::hub_browser::HubBrowserState>,
+    /// Posts sent from the hub browser, oldest first. A new browser starts
+    /// with them, so Up in the post box recalls posts from an earlier visit.
+    pub(crate) hub_post_history: Vec<String>,
     /// Local file tree and preview, retained while this session is open.
     pub(crate) file_browser: Option<crate::views::file_browser::FileBrowserState>,
     /// UTC ms when the current turn started (`turnStartMs` from notification meta).
