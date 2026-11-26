@@ -268,6 +268,15 @@ fn record_dot_pulse() -> (bool, f32) {
 }
 /// A clickable/hoverable screen region.
 ///
+/// One clickable hint of a surface shortcuts bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SurfaceHintHit {
+    pub rect: ratatui::layout::Rect,
+    pub key: crate::input::key::KeyShortcut,
+    /// Index of the hint in the bar, for the hover style.
+    pub index: usize,
+}
+
 /// Tracks an optional screen rect (set during render) and whether the
 /// mouse is currently hovering over it. Consolidates the repeated
 /// `area: Option<Rect>` + `hovered: bool` pattern.
@@ -1286,6 +1295,11 @@ pub struct AgentView {
     pub(crate) btw_focused: bool,
     /// Hit area for the [Esc] close button in the /btw panel title.
     pub(crate) hit_btw_close: HitArea,
+    /// Clickable hints of a surface shortcuts bar (such as `/files`), from
+    /// the last frame. A click presses the key of the hint.
+    pub(crate) surface_hint_hits: Vec<SurfaceHintHit>,
+    /// Hint index of the surface bar hint under the mouse pointer.
+    pub(crate) surface_hint_hover: Option<usize>,
     /// Toast message to display briefly (e.g., "Copied!" after y).
     /// Tuple of (message, remaining_ticks). Decremented each tick, removed at 0.
     /// Does **not** carry sticky status banners — see [`Self::sticky_toast`].

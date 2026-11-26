@@ -71,6 +71,15 @@ impl HintItem {
         self
     }
 
+    /// The key that a click on this hint presses. A hint with two or more
+    /// keys (such as j/k) names no single key, so it is not clickable.
+    pub fn click_key(&self) -> Option<KeyShortcut> {
+        match self.keys.as_slice() {
+            [key] => Some(*key),
+            _ => None,
+        }
+    }
+
     fn bar_key_display(&self) -> String {
         bar_key_segments(self)
             .into_iter()
@@ -155,6 +164,8 @@ pub struct ShortcutsBar<'a> {
     /// `hints`, then always append `help_hint` (e.g. the "all shortcuts"
     /// modal trigger). When None, all hints are rendered.
     compact: Option<CompactConfig>,
+    /// Index of the hint under the mouse pointer, in the effective hint list.
+    hovered: Option<usize>,
 }
 
 /// Compact-mode configuration for the shortcuts bar.
@@ -182,6 +193,7 @@ impl<'a> ShortcutsBar<'a> {
             pending_confirmation: None,
             right_text: None,
             compact: None,
+            hovered: None,
         }
     }
 
@@ -206,12 +218,21 @@ impl<'a> ShortcutsBar<'a> {
         self.right_text = text;
         self
     }
-}
 
-impl Widget for ShortcutsBar<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    /// Paint the hint at `index` of the effective hint list as hovered.
+    pub fn with_hovered(mut self, index: Option<usize>) -> Self {
+        self.hovered = index;
+        self
+    }
+
+    /// Purpose: Draw the bar and report where each hint is.
+    /// Input: The bar area and the buffer.
+    /// Output: One screen area per drawn hint, in the order of the effective
+    ///     hint list. A hint that does not fit is not in the list.
+    pub fn render_with_hits(self, area: Rect, buf: &mut Buffer) -> Vec<Rect> {
+        let mut hits = Vec::new();
         if area.height == 0 {
-            return;
+            return hits;
         }
 
         let theme = Theme::current();
@@ -258,8 +279,7 @@ impl Widget for ShortcutsBar<'_> {
             let action_span = Span::styled(label.as_ref(), action_style);
             let action_width = label.width() as u16;
             buf.set_span(x, area.y, &action_span, action_width);
-            let _ = x + action_width; // suppress unused
-            return;
+            return hits;
         }
 
         let sep_style = Style::default()
@@ -288,6 +308,20 @@ impl Widget for ShortcutsBar<'_> {
             if x + key_width > area.x + area.width {
                 break;
             }
+            let is_hovered = self.hovered == Some(i);
+            let (key_style, action_style) = if is_hovered {
+                (
+                    key_style
+                        .fg(theme.text_primary)
+                        .add_modifier(Modifier::UNDERLINED),
+                    action_style
+                        .fg(theme.text_primary)
+                        .add_modifier(Modifier::UNDERLINED),
+                )
+            } else {
+                (key_style, action_style)
+            };
+            let hint_x = x;
             x = paint_hint_keys(buf, x, area.y, hint, key_style, action_style);
 
             let colon = Span::styled(":", action_style);
@@ -304,6 +338,12 @@ impl Widget for ShortcutsBar<'_> {
             }
             buf.set_span(x, area.y, &action_span, action_width);
             x += action_width;
+            hits.push(Rect {
+                x: hint_x,
+                y: area.y,
+                width: x - hint_x,
+                height: 1,
+            });
         }
 
         // Right-aligned text (team name etc.)
@@ -319,6 +359,13 @@ impl Widget for ShortcutsBar<'_> {
                 }
             }
         }
+        hits
+    }
+}
+
+impl Widget for ShortcutsBar<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_with_hits(area, buf);
     }
 }
 
@@ -391,6 +438,29 @@ mod tests {
 
     fn h(label: &'static str, k: crate::input::key::KeyShortcut) -> HintItem {
         HintItem::new(k, label)
+    }
+
+    #[test]
+    fn render_with_hits_reports_one_area_per_drawn_hint() {
+        let hints = vec![h("send", key!(Enter)), h("cancel", key!(Esc))];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 1));
+        let rects = ShortcutsBar::new(&hints)
+            .with_hovered(Some(1))
+            .render_with_hits(Rect::new(0, 0, 60, 1), &mut buf);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].x, 0);
+        assert!(rects[1].x > rects[0].right());
+        let hovered = buf.cell((rects[1].x, 0)).unwrap();
+        assert!(hovered.modifier.contains(Modifier::UNDERLINED));
+        let plain = buf.cell((rects[0].x, 0)).unwrap();
+        assert!(!plain.modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn only_single_key_hints_are_clickable() {
+        assert_eq!(h("send", key!(Enter)).click_key(), Some(key!(Enter)));
+        let paired = HintItem::paired(key!('j'), key!('k'), "nav");
+        assert_eq!(paired.click_key(), None);
     }
 
     #[test]

@@ -305,6 +305,8 @@ impl AgentView {
             minimal_btw_lifecycle: None,
             btw_focused: false,
             hit_btw_close: Default::default(),
+            surface_hint_hits: Vec::new(),
+            surface_hint_hover: None,
             toast: None,
             ephemeral_tip: Default::default(),
             word_select_tip_prompt_snapshot: None,

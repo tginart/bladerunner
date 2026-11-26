@@ -107,6 +107,9 @@ pub struct FileBrowserState {
     requests: Sender<Request>,
     responses: Receiver<Response>,
     hits: HitAreas,
+    /// The mouse pointer cell from the last move over the browser, for the
+    /// hover style of the buttons.
+    pointer: Option<(u16, u16)>,
     editor: Option<EditorPane>,
     editor_choice: Option<usize>,
     editor_target: Option<PathBuf>,
@@ -147,6 +150,7 @@ impl FileBrowserState {
             requests,
             responses,
             hits: HitAreas::default(),
+            pointer: None,
             editor: None,
             editor_choice: None,
             editor_target: None,
@@ -326,6 +330,9 @@ impl FileBrowserState {
         row: u16,
     ) -> BrowserAction {
         let point = (column, row).into();
+        if kind == MouseEventKind::Moved {
+            self.pointer = Some((column, row));
+        }
         if kind == MouseEventKind::Down(MouseButton::Left) {
             self.focused = true;
             if self.hits.close.contains(point) {
@@ -391,6 +398,12 @@ impl FileBrowserState {
             }
         }
         BrowserAction::Changed
+    }
+
+    /// Forget the pointer when it leaves the browser. Returns true when a
+    /// button loses its hover style.
+    pub(crate) fn clear_pointer(&mut self) -> bool {
+        self.pointer.take().is_some()
     }
 
     pub(crate) fn contains(&self, column: u16, row: u16) -> bool {

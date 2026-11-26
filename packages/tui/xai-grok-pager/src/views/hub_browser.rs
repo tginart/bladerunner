@@ -20,10 +20,13 @@ use ratatui::widgets::{Clear, Widget};
 use unicode_width::UnicodeWidthStr;
 use xai_grok_tools::implementations::grok_build::agent_hub::{self, MemberKind, store};
 
+use crate::input::key::KeyShortcut;
 use crate::render::SafeBuf;
+use crate::render::osc8::{LinkOverlay, LinkTarget, scan_lines_for_url_overlays};
 use crate::render::scrollbar::{ScrollbarClickResult, render_scrollbar, scrollbar_click_to_offset};
 use crate::scrollback::types::{col_past_grapheme, grapheme_cells_at, slice_display_cols};
 use crate::theme::Theme;
+use crate::views::shortcuts_bar::{HintItem, ShortcutsBar};
 
 /// Messages that one feed shows.
 const FEED_LIMIT: usize = 300;
@@ -161,7 +164,46 @@ impl FeedSelection {
 pub enum HubKeyOutcome {
     Close,
     Changed,
-    Post { to: String, text: String },
+    /// Nothing visible changed, so the caller can skip a redraw.
+    Unchanged,
+    Post {
+        to: String,
+        text: String,
+    },
+    /// Open a URL or a file from the feed.
+    OpenLink(LinkTarget),
+}
+
+/// What a clickable feed span points to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpanTarget {
+    /// A member handle, without `@`.
+    Member(String),
+    /// A channel name, without `#`.
+    Channel(String),
+    Link(LinkTarget),
+}
+
+/// One clickable span of the feed in the last frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeedSpanHit {
+    row: u16,
+    cols: Range<u16>,
+    target: SpanTarget,
+}
+
+/// The element under the mouse pointer. A change of this value needs a redraw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoverKey {
+    /// A feed span, by its screen row and first column.
+    Span(u16, u16),
+    /// A sidebar row, by its screen row.
+    SidebarRow(u16),
+    Chip,
+    DmToggle,
+    Compose,
+    /// A footer hint, by its index.
+    Hint(usize),
 }
 
 /// Screen areas of the last frame, for mouse hits.
@@ -188,6 +230,11 @@ struct HitAreas {
     feed_text: Vec<String>,
     /// The all/active toggle on the "Direct messages" section row.
     dm_toggle: Rect,
+    /// Clickable spans of the visible feed lines.
+    feed_spans: Vec<FeedSpanHit>,
+    /// Screen area and key of each footer hint. A hint with no single key
+    /// is not clickable.
+    footer_hints: Vec<(Rect, Option<KeyShortcut>)>,
 }
 
 /// Purpose: Hold the hub browser state for one perspective.
@@ -228,6 +275,10 @@ pub struct HubBrowserState {
     feed_selection: Option<FeedSelection>,
     /// Text of the last finished drag. The caller takes it and copies it.
     pub copy_text: Option<String>,
+    /// The mouse pointer cell from the last mouse event.
+    pointer: Option<(u16, u16)>,
+    /// The element under the pointer in the last frame.
+    hover: Option<HoverKey>,
     hits: HitAreas,
 }
 
@@ -258,6 +309,8 @@ impl HubBrowserState {
             dm_filter: DmFilter::default(),
             feed_selection: None,
             copy_text: None,
+            pointer: None,
+            hover: None,
             hits: HitAreas::default(),
         };
         let rows = state.rows();
@@ -453,7 +506,9 @@ impl HubBrowserState {
     /// Output: What the caller must do next.
     /// Note: The hit areas come from the last frame.
     pub fn handle_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> HubKeyOutcome {
+        self.pointer = Some((col, row));
         match kind {
+            MouseEventKind::Moved => return self.update_hover(col, row),
             MouseEventKind::ScrollUp => self.handle_scroll(-WHEEL_LINES, col, row),
             MouseEventKind::ScrollDown => self.handle_scroll(WHEEL_LINES, col, row),
             MouseEventKind::Down(MouseButton::Left)
@@ -476,7 +531,7 @@ impl HubBrowserState {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.is_dragging_scrollbar = false;
                 self.feed_selection = None;
-                self.click(col, row);
+                return self.click(col, row);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.is_dragging_scrollbar => {
                 self.drag_feed_scrollbar(row);
@@ -484,11 +539,129 @@ impl HubBrowserState {
             MouseEventKind::Drag(MouseButton::Left) => self.drag_feed_selection(col, row),
             MouseEventKind::Up(MouseButton::Left) => {
                 self.is_dragging_scrollbar = false;
+                let is_plain_click = self
+                    .feed_selection
+                    .is_some_and(|s| s.is_dragging && s.anchor == s.head);
                 self.finish_feed_selection();
+                if is_plain_click && let Some(target) = self.feed_span_at(col, row) {
+                    return self.activate(target);
+                }
             }
             _ => {}
         }
         HubKeyOutcome::Changed
+    }
+
+    /// Purpose: Track the element under the pointer.
+    /// Input: The pointer position.
+    /// Output: `Changed` when the hovered element is another one, so the
+    ///     hover style moves. Otherwise `Unchanged`.
+    fn update_hover(&mut self, col: u16, row: u16) -> HubKeyOutcome {
+        if let Some(idx) = self.picker_row_at(col, row) {
+            if self.picker == Some(idx) {
+                return HubKeyOutcome::Unchanged;
+            }
+            self.picker = Some(idx);
+            return HubKeyOutcome::Changed;
+        }
+        let hover = self.hover_key_at(col, row);
+        if hover == self.hover {
+            return HubKeyOutcome::Unchanged;
+        }
+        self.hover = hover;
+        HubKeyOutcome::Changed
+    }
+
+    /// The element at a screen cell, from the hit areas of the last frame.
+    fn hover_key_at(&self, col: u16, row: u16) -> Option<HoverKey> {
+        let hits = &self.hits;
+        if self.picker.is_some() {
+            return None;
+        }
+        if let Some(idx) = hits
+            .footer_hints
+            .iter()
+            .position(|(rect, key)| key.is_some() && contains(*rect, col, row))
+        {
+            return Some(HoverKey::Hint(idx));
+        }
+        if contains(hits.chip, col, row) {
+            return Some(HoverKey::Chip);
+        }
+        if contains(hits.dm_toggle, col, row) {
+            return Some(HoverKey::DmToggle);
+        }
+        if self.is_person_view() && contains(hits.compose, col, row) {
+            return Some(HoverKey::Compose);
+        }
+        if contains(hits.sidebar, col, row) {
+            let is_row = hits
+                .rows
+                .iter()
+                .any(|(y, hit)| *y == row && hit.is_selectable());
+            return is_row.then_some(HoverKey::SidebarRow(row));
+        }
+        hits.feed_spans
+            .iter()
+            .find(|span| span.row == row && span.cols.contains(&col))
+            .map(|span| HoverKey::Span(span.row, span.cols.start))
+    }
+
+    /// The target of the clickable feed span at a screen cell.
+    fn feed_span_at(&self, col: u16, row: u16) -> Option<SpanTarget> {
+        self.hits
+            .feed_spans
+            .iter()
+            .find(|span| span.row == row && span.cols.contains(&col))
+            .map(|span| span.target.clone())
+    }
+
+    fn picker_row_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.picker?;
+        let (_, handle) = self
+            .hits
+            .picker
+            .iter()
+            .find(|(rect, _)| contains(*rect, col, row))?;
+        self.picker_members().iter().position(|h| h == handle)
+    }
+
+    /// Purpose: Follow a clicked feed span, like a link in a chat app.
+    /// Input: The span target.
+    /// Output: The next browser action. A member opens the DM of the person
+    ///     with that member. A channel opens the channel. A link goes to the caller.
+    fn activate(&mut self, target: SpanTarget) -> HubKeyOutcome {
+        match target {
+            SpanTarget::Member(handle) => self.open_dm_with(&handle),
+            SpanTarget::Channel(name) => {
+                self.stop_compose();
+                self.select(Some(Row::Channel(name)));
+            }
+            SpanTarget::Link(link) => return HubKeyOutcome::OpenLink(link),
+        }
+        HubKeyOutcome::Changed
+    }
+
+    /// Purpose: Show the DM of the person with a member.
+    /// Input: The member handle.
+    /// Output: None. The view changes to the person when it shows another
+    ///     member. The own handle and unknown handles change nothing.
+    pub fn open_dm_with(&mut self, handle: &str) {
+        if handle == self.person || self.snapshot.meta.member(handle).is_none() {
+            return;
+        }
+        if !self.is_person_view() {
+            let person = self.person.clone();
+            self.apply_perspective(&person);
+        }
+        self.stop_compose();
+        let row = Row::Dm {
+            peer: handle.to_string(),
+            conv: store::dm_conv(&self.person, handle),
+        };
+        if self.snapshot.dm_peers.iter().any(|peer| peer == handle) {
+            self.select(Some(row));
+        }
     }
 
     /// Move the head of an open feed selection to the pointer. A pointer above
@@ -588,7 +761,22 @@ impl HubBrowserState {
         self.feed_scroll = feed_scroll_for_cell(cell, bar.height, self.hits.feed_line_count);
     }
 
-    fn click(&mut self, col: u16, row: u16) {
+    fn click(&mut self, col: u16, row: u16) -> HubKeyOutcome {
+        let hint_key = self
+            .hits
+            .footer_hints
+            .iter()
+            .find(|(rect, _)| contains(*rect, col, row))
+            .and_then(|(_, key)| *key);
+        if let Some(key) = hint_key {
+            // A click on a footer hint is the same as a press of its key.
+            return self.handle_key(&key.to_key_event());
+        }
+        self.click_area(col, row);
+        HubKeyOutcome::Changed
+    }
+
+    fn click_area(&mut self, col: u16, row: u16) {
         if self.picker.is_some() {
             let hit = self
                 .hits
@@ -938,6 +1126,8 @@ enum Part {
     Time,
     Text,
     Mention,
+    /// A URL or a file path in message text.
+    Link,
     Muted,
     Rule,
     NewRule,
@@ -1095,7 +1285,7 @@ fn push_body(
         }
         for chunk in textwrap::wrap(paragraph, body_width) {
             let mut line = vec![(indent.clone(), Part::Text)];
-            line.extend(mention_spans(&chunk, names.mentions));
+            line.extend(body_spans(&chunk, names.mentions));
             lines.push(line);
         }
     }
@@ -1107,6 +1297,77 @@ fn push_body(
             format!("▣ {count} images")
         };
         lines.push(vec![(indent, Part::Text), (label, Part::Muted)]);
+    }
+}
+
+/// Purpose: Split one wrapped body line into styled spans.
+/// Input: The line text and the known `@handle`, `@here`, and `#channel` words.
+/// Output: Link spans for URLs and file paths, mention spans, and plain text.
+fn body_spans(text: &str, mentions: &BTreeSet<String>) -> Vec<(String, Part)> {
+    let mut spans = Vec::new();
+    let mut rest_start = 0;
+    for (range, _) in scan_links(text) {
+        spans.extend(mention_spans(&text[rest_start..range.start], mentions));
+        spans.push((text[range.clone()].to_string(), Part::Link));
+        rest_start = range.end;
+    }
+    spans.extend(mention_spans(&text[rest_start..], mentions));
+    spans
+}
+
+/// Purpose: Find the URLs and file paths in one line of text.
+/// Input: The line text.
+/// Output: The byte range and target of each link, in order, with no overlap.
+/// Note: This uses the link scanner of the scrollback, so the hub finds the
+///     same links.
+fn scan_links(text: &str) -> Vec<(Range<usize>, LinkTarget)> {
+    let mut overlay = LinkOverlay::new();
+    let line = ratatui::text::Line::from(text.to_string());
+    scan_lines_for_url_overlays(std::iter::once((0, &line, None)), 0, &[], &mut overlay);
+    let mut links: Vec<(Range<usize>, LinkTarget)> = overlay
+        .links()
+        .iter()
+        .filter_map(|link| {
+            let start = byte_at_col(text, link.col_start)?;
+            let end = byte_at_col(text, link.col_end)?;
+            (start < end).then(|| (start..end, link.target.clone()))
+        })
+        .collect();
+    links.sort_by_key(|(range, _)| range.start);
+    links.dedup_by(|next, prev| next.0.start < prev.0.end);
+    links
+}
+
+/// The byte index where display column `col` starts, or the text end.
+fn byte_at_col(text: &str, col: u16) -> Option<usize> {
+    let mut used = 0usize;
+    for (idx, c) in text.char_indices() {
+        if used >= col as usize {
+            return Some(idx);
+        }
+        used += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    (used >= col as usize).then_some(text.len())
+}
+
+/// Purpose: Find where a feed span points.
+/// Input: The span text and part, and the hub data.
+/// Output: The member, channel, or link target. Plain spans have none.
+fn span_target(text: &str, part: Part, meta: &store::HubMeta) -> Option<SpanTarget> {
+    match part {
+        Part::Agent(_) | Part::Person | Part::Mention => {
+            if let Some(name) = text.strip_prefix('#') {
+                return Some(SpanTarget::Channel(name.to_string()));
+            }
+            let handle = text.strip_prefix('@')?;
+            meta.member(handle)?;
+            Some(SpanTarget::Member(handle.to_string()))
+        }
+        Part::Link => {
+            let (_, link) = scan_links(text).into_iter().next()?;
+            Some(SpanTarget::Link(link))
+        }
+        _ => None,
     }
 }
 
@@ -1185,7 +1446,7 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     render_sidebar(buf, sidebar, state, &theme);
     state.hits.main = main;
     render_main(buf, main, previous_feed_width, state, &theme);
-    render_footer(buf, footer, state, &theme);
+    render_footer(buf, footer, state);
     if state.picker.is_some() {
         render_picker(buf, area, state, &theme);
     }
@@ -1241,13 +1502,16 @@ fn render_top_bar(buf: &mut Buffer, bar: Rect, state: &mut HubBrowserState, them
     let chip_x = bar.right().saturating_sub(chip_w + 1);
     let label_x = chip_x.saturating_sub(label_w);
     span_at(buf, label_x, bar.y, label, theme.muted().bg(bar_bg), chip_x);
-    let chip_style = if state.is_person_view() {
+    let mut chip_style = if state.is_person_view() {
         Style::default()
             .fg(theme.text_primary)
             .bg(theme.bg_highlight)
     } else {
         Style::default().fg(theme.bg_base).bg(theme.accent_plan)
     };
+    if state.hover == Some(HoverKey::Chip) {
+        chip_style = chip_style.add_modifier(Modifier::UNDERLINED);
+    }
     span_at(
         buf,
         chip_x,
@@ -1336,8 +1600,12 @@ fn render_sidebar_row(
     state: &HubBrowserState,
     theme: &Theme,
 ) -> Rect {
+    let is_hovered =
+        row.is_selectable() && state.pointer.is_some_and(|(x, y)| contains(area, x, y));
     let bg = if is_selected {
         theme.bg_highlight
+    } else if is_hovered {
+        theme.bg_hover
     } else {
         theme.bg_dark
     };
@@ -1352,7 +1620,8 @@ fn render_sidebar_row(
             let mut toggle = Rect::default();
             let mut title_end = area.right();
             if *title == DM_SECTION {
-                toggle = render_dm_toggle(buf, area, state.dm_filter, theme);
+                let is_hovered = state.hover == Some(HoverKey::DmToggle);
+                toggle = render_dm_toggle(buf, area, state.dm_filter, is_hovered, theme);
                 title_end = toggle.x.saturating_sub(1);
             }
             span_at(buf, area.x + 2, area.y, title, style, title_end);
@@ -1421,13 +1690,22 @@ fn render_sidebar_row(
 }
 
 /// Draw the all/active chip at the right end of the DM section row.
-fn render_dm_toggle(buf: &mut Buffer, area: Rect, dm_filter: DmFilter, theme: &Theme) -> Rect {
+fn render_dm_toggle(
+    buf: &mut Buffer,
+    area: Rect,
+    dm_filter: DmFilter,
+    is_hovered: bool,
+    theme: &Theme,
+) -> Rect {
     let label = dm_filter.label();
     let width = label.width() as u16;
     let x = area.right().saturating_sub(width + 1).max(area.x);
-    let style = Style::default()
+    let mut style = Style::default()
         .fg(theme.text_primary)
         .bg(theme.bg_highlight);
+    if is_hovered {
+        style = style.bg(theme.bg_hover).add_modifier(Modifier::UNDERLINED);
+    }
     span_at(buf, x, area.y, label, style, area.right());
     Rect {
         x,
@@ -1615,11 +1893,30 @@ fn render_feed(
         .iter()
         .map(|line| line.iter().map(|(text, _)| text.as_str()).collect())
         .collect();
+    let pointer = state.pointer;
     for (i, line) in lines[start..end].iter().enumerate() {
         let y = top + i as u16;
         let mut x = area.x;
         for (text, part) in line {
-            x = span_at(buf, x, y, text, part_style(*part, theme), area.right());
+            let target = span_target(text, *part, &state.snapshot.meta);
+            let mut style = part_style(*part, theme);
+            let end_x = x.saturating_add(text.width() as u16).min(area.right());
+            if target.is_some()
+                && pointer.is_some_and(|(px, py)| py == y && (x..end_x).contains(&px))
+            {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            let start_x = x;
+            x = span_at(buf, x, y, text, style, area.right());
+            if let Some(target) = target
+                && x > start_x
+            {
+                state.hits.feed_spans.push(FeedSpanHit {
+                    row: y,
+                    cols: start_x..x,
+                    target,
+                });
+            }
         }
         let index = start + i;
         if let Some(columns) = state.feed_selection.and_then(|s| s.columns_on(index)) {
@@ -1731,6 +2028,9 @@ fn part_style(part: Part, theme: &Theme) -> Style {
         Part::Mention => Style::default()
             .fg(theme.accent_user)
             .bg(theme.bg_highlight),
+        Part::Link => Style::default()
+            .fg(theme.accent_user)
+            .add_modifier(Modifier::UNDERLINED),
         Part::Muted => Style::default().fg(theme.gray),
         Part::Rule => Style::default().fg(theme.gray_dim),
         Part::NewRule => Style::default().fg(theme.accent_error),
@@ -1744,7 +2044,8 @@ fn render_compose(
     state: &mut HubBrowserState,
     theme: &Theme,
 ) {
-    let border = if state.is_composing {
+    let is_hovered = state.hover == Some(HoverKey::Compose);
+    let border = if state.is_composing || is_hovered {
         theme.prompt_border_active
     } else if state.is_person_view() {
         theme.prompt_border
@@ -1830,53 +2131,56 @@ fn tail_to_width(text: &str, width: usize) -> String {
     out.into_iter().rev().collect()
 }
 
-fn render_footer(buf: &mut Buffer, bar: Rect, state: &HubBrowserState, theme: &Theme) {
-    let bar_bg = theme.bg_dark;
-    fill(buf, bar, Style::default().bg(bar_bg));
-    let keys: &[(&str, &str)] = if state.picker.is_some() {
-        &[("↑↓", "choose"), ("Enter", "view as"), ("Esc", "cancel")]
-    } else if state.is_composing {
-        &[("Enter", "send"), ("Esc", "stop writing")]
-    } else if state.is_person_view() {
-        &[
-            ("↑↓", "conversations"),
-            ("Tab", "write"),
-            ("p", "perspective"),
-            ("a", "all/active DMs"),
-            ("PgUp/PgDn", "scroll"),
-            ("Esc", "close hub"),
-        ]
-    } else {
-        &[
-            ("↑↓", "conversations"),
-            ("p", "perspective"),
-            ("a", "all/active DMs"),
-            ("PgUp/PgDn", "scroll"),
-            ("Esc", "close hub"),
-        ]
+fn render_footer(buf: &mut Buffer, bar: Rect, state: &mut HubBrowserState) {
+    let hints = footer_hints(state);
+    let hovered = match state.hover {
+        Some(HoverKey::Hint(idx)) => Some(idx),
+        _ => None,
     };
-    let mut x = bar.x + 2;
-    for (key, label) in keys {
-        x = span_at(
-            buf,
-            x,
-            bar.y,
-            key,
-            Style::default()
-                .fg(theme.gray_bright)
-                .bg(bar_bg)
-                .add_modifier(Modifier::BOLD),
-            bar.right(),
-        );
-        x = span_at(
-            buf,
-            x,
-            bar.y,
-            &format!(" {label}   "),
-            Style::default().fg(theme.gray).bg(bar_bg),
-            bar.right(),
-        );
+    let footer = Rect {
+        x: bar.x + 2,
+        width: bar.width.saturating_sub(2),
+        ..bar
+    };
+    let rects = ShortcutsBar::new(&hints)
+        .with_hovered(hovered)
+        .render_with_hits(footer, buf);
+    state.hits.footer_hints = hints
+        .iter()
+        .zip(rects)
+        .map(|(hint, rect)| (rect, hint.click_key()))
+        .collect();
+}
+
+/// The footer hints for the current mode. A click on a hint presses its key.
+fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
+    use crate::key;
+    if state.picker.is_some() {
+        return vec![
+            HintItem::paired(key!(Up), key!(Down), "choose"),
+            HintItem::new(key!(Enter), "view as"),
+            HintItem::new(key!(Esc), "cancel"),
+        ];
     }
+    if state.is_composing {
+        return vec![
+            HintItem::new(key!(Enter), "send"),
+            HintItem::new(key!(Esc), "stop writing"),
+        ];
+    }
+    // Clickable hints come first, so a narrow footer keeps them.
+    let mut hints = Vec::new();
+    if state.is_person_view() {
+        hints.push(HintItem::new(key!(Tab), "write"));
+    }
+    hints.extend([
+        HintItem::new(key!('p'), "perspective"),
+        HintItem::new(key!('a'), "all/active DMs"),
+        HintItem::new(key!(Esc), "close hub"),
+        HintItem::paired(key!(Up), key!(Down), "conversations"),
+        HintItem::paired(key!(PageUp), key!(PageDown), "scroll"),
+    ]);
+    hints
 }
 
 fn render_picker(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, theme: &Theme) {
@@ -2889,5 +3193,187 @@ mod tests {
                 assert!(line.iter().map(|(t, _)| t.width()).sum::<usize>() <= width);
             }
         }
+    }
+
+    /// Open the demo hub with one agent message in #general and draw a frame.
+    fn open_with_general_post(text: &str) -> (tempfile::TempDir, HubBrowserState) {
+        let (root, hub) = hub_with_dms();
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            text,
+            store::now_ms(),
+        ))
+        .unwrap();
+        let mut state = open(hub);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        let area = buf.area;
+        render_hub_browser(&mut buf, area, &mut state);
+        (root, state)
+    }
+
+    fn span_cell(state: &HubBrowserState, target: &SpanTarget) -> (u16, u16) {
+        let span = state
+            .hits
+            .feed_spans
+            .iter()
+            .find(|span| &span.target == target)
+            .expect("span is drawn");
+        (span.cols.start, span.row)
+    }
+
+    fn click(state: &mut HubBrowserState, (x, y): (u16, u16)) -> HubKeyOutcome {
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        state.handle_mouse(MouseEventKind::Up(MouseButton::Left), x, y)
+    }
+
+    #[test]
+    fn click_on_a_sender_handle_opens_the_dm_with_that_member() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let cell = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        assert_eq!(click(&mut state, cell), HubKeyOutcome::Changed);
+        assert_eq!(state.selected_row(), Some(dm("front", "me")));
+    }
+
+    #[test]
+    fn click_on_a_handle_in_another_view_returns_to_the_person() {
+        let (_root, mut state) = open_with_general_post("ready");
+        state.set_perspective("back").unwrap();
+        state.select(Some(Row::Channel("general".to_string())));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        let area = buf.area;
+        render_hub_browser(&mut buf, area, &mut state);
+        let cell = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        click(&mut state, cell);
+        assert!(state.is_person_view());
+        assert_eq!(state.selected_row(), Some(dm("front", "me")));
+    }
+
+    #[test]
+    fn click_on_a_channel_mention_opens_the_channel() {
+        let (root, hub) = hub_with_dms();
+        hub.update_meta(|meta| {
+            meta.channels.push(store::Channel {
+                name: "ops".to_string(),
+                purpose: String::new(),
+                created_ms: 0,
+            });
+        })
+        .unwrap();
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "see #ops now",
+            store::now_ms(),
+        ))
+        .unwrap();
+        let mut state = open(hub);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        let area = buf.area;
+        render_hub_browser(&mut buf, area, &mut state);
+        let cell = span_cell(&state, &SpanTarget::Channel("ops".to_string()));
+        click(&mut state, cell);
+        assert_eq!(state.selected_row(), Some(Row::Channel("ops".to_string())));
+        drop(root);
+    }
+
+    #[test]
+    fn click_on_a_url_asks_the_caller_to_open_it() {
+        let (_root, mut state) = open_with_general_post("docs at https://example.com/a today");
+        let span = state
+            .hits
+            .feed_spans
+            .iter()
+            .find(|span| matches!(span.target, SpanTarget::Link(_)))
+            .expect("link span")
+            .clone();
+        let outcome = click(&mut state, (span.cols.start, span.row));
+        assert_eq!(
+            outcome,
+            HubKeyOutcome::OpenLink(LinkTarget::Url("https://example.com/a".into()))
+        );
+    }
+
+    #[test]
+    fn a_drag_over_a_handle_selects_text_and_does_not_follow_it() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let (x, y) = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        state.handle_mouse(MouseEventKind::Drag(MouseButton::Left), x + 3, y);
+        state.handle_mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        assert_eq!(
+            state.selected_row(),
+            Some(Row::Channel("general".to_string()))
+        );
+        assert!(state.copy_text.is_some());
+    }
+
+    #[test]
+    fn hover_redraws_only_when_the_hovered_element_changes() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let (x, y) = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        assert_eq!(
+            state.handle_mouse(MouseEventKind::Moved, x, y),
+            HubKeyOutcome::Changed
+        );
+        assert_eq!(
+            state.handle_mouse(MouseEventKind::Moved, x + 1, y),
+            HubKeyOutcome::Unchanged
+        );
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        let area = buf.area;
+        render_hub_browser(&mut buf, area, &mut state);
+        let cell = buf.cell((x, y)).unwrap();
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        let empty = (state.hits.main.x + 3, state.hits.main.y + 1);
+        assert_eq!(
+            state.handle_mouse(MouseEventKind::Moved, empty.0, empty.1),
+            HubKeyOutcome::Changed
+        );
+        assert_eq!(
+            state.handle_mouse(MouseEventKind::Moved, empty.0 + 1, empty.1),
+            HubKeyOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn click_on_a_footer_hint_presses_its_key() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let filter_key = crate::key!('a');
+        let rect = state
+            .hits
+            .footer_hints
+            .iter()
+            .find(|(_, key)| *key == Some(filter_key))
+            .map(|(rect, _)| *rect)
+            .expect("filter hint");
+        state.handle_mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert_eq!(state.dm_filter, DmFilter::Active);
+        let close = state
+            .hits
+            .footer_hints
+            .iter()
+            .find(|(_, key)| *key == Some(crate::key!(Esc)))
+            .map(|(rect, _)| *rect)
+            .expect("close hint");
+        assert_eq!(
+            state.handle_mouse(MouseEventKind::Down(MouseButton::Left), close.x, close.y),
+            HubKeyOutcome::Close
+        );
+    }
+
+    #[test]
+    fn body_spans_mark_urls_and_paths_as_links() {
+        let mentions = BTreeSet::from(["@front".to_string()]);
+        let spans = body_spans("ask @front about /tmp/a/b.rs or https://x.io", &mentions);
+        let links: Vec<&str> = spans
+            .iter()
+            .filter(|(_, part)| *part == Part::Link)
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(links, vec!["/tmp/a/b.rs", "https://x.io"]);
+        assert!(spans.contains(&("@front".to_string(), Part::Mention)));
+        let text: String = spans.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(text, "ask @front about /tmp/a/b.rs or https://x.io");
     }
 }

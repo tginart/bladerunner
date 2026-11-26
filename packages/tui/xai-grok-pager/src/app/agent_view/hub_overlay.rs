@@ -5,6 +5,7 @@ use crossterm::event::{Event, KeyEventKind};
 use xai_grok_tools::implementations::grok_build::agent_hub::{self, store};
 
 use super::AgentView;
+use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crate::key;
 use crate::scrollback::block::RenderBlock;
@@ -63,6 +64,10 @@ impl AgentView {
         match outcome {
             HubKeyOutcome::Close => self.hub_browser = None,
             HubKeyOutcome::Changed => {}
+            HubKeyOutcome::Unchanged => return Some(InputOutcome::Unchanged),
+            HubKeyOutcome::OpenLink(target) => {
+                return Some(InputOutcome::Action(Action::OpenLink(target)));
+            }
             HubKeyOutcome::Post { to, text } => {
                 let result =
                     agent_hub::post_as_person(&browser.hub, browser.person_name(), &to, &text, &[]);

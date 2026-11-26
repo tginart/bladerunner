@@ -119,6 +119,13 @@ impl AgentView {
             Event::Mouse(mouse) if browser.contains(mouse.column, mouse.row) => {
                 browser.handle_mouse(mouse.kind, mouse.column, mouse.row)
             }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+                // The pointer left the browser, so no button keeps its hover style.
+                if browser.clear_pointer() {
+                    return Some(InputOutcome::Changed);
+                }
+                return None;
+            }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 browser.focused = false;
                 return None;
@@ -235,6 +242,34 @@ mod tests {
         assert!(!text.contains("conversation marker"), "{text}");
         agent.handle_file_browser_input(&event(KeyCode::Esc));
         assert!(render_text(&mut agent).contains("conversation marker"));
+    }
+
+    #[test]
+    fn a_click_on_a_files_footer_hint_presses_its_key() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = crate::test_util::make_agent_view(None, root.path().to_str().unwrap());
+        agent.open_file_browser();
+        render_text(&mut agent);
+        let close = agent
+            .surface_hint_hits
+            .iter()
+            .find(|hit| hit.key == crate::key!(Esc))
+            .copied()
+            .expect("close hint");
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: close.rect.x,
+                row: close.rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let registry = ActionRegistry::defaults();
+        agent.handle_input(&mouse(MouseEventKind::Moved), &registry);
+        assert_eq!(agent.surface_hint_hover, Some(close.index));
+        agent.handle_input(&mouse(MouseEventKind::Down(MouseButton::Left)), &registry);
+        assert!(!agent.file_browser_is_open());
     }
 
     fn render_text(agent: &mut AgentView) -> String {
