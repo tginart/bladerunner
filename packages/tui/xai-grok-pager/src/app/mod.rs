@@ -56,6 +56,7 @@ mod dispatch;
 mod display_refresh_startup;
 mod effects;
 pub(crate) mod error_display;
+mod hub_bot;
 mod review_chat;
 pub mod roster;
 pub mod session_startup;

@@ -1498,6 +1498,12 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
                 handle_credit_limit_recheck_complete(app, agent_id, meta)
             }
         }
+        TaskResult::HubBotAnswered {
+            agent_id,
+            hub,
+            request,
+            response,
+        } => crate::app::hub_bot::finish_answer(app, agent_id, &hub, &request, response),
         TaskResult::ReviewChatAnswered {
             agent_id,
             parent_session_id,

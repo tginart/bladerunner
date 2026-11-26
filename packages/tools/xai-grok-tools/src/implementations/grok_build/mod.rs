@@ -41,7 +41,7 @@ pub mod web_search;
 pub mod workflow;
 pub use agent_hub::{
     AGENT_HUB_TOOL_NAME, AgentBus, AgentBusResource, AgentHubTool, AgentSelfIdResource,
-    MAIN_PEER_ID, PeerWakeFn,
+    HubReadTool, MAIN_PEER_ID, PeerWakeFn,
 };
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;

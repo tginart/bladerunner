@@ -19,8 +19,8 @@ use tokio::sync::Notify;
 
 use super::AGENT_HUB_MODEL_NAME;
 use super::store::{
-    self, Activity, Channel, Cursors, HERE_MENTION, Hub, HubMeta, Member, MemberKind, Message,
-    Presence,
+    self, Activity, BOT_HANDLE, Channel, Cursors, HERE_MENTION, Hub, HubMeta, Member, MemberKind,
+    Message, Presence,
 };
 
 /// Soft cap on message body size (UTF-8 bytes).
@@ -1000,6 +1000,62 @@ fn post_person_draft(
     Ok(id)
 }
 
+/// Purpose: Write a question of the person to hub-bot.
+/// Input: The hub, the person's preferred handle, and the question.
+/// Output: The new message. It wakes nobody: the caller asks the bot.
+pub fn ask_bot(hub: &Hub, person: &str, text: &str) -> Result<Message> {
+    let person = ensure_person(hub, person)?;
+    write_bot_dm(hub, &person, &person, text)
+}
+
+/// Purpose: Write an answer of hub-bot to the person.
+/// Input: The hub, the person's handle, and the answer.
+/// Output: The new message id.
+/// Note: The bot can write only to its DM with the person. A long answer is cut.
+pub fn answer_as_bot(hub: &Hub, person_handle: &str, text: &str) -> Result<String> {
+    let text = cut_to_limit(text.trim(), MAX_MESSAGE_BYTES);
+    write_bot_dm(hub, BOT_HANDLE, person_handle, &text).map(|message| message.id)
+}
+
+fn write_bot_dm(hub: &Hub, from: &str, person: &str, text: &str) -> Result<Message> {
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("empty message");
+    }
+    if text.len() > MAX_MESSAGE_BYTES {
+        bail!("message exceeds {MAX_MESSAGE_BYTES} bytes");
+    }
+    let meta = hub.meta()?;
+    if meta.archived {
+        bail!("hub {:?} is archived (read-only)", meta.name);
+    }
+    let message = Message {
+        id: new_message_id(),
+        conv: store::dm_conv(BOT_HANDLE, person),
+        from: from.to_string(),
+        text: text.to_string(),
+        reply_to: None,
+        mentions: Vec::new(),
+        images: Vec::new(),
+        ts_unix_ms: store::now_ms(),
+    };
+    hub.append(&message)?;
+    Ok(message)
+}
+
+/// The text, cut on a char boundary to at most `max_bytes`, with a mark.
+fn cut_to_limit(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    const MARK: &str = "\n[answer cut]";
+    let mut end = max_bytes - MARK.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARK}", &text[..end])
+}
+
 /// A message before it is validated and written.
 struct Draft<'a> {
     to: &'a str,
@@ -1080,6 +1136,9 @@ fn resolve_target(meta: &HubMeta, from: &str, to: &str) -> Result<String> {
     };
     if handle == from {
         bail!("cannot send to self");
+    }
+    if handle == BOT_HANDLE {
+        bail!("@{BOT_HANDLE} answers only the person, in the hub browser");
     }
     match meta.member(&handle) {
         None => bail!("unknown peer {handle:?}; call message_agents op list"),
@@ -1194,7 +1253,7 @@ fn peer_handle_base(is_session_hub: bool, main_handle: &str, id: &str, label: &s
 fn reserve_member(meta: &mut HubMeta, base: &str, label: &str, session_id: &str) -> String {
     let handle = std::iter::once(store::handle_candidate(base, ""))
         .chain((2..).map(|n| store::handle_candidate(base, &format!("-{n}"))))
-        .filter(|handle| handle != HERE_MENTION)
+        .filter(|handle| handle != HERE_MENTION && handle != BOT_HANDLE)
         .find(|handle| match meta.member(handle) {
             None => true,
             Some(member) => {
@@ -1243,7 +1302,7 @@ pub fn ensure_person(hub: &Hub, person: &str) -> Result<String> {
             } else {
                 store::handle_candidate(person, &format!("-{n}"))
             };
-            if handle == HERE_MENTION {
+            if handle == HERE_MENTION || handle == BOT_HANDLE {
                 continue;
             }
             if let Some(member) = meta
@@ -1284,7 +1343,7 @@ pub fn person_handle_in(meta: &HubMeta, person: &str) -> String {
         } else {
             store::handle_candidate(person, &format!("-{n}"))
         };
-        if handle == HERE_MENTION {
+        if handle == HERE_MENTION || handle == BOT_HANDLE {
             continue;
         }
         match meta.member(&handle) {
@@ -1447,6 +1506,49 @@ mod tests {
         let frame = format_messages(&hub, &meta, std::slice::from_ref(reply));
         assert!(frame.contains(&format!("reply_to={parent}")), "{frame}");
         assert_eq!(parse_delivery(&frame).unwrap().messages[0].text, "yes");
+    }
+
+    #[test]
+    fn the_bot_dm_holds_questions_and_answers_and_agents_cannot_use_it() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        let question = ask_bot(&hub, "me", "who does the login page?").unwrap();
+        assert_eq!(question.conv, store::dm_conv(BOT_HANDLE, "me"));
+        let long = "x".repeat(MAX_MESSAGE_BYTES * 2);
+        answer_as_bot(&hub, &question.from, &long).unwrap();
+        let messages = hub.messages(&question.conv, 0).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].from, BOT_HANDLE);
+        assert!(messages[1].text.len() <= MAX_MESSAGE_BYTES);
+        assert!(messages[1].text.ends_with("[answer cut]"));
+        assert!(hub.meta().unwrap().member(BOT_HANDLE).is_none());
+        let error = post_as_person(&hub, "me", "@hub-bot", "hi", &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("answers only the person"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_member_takes_the_bot_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        assert_eq!(ensure_person(&hub, "hub-bot").unwrap(), "hub-bot-2");
+        let mut meta = hub.meta().unwrap();
+        assert_eq!(reserve_member(&mut meta, "hub-bot", "x", "s1"), "hub-bot-3");
+    }
+
+    #[test]
+    fn the_bot_thread_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        assert_eq!(hub.bot_thread("me"), None);
+        let thread = store::BotThread {
+            session_id: "s1".to_string(),
+            child_id: "c1".to_string(),
+        };
+        hub.save_bot_thread("me", &thread).unwrap();
+        assert_eq!(hub.bot_thread("me"), Some(thread));
     }
 
     #[test]

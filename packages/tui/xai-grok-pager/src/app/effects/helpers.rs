@@ -1803,6 +1803,25 @@ pub(super) fn unregister_active_session_best_effort_in(
     }
 }
 
+/// Purpose: Send one hub-bot question and wait for the answer.
+/// Input: The request and the agent channel.
+/// Output: The answer, or the error text.
+pub(super) async fn ask_hub_bot(
+    request: &xai_grok_shell::extensions::hub_bot::AskRequest,
+    tx: &AcpAgentTx,
+) -> Result<xai_grok_shell::extensions::hub_bot::AskResponse, String> {
+    let params = serde_json::value::to_raw_value(request).map_err(|e| e.to_string())?;
+    let req = acp::ExtRequest::new(xai_grok_shell::extensions::hub_bot::ASK_METHOD, params.into());
+    let response = acp_send(req, tx).await.map_err(|e| e.to_string())?;
+    let envelope: serde_json::Value =
+        serde_json::from_str(response.0.get()).map_err(|e| e.to_string())?;
+    if let Some(error) = envelope.get("error") {
+        return Err(error.to_string());
+    }
+    let result = envelope.get("result").cloned().ok_or("Missing hub-bot response")?;
+    serde_json::from_value(result).map_err(|e| e.to_string())
+}
+
 /// Fetch pending changes (files + hunks) from the hunk-tracker and map them
 /// into `TaskResult::ChangesLoaded`. Two ACP calls in sequence: file
 /// summaries for the header rows, then the hunks with their patches.

@@ -111,6 +111,22 @@ pub(crate) fn execute(
                 TaskResult::ReviewChatAnswered { agent_id, parent_session_id, child_id, response }
             });
         }
+        Effect::AskHubBot {
+            agent_id,
+            hub,
+            request,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let response = ask_hub_bot(&request, &tx).await;
+                TaskResult::HubBotAnswered {
+                    agent_id,
+                    hub,
+                    request,
+                    response,
+                }
+            });
+        }
         Effect::FetchChanges {
             agent_id,
             session_id,

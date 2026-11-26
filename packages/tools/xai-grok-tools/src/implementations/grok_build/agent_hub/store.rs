@@ -26,6 +26,10 @@ pub const HUBS_DIR: &str = "hubs";
 pub const GENERAL_CHANNEL: &str = "general";
 /// Mention that wakes every active member of a channel (people only).
 pub const HERE_MENTION: &str = "here";
+/// Handle of hub-bot, the read-only helper that answers the person. It is not
+/// a member in `hub.json`, so older binaries can still read the hub.
+pub const BOT_HANDLE: &str = "hub-bot";
+const BOT_DIR: &str = "bot";
 /// Prefix of the hidden hub for one root session and its subagents.
 const SESSION_HUB_PREFIX: &str = ".session-";
 const META_FILE: &str = "hub.json";
@@ -192,6 +196,14 @@ pub struct Presence {
 }
 
 /// A handle to one hub directory.
+/// The conversation of hub-bot with one person: the last child run, which the
+/// next question resumes when it comes from the same session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotThread {
+    pub session_id: String,
+    pub child_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Hub {
     dir: PathBuf,
@@ -216,6 +228,23 @@ impl Hub {
             bail!("hub {name:?} does not exist");
         }
         Ok(hub)
+    }
+
+    /// Purpose: Open an existing named hub or session hub by its directory name.
+    /// Input: The hubs root and the name that `Hub::name` gives.
+    /// Output: The hub. Fails for a name that is not a hub name.
+    pub fn open_by_name(hubs_root: &Path, name: &str) -> Result<Hub> {
+        let Some(session_id) = name.strip_prefix(SESSION_HUB_PREFIX) else {
+            return Self::open(hubs_root, name);
+        };
+        let is_valid = !session_id.is_empty()
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !is_valid {
+            bail!("invalid hub name {name:?}");
+        }
+        Self::open_existing_session_hub(hubs_root, session_id)
     }
 
     /// Open the hidden hub of a root session, and create it on first use.
@@ -493,6 +522,23 @@ impl Hub {
         write_json_atomic(&self.presence_path(handle), presence)
     }
 
+    /// The last hub-bot run for a person, or None before the first question.
+    pub fn bot_thread(&self, person: &str) -> Option<BotThread> {
+        read_json(&self.bot_thread_path(person)).ok()
+    }
+
+    /// Save the last hub-bot run for a person. The file is replaced atomically.
+    pub fn save_bot_thread(&self, person: &str, thread: &BotThread) -> Result<()> {
+        create_private_dir(&self.dir.join(BOT_DIR))?;
+        write_json_atomic(&self.bot_thread_path(person), thread)
+    }
+
+    fn bot_thread_path(&self, person: &str) -> PathBuf {
+        self.dir
+            .join(BOT_DIR)
+            .join(format!("{}.json", encode_handle(person)))
+    }
+
     fn presence_path(&self, handle: &str) -> PathBuf {
         self.dir
             .join(PRESENCE_DIR)
@@ -512,6 +558,19 @@ impl Hub {
 ///     contains the query, ignoring case. Every channel and DM is searched.
 ///     No cursor moves.
 pub fn search(hub: &Hub, query: &str, limit: usize) -> Result<Vec<Message>> {
+    search_where(hub, query, limit, |_| true)
+}
+
+/// Purpose: Find the messages of a hub that contain a query and pass a filter.
+/// Input: The hub, the query, the maximum count, and the filter.
+/// Output: As `search`. A message that the filter refuses does not count
+///     toward `limit`.
+pub fn search_where(
+    hub: &Hub,
+    query: &str,
+    limit: usize,
+    keep: impl Fn(&Message) -> bool,
+) -> Result<Vec<Message>> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Ok(Vec::new());
@@ -520,7 +579,7 @@ pub fn search(hub: &Hub, query: &str, limit: usize) -> Result<Vec<Message>> {
     for message in recent_messages(hub, None, usize::MAX)?.into_iter().rev() {
         let is_hit = message.text.to_lowercase().contains(&query)
             || format!("@{}", message.from).to_lowercase().contains(&query);
-        if is_hit {
+        if is_hit && keep(&message) {
             hits.push(message);
             if hits.len() == limit {
                 break;
