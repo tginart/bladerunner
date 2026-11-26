@@ -283,10 +283,14 @@ impl AgentBus {
                     peer.published = None;
                 }
                 None => {
-                    g.peers.insert(id, LocalPeer::new(label, handle, wake));
+                    g.peers
+                        .insert(id.clone(), LocalPeer::new(label, handle, wake));
                 }
             }
         }
+        // A resumed session reuses its handle. Write its state now, so a
+        // presence file from an old process does not show stale activity.
+        self.change_peer(&id, |_| {});
         self.start_watcher();
     }
 
@@ -294,7 +298,10 @@ impl AgentBus {
     /// Input: The peer id, and the turn prompt when a person or a parent
     ///     agent sent it. A wake turn passes None and keeps the old task.
     /// Output: None. The presence file shows `working`.
+    /// Note: A hub delivery can arrive as a user prompt (an idle wake becomes
+    ///     a prompt). It is not an assignment, so it keeps the old task too.
     pub fn turn_started(&self, id: &str, task: Option<&str>) {
+        let task = task.filter(|text| parse_delivery(text).is_none());
         self.change_peer(id, |peer| {
             peer.is_turn_running = true;
             if let Some(task) = task.and_then(task_summary) {
@@ -1481,7 +1488,11 @@ mod tests {
         let hub = bus.hub();
         let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
         let activity = || hub.presence(&handle).map(|p| p.activity);
-        assert_eq!(activity(), None, "no report before the first turn");
+        assert_eq!(
+            activity(),
+            Some(Activity::Idle),
+            "registration reports idle"
+        );
         bus.turn_started(MAIN_PEER_ID, Some("\n  fix the login bug\nmore detail"));
         assert_eq!(activity(), Some(Activity::Working));
         assert_eq!(
@@ -1505,6 +1516,29 @@ mod tests {
         bus.turn_ended(MAIN_PEER_ID);
         assert_eq!(activity(), Some(Activity::Idle));
         assert_eq!(hub.presences().len(), 1);
+    }
+
+    #[test]
+    fn a_hub_delivery_prompt_keeps_the_task() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.register("sub-1", "worker", None);
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        bus.turn_started(MAIN_PEER_ID, Some("fix the login bug"));
+        bus.turn_ended(MAIN_PEER_ID);
+        bus.send("sub-1", "#general", "done", None, &[])
+            .into_result()
+            .unwrap();
+        let hub = bus.hub();
+        let messages = hub.messages("#general", 0).unwrap();
+        let wake = format_messages(&hub, &hub.meta().unwrap(), &messages);
+        assert!(parse_delivery(&wake).is_some());
+        bus.turn_started(MAIN_PEER_ID, Some(&wake));
+        assert_eq!(
+            bus.hub().presence(&handle).unwrap().task.as_deref(),
+            Some("fix the login bug")
+        );
     }
 
     #[test]

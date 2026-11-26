@@ -60,7 +60,11 @@ pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
     session_id: String,
     handle: String,
 ) -> Vec<Effect> {
-    if focus_if_session_already_open(app, &session_id, false).is_some() {
+    if let Some(id) = focus_if_session_already_open(app, &session_id, false) {
+        // An open hub browser in that tab would cover the session.
+        if let Some(agent) = app.agents.get_mut(&id) {
+            agent.hub_browser = None;
+        }
         return vec![];
     }
     let owner = app
