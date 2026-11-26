@@ -1411,12 +1411,20 @@ fn scan_links(text: &str) -> Vec<(Range<usize>, LinkTarget)> {
     let mut overlay = LinkOverlay::new();
     let line = ratatui::text::Line::from(text.to_string());
     scan_lines_for_url_overlays(std::iter::once((0, &line, None)), 0, &[], &mut overlay);
+    if overlay.links().is_empty() {
+        return Vec::new();
+    }
+    let boundaries: Vec<usize> = text
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(text.len()))
+        .collect();
     let mut links: Vec<(Range<usize>, LinkTarget)> = overlay
         .links()
         .iter()
         .filter_map(|link| {
-            let start = byte_at_col(text, link.col_start)?;
-            let end = byte_at_col(text, link.col_end)?;
+            let start = byte_at_col(text, &boundaries, link.col_start)?;
+            let end = byte_at_col(text, &boundaries, link.col_end)?;
             (start < end).then(|| (start..end, link.target.clone()))
         })
         .collect();
@@ -1425,15 +1433,16 @@ fn scan_links(text: &str) -> Vec<(Range<usize>, LinkTarget)> {
     links
 }
 
-/// The byte index where display column `col` starts, or the text end.
+/// Purpose: Find the byte index where display column `col` starts.
+/// Input: The text, its char boundaries (with the text end), and the column.
+/// Output: The first boundary whose prefix is `col` columns wide or wider.
 /// Note: The width is the string width of the prefix, as the link scanner
-///     counts it. A sum of char widths differs for emoji ZWJ sequences.
-fn byte_at_col(text: &str, col: u16) -> Option<usize> {
+///     counts it. A sum of char widths differs for emoji ZWJ sequences. The
+///     prefix width only grows, so a binary search needs few measurements.
+fn byte_at_col(text: &str, boundaries: &[usize], col: u16) -> Option<usize> {
     let col = usize::from(col);
-    text.char_indices()
-        .map(|(idx, _)| idx)
-        .chain(std::iter::once(text.len()))
-        .find(|idx| text[..*idx].width() >= col)
+    let idx = boundaries.partition_point(|end| text[..*end].width() < col);
+    boundaries.get(idx).copied()
 }
 
 /// Purpose: Find where a feed span points.
