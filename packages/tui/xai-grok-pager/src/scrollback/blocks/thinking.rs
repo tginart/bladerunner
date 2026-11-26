@@ -75,7 +75,7 @@ fn body_emphasis_patch(ctx: &BlockContext) -> Option<Style> {
 /// Uses [`MarkdownContent`] for incremental markdown rendering with cached
 /// word-wrapping, plus special display modes:
 /// - **Collapsed**: Shows "Thought" or "Thought for Xs" if time is set
-/// - **Truncated** (default): Shows "…" + last N lines
+/// - **Truncated** (default): Shows the last N lines
 /// - **Expanded**: Full content
 #[derive(Debug, Clone)]
 pub struct ThinkingBlock {
@@ -307,7 +307,7 @@ impl ThinkingBlock {
         block_line
     }
 
-    /// Render truncated view: optional header + "…" + last N lines.
+    /// Render truncated view: optional header + last N lines.
     fn render_truncated(&self, ctx: &BlockContext) -> BlockOutput {
         let config = &ctx.appearance.scrollback.blocks.thinking;
         let n = config.truncated_lines as usize;
@@ -349,15 +349,9 @@ impl ThinkingBlock {
                 return self.maybe_prepend_header(output, ctx);
             }
 
-            // Build truncated output: "…" + last N lines
-            let theme = Theme::current();
-            let mut output_lines = Vec::with_capacity(n + 1);
-
-            // Ellipsis line
-            let ellipsis = Line::from(Span::styled("…", theme.muted()));
-            output_lines.push(ellipsis.into());
-
-            // Last N lines (with blending)
+            // Last N lines only: a lone muted "…" row above the tail read as
+            // stray noise rather than a truncation cue.
+            let mut output_lines = Vec::with_capacity(n);
             for i in (total - n)..total {
                 output_lines.push(Self::thinking_body_line(
                     &wrapped.lines[i],

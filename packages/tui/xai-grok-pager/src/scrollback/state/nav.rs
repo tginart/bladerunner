@@ -1997,8 +1997,8 @@ mod tests {
         }
         state.prepare_layout(40, 12);
 
-        // Thinking entries default to Truncated, whose output starts with a "…"
-        // ellipsis row; reveal expands the entry first, so measure the Expanded
+        // Thinking entries default to Truncated, which hides the head of the
+        // reasoning; reveal expands the entry first, so measure the Expanded
         // output reveal actually operates on. In Expanded mode the index's
         // logical line 0 is the first reasoning line, NOT the header.
         state
