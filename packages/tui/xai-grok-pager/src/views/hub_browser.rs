@@ -984,16 +984,21 @@ impl HubBrowserState {
     }
 
     fn close_thread(&mut self) {
-        let thread = self.thread.take();
-        // A paused draft in the thread stays a reply to its root.
-        if !self.composer.is_empty() && self.compose_target.is_some() && !self.is_draft_elsewhere()
-        {
-            self.reply_to = thread.or_else(|| self.reply_to.take());
-        }
+        self.leave_thread();
         self.feed_scroll = 0;
         self.feed_selection = None;
         if let Err(error) = self.load_feed(false) {
             tracing::warn!(%error, "hub browser: feed load failed");
+        }
+    }
+
+    /// Purpose: Drop the thread filter, with no feed load.
+    /// Output: None. A paused draft in the thread stays a reply to its root.
+    fn leave_thread(&mut self) {
+        let thread = self.thread.take();
+        if !self.composer.is_empty() && self.compose_target.is_some() && !self.is_draft_elsewhere()
+        {
+            self.reply_to = thread.or_else(|| self.reply_to.take());
         }
     }
 
@@ -1011,6 +1016,9 @@ impl HubBrowserState {
                 .is_some_and(|conv| self.snapshot.unread(&conv) > 0);
             if has_unread {
                 self.stop_compose();
+                // The unread message can be outside the open thread of the
+                // same conversation, so the jump always shows it whole.
+                self.leave_thread();
                 self.select(Some(rows[idx].clone()));
                 return;
             }
@@ -1088,7 +1096,7 @@ impl HubBrowserState {
         // A thread filter would hide a result from the same conversation.
         if self.selected_row().and_then(|row| row.conv()).as_deref() == Some(message.conv.as_str())
         {
-            self.thread = None;
+            self.leave_thread();
         }
         let row = match store::split_dm_conv(&message.conv) {
             None => message
@@ -5085,6 +5093,54 @@ mod tests {
         let search = state.search.as_ref().unwrap();
         assert_eq!(search.query, "status");
         assert!(!search.results.is_empty());
+    }
+
+    #[test]
+    fn a_search_hit_keeps_the_parent_of_a_paused_thread_draft() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "unrelated note",
+            store::now_ms(),
+        ))
+        .unwrap();
+        let mut state = open(hub);
+        state.open_thread(&parent_id);
+        state.handle_key(&key(KeyCode::Tab));
+        state.handle_paste("thread draft");
+        state.handle_key(&key(KeyCode::Esc));
+        state.handle_key(&key(KeyCode::Char('/')));
+        state.handle_paste("unrelated");
+        state.handle_key(&key(KeyCode::Enter));
+        assert_eq!(state.thread, None);
+        state.handle_key(&key(KeyCode::Tab));
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Reply {
+                to: "#general".to_string(),
+                text: "thread draft".to_string(),
+                reply_to: parent_id,
+            }
+        );
+    }
+
+    #[test]
+    fn the_unread_jump_leaves_a_thread_of_the_same_conversation() {
+        let (_root, hub, parent_id) = hub_with_thread();
+        let mut state = open(hub.clone());
+        state.open_thread(&parent_id);
+        hub.append(&message(
+            "front",
+            "#general".to_string(),
+            "outside",
+            store::now_ms(),
+        ))
+        .unwrap();
+        state.reload().unwrap();
+        state.handle_key(&key(KeyCode::Char(']')));
+        assert_eq!(state.thread, None);
+        assert!(state.feed.iter().any(|m| m.text == "outside"));
     }
 
     #[test]
