@@ -122,6 +122,9 @@ impl AgentView {
             return InputOutcome::Action(Action::KillSubagent(session_id));
         }
         if self.is_own_session(&session_id) {
+            // The cancel can open a chooser for running subagents, and the
+            // browser would cover it and take its keys.
+            self.hub_browser = None;
             return InputOutcome::Action(Action::CancelTurn);
         }
         if let Some(browser) = self.hub_browser.as_mut() {
