@@ -693,6 +693,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::KillTerminalCommandTool>();
         b.register::<grok_build::TodoWriteTool>();
         b.register::<grok_build::AgentHubTool>();
+        b.register::<grok_build::HubReadTool>();
         b.register::<grok_build::DapDebugTool>();
         b.register::<grok_build::UpdateGoalTool>();
         b.register::<grok_build::WorkflowTool>();

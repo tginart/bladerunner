@@ -75,7 +75,7 @@ pub(super) fn render(browser: &mut FileBrowserState, buf: &mut Buffer, area: Rec
     let default_hint = if browser.editor.is_some() {
         "Ctrl+]: focus tree · Tab: focus editor · Exit editor normally to return to preview"
     } else {
-        "Tab: tree → preview → prompt · Enter: open · ←/→: collapse/expand"
+        "Tab: tree → preview → prompt · Enter: open · ←/→: collapse/expand · L: layout"
     };
     let notice = browser.notice.as_deref().unwrap_or(default_hint);
     buf.set_stringn(
@@ -264,15 +264,30 @@ Output: Button labels and hit areas for visible buttons.
 fn render_buttons(browser: &mut FileBrowserState, buf: &mut Buffer, area: Rect, theme: &Theme) {
     let mut x = area.x;
     let y = area.bottom() - 1;
+    let pointer = browser.pointer;
     let close_label = "[Close]";
-    let right = if area.width >= close_label.len() as u16 {
+    let mut right = if area.width >= close_label.len() as u16 {
         let close_x = area.right() - close_label.len() as u16;
-        buf.set_string(close_x, y, close_label, Style::default().fg(theme.command));
-        browser.hits.close = Rect::new(close_x, y, close_label.len() as u16, 1);
+        let close = Rect::new(close_x, y, close_label.len() as u16, 1);
+        buf.set_string(close_x, y, close_label, button_style(close, pointer, theme));
+        browser.hits.close = close;
         close_x.saturating_sub(2)
     } else {
         area.right()
     };
+    let layout_label = format!("[Layout: {}]", browser.layout.label());
+    let layout_width = layout_label.len() as u16;
+    if right >= area.x + layout_width {
+        let layout_x = right - layout_width;
+        buf.set_string(
+            layout_x,
+            y,
+            &layout_label,
+            Style::default().fg(theme.command),
+        );
+        browser.hits.layout = Rect::new(layout_x, y, layout_width, 1);
+        right = layout_x.saturating_sub(2);
+    }
     let all_label = if browser.show_all {
         "[Hide ignored]"
     } else {
@@ -288,8 +303,20 @@ fn render_buttons(browser: &mut FileBrowserState, buf: &mut Buffer, area: Rect, 
         if x + width > right {
             continue;
         }
-        buf.set_string(x, y, label, Style::default().fg(theme.command));
-        *hit = Rect::new(x, y, width, 1);
+        let rect = Rect::new(x, y, width, 1);
+        buf.set_string(x, y, label, button_style(rect, pointer, theme));
+        *hit = rect;
         x += width + 2;
+    }
+}
+
+/// The style of a footer button: underlined and bright under the pointer.
+fn button_style(rect: Rect, pointer: Option<(u16, u16)>, theme: &Theme) -> Style {
+    let style = Style::default().fg(theme.command);
+    match pointer {
+        Some(point) if rect.contains(point.into()) => style
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        _ => style,
     }
 }

@@ -125,6 +125,11 @@ pub enum Action {
     /// Open the changes review modal (fetch pending hunks first).
     OpenChanges,
     AskReviewChat(xai_grok_shell::extensions::review_chat::AskRequest),
+    /// Ask hub-bot a question of the person in the hub browser.
+    AskHubBot {
+        hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
+        request: xai_grok_shell::extensions::hub_bot::AskRequest,
+    },
     ForwardReviewRequest(String),
     /// Dispatch a review action (accept/reject) from the changes modal.
     ChangesAction(crate::views::changes_modal::ChangesActionKind),
@@ -143,6 +148,13 @@ pub enum Action {
     /// load effect; under `--chat`, local Build disk rows are refused in
     /// dispatch (never coerced).
     LoadSession(String, Option<std::path::PathBuf>, bool),
+    /// Show the session of a hub member when this window has it open. A
+    /// session that is not open here gets a toast, never a load, because
+    /// another process can run it.
+    FocusHubMember {
+        session_id: String,
+        handle: String,
+    },
     /// Welcome Local workspace ACK confirmed (y); write ack + start session.
     #[cfg(feature = "local-workspace")]
     ConfirmWelcomeLocalWorkspaceAck,
@@ -1519,6 +1531,11 @@ pub enum Effect {
         agent_id: AgentId,
         request: xai_grok_shell::extensions::review_chat::AskRequest,
     },
+    AskHubBot {
+        agent_id: AgentId,
+        hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
+        request: xai_grok_shell::extensions::hub_bot::AskRequest,
+    },
     /// Fetch pending changes (files + hunks) for the review modal.
     /// `post_action`: this is a refetch after an action landed (must not
     /// reopen a closed modal).
@@ -2440,6 +2457,12 @@ impl TaskResult {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    HubBotAnswered {
+        agent_id: AgentId,
+        hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
+        request: xai_grok_shell::extensions::hub_bot::AskRequest,
+        response: Result<xai_grok_shell::extensions::hub_bot::AskResponse, String>,
+    },
     ReviewChatAnswered {
         agent_id: AgentId,
         parent_session_id: String,

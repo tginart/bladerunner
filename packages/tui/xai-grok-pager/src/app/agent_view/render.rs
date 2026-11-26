@@ -901,6 +901,9 @@ impl AgentView {
             #[cfg(feature = "codex-live")]
             live_visualizer,
         } = app_params;
+        // The bar sets its hit areas again below. A frame without the bar,
+        // such as a modal or a full-screen subagent, must leave no stale hits.
+        self.surface_hint_hits.clear();
         self.scrollback.begin_frame();
         self.in_dashboard_overlay = in_dashboard_overlay;
         self.overlay_can_cycle = overlay_can_cycle;
@@ -1415,6 +1418,7 @@ impl AgentView {
                 .height
                 .saturating_sub(search_reserved_rows);
         }
+        let mut file_browser_area = self.place_file_browser(&mut layout);
         let overlay_blocks_rail_hover = self.jump_state.is_some()
             || self.rewind_state.is_some()
             || self.question_view.is_some()
@@ -1487,6 +1491,7 @@ impl AgentView {
                             .height
                             .saturating_sub(search_reserved_rows);
                     }
+                    file_browser_area = self.place_file_browser(&mut layout);
                     self.scrollback.prepare_layout(
                         layout.scrollback_content.width,
                         layout.scrollback_content.height,
@@ -2050,18 +2055,23 @@ impl AgentView {
                 }
             }
         }
-        if self.file_browser_can_draw()
+        // A split browser leaves the conversation, its scrollbar, and its
+        // follow indicators live beside it.
+        let is_browser_full = file_browser_area == Some(layout.scrollback);
+        if let Some(browser_area) = file_browser_area
             && let Some(browser) = &mut self.file_browser
         {
-            browser.render(buf, layout.scrollback);
-            self.frame_occluder_rects.push(layout.scrollback);
-            self.hit_scrollbar.clear();
-            self.hit_sb_copy.clear();
-            self.hit_sb_view.clear();
+            browser.render(buf, browser_area);
+            self.frame_occluder_rects.push(browser_area);
+            if is_browser_full {
+                self.hit_scrollbar.clear();
+                self.hit_sb_copy.clear();
+                self.hit_sb_view.clear();
+            }
         }
         let mut follow_indicator_y: Option<u16> = None;
         let mut response_top_indicator_y: Option<u16> = None;
-        if self.block_viewer.is_none() && !search_active && !self.file_browser_can_draw() {
+        if self.block_viewer.is_none() && !search_active && !is_browser_full {
             use crate::appearance::FollowIndicator;
             let gap_y = layout.scrollback.y + layout.scrollback.height;
             let gap_x = layout.scrollback.x;
@@ -3573,9 +3583,23 @@ impl AgentView {
         match self.shortcuts_bar_content(registry, esc_owned_before_agent) {
             ShortcutsBarContent::Hidden => {}
             ShortcutsBarContent::Surface(hints) => {
-                ShortcutsBar::new(&hints)
+                let is_pending = pending_hint.is_some();
+                let rects = ShortcutsBar::new(&hints)
                     .with_pending(pending_hint)
-                    .render(layout.shortcuts, buf);
+                    .with_hovered(self.surface_hint_hover)
+                    .render_with_hits(layout.shortcuts, buf);
+                // A surface bar shows every hint, so the rects line up with `hints`.
+                if !is_pending {
+                    self.surface_hint_hits = hints
+                        .iter()
+                        .zip(rects)
+                        .enumerate()
+                        .filter_map(|(index, (hint, rect))| {
+                            let key = hint.click_key()?;
+                            Some(super::SurfaceHintHit { rect, key, index })
+                        })
+                        .collect();
+                }
             }
             ShortcutsBarContent::Pane(hints) => {
                 let help_hint = registry.find(ActionId::ShortcutsHelp).map(|def| {
@@ -4723,9 +4747,9 @@ impl AgentView {
                 .is_some_and(|browser| browser.focused)
         {
             None
-        } else if self.hub_browser.is_some() {
-            // The hub browser covers the prompt and draws its own cursor.
-            None
+        } else if let Some(browser) = &self.hub_browser {
+            // The hub browser covers the prompt. Its post box has the cursor.
+            browser.cursor
         } else if self.inline_edit.is_some() {
             inline_edit_cursor
         } else {

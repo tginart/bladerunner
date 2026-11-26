@@ -34,6 +34,7 @@ impl Default for NotificationConfig {
             events: vec![
                 NotificationEventKind::TurnComplete,
                 NotificationEventKind::ApprovalRequired,
+                NotificationEventKind::HubMention,
             ],
             sleep_prevention: true,
             progress_bar: true,
@@ -175,6 +176,8 @@ pub enum NotificationEventKind {
     SessionReady,
     TaskComplete,
     AgentError,
+    /// A hub message mentions the person or DMs the person.
+    HubMention,
 }
 
 impl NotificationEventKind {
@@ -185,6 +188,7 @@ impl NotificationEventKind {
             Self::SessionReady => "Session ready",
             Self::TaskComplete => "Task complete",
             Self::AgentError => "Agent error",
+            Self::HubMention => "Hub mention",
         }
     }
 }
@@ -226,8 +230,9 @@ condition = \"unfocused\"
 # Minimum seconds the terminal must be unfocused before notifications fire.
 idle_threshold_secs = 3
 # Events that trigger notifications.
-# Options: turn_complete, approval_required, session_ready, task_complete, agent_error
-events = [\"turn_complete\", \"approval_required\"]
+# Options: turn_complete, approval_required, session_ready, task_complete, agent_error,
+# hub_mention
+events = [\"turn_complete\", \"approval_required\", \"hub_mention\"]
 # Prevent display sleep during agent turns (macOS/Linux).
 sleep_prevention = true
 # Show a progress indicator in the terminal tab (OSC 9;4).
@@ -328,6 +333,7 @@ mod tests {
             vec![
                 NotificationEventKind::TurnComplete,
                 NotificationEventKind::ApprovalRequired,
+                NotificationEventKind::HubMention,
             ]
         );
         assert!(parsed.sleep_prevention);

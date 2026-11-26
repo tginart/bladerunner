@@ -147,6 +147,35 @@ impl SlashCommand for AcpSlashCommand {
     }
 }
 
+impl AcpSlashCommand {
+    /// Same command under an alias name, so a typed `/alias args` passes
+    /// through to the shell verbatim, which resolves the alias itself.
+    pub fn alias_of(cmd: &acp::AvailableCommand, alias: &str) -> Self {
+        Self {
+            name: alias.to_string(),
+            ..Self::from(cmd)
+        }
+    }
+}
+
+/// Aliases a shell builtin advertises in `_meta.aliases` (ACP has no alias
+/// field). Non-string entries are ignored.
+pub fn advertised_aliases(cmd: &acp::AvailableCommand) -> Vec<String> {
+    let Some(aliases) = cmd
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("aliases"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    aliases
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
 impl From<&acp::AvailableCommand> for AcpSlashCommand {
     fn from(cmd: &acp::AvailableCommand) -> Self {
         let arg_hint = cmd.input.as_ref().and_then(|input| match input {

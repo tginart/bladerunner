@@ -191,6 +191,11 @@ impl ClientType {
             Self::Desktop => "desktop",
         }
     }
+    /// Whether this client has a UI that can show a permission card. A
+    /// `Generic` client (for example `agent stdio`) may have no person watching.
+    pub const fn can_present_permission_prompt(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
 }
 #[derive(Clone, Debug)]
 pub enum AccessKind {

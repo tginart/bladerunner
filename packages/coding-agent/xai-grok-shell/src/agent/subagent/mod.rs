@@ -1892,8 +1892,7 @@ fn resolve_agent_definition(
     subagent_type: &str,
     ctx: &SubagentSpawnContext,
 ) -> Option<xai_grok_agent::config::AgentDefinition> {
-    if subagent_type == crate::extensions::review_chat::AGENT_NAME {
-        let mut def = crate::extensions::review_chat::definition();
+    if let Some(mut def) = crate::extensions::internal_definition(subagent_type) {
         ctx.apply_session_cli_overrides(&mut def);
         return Some(def);
     }
@@ -1985,7 +1984,7 @@ fn gate_subagent_type(
     subagent_type: &str,
     ctx: &SubagentSpawnContext,
 ) -> SubagentValidateTypeOutcome {
-    if subagent_type == crate::extensions::review_chat::AGENT_NAME {
+    if crate::extensions::internal_definition(subagent_type).is_some() {
         return SubagentValidateTypeOutcome::Ok;
     }
     let cli_agents = ctx

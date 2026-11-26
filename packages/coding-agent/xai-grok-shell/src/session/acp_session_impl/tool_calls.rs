@@ -1433,6 +1433,7 @@ impl SessionActor {
                         tool_call_id.to_string(),
                         crate::session::pending_interaction::PendingKind::Permission,
                     );
+                let _hub_input_guard = self.hub_input_guard();
                 self.permissions
                     .request_with_path_context_resolved(
                         access_kind.clone(),
@@ -1774,6 +1775,7 @@ impl SessionActor {
                 tool_call_id.to_string(),
                 crate::session::pending_interaction::PendingKind::PlanApproval,
             );
+            let _hub_input_guard = self.hub_input_guard();
             self.notifications.gateway.ext_method(ext_request).await
         };
         let raw = match resp {
@@ -2252,6 +2254,7 @@ impl SessionActor {
                 vec![],
             ),
             ToolInput::AgentHub(ref hub) => (hub.title(), acp::ToolKind::Other, vec![], vec![]),
+            ToolInput::HubRead(ref read) => (read.title(), acp::ToolKind::Search, vec![], vec![]),
             ToolInput::SchedulerList(_) => (
                 "List scheduled tasks".to_string(),
                 acp::ToolKind::Other,

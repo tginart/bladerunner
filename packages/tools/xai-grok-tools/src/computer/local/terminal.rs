@@ -56,7 +56,7 @@ const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 /// Env override: `GROK_FOREGROUND_BLOCK_BUDGET_MS`.
 const FOREGROUND_BLOCK_BUDGET: Duration = Duration::from_secs(15);
 
-fn foreground_block_budget_from_env() -> Duration {
+pub(crate) fn foreground_block_budget_from_env() -> Duration {
     std::env::var("GROK_FOREGROUND_BLOCK_BUDGET_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

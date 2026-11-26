@@ -158,6 +158,10 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
             ) {
                 return changed;
             }
+            if let Some(changed) = crate::app::hub_bot::route_update(app, &notif.request.session_id)
+            {
+                return changed;
+            }
 
             let affected = match find_session_match(app, &notif.request.session_id) {
                 Some(SessionMatch::Root(id)) => {

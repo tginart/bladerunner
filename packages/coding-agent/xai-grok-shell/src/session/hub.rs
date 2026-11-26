@@ -220,28 +220,60 @@ fn join_notice(bus: &AgentBus) -> Option<String> {
     }
 }
 
-/// Purpose: Build the status-bar label of a session's hub.
-/// Input: The session id.
-/// Output: `hub <name> · @<handle>` for a named hub, or `hub · private` for
-///     the session hub, plus ` · N unread` when there are unread messages.
-///     `None` when the session is in no named hub and its session hub holds
-///     no message.
-/// Note: The label of the session hub lets the person open the hub where
-///     main and its subagents talk.
-pub fn status_label(session_id: &str) -> Option<String> {
-    status_label_in(&hubs_root(), session_id)
+/// The hub state that the TUI status bar shows for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubStatus {
+    /// Such as `hub api · @backend · 3 unread · 1 @you`.
+    pub label: String,
+    /// The hub name, the key for mention notices.
+    pub hub: String,
+    /// Unread messages that mention the person or DM the person, oldest first.
+    pub mentions: Vec<HubMention>,
 }
 
-fn status_label_in(root: &Path, session_id: &str) -> Option<String> {
+/// One unread message that asks for the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubMention {
+    pub id: String,
+    pub from: String,
+    /// `#channel` or `DM`.
+    pub place: String,
+    pub text: String,
+    pub ts_unix_ms: u64,
+}
+
+/// Purpose: Build the status-bar state of a session's hub.
+/// Input: The session id.
+/// Output: `hub <name> · @<handle>` for a named hub, or `hub · private` for
+///     the session hub, plus ` · N unread` when there are unread messages and
+///     ` · N @you` when some of them mention or DM the person. `None` when the
+///     session is in no named hub and its session hub holds no message.
+/// Note: The label of the session hub lets the person open the hub where
+///     main and its subagents talk.
+pub fn hub_status(session_id: &str) -> Option<HubStatus> {
+    status_in(&hubs_root(), session_id)
+}
+
+fn status_in(root: &Path, session_id: &str) -> Option<HubStatus> {
     let Some((name, handle)) = store::find_membership(root, session_id) else {
-        return session_hub_label(root, session_id);
+        return session_hub_status(root, session_id);
     };
     let hub = store::Hub::open(root, &name).ok()?;
     let unread = unread_count(&hub, &handle).ok()?;
-    Some(with_unread(format!("hub {name} \u{b7} @{handle}"), unread))
+    let mentions = person_mentions(&hub, &store::person_handle()).unwrap_or_default();
+    let label = with_counts(
+        format!("hub {name} \u{b7} @{handle}"),
+        unread,
+        mentions.len(),
+    );
+    Some(HubStatus {
+        label,
+        hub: name,
+        mentions,
+    })
 }
 
-fn session_hub_label(root: &Path, session_id: &str) -> Option<String> {
+fn session_hub_status(root: &Path, session_id: &str) -> Option<HubStatus> {
     let hub = store::Hub::open_existing_session_hub(root, session_id).ok()?;
     if !hub.has_messages() {
         return None;
@@ -249,14 +281,76 @@ fn session_hub_label(root: &Path, session_id: &str) -> Option<String> {
     // The same handle that the hub browser reads and saves the cursors of.
     let person = person_handle_in(&hub.meta().ok()?, &store::person_handle());
     let unread = unread_count(&hub, &person).ok()?;
-    Some(with_unread("hub \u{b7} private".to_string(), unread))
+    let mentions = person_mentions(&hub, &store::person_handle()).unwrap_or_default();
+    Some(HubStatus {
+        label: with_counts("hub \u{b7} private".to_string(), unread, mentions.len()),
+        hub: hub.name().to_string(),
+        mentions,
+    })
 }
 
-fn with_unread(mut label: String, unread: usize) -> String {
+fn with_counts(mut label: String, unread: usize, mentions: usize) -> String {
     if unread > 0 {
         label.push_str(&format!(" \u{b7} {unread} unread"));
     }
+    if mentions > 0 {
+        label.push_str(&format!(" \u{b7} {mentions} @you"));
+    }
     label
+}
+
+/// Purpose: Find the unread messages that ask for the person.
+/// Input: The hub and the person name.
+/// Output: Messages after the person's read cursor that DM the person or
+///     mention the person or `@here`, oldest first. None when the person is
+///     not a member, because nobody can address a person who never joined.
+fn person_mentions(hub: &store::Hub, person_name: &str) -> Result<Vec<HubMention>> {
+    let meta = hub.meta()?;
+    let person = person_handle_in(&meta, person_name);
+    if meta
+        .member(&person)
+        .is_none_or(|member| member.kind != MemberKind::Person)
+    {
+        return Ok(Vec::new());
+    }
+    let cursors = hub.cursors(&person)?;
+    let mut convs: Vec<(String, bool)> = meta
+        .channels
+        .iter()
+        .map(|c| (format!("#{}", c.name), false))
+        .collect();
+    convs.extend(
+        hub.dm_convs_for(&person)?
+            .into_iter()
+            .map(|conv| (conv, true)),
+    );
+    let mut out = Vec::new();
+    for (conv, is_dm) in convs {
+        let read = cursors.read.get(&conv).copied().unwrap_or(0);
+        for message in hub.messages(&conv, read)? {
+            let is_for_person = is_dm
+                || message
+                    .mentions
+                    .iter()
+                    .any(|m| *m == person || m == store::HERE_MENTION);
+            if message.from == person || !is_for_person {
+                continue;
+            }
+            out.push(HubMention {
+                id: message.id,
+                from: message.from,
+                place: if is_dm {
+                    "DM".to_string()
+                } else {
+                    conv.clone()
+                },
+                text: message.text,
+                ts_unix_ms: message.ts_unix_ms,
+            });
+        }
+    }
+    out.sort_by_key(|mention| mention.ts_unix_ms);
+    Ok(out)
 }
 
 /// Messages after the member's read cursor, over all channels and its DMs.
@@ -915,16 +1009,16 @@ mod tests {
     #[test]
     fn status_label_counts_unread() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(status_label_in(root.path(), "s1"), None);
+        assert_eq!(status_in(root.path(), "s1"), None);
         let bus = bus_in(root.path(), "s1");
         dispatch(&bus, "new api", "backend").unwrap();
         assert_eq!(
-            status_label_in(root.path(), "s1").as_deref(),
+            status_in(root.path(), "s1").map(|s| s.label).as_deref(),
             Some("hub api \u{b7} @backend")
         );
         dispatch(&bus, "post #general hello", "x").unwrap();
         assert_eq!(
-            status_label_in(root.path(), "s1").as_deref(),
+            status_in(root.path(), "s1").map(|s| s.label).as_deref(),
             Some("hub api \u{b7} @backend \u{b7} 1 unread")
         );
     }
@@ -933,20 +1027,56 @@ mod tests {
     fn status_label_shows_the_session_hub_once_it_has_messages() {
         let root = tempfile::tempdir().unwrap();
         let bus = bus_in(root.path(), "s1");
-        assert_eq!(status_label_in(root.path(), "s1"), None);
+        assert_eq!(status_in(root.path(), "s1"), None);
         dispatch(&bus, "post #general hi", "x").unwrap();
         assert_eq!(
-            status_label_in(root.path(), "s1").as_deref(),
+            status_in(root.path(), "s1").map(|s| s.label).as_deref(),
             Some("hub \u{b7} private")
         );
         bus.send(MAIN_PEER_ID, "#general", "status", None, &[])
             .into_result()
             .unwrap();
         assert_eq!(
-            status_label_in(root.path(), "s1").as_deref(),
+            status_in(root.path(), "s1").map(|s| s.label).as_deref(),
             Some("hub \u{b7} private \u{b7} 1 unread")
         );
-        assert_eq!(status_label_in(root.path(), "s2"), None);
+        assert_eq!(status_in(root.path(), "s2"), None);
+    }
+
+    #[test]
+    fn person_mentions_list_unread_dms_and_mentions_of_the_person() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "s1");
+        dispatch(&bus, "new api", "backend").unwrap();
+        let hub = bus.hub();
+        xai_grok_tools::implementations::grok_build::agent_hub::post_as_person(
+            &hub,
+            "me",
+            "#general",
+            "hello all",
+            &[],
+        )
+        .unwrap();
+        assert!(person_mentions(&hub, "me").unwrap().is_empty());
+        bus.send(MAIN_PEER_ID, "#general", "@me please review", None, &[])
+            .into_result()
+            .unwrap();
+        bus.send(MAIN_PEER_ID, "#general", "no ask here", None, &[])
+            .into_result()
+            .unwrap();
+        bus.send(MAIN_PEER_ID, "@me", "a direct note", None, &[])
+            .into_result()
+            .unwrap();
+        let mentions = person_mentions(&hub, "me").unwrap();
+        let texts: Vec<&str> = mentions.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["@me please review", "a direct note"]);
+        assert_eq!(mentions[0].place, "#general");
+        assert_eq!(mentions[1].place, "DM");
+        assert_eq!(mentions[0].from, "backend");
+        assert_eq!(
+            with_counts("hub api".into(), 3, 2),
+            "hub api \u{b7} 3 unread \u{b7} 2 @you"
+        );
     }
 
     #[test]

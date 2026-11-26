@@ -4,6 +4,7 @@
 //! - `hub.json`: the hub name, members, channels and the loop-guard streak.
 //! - `channels/<channel>.jsonl` and `dms/<a>__<b>.jsonl`: append-only messages.
 //! - `cursors/<handle>.json`: per-member read and notify positions.
+//! - `presence/<handle>.json`: what each agent does now (working, idle, ...).
 //! - `blobs/`: images attached to messages.
 //! - `hub.lock`: an advisory lock that every write holds.
 //!
@@ -25,6 +26,10 @@ pub const HUBS_DIR: &str = "hubs";
 pub const GENERAL_CHANNEL: &str = "general";
 /// Mention that wakes every active member of a channel (people only).
 pub const HERE_MENTION: &str = "here";
+/// Handle of hub-bot, the read-only helper that answers the person. It is not
+/// a member in `hub.json`, so older binaries can still read the hub.
+pub const BOT_HANDLE: &str = "hub-bot";
+const BOT_DIR: &str = "bot";
 /// Prefix of the hidden hub for one root session and its subagents.
 const SESSION_HUB_PREFIX: &str = ".session-";
 const META_FILE: &str = "hub.json";
@@ -38,6 +43,9 @@ pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 /// Token-count key for all DMs of a hub.
 pub const DM_TOKENS_KEY: &str = "dm";
+const PRESENCE_DIR: &str = "presence";
+/// Longest task text that a presence file keeps, in characters.
+pub const MAX_TASK_CHARS: usize = 120;
 /// Age after which an unused session hub of an ended session is removed.
 const IDLE_SESSION_HUB_MS: u64 = 60 * 60 * 1000;
 
@@ -151,7 +159,51 @@ pub struct Cursors {
     pub notified: BTreeMap<String, usize>,
 }
 
+/// What a live agent does now, as its session reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    /// A turn runs.
+    Working,
+    /// No turn runs.
+    Idle,
+    /// The agent waits in `agent_hub wait` for a message.
+    Waiting,
+    /// A permission prompt, a question, or a plan approval waits for a person.
+    NeedsInput,
+}
+
+impl Activity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activity::Working => "working",
+            Activity::Idle => "idle",
+            Activity::Waiting => "waiting",
+            Activity::NeedsInput => "needs_input",
+        }
+    }
+}
+
+/// The contents of one presence file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Presence {
+    pub activity: Activity,
+    /// When the activity started.
+    pub since_ms: u64,
+    /// The prompt of the last turn that a person or a parent agent started.
+    #[serde(default)]
+    pub task: Option<String>,
+}
+
 /// A handle to one hub directory.
+/// The conversation of hub-bot with one person: the last child run, which the
+/// next question resumes when it comes from the same session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotThread {
+    pub session_id: String,
+    pub child_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Hub {
     dir: PathBuf,
@@ -176,6 +228,23 @@ impl Hub {
             bail!("hub {name:?} does not exist");
         }
         Ok(hub)
+    }
+
+    /// Purpose: Open an existing named hub or session hub by its directory name.
+    /// Input: The hubs root and the name that `Hub::name` gives.
+    /// Output: The hub. Fails for a name that is not a hub name.
+    pub fn open_by_name(hubs_root: &Path, name: &str) -> Result<Hub> {
+        let Some(session_id) = name.strip_prefix(SESSION_HUB_PREFIX) else {
+            return Self::open(hubs_root, name);
+        };
+        let is_valid = !session_id.is_empty()
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !is_valid {
+            bail!("invalid hub name {name:?}");
+        }
+        Self::open_existing_session_hub(hubs_root, session_id)
     }
 
     /// Open the hidden hub of a root session, and create it on first use.
@@ -418,11 +487,106 @@ impl Hub {
         Ok(self.dir.join("dms").join(file))
     }
 
+    /// The presence of a member, or None when it has not reported one.
+    /// A presence file that cannot be read counts as none.
+    pub fn presence(&self, handle: &str) -> Option<Presence> {
+        read_json(&self.presence_path(handle)).ok()
+    }
+
+    /// Purpose: Read the presence of every member that reported one.
+    /// Input: The hub.
+    /// Output: Presence by handle. Files that cannot be read are left out.
+    pub fn presences(&self) -> BTreeMap<String, Presence> {
+        let mut out = BTreeMap::new();
+        let Ok(entries) = fs::read_dir(self.dir.join(PRESENCE_DIR)) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if let Ok(presence) = read_json(&path) {
+                out.insert(decode_handle(stem), presence);
+            }
+        }
+        out
+    }
+
+    /// Save the presence of a member. The file is replaced atomically.
+    pub fn save_presence(&self, handle: &str, presence: &Presence) -> Result<()> {
+        create_private_dir(&self.dir.join(PRESENCE_DIR))?;
+        write_json_atomic(&self.presence_path(handle), presence)
+    }
+
+    /// The last hub-bot run for a person, or None before the first question.
+    pub fn bot_thread(&self, person: &str) -> Option<BotThread> {
+        read_json(&self.bot_thread_path(person)).ok()
+    }
+
+    /// Save the last hub-bot run for a person. The file is replaced atomically.
+    pub fn save_bot_thread(&self, person: &str, thread: &BotThread) -> Result<()> {
+        create_private_dir(&self.dir.join(BOT_DIR))?;
+        write_json_atomic(&self.bot_thread_path(person), thread)
+    }
+
+    fn bot_thread_path(&self, person: &str) -> PathBuf {
+        self.dir
+            .join(BOT_DIR)
+            .join(format!("{}.json", encode_handle(person)))
+    }
+
+    fn presence_path(&self, handle: &str) -> PathBuf {
+        self.dir
+            .join(PRESENCE_DIR)
+            .join(format!("{}.json", encode_handle(handle)))
+    }
+
     fn cursor_path(&self, handle: &str) -> PathBuf {
         self.dir
             .join("cursors")
             .join(format!("{}.json", encode_handle(handle)))
     }
+}
+
+/// Purpose: Find the messages of a hub that contain a query.
+/// Input: The hub, the query, and the maximum count.
+/// Output: Up to `limit` messages, newest first, whose text or sender
+///     contains the query, ignoring case. Every channel and DM is searched.
+///     No cursor moves.
+pub fn search(hub: &Hub, query: &str, limit: usize) -> Result<Vec<Message>> {
+    search_where(hub, query, limit, |_| true)
+}
+
+/// Purpose: Find the messages of a hub that contain a query and pass a filter.
+/// Input: The hub, the query, the maximum count, and the filter.
+/// Output: As `search`. A message that the filter refuses does not count
+///     toward `limit`.
+pub fn search_where(
+    hub: &Hub,
+    query: &str,
+    limit: usize,
+    keep: impl Fn(&Message) -> bool,
+) -> Result<Vec<Message>> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for message in recent_messages(hub, None, usize::MAX)?.into_iter().rev() {
+        let is_hit = message.text.to_lowercase().contains(&query)
+            || format!("@{}", message.from).to_lowercase().contains(&query);
+        if is_hit && keep(&message) {
+            hits.push(message);
+            if hits.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(hits)
 }
 
 /// Purpose: Read the latest messages of a hub for a person to look at.

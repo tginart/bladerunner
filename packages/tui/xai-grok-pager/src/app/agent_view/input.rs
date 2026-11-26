@@ -456,6 +456,48 @@ impl AgentView {
         self.clear_btw_drag_state();
         Handled(Box::new(InputOutcome::Changed))
     }
+    /// Purpose: Apply hover and clicks to the hints of a surface shortcuts bar.
+    /// Input: An input event.
+    /// Output: `Press` with the hint key for a left click on a hint, `Hover`
+    ///     for a pointer move on or off a hint, or `Pass` for every other event.
+    fn surface_hint_mouse(&mut self, ev: &Event) -> SurfaceHintMouse {
+        let Event::Mouse(mouse) = ev else {
+            return SurfaceHintMouse::Pass;
+        };
+        let hit = self.surface_hint_at(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => match hit {
+                Some(hit) => SurfaceHintMouse::Press(hit.key),
+                None => SurfaceHintMouse::Pass,
+            },
+            MouseEventKind::Moved => {
+                let hovered = hit.map(|hit| hit.index);
+                if hovered == self.surface_hint_hover {
+                    return match hovered {
+                        Some(_) => SurfaceHintMouse::Hover { is_changed: false },
+                        None => SurfaceHintMouse::Pass,
+                    };
+                }
+                self.surface_hint_hover = hovered;
+                SurfaceHintMouse::Hover { is_changed: true }
+            }
+            _ => SurfaceHintMouse::Pass,
+        }
+    }
+
+    /// The surface shortcuts bar hint at a screen cell.
+    fn surface_hint_at(&self, col: u16, row: u16) -> Option<super::SurfaceHintHit> {
+        self.surface_hint_hits.iter().copied().find(|hit| {
+            let rect = hit.rect;
+            col >= rect.x && col < rect.right() && row >= rect.y && row < rect.bottom()
+        })
+    }
+
+    /// True for a mouse event over a hint of the surface shortcuts bar.
+    fn is_on_surface_hint(&self, ev: &Event) -> bool {
+        matches!(ev, Event::Mouse(mouse) if self.surface_hint_at(mouse.column, mouse.row).is_some())
+    }
+
     fn handle_input_inner(
         &mut self,
         ev: &Event,
@@ -536,11 +578,15 @@ impl AgentView {
             }
             return InputOutcome::Unchanged;
         }
+        // A hint click must not reach the browser first: its mouse-down
+        // outside the browser takes the focus away, and the pressed key then
+        // misses the focused editor.
         if self.file_browser_can_draw()
             && self
                 .file_browser
                 .as_ref()
                 .is_some_and(|browser| browser.terminal_has_focus())
+            && !self.is_on_surface_hint(ev)
         {
             self.esc_pressed_at = None;
             if let Some(outcome) = self.handle_file_browser_input(ev) {
@@ -633,6 +679,16 @@ impl AgentView {
         }
         if let Some(outcome) = self.handle_hub_browser_input(ev) {
             return outcome;
+        }
+        match self.surface_hint_mouse(ev) {
+            SurfaceHintMouse::Pass => {}
+            SurfaceHintMouse::Hover { is_changed: true } => return InputOutcome::Changed,
+            SurfaceHintMouse::Hover { is_changed: false } => return InputOutcome::Unchanged,
+            SurfaceHintMouse::Press(key) => {
+                // A click on a hint is the same as a press of its key.
+                let press = Event::Key(key.to_key_event());
+                return self.handle_input_inner(&press, registry, prompt_paging);
+            }
         }
         if let Some(outcome) = self.handle_file_browser_input(ev) {
             return outcome;
@@ -2639,4 +2695,14 @@ mod rich_textarea_paste_routing_tests {
         );
         assert_eq!(agent.prompt.text(), "hidden prompt");
     }
+}
+
+/// What a mouse event does to the hints of a surface shortcuts bar.
+enum SurfaceHintMouse {
+    /// The event is not for the bar.
+    Pass,
+    /// The pointer is on a hint, or it left one.
+    Hover { is_changed: bool },
+    /// A click on a hint presses this key.
+    Press(crate::input::key::KeyShortcut),
 }

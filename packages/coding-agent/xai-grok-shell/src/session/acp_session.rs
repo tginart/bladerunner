@@ -110,6 +110,8 @@ pub(crate) use auth_retry::{
 };
 #[path = "acp_session_impl/deadline.rs"]
 pub(crate) mod deadline;
+#[path = "acp_session_impl/hub_presence.rs"]
+mod hub_presence;
 #[path = "acp_session_impl/interjection.rs"]
 mod interjection;
 #[path = "acp_session_impl/mcp_argument_coercion.rs"]

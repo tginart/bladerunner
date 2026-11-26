@@ -133,6 +133,9 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     if let Some(changed) = crate::app::review_chat::route_lifecycle(app, &session_notif) {
         return changed;
     }
+    if let Some(changed) = crate::app::hub_bot::route_lifecycle(app, &session_notif) {
+        return changed;
+    }
     match &session_notif.update {
         XaiSessionUpdate::TaskBackgrounded { .. } => {
             return handle_task_backgrounded(notif, app);

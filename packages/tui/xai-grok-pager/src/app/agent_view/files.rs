@@ -5,10 +5,12 @@ Output: Browser state changes and native file open requests.
 */
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 
 use super::{AgentPane, AgentView};
 use crate::app::app_view::InputOutcome;
-use crate::views::file_browser::{BrowserAction, FileBrowserState};
+use crate::views::agent::AgentViewLayout;
+use crate::views::file_browser::{BrowserAction, FileBrowserState, split_area};
 
 impl AgentView {
     /*
@@ -72,6 +74,28 @@ impl AgentView {
             && !self.show_workflows
     }
 
+    /*
+    Purpose: Give the browser its part of the conversation area for this frame.
+    Input: The frame layout after the search rows are reserved.
+    Output: The browser area, or None when the browser does not draw.
+    Note: A split layout confines the conversation to the rest of the area.
+    */
+    pub(super) fn place_file_browser(&self, layout: &mut AgentViewLayout) -> Option<Rect> {
+        if !self.file_browser_can_draw() {
+            return None;
+        }
+        let browser = self.file_browser.as_ref()?;
+        let (browser_area, conversation) = split_area(
+            browser.layout(),
+            layout.scrollback,
+            layout.scrollbar_gutter(),
+        );
+        if let Some(conversation) = conversation {
+            layout.confine_scrollback(conversation);
+        }
+        Some(browser_area)
+    }
+
     pub(crate) fn poll_file_browser(&mut self) -> bool {
         if self
             .file_browser
@@ -118,6 +142,13 @@ impl AgentView {
             }
             Event::Mouse(mouse) if browser.contains(mouse.column, mouse.row) => {
                 browser.handle_mouse(mouse.kind, mouse.column, mouse.row)
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+                // The pointer left the browser, so no button keeps its hover style.
+                if browser.clear_pointer() {
+                    return Some(InputOutcome::Changed);
+                }
+                return None;
             }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 browser.focused = false;
@@ -235,6 +266,77 @@ mod tests {
         assert!(!text.contains("conversation marker"), "{text}");
         agent.handle_file_browser_input(&event(KeyCode::Esc));
         assert!(render_text(&mut agent).contains("conversation marker"));
+    }
+
+    #[test]
+    fn a_click_on_a_files_footer_hint_presses_its_key() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = crate::test_util::make_agent_view(None, root.path().to_str().unwrap());
+        agent.open_file_browser();
+        render_text(&mut agent);
+        let close = agent
+            .surface_hint_hits
+            .iter()
+            .find(|hit| hit.key == crate::key!(Esc))
+            .copied()
+            .expect("close hint");
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: close.rect.x,
+                row: close.rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let registry = ActionRegistry::defaults();
+        agent.handle_input(&mouse(MouseEventKind::Moved), &registry);
+        assert_eq!(agent.surface_hint_hover, Some(close.index));
+        agent.handle_input(&mouse(MouseEventKind::Down(MouseButton::Left)), &registry);
+        assert!(!agent.file_browser_is_open());
+    }
+
+    #[test]
+    fn file_browser_layout_key_splits_the_area_and_keeps_the_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = crate::test_util::make_agent_view(None, root.path().to_str().unwrap());
+        agent
+            .scrollback
+            .push_block(crate::scrollback::block::RenderBlock::system(
+                "conversation marker",
+            ));
+        agent.open_file_browser();
+        let layout_key = Event::Key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        for expected in ["Top", "Left", "Right"] {
+            agent.handle_file_browser_input(&layout_key);
+            let text = render_text(&mut agent);
+            assert!(text.contains(&format!("[Layout: {expected}]")), "{text}");
+            assert!(text.contains("Files —"), "{text}");
+            assert!(text.contains("conversation marker"), "{expected}: {text}");
+        }
+        agent.handle_file_browser_input(&layout_key);
+        let text = render_text(&mut agent);
+        assert!(text.contains("[Layout: Full]"), "{text}");
+        assert!(!text.contains("conversation marker"), "{text}");
+    }
+
+    #[test]
+    fn a_modal_frame_leaves_no_stale_footer_hints() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = crate::test_util::make_agent_view(None, root.path().to_str().unwrap());
+        agent.open_file_browser();
+        render_text(&mut agent);
+        assert!(!agent.surface_hint_hits.is_empty());
+        agent.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
+            entries: crate::views::modal::default_palette_entries(
+                agent.sharing_enabled,
+                &agent.prompt.slash_controller,
+            ),
+            state: crate::views::picker::PickerState::input_active(),
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+        render_text(&mut agent);
+        assert!(agent.surface_hint_hits.is_empty());
     }
 
     fn render_text(agent: &mut AgentView) -> String {
