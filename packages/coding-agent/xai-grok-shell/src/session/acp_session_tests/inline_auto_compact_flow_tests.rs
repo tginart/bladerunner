@@ -1154,7 +1154,7 @@ async fn test_idle_flush_conversation_len_reset_after_compaction() {
                 let new_len = compacted.len();
                 actor
                     .chat_state_handle
-                    .replace_conversation_for_compaction(compacted);
+                    .replace_conversation_for_compaction(compacted, None);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 actor
                     .last_idle_flush_conversation_len
