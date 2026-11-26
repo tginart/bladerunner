@@ -18,8 +18,8 @@ use crate::theme::Theme;
 
 /// Most text rows the post box shows before it scrolls.
 pub const MAX_TEXT_ROWS: u16 = 6;
-/// Most rows of the completion popup.
-const MAX_COMPLETIONS: usize = 6;
+/// Most candidate rows that the completion popup shows. More candidates scroll.
+const MAX_VISIBLE_COMPLETIONS: usize = 6;
 /// Most sent posts that the history keeps.
 const MAX_HISTORY: usize = 100;
 
@@ -48,9 +48,11 @@ pub struct CompletionNames {
 struct Completion {
     /// Byte index of the `@` or `#` that starts the word.
     start: usize,
-    /// Candidates with their sigil, such as `@front` or `#ops`.
+    /// All the candidates with their sigil, such as `@front` or `#ops`.
     items: Vec<String>,
     selected: usize,
+    /// Index of the first candidate that the popup shows.
+    scroll: usize,
 }
 
 /// Purpose: Hold the draft of the hub post box.
@@ -122,6 +124,15 @@ impl HubComposer {
     #[cfg(test)]
     pub fn completion_items(&self) -> &[String] {
         self.completion.as_ref().map_or(&[], |c| c.items.as_slice())
+    }
+
+    #[cfg(test)]
+    pub fn completion_selected(&self) -> Option<&str> {
+        let completion = self.completion.as_ref()?;
+        completion
+            .items
+            .get(completion.selected)
+            .map(String::as_str)
     }
 
     #[cfg(test)]
@@ -210,10 +221,12 @@ impl HubComposer {
                 self.hovered_row = popup_row;
                 is_changed
             }
+            MouseEventKind::ScrollUp if popup_row.is_some() => self.move_selection(-1),
+            MouseEventKind::ScrollDown if popup_row.is_some() => self.move_selection(1),
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = popup_row {
+                if let Some(row) = popup_row {
                     if let Some(completion) = &mut self.completion {
-                        completion.selected = idx;
+                        completion.selected = completion.scroll + row;
                     }
                     self.accept_completion();
                     return true;
@@ -277,19 +290,23 @@ impl HubComposer {
             return;
         };
         // Keys must never pick a candidate that the person cannot see. So the
-        // popup keeps only the rows that fit, or closes when none fit.
+        // window scrolls to the selection, or the popup closes when no row fits.
         let room = compose.y.saturating_sub(bounds.y);
         if room < 3 {
             self.completion = None;
             return;
         }
-        let max_items = usize::from(room - 2);
-        if completion.items.len() > max_items {
-            completion.items.truncate(max_items);
-            completion.selected = completion.selected.min(max_items - 1);
-        }
+        let visible = completion
+            .items
+            .len()
+            .min(MAX_VISIBLE_COMPLETIONS)
+            .min(usize::from(room - 2));
+        completion.scroll = scroll_to_show(completion.scroll, completion.selected, visible);
         let completion = &*completion;
-        let rows = completion.items.len() as u16;
+        let shown = &completion.items[completion.scroll..completion.scroll + visible];
+        let thumb = scroll_thumb(completion.items.len(), visible, completion.scroll);
+        let rows = visible as u16;
+        // Width comes from all the candidates, so the popup does not jump on scroll.
         let width = completion
             .items
             .iter()
@@ -320,8 +337,9 @@ impl HubComposer {
             format!("╰{}╯", "─".repeat(inner_w)),
             border,
         );
-        for (idx, item) in completion.items.iter().enumerate() {
-            let y = rect.y + 1 + idx as u16;
+        for (row_idx, item) in shown.iter().enumerate() {
+            let idx = completion.scroll + row_idx;
+            let y = rect.y + 1 + row_idx as u16;
             let row = Rect {
                 x: rect.x + 1,
                 y,
@@ -330,14 +348,16 @@ impl HubComposer {
             };
             let bg = if idx == completion.selected {
                 theme.bg_highlight
-            } else if Some(idx) == self.hovered_row {
+            } else if Some(row_idx) == self.hovered_row {
                 theme.bg_hover
             } else {
                 theme.bg_base
             };
             buf.set_style(row, Style::default().bg(bg));
             buf.set_string_safe(rect.x, y, "│", border);
-            buf.set_string_safe(rect.right() - 1, y, "│", border);
+            let is_thumb = thumb.as_ref().is_some_and(|t| t.contains(&row_idx));
+            let right = if is_thumb { "┃" } else { "│" };
+            buf.set_string_safe(rect.right() - 1, y, right, border);
             let mut style = Style::default().fg(theme.text_primary).bg(bg);
             if idx == completion.selected {
                 style = style.add_modifier(Modifier::BOLD);
@@ -348,11 +368,13 @@ impl HubComposer {
     }
 
     fn handle_completion_key(&mut self, key: &KeyEvent) -> Option<ComposerKey> {
-        let completion = self.completion.as_mut()?;
-        let last = completion.items.len().saturating_sub(1);
+        self.completion.as_ref()?;
+        let page = MAX_VISIBLE_COMPLETIONS as isize;
         match key.code {
-            KeyCode::Up => completion.selected = completion.selected.saturating_sub(1),
-            KeyCode::Down => completion.selected = (completion.selected + 1).min(last),
+            KeyCode::Up => _ = self.move_selection(-1),
+            KeyCode::Down => _ = self.move_selection(1),
+            KeyCode::PageUp => _ = self.move_selection(-page),
+            KeyCode::PageDown => _ = self.move_selection(page),
             // Shift+Enter and Alt+Enter stay newlines, as without the popup.
             KeyCode::Tab => self.accept_completion(),
             KeyCode::Enter if key.modifiers == KeyModifiers::NONE => self.accept_completion(),
@@ -360,6 +382,18 @@ impl HubComposer {
             _ => return None,
         }
         Some(ComposerKey::Edited)
+    }
+
+    /// Move the popup selection by `step` rows, and stop at the ends. The
+    /// next frame scrolls the popup to the selection. Returns true when an
+    /// open popup took the move.
+    fn move_selection(&mut self, step: isize) -> bool {
+        let Some(completion) = self.completion.as_mut() else {
+            return false;
+        };
+        let last = completion.items.len().saturating_sub(1);
+        completion.selected = completion.selected.saturating_add_signed(step).min(last);
+        true
     }
 
     /// Purpose: Replace the word at the cursor with the selected candidate.
@@ -407,14 +441,15 @@ impl HubComposer {
             self.completion = None;
             return;
         }
-        let selected = match &self.completion {
-            Some(old) if old.start == start => old.selected.min(items.len() - 1),
-            _ => 0,
+        let (selected, scroll) = match &self.completion {
+            Some(old) if old.start == start => (old.selected.min(items.len() - 1), old.scroll),
+            _ => (0, 0),
         };
         self.completion = Some(Completion {
             start,
             items,
             selected,
+            scroll,
         });
     }
 
@@ -496,15 +531,37 @@ fn completion_word(text: &str, cursor: usize) -> Option<(usize, char, &str)> {
     is_word_start.then(|| (start, sigil, &before[start + sigil.len_utf8()..]))
 }
 
+/// Purpose: Find the first shown candidate so that the selection is in view.
+/// Input: The old first index, the selected index, and the shown row count.
+/// Output: The new first index. It moves as little as possible.
+fn scroll_to_show(scroll: usize, selected: usize, visible: usize) -> usize {
+    if visible == 0 || selected < scroll {
+        return selected;
+    }
+    scroll.max((selected + 1).saturating_sub(visible))
+}
+
+/// Purpose: Find the shown rows of the scroll thumb on the popup border.
+/// Input: The candidate count, the shown row count, and the first shown index.
+/// Output: The row range of the thumb, or None when all candidates fit.
+fn scroll_thumb(total: usize, visible: usize, scroll: usize) -> Option<std::ops::Range<usize>> {
+    if visible == 0 || total <= visible {
+        return None;
+    }
+    let len = (visible * visible / total).max(1);
+    let start = scroll * (visible - len) / (total - visible);
+    Some(start..start + len)
+}
+
 fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')
 }
 
-/// The best matches of `query` in `pool`, with the sigil in front.
+/// All the matches of `query` in `pool`, best first, with the sigil in front.
 fn rank_names(pool: &[String], query: &str, sigil: char) -> Vec<String> {
     let mut matcher = FuzzyMatcher::new();
     matcher
-        .rank(pool, query, MAX_COMPLETIONS, |name| name.as_str())
+        .rank(pool, query, pool.len(), |name| name.as_str())
         .into_iter()
         .map(|(idx, _)| format!("{sigil}{}", pool[idx]))
         .collect()
@@ -647,6 +704,101 @@ mod tests {
         let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
         composer.handle_key(&shift_enter, &names);
         assert_eq!(composer.text(), "ask @fr\n");
+    }
+
+    fn many_names() -> CompletionNames {
+        CompletionNames {
+            handles: (0..10).map(|i| format!("agent{i}")).collect(),
+            channels: Vec::new(),
+        }
+    }
+
+    /// Draw the popup above a post box at row 20, and return the shown rows.
+    fn render_rows(composer: &mut HubComposer) -> Vec<String> {
+        let bounds = Rect::new(0, 0, 40, 24);
+        let compose = Rect::new(0, 20, 40, 3);
+        let mut buf = Buffer::empty(bounds);
+        composer.render_popup(&mut buf, compose, bounds, &Theme::current());
+        composer
+            .popup_rows
+            .clone()
+            .iter()
+            .map(|row| {
+                let text: String = (row.x..row.right())
+                    .map(|x| buf[(x, row.y)].symbol().to_string())
+                    .collect();
+                text.trim().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_at_lists_every_member_and_the_popup_scrolls() {
+        let names = many_names();
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "@", &names);
+        assert_eq!(composer.completion_items().len(), 10);
+        assert_eq!(render_rows(&mut composer).len(), MAX_VISIBLE_COMPLETIONS);
+        for _ in 0..7 {
+            press(&mut composer, KeyCode::Down, &names);
+        }
+        assert_eq!(composer.completion_selected(), Some("@agent7"));
+        let rows = render_rows(&mut composer);
+        assert_eq!(rows.first().map(String::as_str), Some("@agent2"));
+        assert_eq!(rows.last().map(String::as_str), Some("@agent7"));
+        press(&mut composer, KeyCode::PageDown, &names);
+        assert_eq!(composer.completion_selected(), Some("@agent9"));
+        press(&mut composer, KeyCode::PageUp, &names);
+        press(&mut composer, KeyCode::PageUp, &names);
+        assert_eq!(composer.completion_selected(), Some("@agent0"));
+        let rows = render_rows(&mut composer);
+        assert_eq!(rows.first().map(String::as_str), Some("@agent0"));
+    }
+
+    #[test]
+    fn typing_filters_the_scrolled_list() {
+        let names = many_names();
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "@", &names);
+        for _ in 0..8 {
+            press(&mut composer, KeyCode::Down, &names);
+        }
+        render_rows(&mut composer);
+        type_text(&mut composer, "agent3", &names);
+        assert!(
+            !composer.is_completing(),
+            "one exact match closes the popup"
+        );
+        press(&mut composer, KeyCode::Backspace, &names);
+        assert_eq!(render_rows(&mut composer).len(), MAX_VISIBLE_COMPLETIONS);
+        assert!(composer.completion_selected().is_some());
+    }
+
+    #[test]
+    fn the_wheel_moves_the_selection_and_a_click_picks_the_shown_row() {
+        let names = many_names();
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "@", &names);
+        render_rows(&mut composer);
+        let row = composer.popup_rows[0];
+        for _ in 0..8 {
+            assert!(composer.handle_mouse(MouseEventKind::ScrollDown, row.x, row.y));
+        }
+        let rows = render_rows(&mut composer);
+        assert_eq!(rows.first().map(String::as_str), Some("@agent3"));
+        let first = composer.popup_rows[0];
+        composer.handle_mouse(MouseEventKind::Down(MouseButton::Left), first.x, first.y);
+        assert_eq!(composer.text(), "@agent3 ");
+    }
+
+    #[test]
+    fn the_scroll_thumb_spans_the_window() {
+        assert_eq!(scroll_thumb(5, 6, 0), None);
+        assert_eq!(scroll_thumb(12, 6, 0), Some(0..3));
+        assert_eq!(scroll_thumb(12, 6, 6), Some(3..6));
+        assert_eq!(scroll_to_show(0, 7, 6), 2);
+        assert_eq!(scroll_to_show(4, 1, 6), 1);
+        assert_eq!(scroll_to_show(2, 4, 6), 2);
     }
 
     #[test]
