@@ -329,6 +329,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ImportClaudeConfirm => dispatch_import_claude_confirm(app),
         Action::ImportClaudeCancel => dispatch_import_claude_cancel(app),
         Action::AskReviewChat(req) => crate::app::review_chat::dispatch_ask(app, req),
+        Action::AskHubBot { hub, request } => crate::app::hub_bot::dispatch_ask(app, hub, request),
         Action::ForwardReviewRequest(text) => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];

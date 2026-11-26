@@ -3036,6 +3036,9 @@ impl acp::Agent for MvpAgent {
             s if s.starts_with("x.ai/review-chat/") => {
                 crate::extensions::review_chat::handle(self, &args).await
             }
+            s if s.starts_with("x.ai/hub-bot/") => {
+                crate::extensions::hub_bot::handle(self, &args).await
+            }
             s if s.starts_with("x.ai/terminal/") => {
                 crate::extensions::terminal::handle(self, &args).await
             }

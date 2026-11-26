@@ -268,11 +268,14 @@ pub(crate) async fn run_shell_child(
         &ctx,
         &mut definition,
     );
-    let is_review = request.subagent_type == crate::extensions::review_chat::AGENT_NAME;
-    if is_review {
+    let internal_definition = crate::extensions::internal_definition(&request.subagent_type);
+    let is_internal = internal_definition.is_some();
+    if let Some(internal_definition) = internal_definition {
         // This internal profile cannot be widened by harness presets, hooks,
         // role/persona configuration, or parent tool-definition injection.
-        definition = crate::extensions::review_chat::definition();
+        // It is not a hub member either, so no agent can wake it.
+        definition = internal_definition;
+        ctx.agent_bus = None;
         ctx.apply_session_cli_overrides(&mut definition);
         ctx.client_hooks = Default::default();
         ctx.hook_registry = None;
@@ -316,7 +319,7 @@ pub(crate) async fn run_shell_child(
         config_effort_pin,
     );
     let prompt = request.prompt.clone();
-    if is_review {
+    if is_internal {
         effective_runtime = Default::default();
         effective_runtime.capability_mode = Some(xai_tool_types::SubagentCapabilityMode::ReadOnly);
     }
@@ -729,7 +732,7 @@ pub(crate) async fn run_shell_child(
         .spawn_depth
         .unwrap_or(ctx.parent_depth + 1);
     let tools_before_policy = definition.tool_config.tools.len();
-    let allow_nested_subagents = !is_review && child_depth < ctx.subagents_max_depth;
+    let allow_nested_subagents = !is_internal && child_depth < ctx.subagents_max_depth;
     xai_grok_subagent_resolution::apply_child_tool_policy(
         &mut definition,
         effective_runtime.capability_mode,

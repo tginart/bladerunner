@@ -5,15 +5,17 @@
 //! Distinct from the workspace remote hub (`xai_grok_workspace::hub`).
 
 mod bus;
+mod read_tool;
 pub mod store;
 
 pub use bus::InputGuard;
 pub use bus::{
     AgentBus, ChannelView, DeliveredMessage, Delivery, HubView, JoinOutcome, LOOP_GUARD_WAKES,
-    MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, ensure_person,
-    format_messages, image_paths, mark_read, parse_delivery, person_handle_in, post_as_person,
-    reply_as_person,
+    MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, answer_as_bot, ask_bot,
+    ensure_person, format_messages, image_paths, mark_read, parse_delivery, person_handle_in,
+    post_as_person, reply_as_person,
 };
+pub use read_tool::{HUB_READ_TOOL_NAME, HubReadInput, HubReadOp, HubReadOutput, HubReadTool};
 pub use store::{Activity, Member, MemberKind, Message, Presence};
 
 use std::path::PathBuf;

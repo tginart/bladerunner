@@ -105,6 +105,7 @@ pub enum ToolInput {
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
     NShot(crate::implementations::grok_build::n_shot::NShotToolInput),
     AgentHub(AgentHubInput),
+    HubRead(crate::implementations::grok_build::agent_hub::HubReadInput),
     DapDebug(DapDebugInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),

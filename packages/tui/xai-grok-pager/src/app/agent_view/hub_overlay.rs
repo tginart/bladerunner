@@ -20,6 +20,7 @@ impl AgentView {
         match self.load_hub_browser(hub, channel) {
             Ok(mut browser) => {
                 browser.composer.set_history(self.hub_post_history.clone());
+                browser.is_bot_thinking = !self.hub_bot_children.is_empty();
                 self.hub_browser = Some(browser);
                 self.show_goal_detail = false;
                 self.show_workflows = false;
@@ -74,6 +75,11 @@ impl AgentView {
             }
             HubKeyOutcome::GoToMember(handle) => return Some(self.go_to_hub_member(&handle)),
             HubKeyOutcome::StopMember(handle) => return Some(self.stop_hub_member(&handle)),
+            HubKeyOutcome::Post { to, text } | HubKeyOutcome::Reply { to, text, .. }
+                if is_bot_target(&to) =>
+            {
+                return Some(self.ask_hub_bot(&text));
+            }
             HubKeyOutcome::Post { to, text } => {
                 let result =
                     agent_hub::post_as_person(&browser.hub, browser.person_name(), &to, &text, &[]);
@@ -91,6 +97,51 @@ impl AgentView {
             }
         }
         Some(InputOutcome::Changed)
+    }
+
+    /// Purpose: Write a question of the person to hub-bot and start the run.
+    /// Input: The question text.
+    /// Output: The action that runs the question, or a notice when it cannot run.
+    /// Note: The next question resumes the last run, when this session made it.
+    fn ask_hub_bot(&mut self, text: &str) -> InputOutcome {
+        let session_id = self.session.session_id.as_ref().map(|s| s.0.to_string());
+        let Some(browser) = self.hub_browser.as_mut() else {
+            return InputOutcome::Changed;
+        };
+        let Some(session_id) = session_id else {
+            browser.notice = Some("hub-bot needs a connected session.".to_string());
+            return InputOutcome::Changed;
+        };
+        if browser.is_bot_thinking {
+            browser.notice = Some("hub-bot still works on the last question.".to_string());
+            return InputOutcome::Changed;
+        }
+        let to = format!("@{}", store::BOT_HANDLE);
+        let question = match agent_hub::ask_bot(&browser.hub, browser.person_name(), text) {
+            Ok(question) => question,
+            Err(error) => {
+                finish_hub_post(browser, &to, Err(error));
+                return InputOutcome::Changed;
+            }
+        };
+        finish_hub_post(browser, &to, Ok(question.id.clone()));
+        browser.is_bot_thinking = true;
+        let previous_child_id = browser
+            .hub
+            .bot_thread(&question.from)
+            .filter(|thread| thread.session_id == session_id)
+            .map(|thread| thread.child_id);
+        let request = xai_grok_shell::extensions::hub_bot::AskRequest {
+            session_id,
+            child_id: uuid::Uuid::new_v4().to_string(),
+            previous_child_id,
+            hub: browser.hub.name().to_string(),
+            person: question.from,
+            question: text.to_string(),
+        };
+        let hub = browser.hub.clone();
+        self.hub_bot_children.insert(request.child_id.clone());
+        InputOutcome::Action(Action::AskHubBot { hub, request })
     }
 
     /// Purpose: Show the session of a hub member.
@@ -183,6 +234,11 @@ impl AgentView {
 }
 
 /// Read the hub again after a post, then show the post result.
+/// True when a post goes to hub-bot, which answers instead of a member.
+fn is_bot_target(to: &str) -> bool {
+    to.trim().trim_start_matches('@') == store::BOT_HANDLE
+}
+
 fn finish_hub_post(browser: &mut HubBrowserState, to: &str, result: anyhow::Result<String>) {
     // The post can reserve a new person handle, so read it before the notice.
     if let Err(error) = browser.reload() {
@@ -295,6 +351,33 @@ mod tests {
         assert_eq!(view.hub_browser.as_ref().unwrap().feed_scroll, 4);
     }
 
+    #[test]
+    fn a_post_to_hub_bot_writes_the_question_and_asks_the_bot() {
+        let (_root, mut view, bus) = browser_with_agent();
+        view.session.session_id = Some(agent_client_protocol::SessionId::new("root"));
+        let browser = view.hub_browser.as_mut().unwrap();
+        browser.open_dm_with(store::BOT_HANDLE);
+        assert!(browser.is_bot_dm());
+        view.handle_hub_browser_input(&key_event(KeyCode::Tab));
+        view.handle_hub_browser_input(&Event::Paste("who works on login?".to_string()));
+        let outcome = view.handle_hub_browser_input(&key_event(KeyCode::Enter));
+        let Some(InputOutcome::Action(Action::AskHubBot { hub, request })) = outcome else {
+            panic!("expected an ask, got {outcome:?}");
+        };
+        assert_eq!(hub.dir(), bus.hub().dir());
+        assert_eq!(request.question, "who works on login?");
+        assert_eq!(request.person, "me");
+        assert_eq!(request.session_id, "root");
+        assert_eq!(request.previous_child_id, None);
+        assert!(view.hub_bot_children.contains(&request.child_id));
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert!(browser.is_bot_thinking);
+        assert!(browser.composer.is_empty());
+        assert_eq!(browser.feed.last().unwrap().text, "who works on login?");
+        let again = view.handle_hub_browser_input(&key_event(KeyCode::Tab));
+        assert!(matches!(again, Some(InputOutcome::Changed)));
+    }
+
     fn key_event(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
@@ -324,6 +407,7 @@ mod tests {
     #[test]
     fn post_to_a_gone_recipient_keeps_the_draft_and_destination() {
         let (_root, mut view, bus) = browser_with_agent();
+        view.handle_hub_browser_input(&key_event(KeyCode::Down));
         view.handle_hub_browser_input(&key_event(KeyCode::Down));
         assert_eq!(
             view.hub_browser.as_ref().unwrap().post_target().as_deref(),

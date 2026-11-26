@@ -336,6 +336,8 @@ pub struct HubBrowserState {
     focus_message: Option<String>,
     /// True until the next frame scrolls the focus message into view.
     scroll_to_focus: bool,
+    /// True while hub-bot works on a question of the person.
+    pub is_bot_thinking: bool,
     hits: HitAreas,
 }
 
@@ -376,6 +378,7 @@ impl HubBrowserState {
             show_help: false,
             focus_message: None,
             scroll_to_focus: false,
+            is_bot_thinking: false,
             hits: HitAreas::default(),
         };
         let rows = state.rows();
@@ -407,6 +410,12 @@ impl HubBrowserState {
 
     pub fn is_person_view(&self) -> bool {
         self.perspective == self.person
+    }
+
+    /// True when the person looks at the DM with hub-bot.
+    pub fn is_bot_dm(&self) -> bool {
+        self.is_person_view()
+            && matches!(self.selected_row(), Some(Row::Dm { peer, .. }) if peer == store::BOT_HANDLE)
     }
 
     /// Purpose: Read the hub again and keep the selected row when it still exists.
@@ -817,7 +826,8 @@ impl HubBrowserState {
     /// Output: None. The view changes to the person when it shows another
     ///     member. The own handle and unknown handles change nothing.
     pub fn open_dm_with(&mut self, handle: &str) {
-        if handle == self.person || self.snapshot.meta.member(handle).is_none() {
+        let is_member = handle == store::BOT_HANDLE || self.snapshot.meta.member(handle).is_some();
+        if handle == self.person || !is_member {
             return;
         }
         if !self.is_person_view() {
@@ -1381,6 +1391,11 @@ pub fn load_snapshot(
             dm_peers.push(peer);
         }
     }
+    // hub-bot is always there for the person, at the top of the DMs.
+    dm_peers.retain(|peer| peer != store::BOT_HANDLE);
+    if perspective == person {
+        dm_peers.insert(0, store::BOT_HANDLE.to_string());
+    }
     Ok(HubSnapshot {
         meta,
         dm_peers,
@@ -1435,10 +1450,11 @@ fn sidebar_rows_with_selection(
 
 /// True when `peer` is a person or a live agent.
 fn is_active_peer(snapshot: &HubSnapshot, peer: &str) -> bool {
-    snapshot
-        .meta
-        .member(peer)
-        .is_some_and(|m| m.kind == MemberKind::Person || m.active)
+    peer == store::BOT_HANDLE
+        || snapshot
+            .meta
+            .member(peer)
+            .is_some_and(|m| m.kind == MemberKind::Person || m.active)
 }
 
 /// Where a post from the person goes for `row`.
@@ -1825,7 +1841,9 @@ fn span_target(text: &str, part: Part, meta: &store::HubMeta) -> Option<SpanTarg
                 return Some(SpanTarget::Channel(name.to_string()));
             }
             let handle = text.strip_prefix('@')?;
-            meta.member(handle)?;
+            if handle != store::BOT_HANDLE {
+                meta.member(handle)?;
+            }
             Some(SpanTarget::Member(handle.to_string()))
         }
         Part::Link => {
@@ -2123,7 +2141,7 @@ fn render_sidebar_row(
     };
     let unread = row.conv().map(|conv| snapshot.unread(&conv)).unwrap_or(0);
     let is_dim = match row {
-        Row::Dm { peer, .. } => snapshot.meta.member(peer).is_none_or(|m| !m.active),
+        Row::Dm { peer, .. } => !is_active_peer(snapshot, peer),
         _ => false,
     };
     let mut name_style = Style::default().bg(bg).fg(if is_dim {
@@ -2387,6 +2405,7 @@ fn render_feed(
         .map(|m| format!("@{}", m.handle))
         .collect();
     mentions.insert(format!("@{}", store::HERE_MENTION));
+    mentions.insert(format!("@{}", store::BOT_HANDLE));
     mentions.extend(meta.channels.iter().map(|c| format!("#{}", c.name)));
     let names = FeedNames {
         persons: &persons,
@@ -2643,6 +2662,7 @@ fn render_compose(
         .and_then(|id| state.feed.iter().find(|m| m.id == *id))
         .map(|parent| parent.from.clone());
     let title = match replying_to {
+        _ if state.is_bot_dm() && state.is_bot_thinking => " hub-bot is thinking… ".to_string(),
         Some(author) if state.is_person_view() => format!(" reply to @{author} in {to} "),
         _ if state.is_person_view() && !state.composer.is_empty() => format!(" to {to} "),
         _ => String::new(),
@@ -2696,7 +2716,11 @@ fn render_compose(
             buf,
             text_area.x,
             text_area.y,
-            &format!("Message {to}"),
+            &if state.is_bot_dm() {
+                "Ask @hub-bot about this hub, such as \"who works on login?\"".to_string()
+            } else {
+                format!("Message {to}")
+            },
             theme.muted(),
             text_area.right(),
         );
@@ -2914,6 +2938,14 @@ struct MemberState {
 /// Output: The status glyph, its color, a short status word, and the task.
 /// Note: A member that is not live is `gone`, whatever its last presence says.
 fn member_state(snapshot: &HubSnapshot, handle: &str, now_ms: u64, theme: &Theme) -> MemberState {
+    if handle == store::BOT_HANDLE {
+        return MemberState {
+            glyph: "✦ ",
+            color: theme.accent_plan,
+            word: "helper".to_string(),
+            task: None,
+        };
+    }
     let Some(member) = snapshot.meta.member(handle) else {
         return MemberState {
             glyph: "○ ",
@@ -2971,6 +3003,9 @@ fn member_summary(snapshot: &HubSnapshot, handle: &str, theme: &Theme) -> String
             format!("{} · {}", member.label, member_state.word)
         }
         Some(_) => member_state.word,
+        None if handle == store::BOT_HANDLE => {
+            "read-only helper · ask what is going on and who works on what".to_string()
+        }
         None => "left the hub".to_string(),
     };
     if let Some(task) = member_state.task {
@@ -3199,7 +3234,7 @@ fn render_search(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, them
 /// Input: The buffer, the browser area, and the theme.
 /// Output: None. Any key or click closes it.
 fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
-    const KEYS: [(&str, &str); 16] = [
+    const KEYS: [(&str, &str); 17] = [
         ("↑ ↓ / j k", "choose a conversation"),
         ("] [", "next / previous unread conversation"),
         ("Tab / i / Enter", "write a post"),
@@ -3207,6 +3242,7 @@ fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
         ("@ #", "complete a member or a channel"),
         ("r", "reply to the newest message"),
         ("/", "search the whole hub"),
+        ("@hub-bot DM", "ask a helper about the hub"),
         ("g", "go to the session of the DM agent"),
         ("x x", "stop the DM agent"),
         ("p", "view the hub as another member"),
@@ -3409,6 +3445,7 @@ mod tests {
                 Row::Section("Channels"),
                 Row::Channel("general".to_string()),
                 Row::Section("Direct messages"),
+                dm(store::BOT_HANDLE, "me"),
                 dm("front", "me"),
                 dm("back", "me"),
             ]
@@ -3420,6 +3457,8 @@ mod tests {
         assert_eq!(state.feed.len(), 1);
         assert_eq!(state.post_target().as_deref(), Some("#general"));
 
+        state.handle_key(&key(KeyCode::Down));
+        assert_eq!(state.post_target().as_deref(), Some("@hub-bot"));
         state.handle_key(&key(KeyCode::Down));
         assert_eq!(state.selected_row(), Some(dm("front", "me")));
         assert_eq!(state.feed.len(), 1);
@@ -3584,8 +3623,7 @@ mod tests {
     fn reload_does_not_redirect_a_draft_when_its_row_disappears() {
         let (_root, hub) = hub_with_dms();
         let mut state = open(hub);
-        state.handle_key(&key(KeyCode::Down));
-        assert_eq!(state.selected_row(), Some(dm("front", "me")));
+        state.select(Some(dm("front", "me")));
         state.handle_key(&key(KeyCode::Tab));
         state.handle_paste("for front only");
         state
@@ -3615,6 +3653,7 @@ mod tests {
         state.handle_key(&key(KeyCode::Tab));
         state.handle_paste("hello");
         state.handle_key(&key(KeyCode::Esc));
+        state.handle_key(&key(KeyCode::Down));
         state.handle_key(&key(KeyCode::Down));
         assert_eq!(state.selected_row(), Some(dm("front", "me")));
         state.handle_key(&key(KeyCode::Tab));
@@ -3805,6 +3844,7 @@ mod tests {
         .unwrap();
         let mut state = open(hub);
         state.handle_key(&key(KeyCode::Char('a')));
+        state.handle_key(&key(KeyCode::Down));
         state.handle_key(&key(KeyCode::Down));
 
         assert_eq!(state.snapshot.unread(&conv), 0);
@@ -4676,5 +4716,41 @@ mod tests {
             Some(Row::Channel("general".to_string())),
             "the closing key does nothing else"
         );
+    }
+
+    #[test]
+    fn hub_bot_is_the_first_dm_of_the_person_only() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        let rows = state.rows();
+        let dms = rows
+            .iter()
+            .position(|r| *r == Row::Section(DM_SECTION))
+            .unwrap();
+        assert_eq!(rows[dms + 1], dm(store::BOT_HANDLE, "me"));
+        state.toggle_dm_filter().unwrap();
+        assert!(state.rows().contains(&dm(store::BOT_HANDLE, "me")));
+        state.set_perspective("front").unwrap();
+        assert!(
+            !state
+                .rows()
+                .iter()
+                .any(|r| matches!(r, Row::Dm { peer, .. } if peer == store::BOT_HANDLE))
+        );
+    }
+
+    #[test]
+    fn a_click_on_at_hub_bot_opens_its_dm_with_an_ask_prompt() {
+        let (_root, mut state) = open_with_general_post("ask @hub-bot");
+        let cell = span_cell(&state, &SpanTarget::Member(store::BOT_HANDLE.to_string()));
+        click(&mut state, cell);
+        assert!(state.is_bot_dm());
+        assert_eq!(state.post_target().as_deref(), Some("@hub-bot"));
+        let text = buffer_text(&render(&mut state));
+        assert!(text.contains("Ask @hub-bot about this hub"), "{text}");
+        assert!(text.contains("read-only helper"), "{text}");
+        state.is_bot_thinking = true;
+        let text = buffer_text(&render(&mut state));
+        assert!(text.contains("hub-bot is thinking"), "{text}");
     }
 }

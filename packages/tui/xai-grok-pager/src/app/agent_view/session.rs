@@ -189,6 +189,7 @@ impl AgentView {
             show_goal_detail: false,
             hub_browser: None,
             hub_post_history: Vec::new(),
+            hub_bot_children: Default::default(),
             file_browser: None,
             turn_start_ms: None,
             turn_start_ms_prompt: None,

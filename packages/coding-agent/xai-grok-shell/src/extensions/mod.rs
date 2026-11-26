@@ -9,6 +9,7 @@ pub mod feedback;
 pub mod fs;
 pub mod git;
 pub mod hooks;
+pub mod hub_bot;
 pub mod hunk_tracker;
 pub mod interject;
 pub mod jj;
@@ -89,3 +90,16 @@ pub(crate) fn to_ext_response_partial<T: Serialize>(
 /// Empty response for operations that return no data.
 #[derive(Debug, Serialize)]
 pub struct Empty {}
+
+/// Purpose: Give the fixed profile of an internal child that the UI owns.
+/// Input: The subagent type.
+/// Output: The review chat or hub-bot profile, or None for any other type.
+pub(crate) fn internal_definition(
+    subagent_type: &str,
+) -> Option<xai_grok_agent::config::AgentDefinition> {
+    match subagent_type {
+        review_chat::AGENT_NAME => Some(review_chat::definition()),
+        hub_bot::AGENT_NAME => Some(hub_bot::definition()),
+        _ => None,
+    }
+}
