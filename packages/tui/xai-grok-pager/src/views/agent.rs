@@ -428,8 +428,11 @@ impl AgentViewLayout {
     Note: The scrollbar and the rail keep their offset from the right edge.
     */
     pub fn confine_scrollback(&mut self, conversation: Rect) {
+        // Edge checks, not `Rect::contains`: an empty rectangle contains no
+        // position, but a zero-size conversation is still a valid result.
         assert!(
-            self.scrollback.contains(conversation.as_position())
+            conversation.x >= self.scrollback.x
+                && conversation.y >= self.scrollback.y
                 && conversation.right() <= self.scrollback.right()
                 && conversation.bottom() <= self.scrollback.bottom(),
             "conversation {conversation:?} must be inside {:?}",

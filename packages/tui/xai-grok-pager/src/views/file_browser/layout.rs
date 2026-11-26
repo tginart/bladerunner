@@ -59,7 +59,7 @@ pub(crate) fn split_area(
     let is_too_small = match layout {
         BrowserLayout::Full => true,
         BrowserLayout::Top => area.height < MIN_SPLIT_HEIGHT,
-        _ => area.width < MIN_SPLIT_WIDTH,
+        _ => area.width < MIN_SPLIT_WIDTH || area.height == 0,
     };
     if is_too_small {
         return (area, None);
@@ -121,6 +121,14 @@ mod tests {
         assert_eq!(split_area(BrowserLayout::Left, narrow, 0), (narrow, None));
         let short = Rect { height: 8, ..AREA };
         assert_eq!(split_area(BrowserLayout::Top, short, 0), (short, None));
+        let empty = Rect { height: 0, ..AREA };
+        for layout in [
+            BrowserLayout::Top,
+            BrowserLayout::Left,
+            BrowserLayout::Right,
+        ] {
+            assert_eq!(split_area(layout, empty, 0), (empty, None));
+        }
     }
 
     #[test]
