@@ -513,6 +513,9 @@ pub struct SubagentResult {
     /// `get_command_or_subagent_output`), so the tool returns a `task_id` notice
     /// instead of a completion. Never set for natively backgrounded subagents.
     pub backgrounded: bool,
+    /// Set with `backgrounded` when the user moved the child to the background
+    /// (cancel panel "Move to background"), not the await budget.
+    pub backgrounded_by_user: bool,
 }
 
 impl Default for SubagentResult {
@@ -535,6 +538,7 @@ impl Default for SubagentResult {
             worktree_path: None,
             worktree_base_commit: None,
             backgrounded: false,
+            backgrounded_by_user: false,
         }
     }
 }
@@ -978,6 +982,13 @@ pub enum SubagentEvent {
     /// permanently block the next prompt.
     OpenSpawnAdmission {
         parent_session_id: String,
+    },
+    /// User request: hand every foreground (turn-blocking) Task child of
+    /// `parent_session_id` to the background. The children keep running.
+    /// `respond_to` gets the number of callers that were handed off.
+    BackgroundParentSession {
+        parent_session_id: String,
+        respond_to: oneshot::Sender<usize>,
     },
     Outstanding(SubagentOutstandingRequest),
     ClearUsageNotApplied(SubagentClearUsageNotAppliedRequest),

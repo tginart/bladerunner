@@ -109,6 +109,20 @@ pub struct CancelSubagentResponse {
 
 // ── Subagent list_running DTOs ────────────────────────────────────────────
 
+/// `x.ai/subagent/background`: move the session's foreground subagents to the
+/// background. The subagents keep running; the parent turn continues.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundSubagentsRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundSubagentsResponse {
+    backgrounded_count: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListRunningSubagentsRequest {
@@ -448,6 +462,18 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                         provenance,
                     )
                 }),
+            }))
+        }
+        "x.ai/subagent/background" => {
+            let req: BackgroundSubagentsRequest = parse(args)?;
+            let backgrounded_count = agent.background_session_subagents(&req.session_id).await;
+            tracing::info!(
+                session_id = %req.session_id,
+                backgrounded_count,
+                "Moved foreground subagents to background via ext method",
+            );
+            respond(Ok::<_, String>(BackgroundSubagentsResponse {
+                backgrounded_count,
             }))
         }
         "x.ai/subagent/list_running" => {

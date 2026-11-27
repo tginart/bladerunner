@@ -184,6 +184,9 @@ pub(super) fn dispatch_cancel_turn_choice(
     choice: crate::views::modal::CancelTurnChoice,
 ) -> Vec<Effect> {
     use crate::views::modal::CancelTurnChoice;
+    if choice == CancelTurnChoice::MoveToBackground {
+        return dispatch_background_subagents(app);
+    }
     let cancel_subagents = matches!(
         choice,
         CancelTurnChoice::StopRunning | CancelTurnChoice::AlwaysStop
@@ -219,10 +222,30 @@ pub(super) fn dispatch_cancel_turn_choice(
         }
         // One-shot choices: apply only to this cancel; global/session pref unchanged.
         CancelTurnChoice::StopRunning | CancelTurnChoice::ContinueToRun => {}
+        CancelTurnChoice::MoveToBackground => unreachable!("handled above"),
     }
 
     effects.extend(do_cancel_turn(app, cancel_subagents));
     effects
+}
+
+/// "Move to background" on the cancel panel: close the panel and keep the turn
+/// running. The shell hands each foreground subagent to the background, and
+/// each waiting Task call returns a "moved to background per user request"
+/// notice to the parent agent.
+fn dispatch_background_subagents(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    agent.cancel_turn_view = None;
+    agent.cancel_turn_buttons.clear();
+    let Some(session_id) = agent.session.session_id.clone() else {
+        return vec![];
+    };
+    vec![Effect::BackgroundSubagents { session_id }]
 }
 
 /// The subagent that a cancel targets instead of the root turn.

@@ -1733,6 +1733,7 @@ pub(crate) async fn run_shell_child(
                             .map(|p| p.to_string_lossy().to_string()),
                         worktree_base_commit: None,
                         backgrounded: false,
+                        backgrounded_by_user: false,
                     }
                 }
                 Ok(Ok(crate::session::commands::PromptTurnOk {
@@ -1765,6 +1766,7 @@ pub(crate) async fn run_shell_child(
                         .map(|p| p.to_string_lossy().to_string()),
                     worktree_base_commit: None,
                     backgrounded: false,
+                    backgrounded_by_user: false,
                 },
                 Ok(Ok(crate::session::commands::PromptTurnOk {
                     structured_output, ..

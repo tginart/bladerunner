@@ -128,13 +128,18 @@ impl ModalConfirmation<ResetSettingsResult> {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelTurnChoice {
+    /// Keep the turn and the subagents running; hand the foreground subagents
+    /// to the background so the parent agent can continue.
+    MoveToBackground,
     StopRunning,
     ContinueToRun,
     AlwaysStop,
     AlwaysContinue,
 }
 impl CancelTurnChoice {
-    pub const ALL: [CancelTurnChoice; 4] = [
+    /// Row order. The row index is also the shortcut digit (0-4).
+    pub const ALL: [CancelTurnChoice; 5] = [
+        CancelTurnChoice::MoveToBackground,
         CancelTurnChoice::StopRunning,
         CancelTurnChoice::ContinueToRun,
         CancelTurnChoice::AlwaysStop,
@@ -142,6 +147,7 @@ impl CancelTurnChoice {
     ];
     pub fn label(&self) -> &'static str {
         match self {
+            Self::MoveToBackground => "Move to background",
             Self::StopRunning => "Stop running",
             Self::ContinueToRun => "Continue to run",
             Self::AlwaysStop => "Always stop",
@@ -884,8 +890,8 @@ pub fn render_modal_overlay(
     }
     ModalRenderResult { buttons }
 }
-/// vpad(1) + title(1) + count(1) + gap(1) + 4 options + vpad(1) = 9
-const CANCEL_TURN_PANEL_HEIGHT: u16 = 9;
+/// vpad(1) + title(1) + count(1) + gap(1) + 5 options + vpad(1) = 10
+const CANCEL_TURN_PANEL_HEIGHT: u16 = 10;
 pub fn cancel_turn_panel_height(screen_h: u16) -> u16 {
     let cap = (screen_h as u32 * 33 / 100)
         .max(8)
@@ -960,7 +966,7 @@ pub fn render_cancel_turn_panel(
         } else {
             "\u{25CB}"
         };
-        let num = (i + 1).to_string();
+        let num = i.to_string();
         let num_style = Style::default().fg(theme.accent_user).bg(row_bg);
         let marker_style = if is_cursor {
             Style::default().fg(theme.accent_user).bg(row_bg)

@@ -626,9 +626,10 @@ impl xai_tool_runtime::Tool for TaskTool {
         }
         let result = result?;
 
-        // 5b. The await budget expired and the coordinator auto-backgrounded the
-        // still-running child — return a task_id to poll, like the background
-        // branch above (the result arrives via auto-wake or a later poll).
+        // 5b. The await budget expired (or the user chose "Move to background")
+        // and the coordinator handed off the still-running child — return a
+        // task_id to poll, like the background branch above (the result
+        // arrives via auto-wake or a later poll).
         if result.backgrounded {
             let (task_output_tool, task_ids_param, timeout_ms_param) =
                 resolve_background_notice_names(&resources).await;
@@ -647,7 +648,12 @@ impl xai_tool_runtime::Tool for TaskTool {
             let continue_parent =
                 detect_continue_parent_work(&resources, &input.description, &input.prompt).await;
 
-            let text = xai_tool_types::format_subagent_auto_backgrounded(
+            let format_notice = if result.backgrounded_by_user {
+                xai_tool_types::format_subagent_user_backgrounded
+            } else {
+                xai_tool_types::format_subagent_auto_backgrounded
+            };
+            let text = format_notice(
                 &id,
                 &input.subagent_type,
                 &input.description,

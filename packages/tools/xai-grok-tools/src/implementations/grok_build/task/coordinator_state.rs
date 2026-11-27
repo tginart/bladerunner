@@ -550,17 +550,42 @@ pub(super) fn background_at_deadline(
         "foreground subagent exceeded await budget; auto-backgrounding (child keeps running)",
     );
     if let Some(respond_to) = child.take_reply() {
-        // Interim handoff, not a completion: keep `success: false` (default)
-        // so `SubagentResult::status()` consumers cannot record a completed
-        // status for a still-running child. Callers branch on `backgrounded`.
-        let _ = respond_to.send(SubagentResult {
-            backgrounded: true,
-            subagent_id: child.id().to_owned(),
-            child_session_id: child.child_session_id().to_owned(),
-            ..Default::default()
-        });
+        send_backgrounded(child, respond_to, /* by_user */ false);
     }
     child.mark_backgrounded();
+}
+
+/// Hand a foreground Task child to the background because the user asked.
+/// The child keeps running. Returns true when a waiting caller was handed off.
+/// A child with no waiting caller is not changed.
+pub(super) fn background_by_user(child: &mut impl ForegroundChild) -> bool {
+    let Some(respond_to) = child.take_reply() else {
+        return false;
+    };
+    tracing::info!(
+        subagent_id = child.id(),
+        "user moved foreground subagent to background (child keeps running)",
+    );
+    send_backgrounded(child, respond_to, /* by_user */ true);
+    child.mark_backgrounded();
+    true
+}
+
+fn send_backgrounded(
+    child: &impl ForegroundChild,
+    respond_to: oneshot::Sender<SubagentResult>,
+    by_user: bool,
+) {
+    // Interim handoff, not a completion: keep `success: false` (default)
+    // so `SubagentResult::status()` consumers cannot record a completed
+    // status for a still-running child. Callers branch on `backgrounded`.
+    let _ = respond_to.send(SubagentResult {
+        backgrounded: true,
+        backgrounded_by_user: by_user,
+        subagent_id: child.id().to_owned(),
+        child_session_id: child.child_session_id().to_owned(),
+        ..Default::default()
+    });
 }
 
 /// Handle a foreground child whose spawn caller dropped the result channel

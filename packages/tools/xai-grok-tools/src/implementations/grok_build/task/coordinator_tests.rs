@@ -347,6 +347,58 @@ async fn foreground_deadline_hands_off_without_stopping_child() {
 }
 
 #[tokio::test]
+async fn user_background_hands_off_session_callers_without_stopping_children() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("fg", false)).await }
+    });
+    let mut other_req = request("other", false);
+    other_req.parent_session_id = "other".to_owned();
+    let other = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(other_req).await }
+    });
+    let mut harness_req = request("harness-internal", false);
+    harness_req.await_to_completion = true;
+    let internal = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(harness_req).await }
+    });
+    for _ in 0..3 {
+        harness.requests.recv().await.unwrap();
+    }
+
+    let count = parent_backend(&harness).background_parent_session().await;
+
+    assert_eq!(count, 1, "only the parent's Task caller is handed off");
+    let interim = spawn.await.unwrap().unwrap();
+    assert!(interim.backgrounded && interim.backgrounded_by_user);
+    assert!(!interim.success);
+    assert!(!other.is_finished(), "other sessions keep waiting");
+    assert!(
+        !internal.is_finished(),
+        "await_to_completion callers keep waiting"
+    );
+    let running = harness.backend.query("fg", false, None).await.unwrap();
+    assert!(running.is_running(), "the child keeps running");
+
+    let _ = harness.finish.send(());
+    assert!(other.await.unwrap().unwrap().success);
+    assert!(internal.await.unwrap().unwrap().success);
+    let mut saw_backgrounded_surface = false;
+    for _ in 0..3 {
+        let disposition = harness.completions.recv().await.unwrap();
+        saw_backgrounded_surface |= disposition.backgrounded && disposition.should_surface;
+    }
+    assert!(
+        saw_backgrounded_surface,
+        "the handed-off child surfaces on completion"
+    );
+    harness.actor.abort();
+}
+
+#[tokio::test]
 async fn live_blocking_waiter_suppresses_async_surface() {
     let mut harness = harness(false, std::time::Duration::from_secs(60));
     let spawn = tokio::spawn({
