@@ -915,10 +915,7 @@ pub async fn git_info(cwd: &Path) -> Result<GitInfoData> {
 ///    (hand-added remotes never get `origin/HEAD`).
 /// 3. `init.defaultBranch` git config value (user/system preference).
 fn detect_default_branch(repo: &Repository) -> Option<String> {
-    if let Some(branch) = detect_remote_default_branch(repo) {
-        return Some(branch);
-    }
-    if let Some(branch) = guess_default_from_remote_tracking(repo) {
+    if let Some(branch) = detect_origin_default_branch(repo) {
         return Some(branch);
     }
     if let Ok(config) = repo.config()
@@ -927,6 +924,10 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
         return Some(val);
     }
     None
+}
+/// Find origin's default branch from its symbolic HEAD or a unique main/master ref.
+pub(crate) fn detect_origin_default_branch(repo: &Repository) -> Option<String> {
+    detect_remote_default_branch(repo).or_else(|| guess_default_from_remote_tracking(repo))
 }
 /// `None` when both exist — a wrong guess would make clients treat the
 /// real default branch as a feature branch (and poll PR status on it).

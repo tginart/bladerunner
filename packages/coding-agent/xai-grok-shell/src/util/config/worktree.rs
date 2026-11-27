@@ -103,6 +103,54 @@ pub fn worktree_type() -> WorktreeType {
     worktree_type_from_toml(&root)
 }
 
+/// Which commit a new worktree session starts from when no ref is given.
+///
+/// Set in config.toml under `[cli]` as `worktree_base = "origin|head"`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeBase {
+    /// Fetch `origin` and start from its default branch (e.g. `origin/main`).
+    /// Falls back to `Head` when the repo has no `origin` default branch.
+    #[default]
+    Origin,
+    /// Start from the current HEAD of the source checkout, with dirty files copied.
+    Head,
+}
+
+impl std::str::FromStr for WorktreeBase {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "origin" => Ok(Self::Origin),
+            "head" => Ok(Self::Head),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Parse `[cli] worktree_base`. Invalid or absent values give the default.
+pub(crate) fn worktree_base_from_toml(root: &TomlValue) -> WorktreeBase {
+    let Some(value) = root.get("cli").and_then(|c| c.get("worktree_base")) else {
+        return WorktreeBase::default();
+    };
+    match value.as_str().map(str::parse::<WorktreeBase>) {
+        Some(Ok(base)) => base,
+        _ => {
+            tracing::warn!("Invalid worktree_base value in config: {value:?}, ignoring");
+            WorktreeBase::default()
+        }
+    }
+}
+
+/// Synchronously get the worktree base from the config file.
+pub fn worktree_base() -> WorktreeBase {
+    match crate::config::load_effective_config() {
+        Ok(root) => worktree_base_from_toml(&root),
+        Err(_) => WorktreeBase::default(),
+    }
+}
+
 /// Returns `Some(value)` when `[cli] restore_code` is set as a boolean in config.toml.
 pub(crate) fn restore_code_from_toml(root: &TomlValue) -> Option<bool> {
     root.get("cli")
@@ -322,6 +370,32 @@ worktree_type = "invalid"
             resolve_worktree_type(&root, Some(&remote)),
             (WorktreeType::Linked, "default")
         );
+    }
+
+    // === worktree_base config tests ===
+
+    #[test]
+    fn test_worktree_base_values() {
+        let head: TomlValue = toml::from_str("[cli]\nworktree_base = \"head\"").unwrap();
+        assert_eq!(worktree_base_from_toml(&head), WorktreeBase::Head);
+        let origin: TomlValue = toml::from_str("[cli]\nworktree_base = \"origin\"").unwrap();
+        assert_eq!(worktree_base_from_toml(&origin), WorktreeBase::Origin);
+    }
+
+    #[test]
+    fn test_worktree_base_default_is_origin() {
+        let absent: TomlValue = toml::from_str("[cli]\nauto_update = true").unwrap();
+        assert_eq!(worktree_base_from_toml(&absent), WorktreeBase::Origin);
+        let no_cli: TomlValue = toml::from_str("[models]\ndefault = \"grok\"").unwrap();
+        assert_eq!(worktree_base_from_toml(&no_cli), WorktreeBase::Origin);
+    }
+
+    #[test]
+    fn test_worktree_base_invalid_falls_back_to_default() {
+        let bogus: TomlValue = toml::from_str("[cli]\nworktree_base = \"main\"").unwrap();
+        assert_eq!(worktree_base_from_toml(&bogus), WorktreeBase::Origin);
+        let wrong_type: TomlValue = toml::from_str("[cli]\nworktree_base = 1").unwrap();
+        assert_eq!(worktree_base_from_toml(&wrong_type), WorktreeBase::Origin);
     }
 
     // === restore_code config tests ===

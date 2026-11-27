@@ -774,7 +774,8 @@ pub struct PagerArgs {
     #[arg(short = 'w', long = "worktree", num_args = 0..= 1, default_missing_value = "")]
     pub worktree: Option<String>,
     /// Branch, tag, or commit to base the worktree on (with `--worktree`).
-    /// Defaults to the current HEAD of the source checkout when omitted.
+    /// When omitted, `[cli] worktree_base` decides: `origin` (default) fetches
+    /// and uses the default branch of `origin`; `head` uses the current HEAD.
     #[arg(long = "worktree-ref", visible_alias = "ref", requires = "worktree")]
     pub worktree_ref: Option<String>,
     /// Restore the original session's repository snapshot when resuming.
