@@ -626,6 +626,48 @@ pub fn format_subagent_auto_backgrounded(
     notified_on_completion: bool,
     continue_parent_work: bool,
 ) -> String {
+    format_moved_to_background(
+        "Subagent took longer than the foreground budget and was moved to the \
+         background to keep the conversation responsive.",
+        subagent_id,
+        subagent_type,
+        description,
+        naming,
+        notified_on_completion,
+        continue_parent_work,
+    )
+}
+
+/// Render the notice for a blocking spawn that the user moved to the
+/// background from the cancel panel. The child is still running.
+pub fn format_subagent_user_backgrounded(
+    subagent_id: &str,
+    subagent_type: &str,
+    description: &str,
+    naming: &BackgroundNoticeNaming,
+    notified_on_completion: bool,
+    continue_parent_work: bool,
+) -> String {
+    format_moved_to_background(
+        "Subagent was moved to the background per user request.",
+        subagent_id,
+        subagent_type,
+        description,
+        naming,
+        notified_on_completion,
+        continue_parent_work,
+    )
+}
+
+fn format_moved_to_background(
+    lead: &str,
+    subagent_id: &str,
+    subagent_type: &str,
+    description: &str,
+    naming: &BackgroundNoticeNaming,
+    notified_on_completion: bool,
+    continue_parent_work: bool,
+) -> String {
     let notify_clause = if notified_on_completion {
         " — you will be notified when it completes"
     } else {
@@ -633,8 +675,7 @@ pub fn format_subagent_auto_backgrounded(
     };
     let result_line = background_result_line(subagent_id, naming);
     let mut text = format!(
-        "Subagent took longer than the foreground budget and was moved to the \
-         background to keep the conversation responsive. It is still running{notify_clause}.\n\
+        "{lead} It is still running{notify_clause}.\n\
          subagent_id: {subagent_id}\n\
          type: {subagent_type}\n\
          description: {description}\n\n\
@@ -2118,7 +2159,10 @@ mod tests {
             is_windows: true,
             task_id_param: "task_id",
         });
-        assert_eq!(desc, "Terminate a background task, monitor, or subagent by task_id (a monitor's task_id is returned by monitor). Success also means the task had already stopped.");
+        assert_eq!(
+            desc,
+            "Terminate a background task, monitor, or subagent by task_id (a monitor's task_id is returned by monitor). Success also means the task had already stopped."
+        );
     }
 
     #[test]
@@ -2313,6 +2357,21 @@ mod tests {
                 && !poll_only.contains(BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK),
             "no leftover parent work must not get the CTA: {poll_only}"
         );
+    }
+
+    #[test]
+    fn user_backgrounded_notice_names_the_user_request() {
+        let naming = BackgroundNoticeNaming {
+            task_output_tool: "get_command_or_subagent_output",
+            task_ids_param: "task_ids",
+            timeout_ms_param: "timeout_ms",
+        };
+        let text =
+            format_subagent_user_backgrounded("sa-7", "explore", "scan", &naming, true, false);
+        assert!(text.starts_with("Subagent was moved to the background per user request."));
+        assert!(text.contains("still running — you will be notified when it completes"));
+        assert!(text.contains("subagent_id: sa-7"));
+        assert!(!text.contains("foreground budget"));
     }
 
     #[test]

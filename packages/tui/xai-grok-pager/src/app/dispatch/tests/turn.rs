@@ -837,6 +837,31 @@ fn cancel_turn_choice_stop_running_sends_cancel_true() {
 }
 
 #[test]
+fn cancel_turn_choice_move_to_background_keeps_the_turn() {
+    use crate::views::modal::{CancelTurnChoice, CancelTurnViewState};
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.state = AgentState::TurnRunning;
+    agent.cancel_turn_view = Some(CancelTurnViewState {
+        active_idx: 0,
+        running_count: 1,
+    });
+
+    let effects = dispatch(
+        Action::CancelTurnChoice(CancelTurnChoice::MoveToBackground),
+        &mut app,
+    );
+
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(&effects[0], Effect::BackgroundSubagents { .. }));
+    assert!(app.agents[&id].cancel_turn_view.is_none());
+    assert!(app.agents[&id].session.state.is_turn_running());
+    assert_eq!(app.agents[&id].cancel_subagents_preference, None);
+}
+
+#[test]
 fn cancel_turn_choice_continue_to_run_sends_cancel_false() {
     use crate::views::modal::CancelTurnChoice;
 

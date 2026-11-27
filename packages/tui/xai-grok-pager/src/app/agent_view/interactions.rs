@@ -248,8 +248,8 @@ impl AgentView {
                 let choice = CancelTurnChoice::ALL[ctv.active_idx];
                 InputOutcome::Action(Action::CancelTurnChoice(choice))
             }
-            KeyCode::Char(c @ '1'..='4') => {
-                let idx = (c as usize) - ('1' as usize);
+            KeyCode::Char(c @ '0'..='4') => {
+                let idx = (c as usize) - ('0' as usize);
                 let choice = CancelTurnChoice::ALL[idx];
                 InputOutcome::Action(Action::CancelTurnChoice(choice))
             }
@@ -1448,30 +1448,47 @@ mod cancel_turn_mouse_tests {
         }
     }
     #[test]
-    fn click_first_row_dispatches_stop_running() {
+    fn click_first_row_dispatches_move_to_background() {
         let mut agent = make_agent();
         setup_panel(&mut agent);
         let outcome = agent.handle_cancel_turn_mouse(&down(10, 10));
         match outcome {
             InputOutcome::Action(Action::CancelTurnChoice(c)) => {
-                assert_eq!(c, CancelTurnChoice::StopRunning);
+                assert_eq!(c, CancelTurnChoice::MoveToBackground);
             }
-            other => panic!("expected CancelTurnChoice(StopRunning), got {other:?}"),
+            other => panic!("expected CancelTurnChoice(MoveToBackground), got {other:?}"),
         }
         assert_eq!(agent.cancel_turn_view.as_ref().unwrap().active_idx, 0);
     }
     #[test]
-    fn click_third_row_dispatches_always_stop() {
+    fn click_fourth_row_dispatches_always_stop() {
         let mut agent = make_agent();
         setup_panel(&mut agent);
-        let outcome = agent.handle_cancel_turn_mouse(&down(10, 12));
+        let outcome = agent.handle_cancel_turn_mouse(&down(10, 13));
         match outcome {
             InputOutcome::Action(Action::CancelTurnChoice(c)) => {
                 assert_eq!(c, CancelTurnChoice::AlwaysStop);
             }
             other => panic!("expected CancelTurnChoice(AlwaysStop), got {other:?}"),
         }
-        assert_eq!(agent.cancel_turn_view.as_ref().unwrap().active_idx, 2);
+        assert_eq!(agent.cancel_turn_view.as_ref().unwrap().active_idx, 3);
+    }
+    #[test]
+    fn digit_keys_pick_the_row_with_that_number() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut agent = make_agent();
+        setup_panel(&mut agent);
+        for (digit, expected) in ['0', '1', '4'].into_iter().zip([
+            CancelTurnChoice::MoveToBackground,
+            CancelTurnChoice::StopRunning,
+            CancelTurnChoice::AlwaysContinue,
+        ]) {
+            let key = KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE);
+            match agent.handle_cancel_turn_key(&key) {
+                InputOutcome::Action(Action::CancelTurnChoice(c)) => assert_eq!(c, expected),
+                other => panic!("digit {digit}: expected {expected:?}, got {other:?}"),
+            }
+        }
     }
     #[test]
     fn click_outside_rows_consumes_event_without_action() {

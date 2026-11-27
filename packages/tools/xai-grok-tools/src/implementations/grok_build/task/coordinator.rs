@@ -24,8 +24,8 @@ use super::admission::Admission;
 use super::coordinator_state::{
     ActiveChild, BlockingWaiter, BufferedCompletion, ChildRecord, CompletedChild, InternalEvent,
     ListRequest, PendingChild, ProgressFuture, ProgressTarget, ReplyFuture, TaggedFuture,
-    active_summary, background_at_deadline, background_if_caller_gone, completed_snapshot,
-    completion_summary, sleep_until, workflow_outstanding,
+    active_summary, background_at_deadline, background_by_user, background_if_caller_gone,
+    completed_snapshot, completion_summary, sleep_until, workflow_outstanding,
 };
 use super::types::{
     SpawnedSubagentRef, SubagentCancelOutcome, SubagentCancelTarget, SubagentDescribeOutcome,
@@ -306,6 +306,13 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 if !self.teardown_drains.contains_key(&parent_session_id) {
                     self.spawn_blocked_sessions.remove(&parent_session_id);
                 }
+            }
+            SubagentEvent::BackgroundParentSession {
+                parent_session_id,
+                respond_to,
+            } => {
+                let count = self.background_session_by_user(&parent_session_id);
+                let _ = respond_to.send(count);
             }
             SubagentEvent::Outstanding(request) => {
                 // Reap again here so turn-freeze / Outstanding polls see
@@ -1004,6 +1011,47 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             )
             .chain(self.teardown_drains.values().map(|drain| drain.deadline))
             .min()
+    }
+
+    /// Hand off every waiting Task caller of `parent_session_id` (pending,
+    /// active and queued children) to the background. Returns the count.
+    /// Harness callers that need the final result (`await_to_completion`)
+    /// and workflow children are not changed.
+    fn background_session_by_user(&mut self, parent_session_id: &str) -> usize {
+        let is_target = |request: &SubagentRequest| {
+            request.parent_session_id == parent_session_id
+                && !request.await_to_completion
+                && !request.owner.is_workflow()
+        };
+        let mut count = 0;
+        for child in self.pending.values_mut() {
+            if is_target(&child.request) {
+                count += usize::from(background_by_user(child));
+            }
+        }
+        for child in self.active.values_mut() {
+            if is_target(&child.request) {
+                count += usize::from(background_by_user(child));
+            }
+        }
+        for queued in self.queued.iter_mut() {
+            if !is_target(&queued.request) {
+                continue;
+            }
+            let caller = std::mem::replace(&mut queued.caller, QueuedCaller::Backgrounded);
+            let Some(result_tx) = caller.into_spawn_reply() else {
+                continue;
+            };
+            let _ = result_tx.send(SubagentResult {
+                backgrounded: true,
+                backgrounded_by_user: true,
+                subagent_id: queued.request.id.clone(),
+                child_session_id: queued.request.id.clone(),
+                ..Default::default()
+            });
+            count += 1;
+        }
+        count
     }
 
     fn reap_abandoned_callers(&mut self) {

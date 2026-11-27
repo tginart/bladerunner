@@ -193,6 +193,24 @@ impl ChannelBackend {
             .is_ok()
     }
 
+    /// Move this session's foreground Task children to the background on a
+    /// user request. The children keep running. Returns how many waiting
+    /// Task calls were handed off (0 when the channel is closed).
+    pub async fn background_parent_session(&self) -> usize {
+        let Some(parent_session_id) = self.parent_session_id() else {
+            return 0;
+        };
+        let (respond_to, response_rx) = oneshot::channel();
+        let event = SubagentEvent::BackgroundParentSession {
+            parent_session_id,
+            respond_to,
+        };
+        if self.tx.send(event).is_err() {
+            return 0;
+        }
+        response_rx.await.unwrap_or(0)
+    }
+
     /// Re-open Task spawns after a prior ParentSession stop (start of next turn).
     pub fn open_spawn_admission(&self) -> bool {
         let Some(parent_session_id) = self.parent_session_id() else {

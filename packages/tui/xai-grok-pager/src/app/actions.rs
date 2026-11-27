@@ -1746,6 +1746,9 @@ pub enum Effect {
         session_id: acp::SessionId,
         task_id: String,
     },
+    /// Move the session's foreground subagents to the background
+    /// (`x.ai/subagent/background`). The turn keeps running.
+    BackgroundSubagents { session_id: acp::SessionId },
     /// Demote a foreground execute tool to background.
     DemoteToBackground {
         session_id: acp::SessionId,

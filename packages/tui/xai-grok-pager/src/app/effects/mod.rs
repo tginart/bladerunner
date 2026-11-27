@@ -1935,6 +1935,23 @@ pub(crate) fn execute(
                     TaskResult::CancelComplete
                 });
         }
+        Effect::BackgroundSubagents { session_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let params = serde_json::json!({ "sessionId": session_id.0.to_string() });
+                    let req = acp::ExtRequest::new(
+                        "x.ai/subagent/background",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize subagent background params")
+                            .into(),
+                    );
+                    if let Err(e) = acp_send(req, &tx).await {
+                        tracing::warn!("Failed to move subagents to background: {e}");
+                    }
+                    TaskResult::CancelComplete
+                });
+        }
         Effect::DemoteToBackground { session_id, tool_call_id } => {
             let tx = acp_tx.clone();
             tasks

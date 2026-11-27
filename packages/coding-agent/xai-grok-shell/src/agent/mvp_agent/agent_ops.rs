@@ -2899,6 +2899,16 @@ impl MvpAgent {
             .cancel(subagent_id)
             .await
     }
+    /// Move `parent_session_id`'s foreground subagents to the background
+    /// (user request). Returns how many waiting Task calls were handed off.
+    pub(crate) async fn background_session_subagents(&self, parent_session_id: &str) -> usize {
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::for_session(
+                self.subagent_event_tx.clone(),
+                parent_session_id,
+            )
+            .background_parent_session()
+            .await
+    }
     pub(crate) async fn list_running_subagents(
         &self,
         parent_session_id: &str,
