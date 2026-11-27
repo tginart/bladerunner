@@ -1360,7 +1360,7 @@ impl AgentView {
 mod tests {
     use super::*;
     use crate::actions::ActionRegistry;
-    use crate::app::agent_view::test_fixtures::make_agent;
+    use crate::app::agent_view::test_fixtures::{make_agent, make_followup_permission_state};
     use crate::scrollback::table_geometry::CellRef;
     use crate::scrollback::text_selection::{ResolvedSelectableLine, VisibleBlockGeometry};
     use crossterm::event::{Event, MouseButton, MouseEventKind};
@@ -2556,6 +2556,91 @@ mod tests {
         agent.pane_areas.scrollback = Rect::new(0, 0, 80, 16);
         agent.pane_areas.prompt = Rect::new(0, 20, 80, 3);
         agent
+    }
+
+    /// Purpose: Prepare strip gestures above parked permission and question cards.
+    /// Input: None.
+    /// Output: Two agents with selectable text and cards parked through Esc.
+    fn agents_with_parked_cards_and_strip() -> [AgentView; 2] {
+        use crate::views::permission_view::PermissionFocus;
+        use crate::views::prompt_widget::StashedPrompt;
+        use crate::views::question_view::QuestionViewState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use xai_grok_tools::implementations::grok_build::ask_user_question::Question;
+
+        let mut permission_agent = agent_with_above_prompt_strip();
+        let mut permission = make_followup_permission_state();
+        permission.focus = PermissionFocus::Options;
+        permission_agent.permission_queue.push_back(permission);
+
+        let mut question_agent = agent_with_above_prompt_strip();
+        question_agent.question_view = Some(QuestionViewState::new(
+            "strip-question".into(),
+            vec![Question {
+                question: "Which?".into(),
+                options: Vec::new(),
+                multi_select: None,
+                id: None,
+            }],
+            StashedPrompt::default(),
+        ));
+        let registry = ActionRegistry::defaults();
+        for agent in [&mut permission_agent, &mut question_agent] {
+            agent.set_active_pane(AgentPane::Prompt, true);
+            agent.handle_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &registry,
+            );
+            assert!(agent.parked_card().is_some());
+        }
+        [permission_agent, question_agent]
+    }
+
+    /// Purpose: Verify that a strip click releases capture after it restores card focus.
+    /// Input: A parked permission or question card and a strip click.
+    /// Output: The card has focus, and no mouse gesture remains active.
+    #[test]
+    fn parked_card_strip_click_finishes_gesture() {
+        let registry = ActionRegistry::defaults();
+        for mut agent in agents_with_parked_cards_and_strip() {
+            let card = agent.parked_card();
+            agent.handle_input(&Event::Mouse(mouse_down(10, 17)), &registry);
+            assert_eq!(agent.focused_card(), card);
+
+            agent.handle_input(&Event::Mouse(mouse_up(10, 17)), &registry);
+
+            assert!(!agent.scrollback_drag_latched());
+            assert_eq!(agent.focused_card(), card);
+            assert!(agent.persistent_text_selection.is_none());
+        }
+    }
+
+    /// Purpose: Verify that a strip drag completes after it restores card focus.
+    /// Input: A parked permission or question card and a drag into transcript text.
+    /// Output: The text selection persists, and the mouse gesture ends.
+    #[test]
+    fn parked_card_strip_drag_copies_text() {
+        let registry = ActionRegistry::defaults();
+        for mut agent in agents_with_parked_cards_and_strip() {
+            let card = agent.parked_card();
+            agent.handle_input(&Event::Mouse(mouse_down(10, 17)), &registry);
+            agent.handle_input(&Event::Mouse(mouse_drag(14, 6)), &registry);
+            agent.handle_input(&Event::Mouse(mouse_drag(5, 5)), &registry);
+            let drag = agent
+                .drag_selection
+                .expect("strip drag reaches transcript text");
+            assert_eq!(drag.head.block_line_idx, 0);
+
+            agent.handle_input(&Event::Mouse(mouse_up(5, 5)), &registry);
+
+            let selection = agent
+                .persistent_text_selection
+                .expect("text copy completes");
+            assert_eq!(selection.anchor.block_line_idx, drag.anchor.block_line_idx);
+            assert_eq!(selection.head.block_line_idx, drag.head.block_line_idx);
+            assert!(!agent.scrollback_drag_latched());
+            assert_eq!(agent.focused_card(), card);
+        }
     }
 
     /// A press on the strip band arms ONLY the anchor-less latch: no block
