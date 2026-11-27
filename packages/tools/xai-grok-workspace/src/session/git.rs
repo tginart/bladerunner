@@ -105,7 +105,7 @@ pub async fn git_cli(cwd: &Path, args: &[&str]) -> Result<String> {
 /// Mutating [`git_cli`]: bump the gate epoch after the attempt. Failed
 /// commands can still change the repo (`pull --rebase` conflicts, partial
 /// checkout); skipping invalidate would keep pre-mutation snapshots.
-pub(crate) async fn git_cli_mut(cwd: &Path, args: &[&str]) -> Result<String> {
+async fn git_cli_mut(cwd: &Path, args: &[&str]) -> Result<String> {
     let result = git_cli(cwd, args).await;
     super::git_gate::invalidate(cwd);
     result
@@ -914,11 +914,8 @@ pub async fn git_info(cwd: &Path) -> Result<GitInfoData> {
 /// 2. A unique remote-tracking `origin/main` or `origin/master`
 ///    (hand-added remotes never get `origin/HEAD`).
 /// 3. `init.defaultBranch` git config value (user/system preference).
-pub(crate) fn detect_default_branch(repo: &Repository) -> Option<String> {
-    if let Some(branch) = detect_remote_default_branch(repo) {
-        return Some(branch);
-    }
-    if let Some(branch) = guess_default_from_remote_tracking(repo) {
+fn detect_default_branch(repo: &Repository) -> Option<String> {
+    if let Some(branch) = detect_origin_default_branch(repo) {
         return Some(branch);
     }
     if let Ok(config) = repo.config()
@@ -927,6 +924,10 @@ pub(crate) fn detect_default_branch(repo: &Repository) -> Option<String> {
         return Some(val);
     }
     None
+}
+/// Find origin's default branch from its symbolic HEAD or a unique main/master ref.
+pub(crate) fn detect_origin_default_branch(repo: &Repository) -> Option<String> {
+    detect_remote_default_branch(repo).or_else(|| guess_default_from_remote_tracking(repo))
 }
 /// `None` when both exist — a wrong guess would make clients treat the
 /// real default branch as a feature branch (and poll PR status on it).

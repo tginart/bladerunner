@@ -5,11 +5,13 @@
 //! explicit `--worktree-ref`. Resume, fork, and subagent worktrees use `HEAD`.
 
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use git2::Repository;
 
-use crate::session::git::{detect_default_branch, git_cli_mut};
+use crate::restore_fetch::run_fetch_command;
+use crate::session::git::detect_origin_default_branch;
 
 const REMOTE_NAME: &str = "origin";
 // Offline or slow remotes must not block worktree creation for long.
@@ -31,7 +33,7 @@ pub async fn resolve_origin_base_ref(cwd: &Path) -> Option<String> {
         .await
         .ok()
         .flatten()?;
-    fetch_origin_branch(cwd, &branch).await;
+    fetch_origin_branch(cwd, &branch, Duration::from_secs(FETCH_TIMEOUT_S)).await;
     let cwd_owned = cwd.to_path_buf();
     let branch_owned = branch.clone();
     let has_ref = tokio::task::spawn_blocking(move || has_origin_branch(&cwd_owned, &branch_owned))
@@ -51,14 +53,28 @@ pub async fn resolve_origin_base_ref(cwd: &Path) -> Option<String> {
 fn find_origin_default_branch(cwd: &Path) -> Option<String> {
     let repo = Repository::discover(cwd).ok()?;
     repo.find_remote(REMOTE_NAME).ok()?;
-    detect_default_branch(&repo)
+    detect_origin_default_branch(&repo)
 }
 
-async fn fetch_origin_branch(cwd: &Path, branch: &str) {
+/// Purpose: Fetch the origin branch and complete process teardown before the fallback.
+/// Input: The repository path, branch name, and fetch time limit.
+/// Output: No value. A failed fetch emits a warning and preserves the local ref.
+async fn fetch_origin_branch(cwd: &Path, branch: &str, timeout: Duration) {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{REMOTE_NAME}/{branch}");
-    let args = ["fetch", "--quiet", "--no-tags", REMOTE_NAME, refspec.as_str()];
-    let timeout = Duration::from_secs(FETCH_TIMEOUT_S);
-    match tokio::time::timeout(timeout, git_cli_mut(cwd, &args)).await {
+    let mut cmd = xai_tty_utils::git_command_locking();
+    cmd.current_dir(cwd)
+        .args(["fetch", "--quiet", "--no-tags", REMOTE_NAME, &refspec])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let cwd_owned = cwd.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = run_fetch_command(cmd, timeout, &refspec);
+        // A failed or timed-out fetch can still change refs before teardown.
+        crate::session::git_gate::invalidate(&cwd_owned);
+        result
+    })
+    .await;
+    match result {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(
             cwd = %cwd.display(),
@@ -66,11 +82,11 @@ async fn fetch_origin_branch(cwd: &Path, branch: &str) {
             error = %e,
             "worktree base: fetch failed; using local origin ref"
         ),
-        Err(_) => tracing::warn!(
+        Err(e) => tracing::warn!(
             cwd = %cwd.display(),
             branch,
-            timeout_s = FETCH_TIMEOUT_S,
-            "worktree base: fetch timed out; using local origin ref"
+            error = %e,
+            "worktree base: fetch task failed; using local origin ref"
         ),
     }
 }
@@ -131,6 +147,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_init_default_branch_when_origin_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q", "-b", "feature"]);
+        commit(tmp.path(), "a");
+        run_git(tmp.path(), &["remote", "add", "origin", "."]);
+        run_git(tmp.path(), &["config", "init.defaultBranch", "main"]);
+        run_git(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run_git(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/master", "HEAD"],
+        );
+
+        assert_eq!(resolve_origin_base_ref(tmp.path()).await, None);
+    }
+
+    #[test]
+    fn origin_head_and_unique_tracking_refs_take_priority_over_init_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q", "-b", "feature"]);
+        commit(tmp.path(), "a");
+        run_git(tmp.path(), &["remote", "add", "origin", "."]);
+        run_git(tmp.path(), &["config", "init.defaultBranch", "main"]);
+        assert_eq!(find_origin_default_branch(tmp.path()), None);
+
+        run_git(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/master", "HEAD"],
+        );
+        assert_eq!(
+            find_origin_default_branch(tmp.path()).as_deref(),
+            Some("master")
+        );
+        run_git(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run_git(
+            tmp.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        );
+        assert_eq!(
+            find_origin_default_branch(tmp.path()).as_deref(),
+            Some("master")
+        );
+    }
+
+    /// Purpose: Prove that a timed-out real fetch stops its transport process tree.
+    /// Input: A local repository with a transport that ignores SIGTERM.
+    /// Output: The fetch returns promptly, all recorded processes exit, and the ref stays local.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_timeout_kills_transport_processes_and_preserves_local_ref() {
+        use std::time::Instant;
+
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        commit(tmp.path(), "a");
+        run_git(tmp.path(), &["remote", "add", "origin", "."]);
+        run_git(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let local_tip = rev_parse(tmp.path(), "origin/main");
+        let transport = tmp.path().join("upload-pack.sh");
+        std::fs::write(
+            &transport,
+            "trap '' TERM\necho $$ > transport.pid\nsleep 30 &\necho $! > grandchild.pid\nwait\n",
+        )
+        .unwrap();
+        run_git(
+            tmp.path(),
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                &format!("sh '{}'", transport.display()),
+            ],
+        );
+
+        let start = Instant::now();
+        fetch_origin_branch(tmp.path(), "main", Duration::from_secs(1)).await;
+        assert!(start.elapsed() < Duration::from_secs(5));
+        for name in ["transport.pid", "grandchild.pid"] {
+            let pid: i32 = std::fs::read_to_string(tmp.path().join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let status = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8(status.stdout).unwrap();
+            assert!(
+                state.trim().is_empty() || state.trim().starts_with('Z'),
+                "live {name}: {pid}"
+            );
+        }
+        assert_eq!(rev_parse(tmp.path(), "origin/main"), local_tip);
+        assert_eq!(
+            find_origin_default_branch(tmp.path()).as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test]
     async fn fetches_latest_origin_default_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let upstream = tmp.path().join("upstream");
@@ -140,7 +268,12 @@ mod tests {
         commit(&upstream, "a");
         run_git(
             tmp.path(),
-            &["clone", "-q", upstream.to_str().unwrap(), clone.to_str().unwrap()],
+            &[
+                "clone",
+                "-q",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
         );
         // The clone is now behind: upstream has a commit the clone never fetched.
         commit(&upstream, "b");

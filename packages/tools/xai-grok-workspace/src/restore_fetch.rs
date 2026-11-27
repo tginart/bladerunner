@@ -333,12 +333,27 @@ fn fetch_refspec_from_origin(repo: &Path, spec: &str, timeout: Duration) -> Resu
         "restore_fetch: targeted fetch"
     );
 
-    let mut child = FetchChild::spawn(targeted_fetch_command(repo, spec, is_shallow))?;
-    let result = child.wait_success(timeout, spec);
+    let result = run_fetch_command(
+        targeted_fetch_command(repo, spec, is_shallow),
+        timeout,
+        spec,
+    );
     if result.is_err() {
         warn_leftover_git_locks(repo);
     }
     result
+}
+
+/// Purpose: Run a fetch with bounded process-group teardown on timeout or failure.
+/// Input: A detached fetch command, a time limit, and a refspec for error messages.
+/// Output: Success after the fetch exits, or an error after teardown.
+pub(crate) fn run_fetch_command(
+    cmd: std::process::Command,
+    timeout: Duration,
+    spec: &str,
+) -> Result<()> {
+    let mut child = FetchChild::spawn(cmd)?;
+    child.wait_success(timeout, spec)
 }
 
 struct FetchChild {
