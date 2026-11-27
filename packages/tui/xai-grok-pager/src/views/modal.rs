@@ -894,7 +894,7 @@ pub fn render_modal_overlay(
 const CANCEL_TURN_PANEL_HEIGHT: u16 = 10;
 pub fn cancel_turn_panel_height(screen_h: u16) -> u16 {
     let cap = (screen_h as u32 * 33 / 100)
-        .max(8)
+        .max(u32::from(CANCEL_TURN_PANEL_HEIGHT))
         .min(screen_h as u32 * 80 / 100) as u16;
     CANCEL_TURN_PANEL_HEIGHT.min(cap)
 }
@@ -1503,6 +1503,44 @@ mod palette_sharing_tests {
         );
     }
 }
+#[cfg(test)]
+mod cancel_turn_panel_tests {
+    use super::*;
+
+    /// Purpose: Verify that each cancel choice has a visible label and a mouse target.
+    /// Input: Terminal heights that can contain the complete panel.
+    /// Output: Each choice has one visible row inside the panel.
+    #[test]
+    fn cancel_turn_panel_shows_all_choices_at_normal_terminal_heights() {
+        for screen_h in [13, 24, 30, 40] {
+            let height = cancel_turn_panel_height(screen_h);
+            let area = Rect::new(0, screen_h - height, 80, height);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, screen_h));
+            let mut buttons = Vec::new();
+            let state = CancelTurnViewState {
+                active_idx: 4,
+                running_count: 1,
+            };
+
+            render_cancel_turn_panel(&mut buf, area, &state, true, &mut buttons);
+
+            assert_eq!(
+                buttons.len(),
+                CancelTurnChoice::ALL.len(),
+                "height {screen_h}"
+            );
+            for (choice, rect) in CancelTurnChoice::ALL.iter().zip(buttons) {
+                assert!(rect.y >= area.y && rect.bottom() <= area.bottom());
+                let mut row = String::new();
+                for x in rect.x..rect.right() {
+                    row.push_str(buf[(x, rect.y)].symbol());
+                }
+                assert!(row.contains(choice.label()), "height {screen_h}: {row}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod doc_picker_tip_tests {
     use super::{
