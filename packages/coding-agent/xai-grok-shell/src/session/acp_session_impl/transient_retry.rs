@@ -1,15 +1,12 @@
 //! Turn-level retry of transient sampler failures.
 //!
-//! Purpose: The sampler retries 429, 5xx and connection errors inside one
-//! request, but it never retries a stalled stream (`IdleTimeout`), and a
-//! stream that breaks after it started used to end the turn. This module
-//! resubmits the turn for those failures, with a slow backoff and two
-//! budgets: a few retries per sampling step and a cap for the whole prompt.
-//! It automates the manual "Continue" that revived a stalled session.
-//!
-//! Note: A failure class that the sampler already retried to exhaustion
-//! (HTTP 5xx, connection errors) is not retried again here. Stacking the two
-//! ladders would turn a hard outage into a ~17 minute wait.
+//! Purpose: Resubmit a failed model request after a transient server error,
+//! stream stall, or stream break. Use a backoff, a per-step retry budget,
+//! and a prompt retry budget.
+//! Input: The terminal sampler failure and the current retry state.
+//! Output: A retry grant or a terminal failure.
+//! Note: Each resubmit uses one sampler attempt. This prevents a new full
+//! sampler retry cycle for each turn retry.
 //!
 //! Note: Subagents and budgeted workflow children stay terminal. The early
 //! returns in `handle_sampling_failure` keep the workflow children out, and
@@ -187,12 +184,9 @@ fn transient_display_ceiling(step_attempts: u32, prompt_attempts: u32) -> u32 {
 /// Purpose: Decide whether a terminal sampler failure is worth a
 /// turn-level resubmit.
 /// Input: The sampler's error info.
-/// Output: True for a stream stall (`IdleTimeout`) or a stream that broke
-/// after it started. False for everything else.
-/// Note: The sampler already retried HTTP 5xx and connection errors to
-/// exhaustion, so they stay terminal here. 4xx, auth, and deterministic
-/// transport errors (bad URL, TLS, DNS) fail the same way again. The vetoes
-/// mirror `SamplingError::is_retry_vetoed`.
+/// Output: True for a stream stall, a stream break, or a transient server error.
+/// Note: Client errors, auth errors, and deterministic transport errors stay
+/// terminal. The vetoes mirror `SamplingError::is_retry_vetoed`.
 pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorInfo) -> bool {
     use xai_grok_sampler::SamplingErrorKind;
     if error.should_retry == Some(false)
@@ -209,10 +203,15 @@ pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorIn
             error.message.starts_with(MID_STREAM_TRANSPORT_PREFIX)
                 && !is_deterministic_transport_error(&error.message)
         }
-        // Status-less: a server error event inside the stream (a
-        // `StreamError`, on every backend). A status means an HTTP response
-        // that the sampler classified, and retried, itself.
-        SamplingErrorKind::Api => error.status_code.is_none() && error.is_retryable,
+        SamplingErrorKind::Api => {
+            error.is_retryable
+                && error.status_code.is_none_or(|code| {
+                    reqwest::StatusCode::from_u16(code).is_ok_and(|status| {
+                        status.is_server_error()
+                            && xai_grok_sampling_types::is_retryable_api_status(status)
+                    })
+                })
+        }
         SamplingErrorKind::Auth
         | SamplingErrorKind::Serialization
         | SamplingErrorKind::RateLimited
@@ -494,9 +493,8 @@ mod tests {
         assert!(transient_retry_eligible(&broken));
     }
 
-    /// The sampler already spent its ~5.5 minute ladder on these.
     #[test]
-    fn errors_the_sampler_already_retried_are_not_eligible() {
+    fn connection_and_rate_limit_errors_are_not_eligible() {
         let connect = error_with(
             SamplingErrorKind::Http,
             None,
@@ -504,17 +502,40 @@ mod tests {
             true,
         );
         assert!(!transient_retry_eligible(&connect));
-        for status in [500, 502, 503, 529] {
+        let rate_limited = error_with(SamplingErrorKind::RateLimited, Some(429), "slow down", true);
+        assert!(!transient_retry_eligible(&rate_limited));
+    }
+
+    #[test]
+    fn transient_server_errors_are_eligible() {
+        for status in [500, 502, 503, 504, 520, 524, 529, 530] {
             let http_5xx = error_with(
                 SamplingErrorKind::Api,
                 Some(status),
                 &format!("API error (status {status}): upstream overloaded"),
                 true,
             );
-            assert!(!transient_retry_eligible(&http_5xx), "{status}");
+            assert!(transient_retry_eligible(&http_5xx), "{status}");
         }
-        let rate_limited = error_with(SamplingErrorKind::RateLimited, Some(429), "slow down", true);
-        assert!(!transient_retry_eligible(&rate_limited));
+    }
+
+    #[test]
+    fn server_retry_vetoes_and_origin_tls_errors_are_not_eligible() {
+        for status in [525, 526] {
+            let err = error_with(
+                SamplingErrorKind::Api,
+                Some(status),
+                "origin TLS error",
+                true,
+            );
+            assert!(!transient_retry_eligible(&err), "{status}");
+        }
+        let mut err = error_with(SamplingErrorKind::Api, Some(500), "server error", true);
+        err.should_retry = Some(false);
+        assert!(!transient_retry_eligible(&err));
+        err.should_retry = None;
+        err.is_retryable = false;
+        assert!(!transient_retry_eligible(&err));
     }
 
     #[test]
