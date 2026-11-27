@@ -11014,6 +11014,73 @@ pub(crate) mod tests {
             modifiers: KeyModifiers::NONE,
         })
     }
+
+    /// Purpose: Check the app scroll route while a hub completion popup is open.
+    /// Input: A temporary hub and normalized scroll deltas.
+    /// Output: The popup selection moves, and the feed offset stays the same.
+    #[test]
+    fn hub_completion_wheel_dispatch_moves_the_popup_instead_of_the_feed() {
+        use crate::views::hub_browser::{HubBrowserState, render_hub_browser};
+        use ratatui::{buffer::Buffer, layout::Rect};
+        use xai_grok_tools::implementations::grok_build::agent_hub::{MemberKind, store};
+
+        let root = tempfile::tempdir().unwrap();
+        let hub = store::Hub::create(root.path(), "scroll-test").unwrap();
+        hub.update_meta(|meta| {
+            for i in 0..10 {
+                meta.members.push(store::Member {
+                    handle: format!("agent{i}"),
+                    label: "test".into(),
+                    kind: MemberKind::Agent,
+                    session_id: None,
+                    active: true,
+                    disconnected: false,
+                    joined_ms: 0,
+                    pid: None,
+                });
+            }
+        })
+        .unwrap();
+        let mut browser = HubBrowserState::open(hub, "me", None).unwrap();
+        browser.handle_key(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        browser.handle_key(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 100, 24);
+        render_hub_browser(&mut Buffer::empty(area), area, &mut browser);
+        let (col, row) = (area.y..area.bottom())
+            .flat_map(|row| (area.x..area.right()).map(move |col| (col, row)))
+            .find(|&(col, row)| browser.composer.popup_contains(col, row))
+            .expect("the completion popup has mouse targets");
+        let first = browser.composer.completion_selected().unwrap().to_owned();
+        let second = browser.composer.completion_items()[1].clone();
+        browser.feed_scroll = 5;
+
+        let mut app = test_app_with_agent();
+        let ActiveView::Agent(id) = app.active_view else {
+            panic!("test app must start on an agent");
+        };
+        app.agents.get_mut(&id).unwrap().hub_browser = Some(browser);
+        app.dispatch_scroll(3, col, row);
+        let browser = app.agents[&id].hub_browser.as_ref().unwrap();
+        assert_eq!(
+            browser.composer.completion_selected(),
+            Some(second.as_str())
+        );
+        assert_eq!(browser.feed_scroll, 5);
+
+        app.dispatch_scroll(-12, col, row);
+        let browser = app.agents[&id].hub_browser.as_ref().unwrap();
+        assert_eq!(browser.composer.completion_selected(), Some(first.as_str()));
+        assert_eq!(browser.feed_scroll, 5);
+
+        app.dispatch_scroll(0, col, row);
+        let browser = app.agents[&id].hub_browser.as_ref().unwrap();
+        assert_eq!(browser.composer.completion_selected(), Some(first.as_str()));
+        assert_eq!(browser.feed_scroll, 5);
+
+        app.dispatch_scroll(-3, col, 4);
+        assert_eq!(app.agents[&id].hub_browser.as_ref().unwrap().feed_scroll, 8);
+    }
+
     #[test]
     fn opening_workflow_transcript_cancels_pending_scroll_stream() {
         use crate::input::mouse::{ScrollConfig, ScrollDirection};

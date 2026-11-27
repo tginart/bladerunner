@@ -950,14 +950,26 @@ impl HubBrowserState {
         FeedPoint { line, col }
     }
 
-    /// Purpose: Apply one mouse-wheel scroll to the thread pane.
+    /// Purpose: Apply one mouse-wheel scroll to the popup or the thread pane.
     /// Input: The scroll lines (positive is down) and the screen position.
-    /// Output: None. The feed scroll changes in place.
+    /// Output: None. The popup selection or the feed scroll changes in place.
     /// Note: The app sends wheel events here, not to `handle_mouse`. The scroll
     /// changes only when the pointer is over the thread pane and the picker
     /// is closed.
     pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
-        if self.picker.is_some() || !contains(self.hits.main, col, row) {
+        if lines == 0 || self.picker.is_some() {
+            return;
+        }
+        if self.is_composing && self.composer.popup_contains(col, row) {
+            let kind = if lines > 0 {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            };
+            self.composer.handle_mouse(kind, col, row);
+            return;
+        }
+        if !contains(self.hits.main, col, row) {
             return;
         }
         let delta = lines.unsigned_abs() as usize;
