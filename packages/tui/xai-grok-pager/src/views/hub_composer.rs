@@ -301,7 +301,8 @@ impl HubComposer {
             .len()
             .min(MAX_VISIBLE_COMPLETIONS)
             .min(usize::from(room - 2));
-        completion.scroll = scroll_to_show(completion.scroll, completion.selected, visible);
+        completion.scroll = scroll_to_show(completion.scroll, completion.selected, visible)
+            .min(completion.items.len().saturating_sub(visible));
         let completion = &*completion;
         let shown = &completion.items[completion.scroll..completion.scroll + visible];
         let thumb = scroll_thumb(completion.items.len(), visible, completion.scroll);
@@ -772,6 +773,52 @@ mod tests {
         press(&mut composer, KeyCode::Backspace, &names);
         assert_eq!(render_rows(&mut composer).len(), MAX_VISIBLE_COMPLETIONS);
         assert!(composer.completion_selected().is_some());
+    }
+
+    /// Purpose: Check the popup window after a filter reduces the candidate count.
+    /// Input: Ten candidates, a scroll to the end, and a filter with five matches.
+    /// Output: All five matches appear, and the selected match stays in view.
+    #[test]
+    fn filtering_a_scrolled_popup_keeps_the_window_in_bounds() {
+        let mut names = CompletionNames::default();
+        for i in 0..5 {
+            names.handles.push(format!("front{i}"));
+            names.handles.push(format!("back{i}"));
+        }
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "@", &names);
+        press(&mut composer, KeyCode::PageDown, &names);
+        press(&mut composer, KeyCode::PageDown, &names);
+        render_rows(&mut composer);
+        assert_eq!(composer.completion.as_ref().unwrap().scroll, 4);
+
+        type_text(&mut composer, "f", &names);
+        let rows = render_rows(&mut composer);
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|row| row.starts_with("@front")));
+        let selected = composer.completion_selected().unwrap();
+        assert!(rows.iter().any(|row| row == selected));
+    }
+
+    /// Purpose: Check the popup window after the available height grows.
+    /// Input: Ten candidates with the last candidate selected in a two-row popup.
+    /// Output: Six candidates appear after the height grows, with the last candidate in view.
+    #[test]
+    fn a_taller_popup_keeps_the_scrolled_window_in_bounds() {
+        let names = many_names();
+        let mut composer = HubComposer::default();
+        type_text(&mut composer, "@", &names);
+        press(&mut composer, KeyCode::PageDown, &names);
+        press(&mut composer, KeyCode::PageDown, &names);
+        let bounds = Rect::new(0, 0, 40, 24);
+        let mut buf = Buffer::empty(bounds);
+        composer.render_popup(&mut buf, Rect::new(0, 4, 40, 3), bounds, &Theme::current());
+        assert_eq!(composer.completion.as_ref().unwrap().scroll, 8);
+
+        let rows = render_rows(&mut composer);
+        assert_eq!(rows.len(), MAX_VISIBLE_COMPLETIONS);
+        assert_eq!(rows.first().map(String::as_str), Some("@agent4"));
+        assert_eq!(rows.last().map(String::as_str), Some("@agent9"));
     }
 
     #[test]
