@@ -34,6 +34,9 @@ pub use xai_grok_workspace_types::rpc::worktree::{
     RemoveWorktreeRequest, RemoveWorktreeResponse, WorktreeCopyMode, WorktreeType,
 };
 
+mod base_ref;
+pub use base_ref::resolve_origin_base_ref;
+
 const WORKTREE_LOG: &str = "xai_worktree";
 
 /// Map a [`WorktreeType`] to the fast-worktree crate's `CreationMode`.

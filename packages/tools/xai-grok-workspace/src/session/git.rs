@@ -105,7 +105,7 @@ pub async fn git_cli(cwd: &Path, args: &[&str]) -> Result<String> {
 /// Mutating [`git_cli`]: bump the gate epoch after the attempt. Failed
 /// commands can still change the repo (`pull --rebase` conflicts, partial
 /// checkout); skipping invalidate would keep pre-mutation snapshots.
-async fn git_cli_mut(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn git_cli_mut(cwd: &Path, args: &[&str]) -> Result<String> {
     let result = git_cli(cwd, args).await;
     super::git_gate::invalidate(cwd);
     result
@@ -914,7 +914,7 @@ pub async fn git_info(cwd: &Path) -> Result<GitInfoData> {
 /// 2. A unique remote-tracking `origin/main` or `origin/master`
 ///    (hand-added remotes never get `origin/HEAD`).
 /// 3. `init.defaultBranch` git config value (user/system preference).
-fn detect_default_branch(repo: &Repository) -> Option<String> {
+pub(crate) fn detect_default_branch(repo: &Repository) -> Option<String> {
     if let Some(branch) = detect_remote_default_branch(repo) {
         return Some(branch);
     }

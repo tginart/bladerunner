@@ -528,6 +528,10 @@ pub(crate) fn execute(
                         .unwrap_or_else(|| {
                             format!("pager-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
                         });
+                    let git_ref = match git_ref {
+                        Some(r) => Some(r),
+                        None => default_worktree_base_ref(&cwd).await,
+                    };
                     let copy_mode = if git_ref.is_some() { "clean" } else { "dirty" };
                     let mut params = serde_json::json!({
                     "sourceWorktreePath": cwd.to_string_lossy(),
@@ -4865,6 +4869,15 @@ fn format_session_info(
 ///
 /// This reflects the process login / ACP auth method, not per-model sampling
 /// credentials (a model `api_key`/`env_key` can still own the turn).
+/// Base ref for a new worktree session with no explicit `--worktree-ref`.
+/// `None` means HEAD of `cwd`, with dirty files copied.
+async fn default_worktree_base_ref(cwd: &Path) -> Option<String> {
+    use xai_grok_shell::util::config::WorktreeBase;
+    match xai_grok_shell::util::config::worktree_base() {
+        WorktreeBase::Head => None,
+        WorktreeBase::Origin => xai_grok_workspace::worktree::resolve_origin_base_ref(cwd).await,
+    }
+}
 fn format_auth_lines(is_api_key_auth: bool, api_key_env_set: bool) -> String {
     if is_api_key_auth {
         let method = if api_key_env_set {
