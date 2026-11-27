@@ -774,7 +774,7 @@ impl AgentView {
                         InputOutcome::Changed
                     }
                     None => {
-                        if self.block_viewer.is_some() {
+                        if self.block_viewer.is_some() || self.is_subagent_view {
                             return InputOutcome::Unchanged;
                         }
                         let scrollback = self.pane_areas.scrollback;
@@ -1835,5 +1835,62 @@ mod tests {
         let outcome = agent.handle_input(&esc, &reg);
         assert!(matches!(outcome, InputOutcome::Changed));
         assert!(agent.persistent_text_selection.is_none());
+
+        let outcome = agent.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty())),
+            &reg,
+        );
+        assert!(matches!(outcome, InputOutcome::Changed), "{outcome:?}");
+        assert_eq!(agent.prompt.text(), "d");
+    }
+
+    /// Purpose: Verify that a background click preserves read-only child navigation.
+    /// Input: A fullscreen child, a background click, and each close key.
+    /// Output: The child keeps scrollback focus, and the close key returns to the parent.
+    #[test]
+    fn subagent_background_click_preserves_scrollback_focus() {
+        use crate::actions::ActionRegistry;
+        use crate::app::agent_view::test_fixtures::make_agent;
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+
+        let registry = ActionRegistry::defaults();
+        for (column, row, close_key) in [
+            (0, 0, KeyCode::Char('q')),
+            (0, 0, KeyCode::Esc),
+            (10, 16, KeyCode::Char('q')),
+            (10, 16, KeyCode::Esc),
+        ] {
+            let mut parent = make_agent();
+            let mut child = make_agent();
+            child.set_active_pane(AgentPane::Scrollback, true);
+            child.pane_areas.scrollback = Rect::new(2, 1, 76, 15);
+            child.pane_areas.prompt = Rect::new(2, 18, 76, 0);
+            parent.insert_subagent_view("child".into(), Box::new(child));
+            parent.open_subagent_fullscreen("child".into());
+
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                parent.handle_input(
+                    &Event::Mouse(MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::empty(),
+                    }),
+                    &registry,
+                );
+            }
+            let child = &parent.subagent_views["child"];
+            assert_eq!(child.active_pane, AgentPane::Scrollback);
+            assert!(!child.left_mouse_down);
+            assert!(child.prompt.text().is_empty());
+            parent.handle_input(
+                &Event::Key(KeyEvent::new(close_key, KeyModifiers::empty())),
+                &registry,
+            );
+            assert!(parent.active_subagent.is_none());
+        }
     }
 }
