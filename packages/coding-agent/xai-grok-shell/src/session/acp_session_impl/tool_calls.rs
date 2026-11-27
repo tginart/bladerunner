@@ -2254,6 +2254,9 @@ impl SessionActor {
                 vec![],
             ),
             ToolInput::AgentHub(ref hub) => (hub.title(), acp::ToolKind::Other, vec![], vec![]),
+            ToolInput::UpdateProgress(ref progress) => {
+                (progress.title(), acp::ToolKind::Other, vec![], vec![])
+            }
             ToolInput::HubRead(ref read) => (read.title(), acp::ToolKind::Search, vec![], vec![]),
             ToolInput::SchedulerList(_) => (
                 "List scheduled tasks".to_string(),
@@ -3575,6 +3578,8 @@ mod plan_mode_edit_gate_tests {
                     timeout: None,
                     description: "write via bash".into(),
                     is_background: false,
+                    progress_pattern: None,
+                    progress_total: None,
                 })
             ),
             PlanEditGate::Allow,

@@ -51,6 +51,51 @@ pub fn resolve_show_thinking_blocks(
     )
 }
 
+/// Env override for progress bars on background-command and subagent rows.
+pub const ENV_TASK_PROGRESS_BARS: &str = "GROK_TASK_PROGRESS_BARS";
+
+/// Resolve whether agents can attach progress bars to background commands
+/// and subagents.
+///
+/// Precedence: requirements > env (`GROK_TASK_PROGRESS_BARS`) >
+/// `[ui] task_progress_bars` > managed > default `true`.
+pub fn resolve_task_progress_bars(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    managed: Option<&TomlValue>,
+) -> crate::agent::config::Resolved<bool> {
+    resolve_ui_bool(
+        ENV_TASK_PROGRESS_BARS,
+        "task_progress_bars",
+        xai_grok_shared::ui_config::UiConfig::TASK_PROGRESS_BARS_DEFAULT,
+        requirements,
+        user,
+        managed,
+        None,
+    )
+}
+
+/// Purpose: Resolve `[ui] task_progress_bars` for the agent of a new session.
+/// Output: True when agents get the progress tool and parameters.
+/// Note: The function reads the config layers from disk at each call, so a
+/// change in `/settings` applies to the next session with no restart.
+pub(crate) fn resolve_task_progress_bars_from_disk() -> bool {
+    let requirements = crate::config::load_merged_requirements();
+    let layers = match crate::config::ConfigLayers::load() {
+        Ok(layers) => Some(layers),
+        Err(e) => {
+            tracing::warn!(error = %e, "task_progress_bars: failed to load config layers");
+            None
+        }
+    };
+    resolve_task_progress_bars(
+        requirements.as_ref(),
+        layers.as_ref().map(|l| &l.user),
+        layers.as_ref().map(|l| &l.managed),
+    )
+    .value
+}
+
 /// Env override for grouping consecutive non-destructive tool calls in the TUI.
 pub const ENV_GROUP_TOOL_VERBS: &str = "GROK_GROUP_TOOL_VERBS";
 
@@ -438,5 +483,56 @@ mod collapsed_edit_blocks_tests {
         let r = resolve_collapsed_edit_blocks(None, None, Some(&on), Some(&remote(Some(false))));
         assert!(r.value);
         assert_eq!(r.source, ConfigSource::ManagedConfig);
+    }
+}
+
+#[cfg(test)]
+mod task_progress_bars_tests {
+    use super::*;
+    use crate::agent::config::ConfigSource;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var(ENV_TASK_PROGRESS_BARS) };
+        g
+    }
+
+    fn toml_ui(v: bool) -> TomlValue {
+        toml::from_str(&format!("[ui]\ntask_progress_bars = {v}\n")).unwrap()
+    }
+
+    #[test]
+    fn defaults_on_when_nothing_set() {
+        let _g = guard();
+        let r = resolve_task_progress_bars(None, None, None);
+        assert!(r.value, "task progress bars must default ON");
+        assert_eq!(r.source, ConfigSource::Default);
+    }
+
+    #[test]
+    fn each_config_layer_can_turn_it_off() {
+        let _g = guard();
+        let off = toml_ui(false);
+        let r = resolve_task_progress_bars(Some(&off), None, None);
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Requirement);
+        let r = resolve_task_progress_bars(None, Some(&off), None);
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Config);
+        let r = resolve_task_progress_bars(None, None, Some(&off));
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::ManagedConfig);
+    }
+
+    #[test]
+    fn env_overrides_user_config() {
+        let _g = guard();
+        unsafe { std::env::set_var(ENV_TASK_PROGRESS_BARS, "0") };
+        let on = toml_ui(true);
+        let r = resolve_task_progress_bars(None, Some(&on), None);
+        unsafe { std::env::remove_var(ENV_TASK_PROGRESS_BARS) };
+        assert!(!r.value, "env must override the user config");
     }
 }

@@ -1119,6 +1119,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "task_progress_bars" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("task_progress_bars", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_task_progress_bars(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "show_inference_speed" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("show_inference_speed", "Bool", &value));

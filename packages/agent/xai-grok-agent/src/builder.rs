@@ -105,6 +105,7 @@ pub struct AgentBuilder {
     subagents_enabled: bool,
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
+    task_progress_enabled: bool,
     subagent_toggle: HashMap<String, bool>,
     task_model_slugs: Vec<String>,
     skills_config: crate::prompt::skills::SkillsConfig,
@@ -181,6 +182,30 @@ fn merge_tool_params(
         }
     }
 }
+/// Purpose: Keep the progress tool only where it can do something.
+/// Input: The tool config, the resolved setting, and whether the agent is a
+/// subagent.
+/// Output: None. The function removes the progress tool from `tool_config`
+/// when the setting is off, or when a top-level agent has no tool that starts
+/// a background command or a subagent.
+/// Note: A subagent always keeps the tool, to report its own progress.
+fn apply_progress_tool_gate(
+    tool_config: &mut xai_grok_tools::registry::types::ToolServerConfig,
+    task_progress_enabled: bool,
+    is_subagent: bool,
+) {
+    use xai_grok_tools::types::tool::ToolKind;
+    let has_target = tool_config
+        .tools
+        .iter()
+        .any(|tool| matches!(tool.kind, Some(ToolKind::Execute | ToolKind::Task)));
+    if task_progress_enabled && (is_subagent || has_target) {
+        return;
+    }
+    tool_config
+        .tools
+        .retain(|tool| tool.kind != Some(ToolKind::ProgressUpdate));
+}
 fn apply_workflow_tool_gates(
     tool_config: &mut xai_grok_tools::registry::types::ToolServerConfig,
     background_workflows_enabled: bool,
@@ -246,6 +271,7 @@ impl AgentBuilder {
             subagents_enabled: false,
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
+            task_progress_enabled: true,
             subagent_toggle: HashMap::new(),
             task_model_slugs: Vec::new(),
             skills_config: Default::default(),
@@ -585,6 +611,17 @@ impl AgentBuilder {
         self.ask_user_question_enabled = enabled;
         self
     }
+    /// Enable or disable progress bars for background commands and subagents.
+    ///
+    /// When disabled, the `update_progress` tool is removed from the tool
+    /// config. The command tool and the subagent tool then also hide their
+    /// progress parameters, and the prompt omits its progress section, so the
+    /// model cannot see the feature at all. Driven by the shell's resolved
+    /// gate (`resolve_task_progress`, default ON).
+    pub fn with_task_progress_enabled(mut self, enabled: bool) -> Self {
+        self.task_progress_enabled = enabled;
+        self
+    }
     /// Set per-subagent enable/disable toggles from `[subagents.toggle]`.
     ///
     /// Keys are agent names, values are booleans. Omitted agents default
@@ -863,6 +900,11 @@ impl AgentBuilder {
                     .retain(|tc| !lifecycle.contains(&short_tool_name(&tc.id)));
             }
         }
+        apply_progress_tool_gate(
+            &mut tool_config,
+            self.task_progress_enabled,
+            self.prompt_audience == crate::prompt::context::PromptAudience::Subagent,
+        );
         if let xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig::Enabled {
             ref params,
         } = self.web_fetch_config
@@ -961,7 +1003,16 @@ impl AgentBuilder {
                     tool_id_matches(&definition.tools, &tc.id)
                         || tc.kind.is_some_and(|k| allow_kinds.contains(&k))
                         || (has_agent_entry && task_deps.contains(&short_tool_name(&tc.id)))
-                        || matches!(tc.kind, Some(ToolKind::SearchTool | ToolKind::UseTool))
+                        || matches!(
+                            tc.kind,
+                            Some(
+                                ToolKind::SearchTool
+                                    | ToolKind::UseTool
+                                    // A subagent must be able to fill the
+                                    // progress bar its parent asked for.
+                                    | ToolKind::ProgressUpdate
+                            )
+                        )
                 });
                 tracing::debug!(agent = %definition.name, allowed = ?definition.tools, "tools allowlist applied");
             } else {
@@ -1565,6 +1616,35 @@ mod tests {
     #[test]
     fn bladerunner_hides_provider_media_tools() {
         assert!(!provider_media_tools_visible());
+    }
+    #[test]
+    fn progress_tool_gate_follows_the_setting_and_the_toolset() {
+        use crate::config::AgentDefinition;
+        use xai_grok_tools::types::tool::ToolKind;
+        let has_progress_tool = |definition: AgentDefinition, enabled: bool, is_subagent: bool| {
+            let mut tool_config = definition.tool_config;
+            assert!(
+                tool_config
+                    .tools
+                    .iter()
+                    .any(|tool| tool.kind == Some(ToolKind::ProgressUpdate)),
+                "the toolset must start with the progress tool"
+            );
+            apply_progress_tool_gate(&mut tool_config, enabled, is_subagent);
+            tool_config
+                .tools
+                .iter()
+                .any(|tool| tool.kind == Some(ToolKind::ProgressUpdate))
+        };
+        // The setting is off: no agent sees the tool.
+        assert!(!has_progress_tool(AgentDefinition::default_grok_build(), false, false));
+        assert!(!has_progress_tool(AgentDefinition::oracle(), false, true));
+        // The setting is on: an agent that can start commands or subagents keeps it.
+        assert!(has_progress_tool(AgentDefinition::default_grok_build(), true, false));
+        // A read-only top-level agent has no row to fill.
+        assert!(!has_progress_tool(AgentDefinition::oracle(), true, false));
+        // A read-only subagent reports the progress of its own row.
+        assert!(has_progress_tool(AgentDefinition::oracle(), true, true));
     }
     #[test]
     fn task_model_guidance_resolves_model_param_override() {

@@ -65,6 +65,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "collapsed_edit_blocks",
     "hooks_muted",
     "show_inference_speed",
+    "task_progress_bars",
     "respect_manual_folds",
     "hunk_tracker_mode",
     "voice_keybind_enabled",
@@ -297,6 +298,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
         }
         ("hooks_muted", Action::SetHooksMuted(b)) => {
             assert_eq!(b, expected, "SetHooksMuted value differs from expected")
+        }
+        ("task_progress_bars", Action::SetTaskProgressBars(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetTaskProgressBars value differs from expected"
+            )
         }
         ("show_inference_speed", Action::SetShowInferenceSpeed(b)) => {
             assert_eq!(
@@ -1836,6 +1843,7 @@ fn registry_kind_membership_through_pr_14() {
             "collapsed_edit_blocks",
             "hooks_muted",
             "show_inference_speed",
+            "task_progress_bars",
             "invert_scroll",
             "display_refresh_auto_cadence",
             "multiline_mode",
@@ -1989,6 +1997,7 @@ fn defaults_round_trip_through_registry() {
     xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
     xai_grok_pager::appearance::cache::set_hooks_muted(false);
     xai_grok_pager::appearance::cache::set_show_inference_speed(false);
+    xai_grok_pager::appearance::cache::set_task_progress_bars(true);
     xai_grok_pager::appearance::cache::set_scroll_mode(
         xai_grok_pager::appearance::ScrollMode::Auto,
     );
@@ -2041,6 +2050,7 @@ fn defaults_round_trip_through_registry() {
             "collapsed_edit_blocks" => SettingValue::Bool(false),
             "hooks_muted" => SettingValue::Bool(false),
             "show_inference_speed" => SettingValue::Bool(false),
+            "task_progress_bars" => SettingValue::Bool(true),
             "respect_manual_folds" => SettingValue::Bool(false),
             // Per-tip contextual-hint children default ON (inherit → true).
             "contextual_hints.undo" => SettingValue::Bool(true),
@@ -2124,6 +2134,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetHooksMuted(_))
             | SettingsKeyOutcome::Action(Action::SetShowInferenceSpeed(_))
+            | SettingsKeyOutcome::Action(Action::SetTaskProgressBars(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
             | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
             | SettingsKeyOutcome::Action(Action::SetVoiceKeybindEnabled(_)) => {}
@@ -8151,4 +8162,42 @@ fn show_inference_speed_renders_under_appearance_below_hooks_muted() {
         "show_inference_speed must be immediately below hooks_muted; \
          Appearance order: {keys:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// task_progress_bars — SHARED Bool (Appearance, default true)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_progress_bars_space_dispatches_typed_setter() {
+    xai_grok_pager::appearance::cache::set_task_progress_bars(true);
+    let mut s = make_state();
+    navigate_to(&mut s, "task_progress_bars");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "task_progress_bars", false);
+}
+
+#[test]
+fn task_progress_bars_cache_off_dispatches_on() {
+    xai_grok_pager::appearance::cache::set_task_progress_bars(false);
+    let mut s = make_state();
+    navigate_to(&mut s, "task_progress_bars");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "task_progress_bars", true);
+    xai_grok_pager::appearance::cache::set_task_progress_bars(true);
+}
+
+#[test]
+fn task_progress_bars_is_a_default_on_appearance_setting() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg
+        .find("task_progress_bars")
+        .expect("task_progress_bars must be registered");
+    assert_eq!(meta.category, SettingCategory::Appearance);
+    assert_eq!(meta.owner, SettingOwner::Shared);
+    assert!(!meta.restart_required);
+    match &meta.kind {
+        SettingKind::Bool { default } => assert!(*default, "default must be true"),
+        other => panic!("expected Bool kind for task_progress_bars, got {other:?}"),
+    }
 }

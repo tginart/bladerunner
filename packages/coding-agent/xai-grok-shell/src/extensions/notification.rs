@@ -64,6 +64,27 @@ pub struct SessionNotification {
     pub meta: Option<serde_json::Value>,
 }
 
+/// Method name of the progress notification for a task row.
+pub const TASK_PROGRESS_METHOD: &str = "x.ai/task_progress";
+
+/// Purpose: This struct is the payload of `x.ai/task_progress`. It gives the
+/// progress bar value of one background command or one subagent.
+///
+/// Note: The shell does not persist this notification. A progress bar shows
+/// live work only, so a replayed session has no use for it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProgressNotification {
+    /// The session that sent the value.
+    pub session_id: acp::SessionId,
+    /// The background command or subagent that the value is for. `None`
+    /// means the session is a subagent and the value is for its own row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub completed: u64,
+    pub total: u64,
+}
+
 /// Wire usage for ACP `_meta.usage` and `TurnCompleted.usage`.
 ///
 /// # Wire contract (ACP vs headless)

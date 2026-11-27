@@ -25,6 +25,7 @@ pub mod list_dir;
 pub mod lsp;
 pub mod monitor;
 pub mod n_shot;
+pub mod progress;
 pub mod read_audio;
 pub mod read_file;
 pub mod read_video;
@@ -58,6 +59,7 @@ pub use image_gen::{
 pub use kill_task::{KillTaskTool, KillTerminalCommandTool};
 pub use list_dir::ListDirTool;
 pub use lsp::LspTool;
+pub use progress::{UPDATE_PROGRESS_TOOL_NAME, UpdateProgressTool};
 pub use monitor::tool::MonitorTool;
 pub use n_shot::{N_SHOT_TOOL_NAME, NShotTool};
 pub use read_audio::{READ_AUDIO_TOOL_NAME, ReadAudioTool};

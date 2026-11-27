@@ -64,6 +64,7 @@ pub(crate) mod session_title_resolve;
 pub mod status_blocks;
 pub mod subagent;
 pub mod subscription;
+pub mod task_progress;
 #[cfg(feature = "codex-live")]
 pub(crate) use dispatch::stop_live_on_teardown;
 pub(crate) use effects::sanitize_user_error;

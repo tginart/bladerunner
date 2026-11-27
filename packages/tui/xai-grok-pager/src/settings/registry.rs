@@ -613,6 +613,10 @@ pub fn current_value_for(
         "show_inference_speed" => Some(SettingValue::Bool(
             crate::appearance::cache::load_show_inference_speed(),
         )),
+        // Cache is the render-path source of truth (tasks-pane bars).
+        "task_progress_bars" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_task_progress_bars(),
+        )),
         "confirm_before_rewind" => Some(SettingValue::Bool(ui.confirm_before_rewind_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
@@ -998,6 +1002,13 @@ mod tests {
                         *default,
                         ui.show_inference_speed.unwrap_or(false),
                         "show_inference_speed default drifts from UiConfig::default()"
+                    );
+                }
+                ("task_progress_bars", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.task_progress_bars_enabled(),
+                        "task_progress_bars default drifts from UiConfig::default()"
                     );
                 }
                 ("simple_mode", SettingKind::Bool { default }) => {

@@ -910,6 +910,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "combine_queued_prompts" => Some(Action::SetCombineQueuedPrompts(new)),
         "hooks_muted" => Some(Action::SetHooksMuted(new)),
         "show_inference_speed" => Some(Action::SetShowInferenceSpeed(new)),
+        "task_progress_bars" => Some(Action::SetTaskProgressBars(new)),
         "invert_scroll" => Some(Action::SetInvertScroll(new)),
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),

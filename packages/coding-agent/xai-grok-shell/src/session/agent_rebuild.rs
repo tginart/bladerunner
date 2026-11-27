@@ -284,6 +284,9 @@ impl AgentRebuildSpec {
                 .collect::<Vec<_>>(),
         )
         .with_ask_user_question_enabled(*ask_user_question_enabled)
+        .with_task_progress_enabled(
+            crate::util::config::resolve_task_progress_bars_from_disk(),
+        )
         .with_persona_summaries(persona_summaries.clone())
         .with_prompt_audience(*prompt_audience)
         .with_role_instructions(role_instructions.clone())

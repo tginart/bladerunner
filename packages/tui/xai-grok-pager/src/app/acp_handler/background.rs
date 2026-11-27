@@ -294,6 +294,49 @@ pub(super) fn handle_monitor_event(notif: &acp::ExtNotification, app: &mut AppVi
     is_active
 }
 
+/// Purpose: Handle `x.ai/task_progress`. The notification sets the progress
+/// bar value of one row in the tasks pane.
+/// Input: The notification and the app.
+/// Output: True when the screen must be drawn again.
+/// Method:
+///     1. Find the agent view that owns the session of the sender.
+///     2. A value with a task ID goes to the view of the sender. The row is a
+///        background command or a subagent that the sender started.
+///     3. A value with no task ID comes from a subagent. It goes to the
+///        parent view, on the row of that subagent.
+pub(super) fn handle_task_progress(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    let Ok(payload) = serde_json::from_str::<TaskProgressNotification>(notif.params.get()) else {
+        return false;
+    };
+    let Some(value) = TaskProgressValue::new(payload.completed, payload.total) else {
+        return false;
+    };
+    let Some((matched, is_active, agent)) = resolve_notif_agent(app, &payload.session_id) else {
+        return false;
+    };
+    let sender_sid: &str = payload.session_id.0.as_ref();
+    let is_child = matches!(matched, SessionMatch::Child(_));
+
+    let (view, row_id) = match (payload.task_id, is_child) {
+        (Some(task_id), false) => (agent, task_id),
+        (Some(task_id), true) => match agent.subagent_views.get_mut(sender_sid) {
+            Some(child_view) => (&mut **child_view, task_id),
+            None => return false,
+        },
+        (None, true) => match agent.subagent_sessions.get(sender_sid) {
+            Some(info) => {
+                let subagent_id = info.subagent_id.to_string();
+                (agent, subagent_id)
+            }
+            None => return false,
+        },
+        // Only a subagent can omit the task ID.
+        (None, false) => return false,
+    };
+    view.task_progress.insert(row_id, value);
+    is_active
+}
+
 pub(super) fn handle_scheduled_task_created(
     notif: &acp::ExtNotification,
     app: &mut AppView,

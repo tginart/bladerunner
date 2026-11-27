@@ -130,6 +130,32 @@ fn durable_append_landed(result: Result<(), DurableAppendError>) -> Result<(), S
         )),
     }
 }
+/// Purpose: Send one progress bar value to the client.
+/// Input: The bridge config and the progress value from a tool.
+/// Output: None.
+/// Note: The function does not persist the value and does not wake the
+/// model. The value is only for the task row in the TUI.
+fn forward_task_progress(
+    config: &NotificationBridgeConfig,
+    progress: xai_grok_tools::notification::types::TaskProgress,
+) {
+    let payload = crate::extensions::notification::TaskProgressNotification {
+        session_id: config.session_id.clone(),
+        task_id: progress.task_id,
+        completed: progress.completed,
+        total: progress.total,
+    };
+    let Ok(params) = serde_json::value::to_raw_value(&payload) else {
+        return;
+    };
+    config
+        .gateway
+        .forward_fire_and_forget(acp::ExtNotification::new(
+            crate::extensions::notification::TASK_PROGRESS_METHOD,
+            params.into(),
+        ));
+}
+
 async fn handle_scheduled_task_removed(
     config: &NotificationBridgeConfig,
     removed: xai_grok_tools::notification::ScheduledTaskRemoved,
@@ -783,6 +809,9 @@ async fn handle_notification(
                         task_id: event.task_id.clone(),
                     },
                 });
+        }
+        ToolNotification::TaskProgress(progress) => {
+            forward_task_progress(config, progress);
         }
         ToolNotification::ScheduledTaskRemoved(removed) => {
             if let Err(error) = handle_scheduled_task_removed(config, removed, None).await {
@@ -1926,6 +1955,36 @@ mod tests {
                 );
             }
         }
+    }
+    /// A progress value is live UI state: it reaches the client, and it is
+    /// not persisted and does not wake the model.
+    #[tokio::test]
+    async fn task_progress_forwards_live_without_persisting_or_waking() {
+        let (config, mut gateway_rx, mut persistence_rx, mut cmd_rx) = make_test_config_full();
+        let notification =
+            ToolNotification::TaskProgress(xai_grok_tools::notification::types::TaskProgress {
+                task_id: Some("task-1".into()),
+                completed: 3,
+                total: 8,
+            });
+        let mut offsets = HashMap::new();
+        handle_notification(&config, notification, &mut offsets).await;
+
+        let args = match gateway_rx.try_recv().expect("progress must be forwarded") {
+            xai_acp_lib::AcpClientMessage::ExtNotification(args) => args,
+            other => panic!("expected ExtNotification, got {other:?}"),
+        };
+        assert_eq!(
+            args.request.method.as_ref(),
+            crate::extensions::notification::TASK_PROGRESS_METHOD
+        );
+        let payload: crate::extensions::notification::TaskProgressNotification =
+            serde_json::from_str(args.request.params.get()).expect("payload parses");
+        assert_eq!(payload.session_id, acp::SessionId::new("test-session"));
+        assert_eq!(payload.task_id.as_deref(), Some("task-1"));
+        assert_eq!((payload.completed, payload.total), (3, 8));
+        assert!(persistence_rx.try_recv().is_err(), "must not be persisted");
+        assert!(cmd_rx.try_recv().is_err(), "must not wake the model");
     }
     #[tokio::test]
     async fn same_session_monitor_event_is_injected() {

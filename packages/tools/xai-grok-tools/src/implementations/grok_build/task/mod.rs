@@ -25,10 +25,13 @@ use self::backend::SubagentBackendResource;
 use self::types::CurrentPromptIdResource;
 
 use self::types::*;
+use crate::implementations::grok_build::progress;
+use crate::notification::types::TaskProgress;
 use crate::types::output::ToolOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
 #[allow(unused_imports)]
 use crate::types::resources::{SessionFolder, SharedResources};
+use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::{ToolKind, ToolNamespace};
 use regex::Regex;
 use xai_tool_types::{SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput};
@@ -177,6 +180,62 @@ async fn resolve_background_notice_names(resources: &SharedResources) -> (String
 #[derive(Debug, Default)]
 pub struct TaskTool;
 
+/// The progress checkpoints of one spawn, ready to use.
+struct ProgressCheckpoints {
+    names: Vec<String>,
+    /// Client-facing name of the progress tool, for the prompt of the child.
+    tool_name: String,
+    notification_handle: crate::notification::ToolNotificationHandle,
+}
+
+/// Purpose: Read the progress checkpoints of a spawn.
+/// Input: The session resources and the checkpoint names from the tool input.
+/// Output: `None` when the input has no checkpoints, or when progress bars
+/// are disabled for this agent. An error when the checkpoint list is not valid.
+async fn resolve_progress_checkpoints(
+    resources: &SharedResources,
+    raw_checkpoints: &[String],
+) -> Result<Option<ProgressCheckpoints>, xai_tool_runtime::ToolError> {
+    if raw_checkpoints.is_empty() {
+        return Ok(None);
+    }
+    let (tool_name, notification_handle) = {
+        let res = resources.lock().await;
+        (
+            res.get::<TemplateRenderer>()
+                .and_then(|renderer| renderer.tool_for_kind(ToolKind::ProgressUpdate))
+                .map(str::to_string),
+            res.get::<crate::types::resources::NotificationHandle>()
+                .map(|handle| handle.0.clone()),
+        )
+    };
+    let (Some(tool_name), Some(notification_handle)) = (tool_name, notification_handle) else {
+        return Ok(None);
+    };
+    let names = progress::validated_checkpoints(raw_checkpoints)
+        .map_err(xai_tool_runtime::ToolError::invalid_arguments)?;
+    if names.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ProgressCheckpoints {
+        names,
+        tool_name,
+        notification_handle,
+    }))
+}
+
+/// The paragraph of the tool description that explains progress bars.
+fn progress_description_paragraph(progress_tool: &str) -> String {
+    format!(
+        "\n\nProgress bars (optional): when a task has clear milestones, pass \
+         `progress_checkpoints` with 2 to {max} short names in order. The user then sees a \
+         progress bar on the row of the subagent, and the subagent fills it as it completes \
+         each checkpoint. Omit it for short or open-ended tasks. A subagent can also report \
+         progress on its own with {progress_tool}.",
+        max = progress::MAX_CHECKPOINTS,
+    )
+}
+
 /// True when `name` is a wire name of the subagent-spawn ("task") tool.
 ///
 /// Accepts every spelling regardless of enabled features: names arrive over
@@ -254,6 +313,41 @@ impl crate::types::tool_metadata::ToolMetadata for TaskTool {
             )
         });
         &DESC
+    }
+
+    /// Purpose: Build the model-facing definition of the tool.
+    /// Method:
+    ///     1. Render the description like the default implementation.
+    ///     2. With progress bars enabled, add the progress paragraph.
+    ///     3. With progress bars disabled, remove `progress_checkpoints` from
+    ///        the schema.
+    fn versioned_definition(
+        &self,
+        _contract_version: Option<&str>,
+        client_name: &str,
+        description_override: Option<&str>,
+        renderer: &TemplateRenderer,
+        param_map: &std::collections::HashMap<String, String>,
+        input_schema: &serde_json::Value,
+        _effective_params: &serde_json::Value,
+    ) -> crate::types::definition::ToolDefinition {
+        let raw_desc = description_override.unwrap_or_else(|| self.description_template());
+        let mut description = renderer.render(raw_desc).unwrap_or_else(|e| {
+            crate::types::template_renderer::strip_markers_on_render_failure(raw_desc, &e)
+        });
+        let schema = match renderer.tool_for_kind(ToolKind::ProgressUpdate) {
+            Some(progress_tool) => {
+                description.push_str(&progress_description_paragraph(progress_tool));
+                input_schema.clone()
+            }
+            None => progress::schema_without_properties(input_schema, &["progress_checkpoints"]),
+        };
+        let schema = if param_map.is_empty() {
+            schema
+        } else {
+            crate::util::remap::remap_schema_properties(&schema, param_map)
+        };
+        crate::types::definition::ToolDefinition::function(client_name, Some(&description), schema)
     }
 
     fn requires_expr(&self) -> Expr<ToolRequirement> {
@@ -494,6 +588,19 @@ impl xai_tool_runtime::Tool for TaskTool {
             }
         }
 
+        // Progress checkpoints: the subagent learns them from its prompt, and
+        // the client shows an empty bar from the start.
+        let checkpoints =
+            resolve_progress_checkpoints(&resources, &input.progress_checkpoints).await?;
+        let prompt = match &checkpoints {
+            Some(checkpoints) => format!(
+                "{}{}",
+                input.prompt,
+                progress::checkpoint_prompt_block(&checkpoints.names, &checkpoints.tool_name)
+            ),
+            None => input.prompt.clone(),
+        };
+
         // 3. Build the subagent request.
         //
         // `task_id` is joined into worktree / session meta / output paths.
@@ -529,9 +636,19 @@ impl xai_tool_runtime::Tool for TaskTool {
             })
             .flatten();
 
+        if let Some(checkpoints) = &checkpoints {
+            checkpoints
+                .notification_handle
+                .send_task_progress(TaskProgress {
+                    task_id: Some(id.clone()),
+                    completed: 0,
+                    total: checkpoints.names.len() as u64,
+                });
+        }
+
         let request = SubagentRequest {
             id: id.clone(),
-            prompt: input.prompt.clone(),
+            prompt,
             description: input.description.clone(),
             subagent_type: input.subagent_type.clone(),
             parent_session_id,
@@ -780,6 +897,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -813,6 +931,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -847,6 +966,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -878,6 +998,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -936,6 +1057,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await
@@ -992,6 +1114,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -1035,6 +1158,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -1143,6 +1267,7 @@ mod tests {
             cwd: None,
             model: None,
             task_id: None,
+            progress_checkpoints: Vec::new(),
         }
     }
 
@@ -1766,6 +1891,7 @@ mod tests {
             cwd: None,
             model: Some("test-model".into()),
             task_id: Some("task-123".into()),
+            progress_checkpoints: Vec::new(),
         };
         let json = serde_json::to_string(&input).unwrap();
         let parsed: TaskToolInput = serde_json::from_str(&json).unwrap();
@@ -2036,6 +2162,7 @@ mod tests {
             cwd: None,
             model: None,
             task_id: None,
+            progress_checkpoints: Vec::new(),
         })
         .unwrap();
         assert!(
@@ -2085,6 +2212,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await
@@ -2121,6 +2249,7 @@ mod tests {
             cwd: None,
             model: None,
             task_id: None,
+            progress_checkpoints: Vec::new(),
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(
@@ -2167,6 +2296,7 @@ mod tests {
                 cwd: None,
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await
@@ -2233,6 +2363,7 @@ mod tests {
                     cwd: None,
                     model: None,
                     task_id: None,
+                    progress_checkpoints: Vec::new(),
                 },
             )
             .await
@@ -2279,6 +2410,7 @@ mod tests {
             cwd: None,
             model: None,
             task_id: None,
+            progress_checkpoints: Vec::new(),
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(!json.contains("cwd"), "None cwd should be skipped: {json}");
@@ -2307,6 +2439,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2361,6 +2494,7 @@ mod tests {
                 cwd: Some("".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2411,6 +2545,7 @@ mod tests {
                 cwd: Some("null".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2461,6 +2596,7 @@ mod tests {
                 cwd: Some("  ".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2514,6 +2650,7 @@ mod tests {
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2548,6 +2685,7 @@ mod tests {
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2603,6 +2741,7 @@ mod tests {
                     cwd: Some(sentinel.into()),
                     model: None,
                     task_id: None,
+                    progress_checkpoints: Vec::new(),
                 },
             )
             .await
@@ -2656,6 +2795,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await
@@ -2713,6 +2853,7 @@ mod tests {
                 cwd: Some("\"/tmp".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await
@@ -2765,6 +2906,7 @@ mod tests {
                 cwd: Some("/tmp".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await;
@@ -2813,6 +2955,7 @@ mod tests {
                 cwd: Some("/tmp/some-dir".into()),
                 model: None,
                 task_id: None,
+                progress_checkpoints: Vec::new(),
             },
         )
         .await

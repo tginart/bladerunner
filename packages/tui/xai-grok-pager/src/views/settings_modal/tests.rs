@@ -657,6 +657,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // SHARED-owned show_inference_speed (Appearance; live cache,
             // hidden in minimal).
             "show_inference_speed",
+            // SHARED-owned task_progress_bars (Appearance; live cache; also
+            // gates the agent's progress tool in new sessions).
+            "task_progress_bars",
             // SHELL-owned display_refresh_auto_cadence (Appearance).
             "display_refresh_auto_cadence",
             // Mouse — scroll + drag selection. The scroll

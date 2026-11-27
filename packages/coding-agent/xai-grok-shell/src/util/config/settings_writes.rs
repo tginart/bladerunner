@@ -69,6 +69,12 @@ pub async fn set_show_inference_speed(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.show_inference_speed = Some(value)).await
 }
 
+/// Persist `[ui].task_progress_bars` via `update_config`. The shell reads the
+/// value again when it builds the agent of a new session.
+pub async fn set_task_progress_bars(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.task_progress_bars = Some(value)).await
+}
+
 /// Persist `[web_search].provider` via `update_config`. `auto` removes the
 /// section, since it is the default.
 pub async fn set_web_search_provider(

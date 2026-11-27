@@ -694,6 +694,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::TodoWriteTool>();
         b.register::<grok_build::AgentHubTool>();
         b.register::<grok_build::HubReadTool>();
+        b.register::<grok_build::UpdateProgressTool>();
         b.register::<grok_build::DapDebugTool>();
         b.register::<grok_build::UpdateGoalTool>();
         b.register::<grok_build::WorkflowTool>();
@@ -2534,6 +2535,8 @@ mod tests {
             timeout: None,
             description: "list files".into(),
             is_background: false,
+            progress_pattern: None,
+            progress_total: None,
         });
         let merged = merge_tool_meta(
             &toolset,

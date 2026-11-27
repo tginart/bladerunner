@@ -1491,6 +1491,9 @@ pub struct AgentView {
     /// `SubagentSpawned` notifications, used for permission routing
     /// (which agent owns a session) and provenance display.
     pub subagent_sessions: HashMap<String, SubagentInfo>,
+    /// Progress bar values for the rows of the tasks pane. The key is the
+    /// task ID of a background command or the subagent ID of a subagent.
+    pub task_progress: crate::app::task_progress::TaskProgressMap,
     /// Temporary UI-owned review conversation; never restored from session logs.
     pub review_chat: Option<crate::views::review_chat::SharedReviewChat>,
     /// Child subagent views. Keyed by child_session_id.

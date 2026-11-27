@@ -105,6 +105,7 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::GoalUpdate,
     ToolKind::Workflow,
     ToolKind::NShot,
+    ToolKind::ProgressUpdate,
     ToolKind::Other,
 ];
 
@@ -129,7 +130,8 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
 
     match kind {
         // Meta tools: always allowed.
-        Plan | EnterPlan | ExitPlan | AskUser | Skill | SearchTool | GoalUpdate => true,
+        Plan | EnterPlan | ExitPlan | AskUser | Skill | SearchTool | GoalUpdate
+        | ProgressUpdate => true,
 
         // Read class.
         Read | MemoryGet | MemorySearch => {

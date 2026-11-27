@@ -106,6 +106,7 @@ pub enum ToolInput {
     NShot(crate::implementations::grok_build::n_shot::NShotToolInput),
     AgentHub(AgentHubInput),
     HubRead(crate::implementations::grok_build::agent_hub::HubReadInput),
+    UpdateProgress(crate::implementations::grok_build::progress::UpdateProgressInput),
     DapDebug(DapDebugInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
@@ -174,6 +175,8 @@ mod tests {
             timeout: None,
             description: "list files".into(),
             is_background: false,
+            progress_pattern: None,
+            progress_total: None,
         })
         .try_into();
         assert_eq!(bash.unwrap().command, "ls");

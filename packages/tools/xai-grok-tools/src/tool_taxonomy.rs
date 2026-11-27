@@ -70,6 +70,7 @@ impl ToolKind {
             ToolKind::GoalUpdate => "Update Goal",
             ToolKind::Workflow => "Workflow",
             ToolKind::NShot => "N-Shot",
+            ToolKind::ProgressUpdate => "Update Progress",
             ToolKind::Other => "Tool",
         }
     }
@@ -90,7 +91,8 @@ impl ToolKind {
             | ToolKind::WebFetch
             | ToolKind::EnterPlan
             | ToolKind::ExitPlan
-            | ToolKind::AskUser => true,
+            | ToolKind::AskUser
+            | ToolKind::ProgressUpdate => true,
             ToolKind::Edit
             | ToolKind::Delete
             | ToolKind::Write

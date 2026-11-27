@@ -55,6 +55,10 @@ hooks_muted = false                    # hide hook results in the transcript; ho
                                        # can still block (default: false; /hooks mute, /settings)
 show_inference_speed = false           # show the latest response's tok/s and time to first token
                                        # (TTFT) in the status bar (default: false; fullscreen only)
+task_progress_bars = true              # let agents show a progress bar on background commands and
+                                       # subagents in the tasks pane (default: true); false hides
+                                       # the bars at once and removes the feature from agents in
+                                       # new sessions (env: GROK_TASK_PROGRESS_BARS)
 page_flip_on_send = true               # pin a just-sent prompt at the top of the viewport so the
                                        # response starts on a fresh page (default: true); set false
                                        # so sending never moves the scroll position

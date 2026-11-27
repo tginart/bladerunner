@@ -186,6 +186,12 @@ pub struct UiConfig {
     /// (TTFT) in the TUI status bar. `None` = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_inference_speed: Option<bool>,
+    /// Progress bars on background-command and subagent rows. When on, agents
+    /// in new sessions get the `update_progress` tool and the progress
+    /// parameters of the command and subagent tools. When off, agents cannot
+    /// see the feature and the TUI draws no bar. `None` = on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_progress_bars: Option<bool>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -330,6 +336,7 @@ impl Default for UiConfig {
             combine_queued_prompts: None,
             hooks_muted: None,
             show_inference_speed: None,
+            task_progress_bars: None,
             display_refresh: DisplayRefreshSettings::default(),
             notifications: UiNotificationsConfig::default(),
         }
@@ -353,6 +360,14 @@ impl UiConfig {
     /// reads through here so they cannot drift.
     pub fn show_timeline_enabled(&self) -> bool {
         self.show_timeline.unwrap_or(Self::SHOW_TIMELINE_DEFAULT)
+    }
+
+    /// Default for [`Self::task_progress_bars`] when unset.
+    pub const TASK_PROGRESS_BARS_DEFAULT: bool = true;
+
+    pub fn task_progress_bars_enabled(&self) -> bool {
+        self.task_progress_bars
+            .unwrap_or(Self::TASK_PROGRESS_BARS_DEFAULT)
     }
 
     /// Default for [`Self::page_flip_on_send`] when unset.

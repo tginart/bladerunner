@@ -326,7 +326,7 @@ pub(crate) async fn run_monitor_pipeline(
     }
 }
 
-async fn read_new_bytes(path: &std::path::Path, offset: &mut u64) -> Vec<u8> {
+pub(crate) async fn read_new_bytes(path: &std::path::Path, offset: &mut u64) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
 
     let Ok(mut file) = tokio::fs::File::open(path).await else {
