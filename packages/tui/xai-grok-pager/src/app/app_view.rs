@@ -4349,6 +4349,14 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                     *ctx.prompt_focused = true;
                     return InputOutcome::Changed;
                 }
+                if matches!(ctx.auth_state, AuthState::Done)
+                    && ctx.has_access
+                    && !ctx.is_zdr_blocked
+                    && !*ctx.prompt_focused
+                {
+                    *ctx.prompt_focused = true;
+                    return InputOutcome::Changed;
+                }
             }
             MouseEventKind::Moved => {
                 let mut new_index = None;
@@ -10153,6 +10161,19 @@ pub(crate) mod tests {
                 "shift+`{ch}` must not open any modal",
             );
         }
+    }
+    #[test]
+    fn welcome_background_click_focuses_prompt() {
+        let mut app = test_app();
+        app.auth_state = AuthState::Done;
+        app.welcome_prompt_focused = false;
+        let click = left_mouse(MouseEventKind::Down(MouseButton::Left), 70, 20);
+        let outcome = app.handle_input(&click);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            app.welcome_prompt_focused,
+            "clicking welcome background must focus the prompt input",
+        );
     }
     #[test]
     fn welcome_pending_l_triggers_login() {

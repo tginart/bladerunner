@@ -4109,6 +4109,18 @@ impl DashboardState {
                 }
                 return InputOutcome::Changed;
             }
+
+            // Click on non-interactive background brings focus to the active
+            // text input (peek reply when peeking, otherwise dispatch box).
+            if let Some(p) = self.peek.as_mut() {
+                if !p.focused {
+                    p.focused = true;
+                    return InputOutcome::Changed;
+                }
+            } else if self.list_focused {
+                self.set_list_focused(false);
+                return InputOutcome::Changed;
+            }
         }
 
         InputOutcome::Unchanged
@@ -7172,18 +7184,41 @@ mod tests {
             state.peek.as_ref().unwrap().focused,
             "a click on the reply rect must focus the reply input",
         );
-        // A click outside the rect (on no row) leaves focus alone.
+        // A click on non-interactive background brings focus to the peek reply input.
         state.peek.as_mut().unwrap().focused = false;
-        let miss = MouseEvent {
+        let bg = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 70,
             row: 20,
             modifiers: KeyModifiers::NONE,
         };
-        let _ = state.handle_mouse(&miss);
+        let outcome = state.handle_mouse(&bg);
+        assert!(matches!(outcome, InputOutcome::Changed));
         assert!(
-            !state.peek.as_ref().unwrap().focused,
-            "a click outside the reply rect must not grab focus",
+            state.peek.as_ref().unwrap().focused,
+            "a click on the background must bring focus to the reply input",
+        );
+    }
+
+    /// Clicking non-interactive background on the dashboard focuses the
+    /// dispatch text input (clears `list_focused`).
+    #[test]
+    fn dashboard_background_click_focuses_dispatch_input() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = DashboardState::new();
+        state.set_list_focused(true);
+        assert!(state.list_focused);
+        let bg = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 70,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        };
+        let outcome = state.handle_mouse(&bg);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            !state.list_focused,
+            "a background click on the dashboard must focus the dispatch text input",
         );
     }
 
@@ -10297,12 +10332,12 @@ mod tests {
     /// A click that lands outside the dispatch box (with no row or
     /// button underneath) does not steal focus into the input.
     #[test]
-    fn click_outside_dispatch_box_leaves_focus() {
+    fn click_outside_dispatch_box_focuses_input() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use ratatui::layout::Rect;
         let mut state = DashboardState::new();
         state.list_focused = true;
-        // Box occupies the first 3 rows; click well below it.
+        // Box occupies the first 3 rows; click well below it on empty background.
         state.dispatch_rect = Some(Rect {
             x: 0,
             y: 0,
@@ -10317,12 +10352,12 @@ mod tests {
         };
         let outcome = state.handle_mouse(&click);
         assert!(
-            matches!(outcome, InputOutcome::Unchanged),
-            "click below the dispatch box must be a no-op, got {outcome:?}",
+            matches!(outcome, InputOutcome::Changed),
+            "background click below the dispatch box must focus input, got {outcome:?}",
         );
         assert!(
-            state.list_focused,
-            "click outside the dispatch box must not move focus to the input",
+            !state.list_focused,
+            "background click outside the dispatch box must move focus to the input",
         );
     }
 

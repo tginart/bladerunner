@@ -943,6 +943,18 @@ impl AgentView {
                 _ => InputOutcome::Changed,
             };
         }
+        // A strip press can restore parked card focus. Its deferred or active
+        // text drag must keep mouse capture through the release.
+        if let Event::Mouse(mouse) = ev
+            && self.left_mouse_down
+            && (self.deferred_text_press.is_some() || self.drag_selection.is_some())
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            return self.handle_mouse(mouse);
+        }
         if self.focused_card() == Some(BlockingCard::Permission) {
             return match ev {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
