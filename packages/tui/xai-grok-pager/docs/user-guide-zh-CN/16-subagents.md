@@ -405,6 +405,8 @@ display_name = "alice"
 | `send` | 向 `to`（来自 `list`）发纯文本；最大 8 KiB |
 | `inbox` | 排空本端邮箱（非阻塞） |
 | `wait` | 阻塞直到有邮件或 `timeout_ms`（上限 30s） |
+| `read` | 读取 `#channel`（从读游标之后）、自己的私信（`@handle`）或某个 `thread`（任一消息 id；返回根消息及全部回复） |
+| `search` | 按文本或 `@sender` 在频道和自己的私信中搜索，最新在前；不移动读游标 |
 
 使用约定：
 

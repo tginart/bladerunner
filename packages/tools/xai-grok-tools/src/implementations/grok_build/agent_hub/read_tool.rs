@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::store::{self, BOT_HANDLE, Hub, Message};
+use super::store::{self, BOT_HANDLE, Hub, Message, is_bot_conv};
 use super::{Member, MemberKind, peer_status};
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::tool::{ToolKind, ToolNamespace};
@@ -286,10 +286,6 @@ fn conv_key(raw: &str) -> Result<String> {
         [Some(a), Some(b)] => Ok(store::dm_conv(a, b)),
         _ => bail!("invalid conversation {raw:?}: use #channel or @a,@b"),
     }
-}
-
-fn is_bot_conv(conv: &str) -> bool {
-    store::split_dm_conv(conv).is_some_and(|(a, b)| a == BOT_HANDLE || b == BOT_HANDLE)
 }
 
 fn message_line(message: &Message) -> String {

@@ -992,12 +992,15 @@ impl HubBrowserState {
         self.feed_scroll = feed_scroll_for_cell(cell, bar.height, self.hits.feed_line_count);
     }
 
-    /// Purpose: Show only the thread of `root` in the selected conversation.
-    /// Input: The root message id.
-    /// Output: None. A root in another conversation (an agent can reply
+    /// Purpose: Show only the thread of a message in the selected conversation.
+    /// Input: The id of the root or of any reply of the thread.
+    /// Output: None. The thread of the root opens, also for a legacy reply
+    ///     to a reply. A message in another conversation (an agent can reply
     ///     across conversations) opens no thread, and a notice says so,
     ///     because a reply here could not point at it.
-    pub fn open_thread(&mut self, root: &str) {
+    pub fn open_thread(&mut self, id: &str) {
+        let root = self.thread_root_of(id);
+        let root = root.as_str();
         self.stop_compose();
         let previous_thread = self.thread.clone();
         let previous_reply = self.reply_to.clone();
@@ -1019,6 +1022,23 @@ impl HubBrowserState {
             self.reply_to = previous_reply;
             if let Err(error) = self.load_feed(false) {
                 tracing::warn!(%error, "hub browser: feed load failed");
+            }
+        }
+    }
+
+    /// The thread root of message `id` in the shown conversation, or `id`
+    /// itself when the conversation does not hold it.
+    fn thread_root_of(&self, id: &str) -> String {
+        let Some(conv) = self.selected_row().and_then(|row| row.conv()) else {
+            return id.to_string();
+        };
+        match self.hub.messages(&conv, 0) {
+            Ok(messages) => {
+                store::resolve_thread_root(&messages, id).unwrap_or_else(|| id.to_string())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "hub browser: feed load failed");
+                id.to_string()
             }
         }
     }
@@ -1381,9 +1401,10 @@ impl HubBrowserState {
 
     /// Purpose: Start a reply to a message of the shown conversation.
     /// Input: The parent message id.
-    /// Output: None. A paused draft for another conversation keeps its
-    ///     destination and gets no parent, because the hub refuses a reply
-    ///     to a message of another conversation. A notice says why.
+    /// Output: None. The draft replies to the thread root of the parent, so
+    ///     threads stay flat. A paused draft for another conversation keeps
+    ///     its destination and gets no parent, because the hub refuses a
+    ///     reply to a message of another conversation. A notice says why.
     fn start_reply(&mut self, parent_id: String) {
         let shown = self.selected_row().as_ref().and_then(post_target);
         if let Some(pinned) = self.compose_target.clone()
@@ -1393,6 +1414,7 @@ impl HubBrowserState {
             self.notice = Some(format!("Send or clear the draft to {pinned} first."));
             return;
         }
+        let parent_id = self.thread_root_of(&parent_id);
         // An explicit reply changes the parent of a draft that has text.
         if !self.composer.is_empty() {
             self.pinned_parent = Some(Some(parent_id.clone()));
@@ -1482,8 +1504,14 @@ impl HubBrowserState {
         let mut messages = self.hub.messages(&conv, 0)?;
         let total = messages.len();
         if let Some(root) = &self.thread {
-            // Filter before the limit, so an old root keeps its replies.
-            messages.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
+            // Filter before the limit, so an old root keeps its replies. A
+            // legacy reply to a reply is in the thread of its root.
+            let members: BTreeSet<String> = store::thread_root_index(&messages)
+                .into_iter()
+                .filter(|(_, thread_root)| *thread_root == root.as_str())
+                .map(|(id, _)| id.to_string())
+                .collect();
+            messages.retain(|m| members.contains(&m.id));
         }
         let skip = feed_window_start(&messages, self.focus_message.as_deref());
         let mut feed = messages.split_off(skip);
@@ -1864,12 +1892,13 @@ fn feed_lines(
     .lines
 }
 
-/// Replies per parent message id, over the feed.
+/// Replies per thread root, over the feed. A legacy reply to a reply counts
+/// for the root of its thread.
 fn reply_counts(messages: &[store::Message]) -> BTreeMap<&str, usize> {
     let mut counts = BTreeMap::new();
-    for message in messages {
-        if let Some(parent) = message.reply_to.as_deref() {
-            *counts.entry(parent).or_default() += 1;
+    for (id, root) in store::thread_root_index(messages) {
+        if id != root {
+            *counts.entry(root).or_default() += 1;
         }
     }
     counts
@@ -4896,14 +4925,78 @@ mod tests {
         );
     }
 
+    /// A #general root with a legacy chain on disk: m2 replies to m1, and m3
+    /// replies to m2.
+    fn hub_with_nested_replies() -> (tempfile::TempDir, store::Hub, [String; 3]) {
+        let (root, hub) = hub_with_dms();
+        let general = || "#general".to_string();
+        let m1 = message("front", general(), "plan?", store::now_ms());
+        let mut m2 = message("back", general(), "use sqlite", store::now_ms());
+        m2.reply_to = Some(m1.id.clone());
+        let mut m3 = message("front", general(), "why sqlite?", store::now_ms());
+        m3.reply_to = Some(m2.id.clone());
+        for message in [&m1, &m2, &m3] {
+            hub.append(message).unwrap();
+        }
+        (root, hub, [m1.id, m2.id, m3.id])
+    }
+
+    #[test]
+    fn a_legacy_reply_to_a_reply_shows_in_the_root_thread() {
+        let (_root, hub, [m1, m2, m3]) = hub_with_nested_replies();
+        let mut state = open(hub);
+        let counts = reply_counts(&state.feed);
+        assert_eq!(counts.get(m1.as_str()), Some(&2));
+        assert_eq!(counts.get(m2.as_str()), None);
+        let text = buffer_text(&render(&mut state));
+        assert!(text.contains("↩ 2 replies"), "{text}");
+        for id in [&m1, &m2, &m3] {
+            state.open_thread(id);
+            assert_eq!(state.thread.as_deref(), Some(m1.as_str()));
+            let ids: Vec<&str> = state.feed.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(ids, [m1.as_str(), m2.as_str(), m3.as_str()]);
+            state.handle_key(&key(KeyCode::Esc));
+            assert_eq!(state.thread, None);
+        }
+    }
+
+    #[test]
+    fn a_click_on_the_quote_of_a_nested_reply_opens_the_root_thread() {
+        let (_root, hub, [m1, m2, _]) = hub_with_nested_replies();
+        let mut state = open(hub);
+        render(&mut state);
+        // Only the quote above m3 points at m2.
+        let cell = span_cell(&state, &SpanTarget::Thread(m2));
+        click(&mut state, cell);
+        assert_eq!(state.thread.as_deref(), Some(m1.as_str()));
+        assert_eq!(state.feed.len(), 3);
+    }
+
+    #[test]
+    fn a_reply_to_a_reply_targets_the_thread_root() {
+        let (_root, hub, [m1, m2, _]) = hub_with_nested_replies();
+        let mut state = open(hub);
+        state.start_reply(m2);
+        assert_eq!(state.reply_to.as_deref(), Some(m1.as_str()));
+        state.handle_paste("agreed");
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Reply {
+                to: "#general".to_string(),
+                text: "agreed".to_string(),
+                reply_to: m1,
+            }
+        );
+    }
+
     #[test]
     fn r_replies_to_the_newest_message_and_esc_drops_the_reply() {
-        let (_root, hub, _) = hub_with_thread();
+        let (_root, hub, parent_id) = hub_with_thread();
         let mut state = open(hub);
-        let newest = state.feed.last().unwrap().id.clone();
         state.handle_key(&key(KeyCode::Char('r')));
         assert!(state.is_composing);
-        assert_eq!(state.reply_to.as_deref(), Some(newest.as_str()));
+        // The newest message is a reply, so the draft replies to its root.
+        assert_eq!(state.reply_to.as_deref(), Some(parent_id.as_str()));
         state.handle_key(&key(KeyCode::Esc));
         assert!(!state.is_composing);
         state.handle_key(&key(KeyCode::Esc));
@@ -5025,20 +5118,20 @@ mod tests {
 
     #[test]
     fn a_paused_draft_keeps_its_reply_parent_in_another_conversation() {
-        let (_root, hub, _) = hub_with_thread();
+        let (_root, hub, parent_id) = hub_with_thread();
         let mut state = open(hub);
-        let newest = state.feed.last().unwrap().id.clone();
         state.handle_key(&key(KeyCode::Char('r')));
         state.handle_paste("agreed");
         state.handle_key(&key(KeyCode::Esc));
         state.select(Some(dm("front", "me")));
         state.handle_key(&key(KeyCode::Tab));
+        // The newest message is a reply, so the draft replies to its root.
         assert_eq!(
             state.handle_key(&key(KeyCode::Enter)),
             HubKeyOutcome::Reply {
                 to: "#general".to_string(),
                 text: "agreed".to_string(),
-                reply_to: newest,
+                reply_to: parent_id,
             }
         );
     }
