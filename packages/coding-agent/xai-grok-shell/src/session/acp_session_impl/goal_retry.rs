@@ -3,6 +3,7 @@
 //! Output: A bounded retry delay, or a terminal decision.
 //! Set `GROK_GOAL_MAX_CONSECUTIVE_RETRIES` to change the default of eight.
 //! Set it to zero to disable goal retries. Delays use 20 percent jitter.
+//! A server Retry-After value sets the minimum delay, even above the backoff cap.
 
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ impl GoalRetryState {
 
     /// Purpose: Spend one retry only for a transient error within the budget.
     /// Input: The turn error and a jitter value from zero through one.
-    /// Output: The attempt number, retry ceiling, and capped delay.
+    /// Output: The attempt number, retry ceiling, and delay with the server cooldown as a minimum.
     pub(super) fn try_retry(
         &mut self,
         error: &acp::Error,
@@ -58,10 +59,18 @@ impl GoalRetryState {
                 .checked_shl(self.consecutive_retries)
                 .unwrap_or(u64::MAX),
         );
-        let delay = Duration::from_secs_f64(
+        let backoff = Duration::from_secs_f64(
             base_secs.min(MAX_DELAY.as_secs()) as f64 * (0.8 + 0.4 * jitter),
         )
         .min(MAX_DELAY);
+        let retry_after = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("retry_after_secs"))
+            .and_then(|value| value.as_u64())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
+        let delay = backoff.max(retry_after);
         self.consecutive_retries += 1;
         Some((self.consecutive_retries, self.max_retries, delay))
     }
@@ -269,6 +278,31 @@ mod tests {
         assert_eq!(state.try_retry(&server_error(), 1.0).unwrap().2, MAX_DELAY);
     }
 
+    /// Purpose: Keep goal retries outside the provider cooldown for all jitter values.
+    /// Input: Retry-After values below and above the normal backoff cap.
+    /// Output: A delay that honors both the backoff and the provider cooldown.
+    #[test]
+    fn goal_retry_honors_retry_after_minimum() {
+        for (retry_after_secs, jitter, expected_secs) in [
+            (60, 0.0, 60),
+            (60, 1.0, 60),
+            (5, 0.5, 15),
+            (0, 0.5, 15),
+            (600, 0.0, 600),
+        ] {
+            let error = acp::Error::internal_error().data(serde_json::json!({
+                "http_status": 429,
+                "retry_after_secs": retry_after_secs,
+            }));
+            let mut state = GoalRetryState {
+                consecutive_retries: 0,
+                max_retries: 1,
+            };
+            let delay = state.try_retry(&error, jitter).unwrap().2;
+            assert_eq!(delay, Duration::from_secs(expected_secs));
+        }
+    }
+
     #[tokio::test]
     async fn goal_retry_pauses_after_exhaustion_or_permanent_error() {
         tokio::task::LocalSet::new()
@@ -378,6 +412,8 @@ mod tests {
                 let (actor, _rx) = super::super::support::build_actor().await;
                 for (retry_after_secs, should_retry, expected) in [
                     (Some(7), None, true),
+                    (Some(60), None, true),
+                    (Some(600), None, true),
                     (Some(0), None, true),
                     (None, None, false),
                     (Some(7), Some(false), false),
@@ -401,11 +437,11 @@ mod tests {
                         consecutive_retries: 0,
                         max_retries: 1,
                     };
-                    assert_eq!(
-                        state.try_retry(&error, 0.5).is_some(),
-                        expected,
-                        "{error:?}"
-                    );
+                    let grant = state.try_retry(&error, 0.5);
+                    assert_eq!(grant.is_some(), expected, "{error:?}");
+                    if let Some((_, _, delay)) = grant {
+                        assert!(delay >= Duration::from_secs(retry_after_secs.unwrap()));
+                    }
                 }
             })
             .await;

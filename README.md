@@ -59,8 +59,9 @@ For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
 `/goal <objective>` automatically retries temporary network, timeout, rate-limit,
 and server failures. It permits eight consecutive retries, with exponential
-backoff from 15 seconds to five minutes and 20% jitter. A successful goal round
-resets the retry count. Set `GROK_GOAL_MAX_CONSECUTIVE_RETRIES` before launch to
+backoff from 15 seconds to five minutes and 20% jitter. A server `Retry-After`
+value sets the minimum wait and can exceed the backoff cap. A successful goal
+round resets the retry count. Set `GROK_GOAL_MAX_CONSECUTIVE_RETRIES` before launch to
 change the limit; `0` disables these retries. The sampler also has its own
 request retry budget, so total recovery time includes both layers.
 

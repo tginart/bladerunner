@@ -1925,6 +1925,7 @@ impl SessionActor {
         serde_json::json!({
             "message": message,
             "http_status": error.status_code,
+            "retry_after_secs": error.retry_after_secs,
             "error_kind": error.kind.as_str(),
             "is_retryable": error.is_retryable
                 && (rate_limit_with_retry_after
