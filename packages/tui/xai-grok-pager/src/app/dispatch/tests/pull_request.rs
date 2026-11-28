@@ -432,6 +432,95 @@ fn dashboard_popup_routes_pr_controls_to_the_attached_session() {
     assert_eq!(app.agents[&id].prompt.text(), "draft for main");
 }
 
+/// Purpose: Route dashboard review actions through the attached session.
+/// Input: A digest or typed question, an answer, and a handoff draft.
+/// Output: Both requests reach the session and preserve its main draft.
+#[test]
+fn dashboard_review_questions_and_handoffs_reach_the_attached_session() {
+    use crate::views::pull_request::summary::Control;
+    use xai_grok_shell::extensions::review_chat::AskResponse;
+
+    for is_digest in [false, true] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let effects = dispatch(Action::OpenPullRequest("8".into()), &mut app);
+        let [Effect::FetchPullRequest { request_id, .. }] = effects.as_slice() else {
+            panic!("open must fetch the PR");
+        };
+        dispatch_task_result(
+            TaskResult::PullRequestLoaded {
+                agent_id: id,
+                request_id: *request_id,
+                result: Ok(snapshot()),
+            },
+            &mut app,
+        );
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .prompt
+            .set_text("main draft");
+        app.active_view = ActiveView::AgentDashboard;
+        ensure_dashboard_state(&mut app);
+        app.dashboard.as_mut().unwrap().attached_agent = Some(id);
+        dispatch(Action::PullRequestControl(Control::Expand), &mut app);
+        let key = |code, modifiers| Event::Key(KeyEvent::new(code, modifiers));
+        let outcome = if is_digest {
+            app.handle_input(&key(KeyCode::Char('d'), KeyModifiers::NONE))
+        } else {
+            app.handle_input(&key(KeyCode::Char('?'), KeyModifiers::NONE));
+            app.handle_input(&Event::Paste("Explain this PR".into()));
+            app.handle_input(&key(KeyCode::Enter, KeyModifiers::NONE))
+        };
+        let InputOutcome::Action(Action::AskReviewChat(request)) = outcome else {
+            panic!("review input must prepare a question");
+        };
+        let effects = dispatch(Action::AskReviewChat(request.clone()), &mut app);
+        assert!(
+            matches!(effects.as_slice(), [Effect::AskReviewChat { agent_id, request: sent }]
+            if *agent_id == id && sent.child_id == request.child_id)
+        );
+        let chat = app.agents[&id]
+            .pull_request
+            .as_ref()
+            .unwrap()
+            .chat
+            .clone()
+            .unwrap();
+        assert!(chat.borrow().busy);
+        dispatch_task_result(
+            TaskResult::ReviewChatAnswered {
+                agent_id: id,
+                parent_session_id: request.session_id,
+                child_id: request.child_id.clone(),
+                response: Ok(AskResponse {
+                    child_id: request.child_id,
+                    success: true,
+                    output: "Review answer".into(),
+                    error: None,
+                }),
+            },
+            &mut app,
+        );
+        assert!(!chat.borrow().busy);
+        app.handle_input(&key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        app.handle_input(&Event::Paste("Apply the reviewed fix".into()));
+        let InputOutcome::Action(Action::ForwardReviewRequest(text)) =
+            app.handle_input(&key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        else {
+            panic!("handoff must prepare a forward request");
+        };
+        let effects = dispatch(Action::ForwardReviewRequest(text), &mut app);
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::SendPrompt { agent_id, text, .. }
+            if *agent_id == id && text.contains("Apply the reviewed fix"))
+        ));
+        assert!(chat.borrow().draft.is_none());
+        assert_eq!(app.agents[&id].prompt.text(), "main draft");
+        assert!(matches!(app.active_view, ActiveView::AgentDashboard));
+    }
+}
+
 #[test]
 fn close_during_fetch_caches_the_result_without_reopening_the_overlay() {
     use crate::views::pull_request::summary::{Control, Display};

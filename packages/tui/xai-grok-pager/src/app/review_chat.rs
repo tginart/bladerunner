@@ -1,7 +1,8 @@
-use super::{
-    actions::Effect,
-    app_view::{ActiveView, AppView},
-};
+//! Purpose: Route review requests and child events to the session that owns them.
+//! Input: Review requests, session events, and the application state.
+//! Output: Review effects and updates to the session's review conversation.
+
+use super::{actions::Effect, app_view::AppView};
 use crate::acp::meta::NotificationMeta;
 use agent_client_protocol as acp;
 use xai_grok_shell::extensions::{
@@ -21,8 +22,11 @@ impl super::agent_view::AgentView {
     }
 }
 
+/// Purpose: Send a review question through the visible session.
+/// Input: The application state and the request with its captured session ID.
+/// Output: An ask effect, or a retry notice when the connection is not valid.
 pub(super) fn dispatch_ask(app: &mut AppView, req: AskRequest) -> Vec<Effect> {
-    let ActiveView::Agent(agent_id) = app.active_view else {
+    let Some(agent_id) = app.visible_agent_id() else {
         return vec![];
     };
     let Some(agent) = app.agents.get(&agent_id) else {

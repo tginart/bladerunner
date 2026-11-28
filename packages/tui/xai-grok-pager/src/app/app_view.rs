@@ -2214,6 +2214,17 @@ impl AppView {
             let _ = crate::voice::commit_interim_into_prompt(self);
         }
     }
+    /// Purpose: Resolve the root session behind the visible agent surface.
+    /// Input: The current tab or dashboard popup.
+    /// Output: The session's agent ID, or None when no session is visible.
+    pub(crate) fn visible_agent_id(&self) -> Option<AgentId> {
+        match self.active_view {
+            ActiveView::Agent(id) => Some(id),
+            ActiveView::AgentDashboard => self.dashboard.as_ref().and_then(|d| d.attached_agent),
+            ActiveView::Welcome => None,
+        }
+    }
+
     /// The active agent's view, when an agent tab is focused.
     ///
     /// Always the root agent, even when a subagent view is focused within the

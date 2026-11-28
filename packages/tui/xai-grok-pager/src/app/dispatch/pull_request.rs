@@ -1,11 +1,7 @@
 //! Connect the PR corner card, minimized chip and fullscreen review workspace.
 //! Each session owns its selected PR. A fetch can complete while the card is closed.
 
-use crate::app::{
-    actions::Effect,
-    agent_view::AgentView,
-    app_view::{ActiveView, AppView},
-};
+use crate::app::{actions::Effect, agent_view::AgentView, app_view::AppView};
 use crate::views::{
     modal::ActiveModal,
     pull_request::{
@@ -18,11 +14,7 @@ use crate::views::{
 /// Input: The application state and the requested PR.
 /// Output: A visible card and an optional fetch effect.
 pub(super) fn open(app: &mut AppView, target: String) -> Vec<Effect> {
-    let id = match app.active_view {
-        ActiveView::Agent(id) => Some(id),
-        ActiveView::AgentDashboard => app.dashboard.as_ref().and_then(|d| d.attached_agent),
-        ActiveView::Welcome => None,
-    };
+    let id = app.visible_agent_id();
     let Some(agent) = id.and_then(|id| app.agents.get_mut(&id)) else {
         return vec![];
     };
@@ -39,11 +31,7 @@ pub(super) fn open(app: &mut AppView, target: String) -> Vec<Effect> {
 /// Purpose: Activate a PR control from either the mouse or a slash command.
 /// Input: The active session and user action. Output: UI state and optional fetch.
 pub(super) fn control(app: &mut AppView, control: Control) -> Vec<Effect> {
-    let id = match app.active_view {
-        ActiveView::Agent(id) => Some(id),
-        ActiveView::AgentDashboard => app.dashboard.as_ref().and_then(|d| d.attached_agent),
-        ActiveView::Welcome => None,
-    };
+    let id = app.visible_agent_id();
     let Some(agent) = id.and_then(|id| app.agents.get_mut(&id)) else {
         return vec![];
     };

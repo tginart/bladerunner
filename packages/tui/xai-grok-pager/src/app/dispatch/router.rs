@@ -331,7 +331,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::AskReviewChat(req) => crate::app::review_chat::dispatch_ask(app, req),
         Action::AskHubBot { hub, request } => crate::app::hub_bot::dispatch_ask(app, hub, request),
         Action::ForwardReviewRequest(text) => {
-            let ActiveView::Agent(id) = app.active_view else {
+            let Some(id) = app.visible_agent_id() else {
                 return vec![];
             };
             let Some(agent) = app.agents.get(&id) else {
@@ -351,7 +351,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             }
             let queued_before = agent.session.pending_prompts.len();
+            // The prompt dispatcher targets an agent tab. Keep the popup visible after the send.
+            let saved_view = app.active_view;
+            app.active_view = ActiveView::Agent(id);
             let effects = dispatch_send_prompt_inner(app, text, false, true, false);
+            app.active_view = saved_view;
             let accepted = !effects.is_empty()
                 || app.agents[&id].session.pending_prompts.len() > queued_before;
             if let Some(chat) = chat {
