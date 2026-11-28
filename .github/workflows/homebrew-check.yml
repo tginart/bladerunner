@@ -1,0 +1,23 @@
+name: Homebrew packaging checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - packaging/homebrew/**
+      - .github/workflows/homebrew*.yml
+  pull_request:
+    paths:
+      - packaging/homebrew/**
+      - .github/workflows/homebrew*.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 -B -m unittest discover -s packaging/homebrew -v
+      - run: ruby -c packaging/homebrew/bladerunner.rb.in

@@ -1,5 +1,29 @@
 # Updates and removal
 
+## Homebrew (Apple Silicon macOS)
+
+```sh
+brew update
+brew upgrade tginart/tap/bladerunner
+```
+
+Homebrew manages the executable and the packaged skills and agents. Use
+`brew upgrade` instead of `bladerunner update`. The launcher disables the
+built-in automatic updater. On first launch, it links `~/.bladerunner/bundled`
+to the active Homebrew package and preserves any previous bundle at
+`~/.bladerunner/bundled.before-homebrew`. `BLADERUNNER_HOME` overrides this
+state directory. Credentials, configuration, and sessions stay in that directory.
+
+If you used the shell installer before, put Homebrew's `bin` before
+`~/.bladerunner/bin` in your `PATH`. Use `command -v bladerunner` to check
+which executable your shell selects.
+
+Remove the Homebrew package with `brew uninstall bladerunner`. Your state
+directory remains. To switch back to the shell installer, remove the
+`bundled` symlink first; keep `bundled.before-homebrew` if you need its contents.
+
+## Shell installer
+
 The installer and built-in updater download verified releases from
 [GitHub Releases](https://github.com/tginart/bladerunner/releases).
 
