@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use chrono::{DateTime, Local, NaiveDate};
@@ -90,6 +91,123 @@ pub struct HubSnapshot {
     pub read: BTreeMap<String, usize>,
     /// What each agent reported that it does now, by handle.
     pub presences: BTreeMap<String, store::Presence>,
+    /// Estimated tokens to agents by token key: `hub.json` plus member files.
+    pub tokens: BTreeMap<String, u64>,
+}
+
+/// Incremental read state of the hub files, so that a reload reads only the
+/// bytes that were appended since the last read.
+#[derive(Debug, Clone, Default)]
+pub struct HubReadCache {
+    /// The member whose counts `unread` holds.
+    perspective: String,
+    /// Unread state per conversation key.
+    unread: BTreeMap<String, UnreadTail>,
+    /// Every message of the last feed conversation.
+    feed: Option<FeedTail>,
+}
+
+#[derive(Debug, Clone)]
+struct UnreadTail {
+    /// The read count that `unread` counts from.
+    read: usize,
+    tail: store::ConvTail,
+    /// Messages after `read` that other members sent.
+    unread: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FeedTail {
+    conv: String,
+    tail: store::ConvTail,
+    messages: Vec<store::Message>,
+}
+
+/// A read position of the person that waits to be saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadMark {
+    pub conv: String,
+    pub count: usize,
+    /// The byte offset after `count` complete lines.
+    pub offset: Option<store::LineOffset>,
+}
+
+/// The inputs of a background refresh. It holds no reference to the browser.
+#[derive(Debug)]
+pub struct HubRefreshJob {
+    pub generation: u64,
+    hub: store::Hub,
+    person_name: String,
+    person: String,
+    perspective: String,
+    unsaved_read: BTreeMap<String, usize>,
+    /// The conversation of the selected row.
+    conv: Option<String>,
+    cache: HubReadCache,
+}
+
+/// The result of a background refresh.
+#[derive(Debug)]
+pub struct HubRefresh {
+    person: String,
+    /// The unsaved read positions that the refresh saved.
+    saved_read: BTreeMap<String, usize>,
+    snapshot: HubSnapshot,
+    cache: HubReadCache,
+}
+
+impl HubRefreshJob {
+    /// Purpose: Read the hub for a background refresh, off the UI thread.
+    /// Input: The job.
+    /// Output: The new snapshot, and the read cache with the feed conversation.
+    /// Note: Like `reload_snapshot`, it saves the unsaved read positions of
+    ///     the person once the person is a member. It moves no other cursor.
+    pub fn run(mut self) -> Result<HubRefresh> {
+        let meta = self.hub.meta()?;
+        let person = agent_hub::person_handle_in(&meta, &self.person_name);
+        let perspective = if self.perspective == self.person {
+            person.clone()
+        } else {
+            self.perspective
+        };
+        let mut saved_read = BTreeMap::new();
+        if is_person_member(&meta, &person) {
+            for (conv, count) in std::mem::take(&mut self.unsaved_read) {
+                agent_hub::mark_read(&self.hub, &person, &conv, count)?;
+                saved_read.insert(conv, count);
+            }
+        }
+        let read_floor = if perspective == person {
+            self.unsaved_read
+        } else {
+            BTreeMap::new()
+        };
+        let snapshot = load_snapshot(
+            &self.hub,
+            &perspective,
+            &person,
+            &read_floor,
+            &mut self.cache,
+        )?;
+        if let Some(conv) = &self.conv {
+            let cached = self.cache.feed.take();
+            self.cache.feed = Some(load_conv(&self.hub, conv, cached)?);
+        }
+        Ok(HubRefresh {
+            person,
+            saved_read,
+            snapshot,
+            cache: self.cache,
+        })
+    }
+}
+
+/// A new refresh generation. Every local load takes one, so a background
+/// refresh that started before it is stale. The values are unique in the
+/// process, so a result never applies to a browser that opened later.
+fn next_refresh_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl HubSnapshot {
@@ -190,6 +308,16 @@ pub enum HubKeyOutcome {
     GoToMember(String),
     /// Stop the running turn of a member.
     StopMember(String),
+    /// Pin a message of a channel, as the person.
+    Pin {
+        channel: String,
+        message_id: String,
+    },
+    /// Unpin a message of a channel, as the person.
+    Unpin {
+        channel: String,
+        message_id: String,
+    },
     /// Create a channel in the shown hub, from the new-channel form.
     CreateChannel {
         name: String,
@@ -249,6 +377,12 @@ enum HoverKey {
     SearchRow(u16),
     /// A feed line of a message, by the feed index of the message.
     FeedMessage(usize),
+    /// The `[📌 N]` pill of a channel header.
+    PinPill,
+    /// The pin or unpin button of the hovered feed message.
+    PinChip,
+    /// A row of the pinned-messages drawer, by its screen row.
+    PinRow(u16),
     /// The hub name chip, the fleet `needs you` count, and the `/hub here`
     /// badge of the top bar.
     HubChip,
@@ -296,6 +430,16 @@ struct HitAreas {
     /// The "go to session" and "stop" buttons of a DM header.
     header_go: Rect,
     header_stop: Rect,
+    /// The `[📌 N]` pill of a channel header.
+    pin_pill: Rect,
+    /// The pin or unpin button of the hovered message, and that message id.
+    pin_chip: Option<(Rect, String)>,
+    /// The open pinned-messages drawer.
+    pin_drawer: Rect,
+    /// Screen row and message id of each visible drawer row.
+    pin_rows: Vec<(u16, String)>,
+    /// The `[unpin]` button and message id of each visible drawer row.
+    pin_unpins: Vec<(Rect, String)>,
     /// The hub name chip, the `needs you` count, and the `/hub here` badge.
     hub_chip: Rect,
     needs_chip: Rect,
@@ -371,6 +515,12 @@ pub struct HubBrowserState {
     scroll_to_focus: bool,
     /// True while hub-bot works on a question of the person.
     pub is_bot_thinking: bool,
+    /// The pinned messages of the selected channel, in pin order.
+    pub pinned: Vec<store::Message>,
+    /// True while the pinned-messages drawer is open.
+    pub show_pins: bool,
+    /// The highlighted row of the drawer.
+    pins_selected: usize,
     /// The open new-channel form (`c`).
     pub channel_form: Option<ChannelForm>,
     /// The open hub switcher (`H`).
@@ -379,6 +529,15 @@ pub struct HubBrowserState {
     /// The hub switcher lists it.
     pub session_hub: Option<String>,
     hits: HitAreas,
+    /// What the last reads saw, so the next reload reads only new bytes.
+    cache: HubReadCache,
+    /// The generation of the last local load. See `next_refresh_generation`.
+    refresh_generation: u64,
+    /// The generation of the background refresh that runs now, if any.
+    refresh_in_flight: Option<u64>,
+    /// `Some` while a background refresh applies: the feed uses the cache
+    /// as it is, and read positions wait here instead of a disk write.
+    deferred_marks: Option<Vec<ReadMark>>,
 }
 
 impl HubBrowserState {
@@ -387,7 +546,8 @@ impl HubBrowserState {
     /// Output: The state, or an error when the hub files cannot be read.
     pub fn open(hub: store::Hub, person_name: &str, channel: Option<&str>) -> Result<Self> {
         let person = agent_hub::person_handle_in(&hub.meta()?, person_name);
-        let snapshot = load_snapshot(&hub, &person, &person, &BTreeMap::new())?;
+        let mut cache = HubReadCache::default();
+        let snapshot = load_snapshot(&hub, &person, &person, &BTreeMap::new(), &mut cache)?;
         let mut state = Self {
             hub,
             person_name: person_name.to_string(),
@@ -421,10 +581,17 @@ impl HubBrowserState {
             focus_message: None,
             scroll_to_focus: false,
             is_bot_thinking: false,
+            pinned: Vec::new(),
+            show_pins: false,
+            pins_selected: 0,
             channel_form: None,
             hub_picker: None,
             session_hub: None,
             hits: HitAreas::default(),
+            cache,
+            refresh_generation: next_refresh_generation(),
+            refresh_in_flight: None,
+            deferred_marks: None,
         };
         let rows = state.rows();
         let target = channel.and_then(store::normalize_channel).map(Row::Channel);
@@ -470,6 +637,80 @@ impl HubBrowserState {
         let previous_index = self.selected_index(&self.rows()).unwrap_or(0);
         self.reload_snapshot()?;
         self.reselect(previous_index)
+    }
+
+    /// Purpose: Start a background refresh, the off-thread form of `reload`.
+    /// Input: The browser state.
+    /// Output: The job to run off the UI thread, or `None` while one runs.
+    /// Note: The job takes the read cache and gives it back in its result.
+    pub fn begin_refresh(&mut self) -> Option<HubRefreshJob> {
+        if self.refresh_in_flight.is_some() {
+            return None;
+        }
+        self.refresh_in_flight = Some(self.refresh_generation);
+        Some(HubRefreshJob {
+            generation: self.refresh_generation,
+            hub: self.hub.clone(),
+            person_name: self.person_name.clone(),
+            person: self.person.clone(),
+            perspective: self.perspective.clone(),
+            unsaved_read: self.unsaved_read.clone(),
+            conv: self.selected_row().and_then(|row| row.conv()),
+            cache: std::mem::take(&mut self.cache),
+        })
+    }
+
+    /// Purpose: Apply the result of a background refresh, as `reload` does.
+    /// Input: The generation of the job and its result.
+    /// Output: The read positions of the person for the caller to save off
+    ///     the UI thread. `None` when the result is stale, because a local
+    ///     load (a new row, perspective, thread, post or reload) ran after
+    ///     the job started, or when the refresh failed.
+    /// Note: This reads no hub file, unless the selected row is gone and the
+    ///     fallback row shows another conversation.
+    pub fn finish_refresh(
+        &mut self,
+        generation: u64,
+        result: Result<HubRefresh, String>,
+    ) -> Option<Vec<ReadMark>> {
+        if self.refresh_in_flight == Some(generation) {
+            self.refresh_in_flight = None;
+        }
+        if generation != self.refresh_generation {
+            return None;
+        }
+        let refresh = match result {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                tracing::warn!(%error, "hub browser: refresh failed");
+                return None;
+            }
+        };
+        let previous_index = self.selected_index(&self.rows()).unwrap_or(0);
+        if refresh.person != self.person {
+            if self.is_person_view() {
+                self.perspective = refresh.person.clone();
+            }
+            self.person = refresh.person;
+        }
+        for (conv, count) in refresh.saved_read {
+            if self
+                .unsaved_read
+                .get(&conv)
+                .is_some_and(|read| *read <= count)
+            {
+                self.unsaved_read.remove(&conv);
+            }
+        }
+        self.snapshot = refresh.snapshot;
+        self.cache = refresh.cache;
+        self.deferred_marks = Some(Vec::new());
+        let result = self.reselect(previous_index);
+        let marks = self.deferred_marks.take().unwrap_or_default();
+        if let Err(error) = result {
+            tracing::warn!(%error, "hub browser: feed load failed");
+        }
+        Some(marks)
     }
 
     /// Purpose: Switch the DM section between all members and active members.
@@ -557,6 +798,7 @@ impl HubBrowserState {
     /// Note: If an agent took the person handle, the person gets the next free
     ///     handle, so the browser never writes the read cursor of an agent.
     fn reload_snapshot(&mut self) -> Result<()> {
+        self.refresh_generation = next_refresh_generation();
         let meta = self.hub.meta()?;
         let person = agent_hub::person_handle_in(&meta, &self.person_name);
         if person != self.person {
@@ -576,7 +818,13 @@ impl HubBrowserState {
         } else {
             BTreeMap::new()
         };
-        self.snapshot = load_snapshot(&self.hub, &self.perspective, &self.person, &read_floor)?;
+        self.snapshot = load_snapshot(
+            &self.hub,
+            &self.perspective,
+            &self.person,
+            &read_floor,
+            &mut self.cache,
+        )?;
         Ok(())
     }
 
@@ -619,6 +867,11 @@ impl HubBrowserState {
         if self.search.is_some() {
             return self.handle_search_key(key);
         }
+        if self.show_pins
+            && let Some(outcome) = self.handle_pins_key(key)
+        {
+            return outcome;
+        }
         let rows = self.rows();
         let pending_stop = self.pending_stop.take();
         match key.code {
@@ -654,6 +907,7 @@ impl HubBrowserState {
             KeyCode::PageDown => self.feed_scroll = self.feed_scroll.saturating_sub(PAGE_LINES),
             KeyCode::End => self.feed_scroll = 0,
             KeyCode::Char('p') => self.open_picker(),
+            KeyCode::Char('P') => self.toggle_pins(),
             KeyCode::Char('n') => return self.jump_to_needs_input(),
             KeyCode::Char('c') => self.open_channel_form(),
             KeyCode::Char('H') => self.open_hub_picker(),
@@ -744,7 +998,7 @@ impl HubBrowserState {
                 if self.picker.is_none()
                     && !self.show_help
                     && contains(self.hits.feed, col, row)
-                    && !self.is_on_reply_chip(col, row) =>
+                    && !self.is_on_feed_button(col, row) =>
             {
                 self.is_dragging_scrollbar = false;
                 let point = self.feed_point_at(col, row);
@@ -813,6 +1067,20 @@ impl HubBrowserState {
         }
         if contains(hits.chip, col, row) {
             return Some(HoverKey::Chip);
+        }
+        if contains(hits.pin_drawer, col, row) {
+            let is_row = hits.pin_rows.iter().any(|(y, _)| *y == row);
+            return is_row.then_some(HoverKey::PinRow(row));
+        }
+        if contains(hits.pin_pill, col, row) {
+            return Some(HoverKey::PinPill);
+        }
+        if hits
+            .pin_chip
+            .as_ref()
+            .is_some_and(|(rect, _)| contains(*rect, col, row))
+        {
+            return Some(HoverKey::PinChip);
         }
         if let Some(key) = self.top_bar_hover_at(col, row) {
             return Some(key);
@@ -1047,12 +1315,15 @@ impl HubBrowserState {
         self.feed_scroll = feed_scroll_for_cell(cell, bar.height, self.hits.feed_line_count);
     }
 
-    /// Purpose: Show only the thread of `root` in the selected conversation.
-    /// Input: The root message id.
-    /// Output: None. A root in another conversation (an agent can reply
+    /// Purpose: Show only the thread of a message in the selected conversation.
+    /// Input: The id of the root or of any reply of the thread.
+    /// Output: None. The thread of the root opens, also for a legacy reply
+    ///     to a reply. A message in another conversation (an agent can reply
     ///     across conversations) opens no thread, and a notice says so,
     ///     because a reply here could not point at it.
-    pub fn open_thread(&mut self, root: &str) {
+    pub fn open_thread(&mut self, id: &str) {
+        let root = self.thread_root_of(id);
+        let root = root.as_str();
         self.stop_compose();
         let previous_thread = self.thread.clone();
         let previous_reply = self.reply_to.clone();
@@ -1074,6 +1345,23 @@ impl HubBrowserState {
             self.reply_to = previous_reply;
             if let Err(error) = self.load_feed(false) {
                 tracing::warn!(%error, "hub browser: feed load failed");
+            }
+        }
+    }
+
+    /// The thread root of message `id` in the shown conversation, or `id`
+    /// itself when the conversation does not hold it.
+    fn thread_root_of(&self, id: &str) -> String {
+        let Some(conv) = self.selected_row().and_then(|row| row.conv()) else {
+            return id.to_string();
+        };
+        match self.hub.messages(&conv, 0) {
+            Ok(messages) => {
+                store::resolve_thread_root(&messages, id).unwrap_or_else(|| id.to_string())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "hub browser: feed load failed");
+                id.to_string()
             }
         }
     }
@@ -1229,6 +1517,133 @@ impl HubBrowserState {
         }
     }
 
+    /// Open or close the pinned-messages drawer of the selected channel.
+    fn toggle_pins(&mut self) {
+        if !matches!(self.selected_row(), Some(Row::Channel(_))) {
+            self.notice = Some("Only channels have pinned messages.".to_string());
+            return;
+        }
+        self.show_pins = !self.show_pins;
+        self.pins_selected = 0;
+    }
+
+    /// Purpose: Apply one key press to the open pinned-messages drawer.
+    /// Input: The key event.
+    /// Output: The outcome of a drawer key. `None` for another key, which
+    ///     closes the drawer and then works as usual.
+    fn handle_pins_key(&mut self, key: &KeyEvent) -> Option<HubKeyOutcome> {
+        let last = self.pinned.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('P') => self.show_pins = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.pins_selected = self.pins_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.pins_selected = (self.pins_selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                if let Some(id) = self.pinned.get(self.pins_selected).map(|m| m.id.clone()) {
+                    self.jump_to_pin(&id);
+                }
+            }
+            KeyCode::Char('u') => {
+                let id = self.pinned.get(self.pins_selected).map(|m| m.id.clone())?;
+                return Some(self.pin_outcome(&id).unwrap_or(HubKeyOutcome::Changed));
+            }
+            _ => {
+                self.show_pins = false;
+                return None;
+            }
+        }
+        Some(HubKeyOutcome::Changed)
+    }
+
+    /// Purpose: Close the drawer and show a pinned message in the feed.
+    /// Input: The message id.
+    /// Output: None. An old message outside the feed window loads with some
+    ///     context, and a thread of the channel closes.
+    fn jump_to_pin(&mut self, id: &str) {
+        self.show_pins = false;
+        self.leave_thread();
+        self.focus_message = Some(id.to_string());
+        self.scroll_to_focus = true;
+        if let Err(error) = self.load_feed(false) {
+            tracing::warn!(%error, "hub browser: feed load failed");
+        }
+    }
+
+    /// Purpose: Ask the caller to pin or unpin a message of the shown channel.
+    /// Input: The message id.
+    /// Output: `Unpin` for a pinned message, `Pin` for another one, or `None`
+    ///     outside the person view or outside a channel, which are read only.
+    fn pin_outcome(&self, message_id: &str) -> Option<HubKeyOutcome> {
+        let Some(Row::Channel(name)) = self.selected_row() else {
+            return None;
+        };
+        if !self.is_person_view() {
+            return None;
+        }
+        let channel = format!("#{name}");
+        let message_id = message_id.to_string();
+        if self.pinned.iter().any(|m| m.id == message_id) {
+            Some(HubKeyOutcome::Unpin {
+                channel,
+                message_id,
+            })
+        } else {
+            Some(HubKeyOutcome::Pin {
+                channel,
+                message_id,
+            })
+        }
+    }
+
+    /// Purpose: Apply a click while the drawer is open.
+    /// Input: The screen position.
+    /// Output: The outcome of a click on the drawer. `None` for a click
+    ///     outside it, which closes the drawer and then works as usual.
+    fn click_pins(&mut self, col: u16, row: u16) -> Option<HubKeyOutcome> {
+        let unpin = self
+            .hits
+            .pin_unpins
+            .iter()
+            .find(|(rect, _)| contains(*rect, col, row))
+            .map(|(_, id)| id.clone());
+        if let Some(id) = unpin {
+            return Some(self.pin_outcome(&id).unwrap_or(HubKeyOutcome::Changed));
+        }
+        let hit = self
+            .hits
+            .pin_rows
+            .iter()
+            .find(|(y, _)| *y == row)
+            .map(|(_, id)| id.clone());
+        if contains(self.hits.pin_drawer, col, row) {
+            if let Some(id) = hit {
+                self.jump_to_pin(&id);
+            }
+            return Some(HubKeyOutcome::Changed);
+        }
+        if contains(self.hits.pin_pill, col, row) {
+            self.show_pins = false;
+            return Some(HubKeyOutcome::Changed);
+        }
+        self.show_pins = false;
+        None
+    }
+
+    /// True on a button over the feed: the reply chip, the pin chip, or the drawer.
+    fn is_on_feed_button(&self, col: u16, row: u16) -> bool {
+        let is_on_pin_chip = self
+            .hits
+            .pin_chip
+            .as_ref()
+            .is_some_and(|(rect, _)| contains(*rect, col, row));
+        self.is_on_reply_chip(col, row)
+            || is_on_pin_chip
+            || contains(self.hits.pin_drawer, col, row)
+    }
+
     /// The peer of the selected DM when it is a live agent, the target of
     /// the member actions.
     fn selected_agent_peer(&self) -> Option<String> {
@@ -1282,6 +1697,20 @@ impl HubBrowserState {
         if let Some(id) = self.search_row_at(col, row) {
             self.jump_to_message(&id);
             return HubKeyOutcome::Changed;
+        }
+        if self.show_pins
+            && let Some(outcome) = self.click_pins(col, row)
+        {
+            return outcome;
+        }
+        if contains(self.hits.pin_pill, col, row) {
+            self.toggle_pins();
+            return HubKeyOutcome::Changed;
+        }
+        if let Some((rect, id)) = self.hits.pin_chip.clone()
+            && contains(rect, col, row)
+        {
+            return self.pin_outcome(&id).unwrap_or(HubKeyOutcome::Changed);
         }
         if let Some((rect, id)) = self.hits.reply_chip.clone()
             && contains(rect, col, row)
@@ -1439,9 +1868,10 @@ impl HubBrowserState {
 
     /// Purpose: Start a reply to a message of the shown conversation.
     /// Input: The parent message id.
-    /// Output: None. A paused draft for another conversation keeps its
-    ///     destination and gets no parent, because the hub refuses a reply
-    ///     to a message of another conversation. A notice says why.
+    /// Output: None. The draft replies to the thread root of the parent, so
+    ///     threads stay flat. A paused draft for another conversation keeps
+    ///     its destination and gets no parent, because the hub refuses a
+    ///     reply to a message of another conversation. A notice says why.
     fn start_reply(&mut self, parent_id: String) {
         let shown = self.selected_row().as_ref().and_then(post_target);
         if let Some(pinned) = self.compose_target.clone()
@@ -1451,6 +1881,7 @@ impl HubBrowserState {
             self.notice = Some(format!("Send or clear the draft to {pinned} first."));
             return;
         }
+        let parent_id = self.thread_root_of(&parent_id);
         // An explicit reply changes the parent of a draft that has text.
         if !self.composer.is_empty() {
             self.pinned_parent = Some(Some(parent_id.clone()));
@@ -1521,6 +1952,7 @@ impl HubBrowserState {
                 self.reply_to = thread.or_else(|| self.reply_to.take());
             }
             self.focus_message = None;
+            self.show_pins = false;
         }
         self.selected = row;
         self.feed_scroll = 0;
@@ -1532,25 +1964,68 @@ impl HubBrowserState {
     /// Input: Whether to place the unread marker again.
     /// Output: Ok, or the read error. In the person view, the read cursor moves to the end.
     fn load_feed(&mut self, is_new_selection: bool) -> Result<()> {
+        self.refresh_generation = next_refresh_generation();
         let Some(conv) = self.selected_row().and_then(|row| row.conv()) else {
             self.feed.clear();
             self.first_unread = None;
             return Ok(());
         };
-        let mut messages = self.hub.messages(&conv, 0)?;
-        let total = messages.len();
-        if let Some(root) = &self.thread {
-            // Filter before the limit, so an old root keeps its replies.
-            messages.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
-        }
-        let skip = feed_window_start(&messages, self.focus_message.as_deref());
-        let mut feed = messages.split_off(skip);
+        let loaded = match self.cache.feed.take() {
+            // The background refresh read this file a moment ago.
+            Some(feed) if feed.conv == conv && self.deferred_marks.is_some() => feed,
+            cached => load_conv(&self.hub, &conv, cached)?,
+        };
+        let result = self.show_feed(&conv, &loaded, is_new_selection);
+        self.cache.feed = Some(loaded);
+        result
+    }
+
+    /// Purpose: Show the loaded messages of the selected conversation.
+    /// Input: The conversation, all of its messages, and whether to place the
+    ///     unread marker again.
+    /// Output: Ok, or the cursor write error. In the person view, the read
+    ///     cursor moves to the end.
+    fn show_feed(&mut self, conv: &str, loaded: &FeedTail, is_new_selection: bool) -> Result<()> {
+        let total = loaded.messages.len();
+        debug_assert_eq!(total, loaded.tail.message_count);
+        let channel = conv
+            .strip_prefix('#')
+            .and_then(|name| self.snapshot.meta.channel(name));
+        self.pinned = match channel {
+            Some(channel) => store::resolve_pins(&channel.pins, &loaded.messages)
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect(),
+            None => Vec::new(),
+        };
+        self.pins_selected = self.pins_selected.min(self.pinned.len().saturating_sub(1));
+        let thread_messages: Vec<store::Message>;
+        let messages: &[store::Message] = match &self.thread {
+            Some(root) => {
+                // Resolve legacy nested replies before the window limit.
+                let members: BTreeSet<String> = store::thread_root_index(&loaded.messages)
+                    .into_iter()
+                    .filter(|(_, thread_root)| *thread_root == root.as_str())
+                    .map(|(id, _)| id.to_string())
+                    .collect();
+                thread_messages = loaded
+                    .messages
+                    .iter()
+                    .filter(|m| members.contains(&m.id))
+                    .cloned()
+                    .collect();
+                &thread_messages
+            }
+            None => &loaded.messages,
+        };
+        let skip = feed_window_start(messages, self.focus_message.as_deref());
+        let mut feed = messages[skip..].to_vec();
         // A thread longer than the window still shows its root first.
         if let Some(root) = &self.thread
             && !feed.iter().any(|m| m.id == *root)
-            && let Some(root) = messages.into_iter().find(|m| m.id == *root)
+            && let Some(root) = messages[..skip].iter().find(|m| m.id == *root)
         {
-            feed.insert(0, root);
+            feed.insert(0, root.clone());
         }
         // A drop or replacement can move text under the stored line indices.
         if self.feed_selection.is_some() && !feed.starts_with(&self.feed) {
@@ -1561,7 +2036,7 @@ impl HubBrowserState {
             // Feed indices of a thread are not conversation positions.
             self.first_unread = None;
         } else if is_new_selection {
-            let read = self.snapshot.read.get(&conv).copied().unwrap_or(0);
+            let read = self.snapshot.read.get(conv).copied().unwrap_or(0);
             self.first_unread = self
                 .feed
                 .iter()
@@ -1576,15 +2051,104 @@ impl HubBrowserState {
         if self.is_person_view() && self.thread.is_none() && self.search.is_none() {
             let count = total;
             if is_person_member(&self.snapshot.meta, &self.person) {
-                agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
+                self.save_read(conv, count, Some(loaded.tail.offset()))?;
             } else {
-                self.unsaved_read.insert(conv.clone(), count);
+                self.unsaved_read.insert(conv.to_string(), count);
             }
-            self.snapshot.read.insert(conv.clone(), count);
-            self.snapshot.unread_counts.insert(conv, 0);
+            self.snapshot.read.insert(conv.to_string(), count);
+            self.snapshot.unread_counts.insert(conv.to_string(), 0);
         }
         Ok(())
     }
+
+    /// Purpose: Save a read position of the person.
+    /// Input: The conversation, the message count, and its byte offset.
+    /// Output: Ok, or the write error. While a background refresh applies,
+    ///     a forward move waits in `deferred_marks` and nothing is written.
+    fn save_read(
+        &mut self,
+        conv: &str,
+        count: usize,
+        offset: Option<store::LineOffset>,
+    ) -> Result<()> {
+        let Some(marks) = self.deferred_marks.as_mut() else {
+            return agent_hub::mark_read_at(&self.hub, &self.person, conv, count, offset);
+        };
+        if self
+            .snapshot
+            .read
+            .get(conv)
+            .is_none_or(|read| *read < count)
+        {
+            marks.push(ReadMark {
+                conv: conv.to_string(),
+                count,
+                offset,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Purpose: Read every message of one conversation, from the cache when it can.
+/// Input: The hub, the conversation, and the cached feed, if any.
+/// Output: The cache for `conv`, with the appended messages added. A cache
+///     of another conversation, or of a shorter or replaced file, is read
+///     again from line 0.
+fn load_conv(hub: &store::Hub, conv: &str, cached: Option<FeedTail>) -> Result<FeedTail> {
+    let mut feed = cached
+        .filter(|feed| feed.conv == conv)
+        .unwrap_or_else(|| FeedTail {
+            conv: conv.to_string(),
+            tail: store::ConvTail::default(),
+            messages: Vec::new(),
+        });
+    match hub.read_tail(conv, &mut feed.tail)? {
+        store::TailRead::Unchanged => {}
+        store::TailRead::Appended(messages) => feed.messages.extend(messages),
+        store::TailRead::Reset(messages) => feed.messages = messages,
+    }
+    Ok(feed)
+}
+
+/// Purpose: Count the unread messages of one conversation for a member.
+/// Input: The hub, the conversation, the member, its read count, the byte
+///     offset of that count when it is known, and the cached state.
+/// Output: The state with the unread count, or `None` when the file has
+///     fewer messages than the read count (then nothing is unread).
+/// Method:
+///     1. With a cache for the same read count, read only the new bytes.
+///     2. If not, read from the read cursor, with a seek when the offset
+///        is known.
+fn unread_tail(
+    hub: &store::Hub,
+    conv: &str,
+    perspective: &str,
+    read: usize,
+    read_offset: Option<store::LineOffset>,
+    cached: Option<UnreadTail>,
+) -> Result<Option<UnreadTail>> {
+    let from_others = |messages: &[store::Message]| {
+        messages
+            .iter()
+            .filter(|message| message.from != perspective)
+            .count()
+    };
+    if let Some(mut state) = cached.filter(|state| state.read == read) {
+        match hub.read_tail(conv, &mut state.tail)? {
+            store::TailRead::Unchanged => {}
+            store::TailRead::Appended(messages) => state.unread += from_others(&messages),
+            store::TailRead::Reset(messages) if messages.len() < read => return Ok(None),
+            store::TailRead::Reset(messages) => state.unread = from_others(&messages[read..]),
+        }
+        return Ok(Some(state));
+    }
+    let slice = hub.messages_from_offset(conv, read, read_offset, None)?;
+    Ok(slice.tail(read).map(|tail| UnreadTail {
+        read,
+        tail,
+        unread: from_others(&slice.messages),
+    }))
 }
 
 /// Purpose: Find the first message that the feed shows.
@@ -1603,22 +2167,26 @@ fn feed_window_start(messages: &[store::Message], focus: Option<&str>) -> usize 
 }
 
 /// Purpose: Read the hub as one member sees it.
-/// Input: The hub, the perspective handle, the person handle, and read
-///     positions that the cursor file does not have yet.
+/// Input: The hub, the perspective handle, the person handle, read
+///     positions that the cursor file does not have yet, and the read cache.
 /// Output: A snapshot with a count for every channel and every DM row.
 /// Note: The person sees every member as a DM row. Another member sees only
-///     the DMs that it is in.
+///     the DMs that it is in. The unread counts read only the bytes after
+///     the cache or after the read cursor. The cache of another perspective
+///     is dropped.
 pub fn load_snapshot(
     hub: &store::Hub,
     perspective: &str,
     person: &str,
     read_floor: &BTreeMap<String, usize>,
+    cache: &mut HubReadCache,
 ) -> Result<HubSnapshot> {
     let mut meta = hub.meta()?;
     for member in &mut meta.members {
         member.active = member.is_live();
     }
-    let mut read = hub.cursors(perspective)?.read;
+    let cursors = hub.cursors(perspective)?;
+    let mut read = cursors.read.clone();
     for (conv, count) in read_floor {
         let position = read.entry(conv.clone()).or_default();
         *position = (*position).max(*count);
@@ -1637,15 +2205,22 @@ pub fn load_snapshot(
         conv_peers.insert(peer.to_string());
         convs.push(conv.clone());
     }
+    if cache.perspective != perspective {
+        cache.perspective = perspective.to_string();
+        cache.unread.clear();
+    }
+    let mut cached = std::mem::take(&mut cache.unread);
     let mut unread_counts = BTreeMap::new();
     for conv in convs {
         let start = read.get(&conv).copied().unwrap_or(0);
-        let unread = hub
-            .messages(&conv, start)?
-            .iter()
-            .filter(|message| message.from != perspective)
-            .count();
-        unread_counts.insert(conv, unread);
+        // A read floor above the cursor has no saved byte offset.
+        let is_cursor = cursors.read.get(&conv).copied().unwrap_or(0) == start;
+        let offset = is_cursor.then(|| cursors.read_offset(&conv)).flatten();
+        let state = unread_tail(hub, &conv, perspective, start, offset, cached.remove(&conv))?;
+        unread_counts.insert(conv.clone(), state.as_ref().map_or(0, |state| state.unread));
+        if let Some(state) = state {
+            cache.unread.insert(conv, state);
+        }
     }
     let mut dm_peers = Vec::new();
     for member in &meta.members {
@@ -1665,6 +2240,7 @@ pub fn load_snapshot(
         dm_peers.insert(0, store::BOT_HANDLE.to_string());
     }
     Ok(HubSnapshot {
+        tokens: hub.tokens(&meta)?,
         meta,
         dm_peers,
         unread_counts,
@@ -1787,6 +2363,8 @@ enum Part {
     Quote,
     /// The "N replies" link under a message. A click opens the thread.
     Thread,
+    /// The badge of a pinned message.
+    Pin,
     Muted,
     Rule,
     NewRule,
@@ -1817,7 +2395,8 @@ struct FeedLayout {
 
 /// Purpose: Lay out feed messages as chat lines, oldest first.
 /// Input: The messages, the width, the index of the first unread message,
-///     the names to highlight, the local date of today, and the feed mode.
+///     the names to highlight, the local date of today, the feed mode, and
+///     the ids of the pinned messages.
 /// Output: Lines of (text, part) spans and the message of each line. No line
 ///     is wider than `width`.
 /// Method:
@@ -1825,7 +2404,8 @@ struct FeedLayout {
 ///     2. Put a "new" rule before the first unread message. If a day rule is
 ///        already there, end the day rule with the "new" label.
 ///     3. Start a group with a sender and time header when the sender changes,
-///        after a gap of GROUP_GAP_MS, or after a rule.
+///        after a gap of GROUP_GAP_MS, after a rule, or at a pinned message.
+///        The header of a pinned message ends with a pin badge.
 ///     4. In a conversation, put a quote of the parent above a reply.
 ///     5. Indent and wrap each message body under its group header.
 ///     6. In a conversation, put a "N replies" link under a message with replies.
@@ -1836,6 +2416,7 @@ fn feed_layout(
     names: &FeedNames<'_>,
     today: NaiveDate,
     mode: FeedMode,
+    pinned: &BTreeSet<String>,
 ) -> FeedLayout {
     let mut layout = FeedLayout {
         lines: Vec::new(),
@@ -1866,9 +2447,11 @@ fn feed_layout(
             lines.push(new_rule(width));
         }
         let is_reply = mode == FeedMode::Conversation && message.reply_to.is_some();
+        let is_pinned = pinned.contains(&message.id);
         let continues_group = !is_new_day
             && !is_first_unread
             && !is_reply
+            && !is_pinned
             && prev.is_some_and(|p| {
                 p.from == message.from
                     && message.ts_unix_ms.saturating_sub(p.ts_unix_ms) < GROUP_GAP_MS
@@ -1878,7 +2461,11 @@ fn feed_layout(
         }
         layout.messages.resize(lines.len(), None);
         if !continues_group {
-            lines.push(sender_header(message, &time, width, names));
+            let mut header = sender_header(message, &time, width, names);
+            if is_pinned {
+                push_pin_badge(&mut header, width);
+            }
+            lines.push(header);
         }
         if is_reply {
             lines.push(quote_line(messages, message, width));
@@ -1918,16 +2505,27 @@ fn feed_lines(
         names,
         today,
         FeedMode::Conversation,
+        &BTreeSet::new(),
     )
     .lines
 }
 
-/// Replies per parent message id, over the feed.
+/// End a sender header with the pin badge when the line has room for it.
+fn push_pin_badge(header: &mut FeedLine, width: usize) {
+    const BADGE: &str = "  📌 pinned";
+    let used: usize = header.iter().map(|(text, _)| text.width()).sum();
+    if used + BADGE.width() <= width {
+        header.push((BADGE.to_string(), Part::Pin));
+    }
+}
+
+/// Replies per thread root, over the feed. A legacy reply to a reply counts
+/// for the root of its thread.
 fn reply_counts(messages: &[store::Message]) -> BTreeMap<&str, usize> {
     let mut counts = BTreeMap::new();
-    for message in messages {
-        if let Some(parent) = message.reply_to.as_deref() {
-            *counts.entry(parent).or_default() += 1;
+    for (id, root) in store::thread_root_index(messages) {
+        if id != root {
+            *counts.entry(root).or_default() += 1;
         }
     }
     counts
@@ -2358,7 +2956,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, the
         }
         state.hits.rows.push((y, rows[idx].clone()));
     }
-    let tokens: u64 = state.snapshot.meta.tokens.values().sum();
+    let tokens: u64 = state.snapshot.tokens.values().sum();
     if tokens == 0 {
         return;
     }
@@ -2551,6 +3149,9 @@ fn render_main(
         ..feed
     };
     render_feed(buf, feed, scrollbar, &row, state, theme);
+    if state.show_pins {
+        render_pins_drawer(buf, feed, state, theme);
+    }
     if let Some(notice) = &state.notice {
         let style = if notice.starts_with("Not posted") {
             Style::default().fg(theme.accent_error)
@@ -2603,6 +3204,7 @@ fn render_conversation_header(
     } else {
         render_member_buttons(buf, area, state, theme)
     };
+    let buttons_x = render_pin_pill(buf, area, buttons_x, state, theme);
     let area = Rect {
         width: buttons_x.saturating_sub(area.x),
         ..area
@@ -2628,7 +3230,12 @@ fn render_conversation_header(
                 .find(|c| &c.name == name)
                 .map(|c| c.purpose.clone())
                 .unwrap_or_default();
-            let tokens = meta.tokens.get(&format!("#{name}")).copied().unwrap_or(0);
+            let tokens = state
+                .snapshot
+                .tokens
+                .get(&format!("#{name}"))
+                .copied()
+                .unwrap_or(0);
             if tokens > 0 {
                 if !detail.is_empty() {
                     detail.push_str(" · ");
@@ -2666,6 +3273,37 @@ fn render_conversation_header(
         Style::default().fg(theme.gray_dim),
         full.right(),
     );
+}
+
+/// Purpose: Draw the `[📌 N]` pill of a channel header that has pins.
+/// Input: The buffer, the header area, the x where the right buttons start,
+///     the state, and the theme.
+/// Output: The x of the pill, or `right_x` when no pill is drawn. A click on
+///     the pill opens the pinned-messages drawer.
+fn render_pin_pill(
+    buf: &mut Buffer,
+    area: Rect,
+    right_x: u16,
+    state: &mut HubBrowserState,
+    theme: &Theme,
+) -> u16 {
+    let is_channel = matches!(state.selected_row(), Some(Row::Channel(_)));
+    if !is_channel || state.thread.is_some() || state.pinned.is_empty() {
+        return right_x;
+    }
+    let label = format!("[📌 {}]", state.pinned.len());
+    let width = label.width() as u16;
+    let x = right_x.saturating_sub(width);
+    if x <= area.x + 10 {
+        return right_x;
+    }
+    let mut style = Style::default().fg(theme.accent_verify);
+    if state.show_pins || state.hover == Some(HoverKey::PinPill) {
+        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    span_at(buf, x, area.y + 1, &label, style, right_x);
+    state.hits.pin_pill = Rect::new(x, area.y + 1, width, 1);
+    x.saturating_sub(1)
 }
 
 /// Draw the "back" button of a thread header. Return the x of the button.
@@ -2723,6 +3361,7 @@ fn render_feed(
         Some(_) => FeedMode::Thread,
         None => FeedMode::Conversation,
     };
+    let pinned: BTreeSet<String> = state.pinned.iter().map(|m| m.id.clone()).collect();
     let FeedLayout {
         lines,
         messages: line_messages,
@@ -2733,6 +3372,7 @@ fn render_feed(
         &names,
         today,
         mode,
+        &pinned,
     );
     if lines.is_empty() {
         let text = empty_feed_text(row, state);
@@ -2932,6 +3572,7 @@ fn part_style(part: &Part, theme: &Theme) -> Style {
         Part::Thread => Style::default()
             .fg(theme.accent_user)
             .add_modifier(Modifier::BOLD),
+        Part::Pin => Style::default().fg(theme.accent_verify),
         Part::Muted => Style::default().fg(theme.gray),
         Part::Rule => Style::default().fg(theme.gray_dim),
         Part::NewRule => Style::default().fg(theme.accent_error),
@@ -3097,6 +3738,17 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
             HintItem::paired(key!(Up), key!(Down), "choose"),
         ];
     }
+    if state.show_pins {
+        let mut hints = vec![HintItem::new(key!(Enter), "jump")];
+        if state.is_person_view() {
+            hints.push(HintItem::new(key!('u'), "unpin"));
+        }
+        hints.extend([
+            HintItem::new(key!(Esc), "close pins"),
+            HintItem::paired(key!(Up), key!(Down), "choose"),
+        ]);
+        return hints;
+    }
     // Clickable hints come first, so a narrow footer keeps them.
     let mut hints = Vec::new();
     if mission::fleet_counts(&state.snapshot).needs_input > 0 {
@@ -3123,6 +3775,11 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
         HintItem::new(key!('a'), "all/active DMs"),
         HintItem::new(key!(Esc), esc_label),
         HintItem::new(key!('?'), "keys"),
+    ]);
+    if matches!(state.selected_row(), Some(Row::Channel(_))) {
+        hints.push(HintItem::new(key!('P'), "pins"));
+    }
+    hints.extend([
         HintItem::paired(key!(Up), key!(Down), "conversations"),
         HintItem::paired(key!(PageUp), key!(PageDown), "scroll"),
         HintItem::new(key!('c'), "new channel"),
@@ -3443,7 +4100,141 @@ fn render_reply_chip(
         style = style.bg(theme.bg_hover).add_modifier(Modifier::UNDERLINED);
     }
     span_at(buf, rect.x, py, label, style, rect.right());
-    state.hits.reply_chip = Some((rect, state.feed[idx].id.clone()));
+    let id = state.feed[idx].id.clone();
+    state.hits.reply_chip = Some((rect, id.clone()));
+    if !matches!(state.selected_row(), Some(Row::Channel(_))) {
+        return;
+    }
+    let pin_label = if state.pinned.iter().any(|m| m.id == id) {
+        " 📌 unpin "
+    } else {
+        " 📌 pin "
+    };
+    let pin_width = pin_label.width() as u16;
+    let pin_x = rect.x.saturating_sub(pin_width + 1);
+    if pin_x < area.x {
+        return;
+    }
+    let pin_rect = Rect::new(pin_x, py, pin_width, 1);
+    let mut style = Style::default()
+        .fg(theme.text_primary)
+        .bg(theme.bg_highlight);
+    if contains(pin_rect, px, py) {
+        style = style.bg(theme.bg_hover).add_modifier(Modifier::UNDERLINED);
+    }
+    span_at(buf, pin_x, py, pin_label, style, pin_rect.right());
+    state.hits.pin_chip = Some((pin_rect, id));
+}
+
+/// Purpose: Draw the pinned messages of the channel over the top of the feed.
+/// Input: The buffer, the feed area, the state, and the theme.
+/// Output: None. Each pin row and each `[unpin]` button becomes a mouse
+///     target. The person view alone gets the buttons.
+fn render_pins_drawer(buf: &mut Buffer, feed: Rect, state: &mut HubBrowserState, theme: &Theme) {
+    let Some(Row::Channel(name)) = state.selected_row() else {
+        return;
+    };
+    let content_rows = state.pinned.len().max(1) as u16;
+    let height = (content_rows + 2).min(feed.height);
+    if height < 3 || feed.width < 20 {
+        return;
+    }
+    let rect = Rect { height, ..feed };
+    Clear.render(rect, buf);
+    fill(buf, rect, Style::default().bg(theme.bg_base));
+    let border = Style::default()
+        .fg(theme.prompt_border_active)
+        .bg(theme.bg_base);
+    let is_person = state.is_person_view();
+    let keys = if is_person {
+        "Enter jump · u unpin · Esc close"
+    } else {
+        "Enter jump · Esc close"
+    };
+    let title = format!(" 📌 Pinned in #{name} · {keys} ");
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let top_fill = inner_w.saturating_sub(title.width() + 1);
+    span_at(
+        buf,
+        rect.x,
+        rect.y,
+        &format!("╭─{title}{}╮", "─".repeat(top_fill)),
+        border,
+        rect.right(),
+    );
+    for y in rect.y + 1..rect.bottom() - 1 {
+        span_at(buf, rect.x, y, "│", border, rect.right());
+        span_at(buf, rect.right() - 1, y, "│", border, rect.right());
+    }
+    span_at(
+        buf,
+        rect.x,
+        rect.bottom() - 1,
+        &format!("╰{}╯", "─".repeat(inner_w)),
+        border,
+        rect.right(),
+    );
+    state.hits.pin_drawer = rect;
+    let inner_x = rect.x + 2;
+    let inner_right = rect.right() - 2;
+    if state.pinned.is_empty() {
+        let text = "No pinned messages. Hover a message and click 📌 pin.";
+        span_at(buf, inner_x, rect.y + 1, text, theme.muted(), inner_right);
+        return;
+    }
+    let visible = (height - 2) as usize;
+    let first = (state.pins_selected + 1).saturating_sub(visible);
+    let unpin_label = "[unpin]";
+    let unpin_w = unpin_label.width() as u16;
+    let mut rows = Vec::new();
+    let mut unpins = Vec::new();
+    for (offset, message) in state.pinned.iter().enumerate().skip(first).take(visible) {
+        let y = rect.y + 1 + (offset - first) as u16;
+        let row_rect = Rect::new(rect.x + 1, y, rect.width.saturating_sub(2), 1);
+        let is_hovered = state.hover == Some(HoverKey::PinRow(y));
+        let bg = if offset == state.pins_selected {
+            theme.bg_highlight
+        } else if is_hovered {
+            theme.bg_hover
+        } else {
+            theme.bg_base
+        };
+        fill(buf, row_rect, Style::default().bg(bg));
+        let text_right = if is_person {
+            inner_right.saturating_sub(unpin_w + 1)
+        } else {
+            inner_right
+        };
+        let x = span_at(
+            buf,
+            inner_x,
+            y,
+            &format!("@{}", message.from),
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+            text_right,
+        );
+        let snippet = message.text.lines().next().unwrap_or_default();
+        span_at(
+            buf,
+            x,
+            y,
+            &format!(" · {snippet}"),
+            Style::default().fg(theme.gray_bright).bg(bg),
+            text_right,
+        );
+        if is_person {
+            let unpin_x = inner_right.saturating_sub(unpin_w);
+            let unpin = Style::default().fg(theme.command).bg(bg);
+            span_at(buf, unpin_x, y, unpin_label, unpin, inner_right);
+            unpins.push((Rect::new(unpin_x, y, unpin_w, 1), message.id.clone()));
+        }
+        rows.push((y, message.id.clone()));
+    }
+    state.hits.pin_rows = rows;
+    state.hits.pin_unpins = unpins;
 }
 
 /// Purpose: Draw a one-line card about the member under the pointer.
@@ -3580,7 +4371,7 @@ fn render_search(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, them
 /// Input: The buffer, the browser area, and the theme.
 /// Output: None. Any key or click closes it.
 fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
-    const KEYS: [(&str, &str); 21] = [
+    const KEYS: [(&str, &str); 23] = [
         ("↑ ↓ / j k", "choose a conversation"),
         ("] [", "next / previous unread conversation"),
         ("Tab / i / Enter", "write a post"),
@@ -3597,6 +4388,8 @@ fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
         ("c", "create a channel"),
         ("h", "/hub here on or off"),
         ("a", "all or active DMs"),
+        ("P", "pinned messages of the channel"),
+        ("click 📌 pin", "pin or unpin a channel message"),
         ("PgUp PgDn End", "scroll the feed"),
         ("click @name", "open the DM with that member"),
         ("click ↩ / quote", "reply / open the thread"),
@@ -3875,6 +4668,119 @@ mod tests {
         assert!(hub.cursors("back").unwrap().read.is_empty());
     }
 
+    fn texts(state: &HubBrowserState) -> Vec<&str> {
+        state.feed.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    fn post(hub: &store::Hub, from: &str, conv: &str, text: &str) {
+        hub.append(&message(from, conv.to_string(), text, store::now_ms()))
+            .unwrap();
+    }
+
+    /// Run one background refresh the way the event loop does.
+    fn refresh(state: &mut HubBrowserState) -> Option<Vec<ReadMark>> {
+        let job = state.begin_refresh().expect("no refresh in flight");
+        let generation = job.generation;
+        let result = job.run().map_err(|error| error.to_string());
+        state.finish_refresh(generation, result)
+    }
+
+    #[test]
+    fn a_background_refresh_shows_new_messages_and_returns_the_read_position() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+        post(&hub, "front", "#general", "news");
+        post(&hub, "back", &store::dm_conv("me", "back"), "ping");
+
+        let job = state.begin_refresh().unwrap();
+        assert!(state.begin_refresh().is_none(), "one refresh at a time");
+        let generation = job.generation;
+        let marks = state
+            .finish_refresh(generation, job.run().map_err(|e| e.to_string()))
+            .expect("the result is current");
+        assert_eq!(texts(&state), vec!["hello", "news"]);
+        assert_eq!(state.snapshot.unread(&store::dm_conv("me", "back")), 1);
+        let len = std::fs::metadata(hub.dir().join("channels/general.jsonl"))
+            .unwrap()
+            .len();
+        let offset = hub
+            .messages_from_offset("#general", 0, None, None)
+            .unwrap()
+            .next_byte_offset;
+        assert_eq!(offset.map(|offset| offset.bytes), Some(len));
+        let mark = ReadMark {
+            conv: "#general".to_string(),
+            count: 2,
+            offset,
+        };
+        assert_eq!(marks, vec![mark]);
+        // The apply wrote no cursor: the caller saves the marks off-thread.
+        assert_eq!(hub.cursors("me").unwrap().read.get("#general"), Some(&1));
+        assert!(state.begin_refresh().is_some(), "the flag clears on apply");
+    }
+
+    #[test]
+    fn a_refresh_result_is_dropped_after_a_local_change() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+        post(&hub, "front", "#general", "news");
+        let job = state.begin_refresh().unwrap();
+        let generation = job.generation;
+        let result = job.run().map_err(|e| e.to_string());
+        // The person picks another conversation while the job runs.
+        state.select(Some(dm("front", "me")));
+        let feed_before = state.feed.clone();
+        assert_eq!(state.finish_refresh(generation, result), None);
+        assert_eq!(state.feed, feed_before);
+        assert!(state.begin_refresh().is_some(), "the flag still clears");
+
+        // A browser that opened later never takes the result of an older one.
+        let mut old = HubBrowserState::open(hub.clone(), "me", None).unwrap();
+        let job = old.begin_refresh().unwrap();
+        let generation = job.generation;
+        let mut reopened = HubBrowserState::open(hub, "me", None).unwrap();
+        let result = job.run().map_err(|e| e.to_string());
+        assert_eq!(reopened.finish_refresh(generation, result), None);
+    }
+
+    #[test]
+    fn incremental_reloads_match_a_full_reload_after_appends_and_truncation() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+        let fresh = |hub: &store::Hub| {
+            let fresh = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+            (fresh.feed.clone(), fresh.snapshot.unread_counts.clone())
+        };
+        for round in 0..3 {
+            post(&hub, "front", "#general", &format!("round {round}"));
+            post(
+                &hub,
+                "back",
+                &store::dm_conv("me", "back"),
+                &format!("dm {round}"),
+            );
+            refresh(&mut state).unwrap();
+            let (feed, unread) = fresh(&hub);
+            assert_eq!(state.feed, feed);
+            assert_eq!(state.snapshot.unread_counts, unread);
+        }
+        assert_eq!(state.snapshot.unread(&store::dm_conv("me", "back")), 3);
+
+        // Another writer replaces the channel file with a shorter one.
+        let path = hub.dir().join("channels/general.jsonl");
+        let line = serde_json::to_string(&message(
+            "front",
+            "#general".to_string(),
+            "only line",
+            store::now_ms(),
+        ))
+        .unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        state.reload().unwrap();
+        assert_eq!(texts(&state), vec!["only line"]);
+        assert_eq!(state.feed, fresh(&hub).0);
+    }
+
     #[test]
     fn unread_marker_points_at_the_first_unread_message() {
         let (_root, hub) = hub_with_dms();
@@ -3948,6 +4854,7 @@ mod tests {
                         store::Channel {
                             name: "alerts".to_string(),
                             purpose: String::new(),
+                            pins: Vec::new(),
                             created_ms: 0,
                         },
                     );
@@ -4639,6 +5546,7 @@ mod tests {
             meta.channels.push(store::Channel {
                 name: "ops".to_string(),
                 purpose: String::new(),
+                pins: Vec::new(),
                 created_ms: 0,
             });
         })
@@ -4973,14 +5881,78 @@ mod tests {
         );
     }
 
+    /// A #general root with a legacy chain on disk: m2 replies to m1, and m3
+    /// replies to m2.
+    fn hub_with_nested_replies() -> (tempfile::TempDir, store::Hub, [String; 3]) {
+        let (root, hub) = hub_with_dms();
+        let general = || "#general".to_string();
+        let m1 = message("front", general(), "plan?", store::now_ms());
+        let mut m2 = message("back", general(), "use sqlite", store::now_ms());
+        m2.reply_to = Some(m1.id.clone());
+        let mut m3 = message("front", general(), "why sqlite?", store::now_ms());
+        m3.reply_to = Some(m2.id.clone());
+        for message in [&m1, &m2, &m3] {
+            hub.append(message).unwrap();
+        }
+        (root, hub, [m1.id, m2.id, m3.id])
+    }
+
+    #[test]
+    fn a_legacy_reply_to_a_reply_shows_in_the_root_thread() {
+        let (_root, hub, [m1, m2, m3]) = hub_with_nested_replies();
+        let mut state = open(hub);
+        let counts = reply_counts(&state.feed);
+        assert_eq!(counts.get(m1.as_str()), Some(&2));
+        assert_eq!(counts.get(m2.as_str()), None);
+        let text = buffer_text(&render(&mut state));
+        assert!(text.contains("↩ 2 replies"), "{text}");
+        for id in [&m1, &m2, &m3] {
+            state.open_thread(id);
+            assert_eq!(state.thread.as_deref(), Some(m1.as_str()));
+            let ids: Vec<&str> = state.feed.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(ids, [m1.as_str(), m2.as_str(), m3.as_str()]);
+            state.handle_key(&key(KeyCode::Esc));
+            assert_eq!(state.thread, None);
+        }
+    }
+
+    #[test]
+    fn a_click_on_the_quote_of_a_nested_reply_opens_the_root_thread() {
+        let (_root, hub, [m1, m2, _]) = hub_with_nested_replies();
+        let mut state = open(hub);
+        render(&mut state);
+        // Only the quote above m3 points at m2.
+        let cell = span_cell(&state, &SpanTarget::Thread(m2));
+        click(&mut state, cell);
+        assert_eq!(state.thread.as_deref(), Some(m1.as_str()));
+        assert_eq!(state.feed.len(), 3);
+    }
+
+    #[test]
+    fn a_reply_to_a_reply_targets_the_thread_root() {
+        let (_root, hub, [m1, m2, _]) = hub_with_nested_replies();
+        let mut state = open(hub);
+        state.start_reply(m2);
+        assert_eq!(state.reply_to.as_deref(), Some(m1.as_str()));
+        state.handle_paste("agreed");
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Enter)),
+            HubKeyOutcome::Reply {
+                to: "#general".to_string(),
+                text: "agreed".to_string(),
+                reply_to: m1,
+            }
+        );
+    }
+
     #[test]
     fn r_replies_to_the_newest_message_and_esc_drops_the_reply() {
-        let (_root, hub, _) = hub_with_thread();
+        let (_root, hub, parent_id) = hub_with_thread();
         let mut state = open(hub);
-        let newest = state.feed.last().unwrap().id.clone();
         state.handle_key(&key(KeyCode::Char('r')));
         assert!(state.is_composing);
-        assert_eq!(state.reply_to.as_deref(), Some(newest.as_str()));
+        // The newest message is a reply, so the draft replies to its root.
+        assert_eq!(state.reply_to.as_deref(), Some(parent_id.as_str()));
         state.handle_key(&key(KeyCode::Esc));
         assert!(!state.is_composing);
         state.handle_key(&key(KeyCode::Esc));
@@ -5102,20 +6074,20 @@ mod tests {
 
     #[test]
     fn a_paused_draft_keeps_its_reply_parent_in_another_conversation() {
-        let (_root, hub, _) = hub_with_thread();
+        let (_root, hub, parent_id) = hub_with_thread();
         let mut state = open(hub);
-        let newest = state.feed.last().unwrap().id.clone();
         state.handle_key(&key(KeyCode::Char('r')));
         state.handle_paste("agreed");
         state.handle_key(&key(KeyCode::Esc));
         state.select(Some(dm("front", "me")));
         state.handle_key(&key(KeyCode::Tab));
+        // The newest message is a reply, so the draft replies to its root.
         assert_eq!(
             state.handle_key(&key(KeyCode::Enter)),
             HubKeyOutcome::Reply {
                 to: "#general".to_string(),
                 text: "agreed".to_string(),
-                reply_to: newest,
+                reply_to: parent_id,
             }
         );
     }
@@ -5668,5 +6640,160 @@ mod tests {
             span_target(text, part, &meta),
             Some(SpanTarget::Member(from.to_string()))
         );
+    }
+
+    /// A hub whose #general has one old pinned message and more than
+    /// FEED_LIMIT newer messages.
+    fn hub_with_old_pin() -> (tempfile::TempDir, store::Hub, store::Message) {
+        let (root, hub) = hub_with_dms();
+        let old = message("front", "#general".to_string(), "decided: REST", 1);
+        hub.append(&old).unwrap();
+        for i in 0..FEED_LIMIT + 10 {
+            let text = format!("filler {i}");
+            hub.append(&message(
+                "back",
+                "#general".to_string(),
+                &text,
+                store::now_ms(),
+            ))
+            .unwrap();
+        }
+        agent_hub::pin_as_person(&hub, "me", "#general", &old.id).unwrap();
+        (root, hub, old)
+    }
+
+    #[test]
+    fn the_pin_pill_opens_a_drawer_that_jumps_to_an_old_pin() {
+        let (_root, hub, old) = hub_with_old_pin();
+        let mut state = open(hub);
+        assert_eq!(state.pinned.len(), 1);
+        assert!(
+            state.feed.iter().all(|m| m.id != old.id),
+            "outside the window"
+        );
+        let buf = render(&mut state);
+        let pill = state.hits.pin_pill;
+        assert!(pill.width > 0, "the header shows the pill");
+        assert!(buffer_text(&buf).contains("1]"));
+
+        click(&mut state, (pill.x + 1, pill.y));
+        assert!(state.show_pins, "a click on the pill opens the drawer");
+        let buf = render(&mut state);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Pinned in #general"), "{text}");
+        assert!(text.contains("@front · decided: REST"), "{text}");
+        assert!(text.contains("[unpin]"), "{text}");
+
+        state.handle_key(&key(KeyCode::Enter));
+        assert!(!state.show_pins);
+        assert_eq!(state.focus_message.as_deref(), Some(old.id.as_str()));
+        assert!(
+            state.feed.iter().any(|m| m.id == old.id),
+            "the old pin loads"
+        );
+        let text = buffer_text(&render(&mut state));
+        assert!(text.contains("decided: REST"), "{text}");
+        assert!(text.contains("pinned"), "the feed marks the pin:\n{text}");
+
+        state.handle_key(&key(KeyCode::Char('P')));
+        assert!(state.show_pins);
+        state.handle_key(&key(KeyCode::Down));
+        assert!(state.show_pins, "a drawer key keeps the drawer");
+        state.handle_key(&key(KeyCode::Char('/')));
+        assert!(!state.show_pins, "another key closes the drawer");
+        assert!(state.search.is_some(), "and then works as usual");
+    }
+
+    #[test]
+    fn p_on_a_dm_opens_no_drawer() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Down));
+        state.handle_key(&key(KeyCode::Char('P')));
+        assert!(!state.show_pins);
+        assert!(state.notice.as_deref().unwrap().contains("Only channels"));
+    }
+
+    #[test]
+    fn the_hover_pin_chip_asks_to_pin_or_unpin_in_the_person_view_only() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let id = state.feed.last().unwrap().id.clone();
+        render(&mut state);
+        let (x, y) = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        let (rect, chip_id) = state.hits.pin_chip.clone().expect("pin chip on hover");
+        assert_eq!(chip_id, id);
+        let outcome = state.handle_mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert_eq!(
+            outcome,
+            HubKeyOutcome::Pin {
+                channel: "#general".to_string(),
+                message_id: id.clone(),
+            }
+        );
+        assert!(state.feed_selection.is_none(), "no text selection starts");
+
+        agent_hub::pin_as_person(&state.hub, "me", "#general", &id).unwrap();
+        state.reload().unwrap();
+        render(&mut state);
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        let (rect, _) = state.hits.pin_chip.clone().expect("unpin chip");
+        let outcome = state.handle_mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(
+            matches!(outcome, HubKeyOutcome::Unpin { .. }),
+            "{outcome:?}"
+        );
+
+        state.set_perspective("front").unwrap();
+        render(&mut state);
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        assert!(
+            state.hits.pin_chip.is_none(),
+            "a read-only view has no chip"
+        );
+        state.handle_key(&key(KeyCode::Char('P')));
+        assert!(state.show_pins, "a read-only view still shows the pins");
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Char('u'))),
+            HubKeyOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn a_pinned_message_gets_its_own_header_with_a_badge() {
+        let persons = BTreeSet::new();
+        let mentions = BTreeSet::new();
+        let names = FeedNames {
+            persons: &persons,
+            mentions: &mentions,
+        };
+        let first = message("front", "#general".to_string(), "one", 1_000);
+        let second = message("front", "#general".to_string(), "two", 2_000);
+        let pinned = BTreeSet::from([second.id.clone()]);
+        let today = local_time(0).date_naive();
+        let layout = feed_layout(
+            &[first, second],
+            60,
+            None,
+            &names,
+            today,
+            FeedMode::Conversation,
+            &pinned,
+        );
+        let headers: Vec<&FeedLine> = layout
+            .lines
+            .iter()
+            .filter(|line| line.iter().any(|(_, part)| matches!(part, Part::Agent(..))))
+            .collect();
+        assert_eq!(headers.len(), 2, "the pin starts a new group");
+        assert!(
+            headers[1]
+                .iter()
+                .any(|(text, part)| { *part == Part::Pin && text.contains("📌") })
+        );
+        assert!(!headers[0].iter().any(|(_, part)| *part == Part::Pin));
     }
 }

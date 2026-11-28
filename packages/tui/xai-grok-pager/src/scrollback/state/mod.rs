@@ -644,10 +644,23 @@ impl ScrollbackState {
         id
     }
 
-    /// Add a block (convenience wrapper).
-    ///
-    /// Returns the assigned EntryId.
+    /// Purpose: Add a block or append a delivery to the last hub delivery card.
+    /// Input: A finalized block.
+    /// Output: The new entry ID or the ID of the existing delivery stack.
+    /// Note: A card already printed to native scrollback cannot change.
     pub fn push_block(&mut self, block: RenderBlock) -> EntryId {
+        if let RenderBlock::HubCard(next) = &block
+            && let Some((&id, entry)) = self.entries.last_mut()
+            && !self.committed.contains(&id)
+            && !entry.is_running
+            && let RenderBlock::HubCard(current) = &mut entry.block
+            && current.append_delivery(next)
+        {
+            entry.invalidate_cache();
+            self.dirty_heights.insert(id);
+            self.bump_content_generation();
+            return id;
+        }
         self.push(ScrollbackEntry::new(block))
     }
 
@@ -2139,6 +2152,134 @@ mod tests {
     use super::test_util::*;
     use super::*;
     use pretty_assertions::assert_eq;
+
+    /// Purpose: Make a delivery block for a test.
+    /// Input: An optional hub name and message texts.
+    /// Output: A card with one DM per text.
+    fn hub_delivery_block(hub: Option<&str>, texts: &[&str]) -> RenderBlock {
+        use crate::scrollback::blocks::HubCardBlock;
+        use xai_grok_tools::implementations::grok_build::agent_hub::{DeliveredMessage, Delivery};
+
+        let mut messages = Vec::new();
+        for text in texts {
+            messages.push(DeliveredMessage {
+                place: "DM".to_string(),
+                from: "backend".to_string(),
+                is_person: false,
+                text: text.to_string(),
+                image_count: 0,
+            });
+        }
+        RenderBlock::HubCard(HubCardBlock::delivery(&Delivery {
+            hub: hub.map(str::to_string),
+            messages,
+        }))
+    }
+
+    /// Purpose: Verify that adjacent deliveries share one collapsed header and total count.
+    /// Input: Two deliveries with three messages across different hubs.
+    /// Output: One entry with fresh header content and the original entry ID.
+    #[test]
+    fn hub_deliveries_stack_with_the_total_message_count() {
+        let mut state = ScrollbackState::new();
+        let first_id = state.push_block(hub_delivery_block(Some("api"), &["first", "second"]));
+        state.prepare_layout(80, 24);
+        let generation = state.content_generation();
+        let next_id = state.push_block(hub_delivery_block(Some("ui"), &["third"]));
+        state.prepare_layout(80, 24);
+
+        assert_eq!(next_id, first_id);
+        assert_eq!(state.len(), 1);
+        assert!(state.content_generation() > generation);
+        let entry = state.get(0).unwrap();
+        assert_eq!(entry.display_mode, DisplayMode::Collapsed);
+        let output = entry.cached_output_ref();
+        assert_eq!(output.lines.len(), 1);
+        assert_eq!(
+            output.lines[0].content.to_string(),
+            "◆ hub · agent messages  3 new messages  ▸"
+        );
+    }
+
+    /// Purpose: Keep an open stack expanded and refresh its body after another delivery.
+    /// Input: An expanded delivery card and a second delivery with a link.
+    /// Output: A taller card with both source hubs, both links, and a divider.
+    #[test]
+    fn hub_stack_append_preserves_expansion_and_refreshes_content() {
+        let mut state = ScrollbackState::new();
+        let first_id = state.push_block(hub_delivery_block(
+            Some("api"),
+            &["[first](https://example.com/first)"],
+        ));
+        state.set_selected(Some(0));
+        state.toggle_fold_selected();
+        state.prepare_layout(80, 24);
+        let height = state.get_cached_entry_height(0).unwrap();
+        let next_id = state.push_block(hub_delivery_block(
+            Some("ui"),
+            &["[second](https://example.com/second)"],
+        ));
+        state.prepare_layout(80, 24);
+
+        assert_eq!(next_id, first_id);
+        assert_eq!(state.selected(), Some(0));
+        assert!(state.get_cached_entry_height(0).unwrap() > height);
+        let entry = state.get(0).unwrap();
+        assert_eq!(entry.display_mode, DisplayMode::Expanded);
+        let RenderBlock::HubCard(card) = &entry.block else {
+            panic!("expected a hub delivery stack");
+        };
+        let source = card.copy_text();
+        assert!(source.contains("hub api"), "{source}");
+        assert!(source.contains("hub ui"), "{source}");
+        entry.block.with_hyperlinks(|links| {
+            let mut urls: Vec<_> = links.iter().map(|link| link.url.as_str()).collect();
+            urls.sort_unstable();
+            urls.dedup();
+            assert_eq!(
+                urls,
+                vec!["https://example.com/first", "https://example.com/second"]
+            );
+        });
+        let output = entry.cached_output_ref();
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.content.to_string().trim() == "───")
+                .count(),
+            1,
+            "{:?}",
+            output.lines
+        );
+    }
+
+    /// Purpose: Stop a delivery stack at other content or the native scrollback frontier.
+    /// Input: Deliveries separated by a block, or a delivery already printed to the terminal.
+    /// Output: A new delivery entry after each boundary.
+    #[test]
+    fn hub_stacks_stop_at_other_blocks_and_committed_cards() {
+        for separator in [
+            agent_block("reply"),
+            tool_block("run"),
+            user_block("question"),
+            RenderBlock::hub_command_card("hubs", "hub list"),
+        ] {
+            let mut state = ScrollbackState::new();
+            let first_id = state.push_block(hub_delivery_block(None, &["first"]));
+            state.push_block(separator);
+            let next_id = state.push_block(hub_delivery_block(None, &["second"]));
+            assert_ne!(first_id, next_id);
+            assert_eq!(state.len(), 3);
+        }
+
+        let mut state = ScrollbackState::new();
+        let first_id = state.push_block(hub_delivery_block(None, &["first"]));
+        state.mark_committed(0);
+        let next_id = state.push_block(hub_delivery_block(None, &["second"]));
+        assert_ne!(first_id, next_id);
+        assert_eq!(state.len(), 2);
+    }
 
     #[test]
     fn test_empty_state() {

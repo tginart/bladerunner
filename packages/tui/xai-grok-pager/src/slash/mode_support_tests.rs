@@ -150,6 +150,11 @@ fn mode_specific_builtin_refusals_are_pinned() {
             ),
             ("minimal", "You're already in minimal mode.".to_string()),
             (
+                "pr",
+                "/pr isn't available in minimal mode (the pull request viewer needs fullscreen). \
+                 Run /fullscreen to switch this session.".to_string()
+            ),
+            (
                 "shots",
                 "/shots isn't available in minimal mode (the n-shot columns need fullscreen). \
                  Run /fullscreen to switch this session."
@@ -176,6 +181,7 @@ fn mode_specific_builtin_refusals_are_pinned() {
                  Run /fullscreen to switch this session."
                     .to_string()
             ),
+            #[cfg(not(feature = "community-build"))]
             (
                 "workflows",
                 "/workflows isn't available in minimal mode \

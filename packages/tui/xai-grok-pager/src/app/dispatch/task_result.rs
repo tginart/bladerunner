@@ -1504,6 +1504,59 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             request,
             response,
         } => crate::app::hub_bot::finish_answer(app, agent_id, &hub, &request, response),
+        TaskResult::PullRequestLoaded {
+            agent_id,
+            request_id,
+            result,
+        } => {
+            use crate::views::review_chat::ReviewChatState;
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            let Some(state) = &mut agent.pull_request else {
+                return vec![];
+            };
+            if state.request_id != request_id {
+                return vec![];
+            }
+            match result {
+                Err(error) => state.message = error,
+                Ok(pr) => {
+                    if let Some(sid) = &agent.session.session_id {
+                        let chat = agent.pr_chats.entry(pr.url.clone()).or_insert_with(|| {
+                            std::rc::Rc::new(std::cell::RefCell::new(ReviewChatState::new(
+                                sid.0.to_string(),
+                                &agent.session.cwd,
+                            )))
+                        });
+                        chat.borrow_mut().visible = false;
+                        chat.borrow_mut().focused = false;
+                        state.chat = Some(chat.clone());
+                    }
+                    state.target = pr.url.clone();
+                    state.data = Some(pr);
+                    if matches!(
+                        agent.active_modal,
+                        Some(crate::views::modal::ActiveModal::PullRequest)
+                    ) {
+                        state.enter_fullscreen();
+                    }
+                }
+            }
+            vec![]
+        }
+        TaskResult::HubBrowserRefreshed {
+            agent_id,
+            subagent,
+            generation,
+            result,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                let result = result.map(|refresh| *refresh);
+                agent.finish_hub_browser_refresh(subagent.as_deref(), generation, result);
+            }
+            vec![]
+        }
         TaskResult::ReviewChatAnswered {
             agent_id,
             parent_session_id,
@@ -1511,12 +1564,10 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             response,
         } => {
             if let Some(agent) = app.agents.get_mut(&agent_id)
-                && let Some(shared) = &agent.review_chat
+                && let Some(shared) = agent.review_chat_for_child(&child_id)
             {
                 let mut chat = shared.borrow_mut();
-                if chat.parent_session_id == parent_session_id
-                    && chat.current_child_id.as_deref() == Some(child_id.as_str())
-                {
+                if chat.parent_session_id == parent_session_id {
                     chat.finish(response);
                 }
             }

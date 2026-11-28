@@ -49,6 +49,16 @@ Version:    0.0.3
 crates.io:  https://crates.io/crates/ordered_hashmap/0.0.3
 
 --------------------------------------------------------------------------------
+gcloud-auth
+--------------------------------------------------------------------------------
+Path:       third_party/gcloud-auth/
+License:    MIT
+License file: third_party/gcloud-auth/LICENSE
+Upstream:   https://github.com/yoshidan/google-cloud-rust/tree/main/foundation/auth
+Version:    1.3.0
+crates.io:  https://crates.io/crates/gcloud-auth/1.3.0
+
+--------------------------------------------------------------------------------
 End of notices for vendored third_party/ crates.
 
 Full product notices (all crates.io / git dependencies shipped with the Grok

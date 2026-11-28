@@ -1427,6 +1427,66 @@ mod tests {
         }
     }
 
+    /// Purpose: Verify that one header click toggles a hub delivery card.
+    /// Input: A card, the state of a mouse press, and mouse release events.
+    /// Output: The body expands, then collapses after the next header click.
+    #[test]
+    fn hub_delivery_header_click_toggles_body() {
+        use crate::scrollback::render::ScratchBuffer;
+        use crate::scrollback::scrollback_pane::ScrollbackPane;
+        use crate::scrollback::types::DisplayMode;
+        use ratatui::buffer::Buffer;
+
+        let mut agent = make_agent();
+        let area = Rect::new(0, 0, 80, 24);
+        agent.pane_areas.scrollback = area;
+        agent.active_pane = AgentPane::Scrollback;
+        let wake = "[message_agents · hub team] 1 message(s).\n\
+                    --- DM · from @backend · id=m1 ---\nthe build is green";
+        let card = crate::acp::tracker::hub_delivery_card(wake).expect("hub delivery");
+        agent.scrollback.push_block(card);
+        let next_wake = "[message_agents · hub team] 1 message(s).\n\
+                         --- DM · from @frontend · id=m2 ---\nthe UI is ready";
+        agent.scrollback.push_block(
+            crate::acp::tracker::hub_delivery_card(next_wake).expect("next hub delivery"),
+        );
+        assert_eq!(agent.scrollback.len(), 1);
+        assert_eq!(
+            agent.scrollback.get(0).unwrap().display_mode,
+            DisplayMode::Collapsed
+        );
+
+        let registry = ActionRegistry::defaults();
+        for expected in [DisplayMode::Expanded, DisplayMode::Collapsed] {
+            agent.scrollback.prepare_layout(area.width, area.height);
+            let mut buffer = Buffer::empty(area);
+            let mut scratch = ScratchBuffer::new();
+            let rendered = ScrollbackPane::new().render_with_scratch_and_selection_boundaries(
+                area,
+                &mut buffer,
+                &agent.scrollback,
+                &mut scratch,
+            );
+            agent.update_scrollback_selection_state(
+                rendered.output.selection_model,
+                rendered.selection_boundaries,
+            );
+            let header = agent
+                .last_scrollback_selection_model
+                .ranges
+                .iter()
+                .flat_map(|range| &range.lines)
+                .find(|line| line.block_line_idx == 0)
+                .expect("hub header");
+            let col = header.screen_x + 1;
+            let row = header.screen_y;
+            // Set the press state directly to avoid the native macOS modifier probe.
+            agent.pending_scrollback_click = Some((col, row));
+            let _ = agent.handle_input(&Event::Mouse(mouse_up(col, row)), &registry);
+            assert_eq!(agent.scrollback.get(0).unwrap().display_mode, expected);
+        }
+    }
+
     #[test]
     fn semantic_word_and_url_copy_ignore_hidden_edit_boundaries() {
         let mut model = ResolvedSelectionModel::default();

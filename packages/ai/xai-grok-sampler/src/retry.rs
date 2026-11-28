@@ -328,6 +328,9 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
                 retry_prefix, detail_str
             )
         }
+        SamplingError::CredentialRefresh { message, .. } => {
+            format!("{retry_prefix}Access token refresh failed: {message}")
+        }
         SamplingError::Serialization(e) => {
             format!(
                 "{}Failed to parse API response at line {} column {}: {}. This indicates an unexpected response format from the server.",
@@ -426,6 +429,12 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
             credential: *credential,
         },
         SamplingError::InvalidConfiguration(msg) => SamplingError::InvalidConfiguration(msg),
+        SamplingError::CredentialRefresh { message, retryable } => {
+            SamplingError::CredentialRefresh {
+                message: message.clone(),
+                retryable: *retryable,
+            }
+        }
         SamplingError::Http(e) => {
             // reqwest::Error is not Clone; preserve the rendered message
             // as an EventStreamError (the closest retryable transport
@@ -510,6 +519,43 @@ mod tests {
     #[test]
     fn resolve_max_retries_env_override_takes_precedence() {
         assert_eq!(resolve_max_retries_with_env(Some("9"), Some(3)), 9);
+    }
+
+    /// Purpose: Confirm that credential errors retain their message and use the request retry budget.
+    /// Input: Transient and permanent credential refresh errors.
+    /// Output: Retries for transient errors until the configured budget ends.
+    #[test]
+    fn credential_refresh_uses_transport_retry_budget_and_preserves_errors() {
+        for retryable in [false, true] {
+            let error = SamplingError::CredentialRefresh {
+                message: "Google ADC token request timed out".into(),
+                retryable,
+            };
+            let cloned = clone_error(&error);
+            assert_eq!(cloned.to_string(), error.to_string());
+            assert_eq!(cloned.is_retryable(), retryable);
+            assert_eq!(
+                format_sampling_error(&error, None),
+                "Access token refresh failed: Google ADC token request timed out"
+            );
+            let decision = classify_error(&error, 0, 8, RATE_LIMIT_RETRY_THRESHOLD);
+            if retryable {
+                assert!(matches!(
+                    decision,
+                    RetryDecision::RetryWithClientRebuild { .. }
+                ));
+                assert!(matches!(
+                    classify_error(&error, 1, 8, RATE_LIMIT_RETRY_THRESHOLD),
+                    RetryDecision::Retry { .. }
+                ));
+            } else {
+                assert!(matches!(decision, RetryDecision::Fatal(_)));
+            }
+            assert!(matches!(
+                classify_error(&error, 7, 8, RATE_LIMIT_RETRY_THRESHOLD),
+                RetryDecision::Fatal(_)
+            ));
+        }
     }
 
     #[test]

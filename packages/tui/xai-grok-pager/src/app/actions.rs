@@ -1123,6 +1123,8 @@ pub enum Action {
     OpenShots,
     /// Open the local file tree and read-only preview for the active session.
     OpenFileBrowser,
+    OpenPullRequest(String),
+    PullRequestControl(crate::views::pull_request::summary::Control),
     /// Open the hub browser on a named hub (or this session's hub), optionally
     /// on a `#channel`.
     OpenHubBrowser {
@@ -1537,6 +1539,12 @@ pub enum AfterSessionDelete {
 /// [`TaskResult`] as `Action::TaskComplete`.
 #[derive(Debug)]
 pub enum Effect {
+    FetchPullRequest {
+        agent_id: AgentId,
+        request_id: uuid::Uuid,
+        cwd: std::path::PathBuf,
+        target: String,
+    },
     AskReviewChat {
         agent_id: AgentId,
         request: xai_grok_shell::extensions::review_chat::AskRequest,
@@ -1545,6 +1553,13 @@ pub enum Effect {
         agent_id: AgentId,
         hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
         request: xai_grok_shell::extensions::hub_bot::AskRequest,
+    },
+    /// Read the files of an open hub browser off the UI thread. `subagent`
+    /// names the subagent view whose browser it is (`None`: the agent view).
+    RefreshHubBrowser {
+        agent_id: AgentId,
+        subagent: Option<String>,
+        job: Box<crate::views::hub_browser::HubRefreshJob>,
     },
     /// Fetch pending changes (files + hunks) for the review modal.
     /// `post_action`: this is a refetch after an action landed (must not
@@ -2470,11 +2485,23 @@ impl TaskResult {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    PullRequestLoaded {
+        agent_id: AgentId,
+        request_id: uuid::Uuid,
+        result: Result<crate::views::pull_request::github::Snapshot, String>,
+    },
     HubBotAnswered {
         agent_id: AgentId,
         hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
         request: xai_grok_shell::extensions::hub_bot::AskRequest,
         response: Result<xai_grok_shell::extensions::hub_bot::AskResponse, String>,
+    },
+    /// A background hub browser refresh finished. See `Effect::RefreshHubBrowser`.
+    HubBrowserRefreshed {
+        agent_id: AgentId,
+        subagent: Option<String>,
+        generation: u64,
+        result: Result<Box<crate::views::hub_browser::HubRefresh>, String>,
     },
     ReviewChatAnswered {
         agent_id: AgentId,

@@ -45,6 +45,8 @@ This header is from the system, not from a hub member. The hub messages follow i
 - If no reply is needed, do not call message_agents. Continue your current work, or end your turn with a one-line note.";
 /// How often the watcher checks the hub for new DMs and mentions.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// How often the watcher checks the hub even when no hub file changed.
+const WATCH_FULL_INTERVAL: Duration = Duration::from_secs(10);
 /// How often `wait` re-checks the hub when no in-process send wakes it.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -101,6 +103,7 @@ pub struct ChannelView {
     pub unread: usize,
     /// Estimated tokens that this channel put into agents' context.
     pub tokens: u64,
+    pub pin_count: usize,
 }
 
 /// Result of [`AgentBus::join`].
@@ -228,11 +231,13 @@ impl AgentBus {
     }
 
     /// Messages framed for a model, with the absolute paths of their images.
+    /// Each DM shows its key, because a tool result can hold the agent's own
+    /// DMs to several peers.
     pub fn frame(&self, messages: &[Message]) -> Result<(String, Vec<PathBuf>)> {
         let hub = self.lock().hub.clone();
         let meta = hub.meta()?;
         Ok((
-            format_messages(&hub, &meta, messages),
+            frame_messages(&hub, &meta, messages, DmPlace::WithKey),
             image_paths(&hub, messages),
         ))
     }
@@ -432,6 +437,7 @@ impl AgentBus {
         let (hub, handle, is_session_hub) = self.peer_context(id)?;
         let meta = hub.meta()?;
         let cursors = hub.cursors(&handle)?;
+        let tokens = hub.tokens(&meta)?;
         let mut channels = Vec::new();
         for channel in &meta.channels {
             let conv = format!("#{}", channel.name);
@@ -442,7 +448,8 @@ impl AgentBus {
                 purpose: channel.purpose.clone(),
                 messages,
                 unread: messages - read,
-                tokens: meta.tokens.get(&conv).copied().unwrap_or(0),
+                tokens: tokens.get(&conv).copied().unwrap_or(0),
+                pin_count: channel.pins.len(),
             });
         }
         Ok(HubView {
@@ -452,7 +459,7 @@ impl AgentBus {
             members: meta.members.clone(),
             channels,
             paused: meta.agent_wake_streak >= LOOP_GUARD_WAKES,
-            dm_tokens: meta.tokens.get(store::DM_TOKENS_KEY).copied().unwrap_or(0),
+            dm_tokens: tokens.get(store::DM_TOKENS_KEY).copied().unwrap_or(0),
         })
     }
 
@@ -466,18 +473,45 @@ impl AgentBus {
         reply_to: Option<&str>,
         images: &[PathBuf],
     ) -> SendOutcome {
+        let draft = Draft {
+            to,
+            text,
+            reply_to,
+            images,
+            pin: false,
+        };
+        self.send_draft(from, &draft)
+    }
+
+    /// Purpose: Post to a `#channel` and pin the new message in one write.
+    /// Input: As for `send`. The target must be a `#channel`.
+    /// Output: The message id, or a failure before any write when the target
+    ///     is a DM, the hub is archived, or the channel has MAX_CHANNEL_PINS pins.
+    pub fn send_and_pin(
+        &self,
+        from: &str,
+        to: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        images: &[PathBuf],
+    ) -> SendOutcome {
+        let draft = Draft {
+            to,
+            text,
+            reply_to,
+            images,
+            pin: true,
+        };
+        self.send_draft(from, &draft)
+    }
+
+    fn send_draft(&self, from: &str, draft: &Draft<'_>) -> SendOutcome {
         let outcome = match self.peer_context(from) {
             Ok((hub, handle, _)) => {
                 if let Err(reason) = self.take_rate_slot(from) {
                     return SendOutcome::Failed { reason };
                 }
-                let draft = Draft {
-                    to,
-                    text,
-                    reply_to,
-                    images,
-                };
-                post(&hub, &handle, &draft)
+                post(&hub, &handle, draft)
             }
             Err(e) => Err(e),
         };
@@ -507,8 +541,8 @@ impl AgentBus {
         if let Some(cursors) = cursors {
             hub.save_cursors(&handle, &cursors)?;
         }
+        record_tokens(&hub, &handle, &pending)?;
         drop(cursor_lock);
-        record_tokens(&hub, &pending)?;
         Ok(pending)
     }
 
@@ -530,10 +564,13 @@ impl AgentBus {
         }
     }
 
-    /// Purpose: Read messages of one channel for peer `id`.
-    /// Input: The channel name, the maximum count, and an optional start index.
-    /// Output: The messages and the count of messages that are still unread.
-    /// Note: The read cursor moves past the returned messages.
+    /// Purpose: Read messages of one channel or of one own DM for peer `id`.
+    /// Input: The target (`#channel`, `@handle` or `@a,@b`), the maximum
+    ///     count, and an optional start index.
+    /// Output: The messages and the count of messages after them. For a
+    ///     channel, that is the count that is still unread.
+    /// Note: A channel read moves the read cursor past the returned messages.
+    ///     A DM read moves no cursor. See [`read_dm`].
     pub fn read(
         &self,
         id: &str,
@@ -542,26 +579,115 @@ impl AgentBus {
         since: Option<usize>,
     ) -> Result<(Vec<Message>, usize)> {
         let (hub, handle, _) = self.peer_context(id)?;
-        let Some(name) = store::normalize_channel(channel) else {
-            bail!("invalid channel {channel:?}");
-        };
-        if !hub.meta()?.has_channel(&name) {
-            bail!("unknown channel #{name}; call message_agents op list");
+        let conv = resolve_read_conv(&hub.meta()?, &handle, channel)?;
+        if store::split_dm_conv(&conv).is_some() {
+            return read_dm(&hub, &handle, &conv, limit, since);
         }
-        let conv = format!("#{name}");
         let cursor_lock = hub.lock_cursors(&handle)?;
         let mut cursors = hub.cursors(&handle)?;
-        let start = since.unwrap_or_else(|| cursors.read.get(&conv).copied().unwrap_or(0));
-        let mut messages = hub.messages(&conv, start)?;
-        let remaining = messages.len().saturating_sub(limit);
-        messages.truncate(limit);
+        let read = cursors.read.get(&conv).copied().unwrap_or(0);
+        let start = since.unwrap_or(read);
+        // The saved byte offset belongs to the cursor. Another `since` scans.
+        let start_byte = (start == read)
+            .then(|| cursors.read_offset(&conv))
+            .flatten();
+        let slice = hub.messages_from_offset(&conv, start, start_byte, Some(limit))?;
+        let end = start + slice.messages.len();
         // A read of old messages with `since` must not move the cursor back.
-        let read = cursors.read.entry(conv).or_default();
-        *read = (*read).max(start + messages.len());
-        hub.save_cursors(&handle, &cursors)?;
+        if end >= read {
+            let before = cursors.clone();
+            cursors.set_read(&conv, end, slice.next_byte_offset);
+            if cursors != before {
+                hub.save_cursors(&handle, &cursors)?;
+            }
+        }
+        record_tokens(&hub, &handle, &slice.messages)?;
         drop(cursor_lock);
-        record_tokens(&hub, &messages)?;
-        Ok((messages, remaining))
+        Ok((slice.messages, slice.remaining))
+    }
+
+    /// Purpose: Read one thread for peer `id`.
+    /// Input: The id of any message of the thread, and the maximum count.
+    /// Output: The root, then its latest replies oldest first, and the count
+    ///     of older replies that were left out.
+    /// Note: No cursor moves. Only channels and the peer's own DMs hold a
+    ///     thread that the peer can read. A message id of another DM gives
+    ///     the same error as an unknown id.
+    pub fn read_thread(
+        &self,
+        id: &str,
+        message_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<Message>, usize)> {
+        let (hub, handle, _) = self.peer_context(id)?;
+        let meta = hub.meta()?;
+        let message_id = message_id.trim();
+        for conv in agent_convs(&hub, &meta, &handle)? {
+            let messages = hub.messages(&conv, 0)?;
+            if let Some((thread, omitted)) = thread_window(&messages, message_id, limit) {
+                record_tokens(&hub, &handle, &thread)?;
+                return Ok((thread, omitted));
+            }
+        }
+        bail!("unknown message id {message_id:?}");
+    }
+
+    /// Purpose: Find the messages that peer `id` can read and that contain a query.
+    /// Input: The query, an optional scope (`#channel`, `@handle` or
+    ///     `@a,@b`), and the maximum count.
+    /// Output: Up to `limit` messages, newest first, whose text or sender
+    ///     contains the query, ignoring case.
+    /// Note: No cursor moves. Messages of hub-bot DMs and of DMs between
+    ///     other members drop out before the limit, so they hide no hit.
+    pub fn search(
+        &self,
+        id: &str,
+        query: &str,
+        scope: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let (hub, handle, _) = self.peer_context(id)?;
+        let scope = match scope {
+            Some(raw) => Some(resolve_read_conv(&hub.meta()?, &handle, raw)?),
+            None => None,
+        };
+        let hits = store::search_where(&hub, query, limit, |m| {
+            can_agent_access_conv(&handle, &m.conv)
+                && scope.as_ref().is_none_or(|conv| *conv == m.conv)
+        })?;
+        record_tokens(&hub, &handle, &hits)?;
+        Ok(hits)
+    }
+
+    /// Purpose: Read the pinned messages of one channel for peer `id`.
+    /// Input: The peer id and the channel name.
+    /// Output: The pinned messages in pin order. A pin without its message is skipped.
+    /// Note: No cursor moves. The token count grows by the returned pins only.
+    pub fn read_pins(&self, id: &str, channel: &str) -> Result<Vec<Message>> {
+        let (hub, handle, _) = self.peer_context(id)?;
+        let pins: Vec<Message> = hub
+            .channel_pins(channel)?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect();
+        record_tokens(&hub, &handle, &pins)?;
+        Ok(pins)
+    }
+
+    /// Channel `read` output framed for a model, with the absolute paths of the
+    /// images of the pins and the messages.
+    pub fn frame_read(
+        &self,
+        channel: &str,
+        pins: &[Message],
+        messages: &[Message],
+    ) -> Result<(String, Vec<PathBuf>)> {
+        let hub = self.lock().hub.clone();
+        let meta = hub.meta()?;
+        let conv = format!("#{}", channel.trim().trim_start_matches('#'));
+        let mut images = image_paths(&hub, pins);
+        images.extend(image_paths(&hub, messages));
+        Ok((format_read(&hub, &meta, &conv, pins, messages), images))
     }
 
     /// Purpose: Create a channel in the current hub under the metadata lock.
@@ -853,10 +979,14 @@ fn task_summary(prompt: &str) -> Option<String> {
 /// Input: A weak reference to the bus state.
 /// Method:
 ///     1. Every WATCH_INTERVAL, list the running peers that have a wake hook.
-///     2. For each peer, collect the DMs and mentions after its notify cursor.
-///     3. Apply the loop guard to messages that only agents wrote.
-///     4. Save the cursors and call the wake hook with the framed messages.
+///     2. Stat the hub files. If no file and no target changed since the last
+///        clean tick, do nothing more. Every WATCH_FULL_INTERVAL, check anyway.
+///     3. For each peer, collect the DMs and mentions after its notify cursor.
+///     4. Apply the loop guard to messages that only agents wrote.
+///     5. Save the cursors and call the wake hook with the framed messages.
 async fn watch(weak: Weak<Mutex<BusInner>>) {
+    let mut last_stamp: Option<WatchStamp> = None;
+    let mut last_full_tick = Instant::now();
     loop {
         tokio::time::sleep(WATCH_INTERVAL).await;
         let Some(inner) = weak.upgrade() else {
@@ -864,11 +994,52 @@ async fn watch(weak: Weak<Mutex<BusInner>>) {
         };
         let (hub, targets) = inner.lock().expect("agent bus lock").delivery_snapshot();
         drop(inner);
-        let result = tokio::task::spawn_blocking(move || deliver(&hub, &targets)).await;
-        if let Ok(Err(e)) = result {
-            tracing::debug!(error = %e, "agent_hub: watcher tick failed");
+        // Some file systems keep change times in whole seconds, so a stat
+        // check alone could miss a same-size rewrite of `hub.json`.
+        let is_full_tick = last_full_tick.elapsed() >= WATCH_FULL_INTERVAL;
+        if is_full_tick {
+            last_full_tick = Instant::now();
+        }
+        let previous = last_stamp.take().filter(|_| !is_full_tick);
+        let result =
+            tokio::task::spawn_blocking(move || deliver_if_changed(&hub, &targets, previous)).await;
+        match result {
+            Ok(Ok(stamp)) => last_stamp = Some(stamp),
+            Ok(Err(e)) => tracing::debug!(error = %e, "agent_hub: watcher tick failed"),
+            Err(e) => tracing::debug!(error = %e, "agent_hub: watcher tick panicked"),
         }
     }
+}
+
+/// The hub files and the delivery targets of one watcher tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchStamp {
+    hub_dir: PathBuf,
+    handles: Vec<String>,
+    files: Vec<(PathBuf, store::FileStamp)>,
+}
+
+/// Purpose: Deliver new DMs and mentions only when the hub changed.
+/// Input: The hub, the delivery targets, and the stamp of the last clean tick.
+/// Output: The stamp of this tick, for the next tick to compare with.
+/// Note: The stamp is read before the delivery, so a write during the
+///     delivery changes the stamp of the next tick. An unchanged stamp takes
+///     no cursor lock and reads no conversation.
+fn deliver_if_changed(
+    hub: &Hub,
+    targets: &[(String, PeerWakeFn)],
+    previous: Option<WatchStamp>,
+) -> Result<WatchStamp> {
+    let stamp = WatchStamp {
+        hub_dir: hub.dir().to_path_buf(),
+        handles: targets.iter().map(|(handle, _)| handle.clone()).collect(),
+        files: hub.file_stamps(),
+    };
+    if previous.as_ref() == Some(&stamp) {
+        return Ok(stamp);
+    }
+    deliver(hub, targets)?;
+    Ok(stamp)
 }
 
 fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
@@ -901,8 +1072,8 @@ fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
         if let Some(cursors) = cursors {
             hub.save_cursors(handle, &cursors)?;
         }
+        record_tokens(hub, handle, &pending)?;
         drop(cursor_lock);
-        record_tokens(hub, &pending)?;
         wake(
             format_messages(hub, &meta, &pending),
             image_paths(hub, &pending),
@@ -915,7 +1086,9 @@ fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
 /// Input: The hub and the member handle.
 /// Output: The messages to deliver, oldest first per conversation, and the
 ///     cursors moved past every message that was checked (`None` if unchanged).
-/// Note: Messages from before the member joined are not delivered.
+/// Note: Messages from before the member joined are not delivered. The read
+///     starts at the saved byte offset of the notify cursor, so only new
+///     bytes are read. A cursor without an offset scans from line 0 once.
 fn collect_pending(hub: &Hub, handle: &str) -> Result<(Vec<Message>, Option<Cursors>)> {
     let meta = hub.meta()?;
     let joined_ms = meta.member(handle).map(|m| m.joined_ms).unwrap_or(0);
@@ -925,12 +1098,13 @@ fn collect_pending(hub: &Hub, handle: &str) -> Result<(Vec<Message>, Option<Curs
 
     for conv in hub.dm_convs_for(handle)? {
         let start = cursors.notified.get(&conv).copied().unwrap_or(0);
-        let messages = hub.messages(&conv, start)?;
-        let end = start + messages.len();
-        cursors.notified.insert(conv.clone(), end);
-        cursors.read.insert(conv, end);
+        let slice = hub.messages_from_offset(&conv, start, cursors.notified_offset(&conv), None)?;
+        let end = start + slice.messages.len();
+        cursors.set_notified(&conv, end, slice.next_byte_offset);
+        cursors.set_read(&conv, end, slice.next_byte_offset);
         pending.extend(
-            messages
+            slice
+                .messages
                 .into_iter()
                 .filter(|m| m.from != handle && m.ts_unix_ms >= joined_ms),
         );
@@ -939,9 +1113,9 @@ fn collect_pending(hub: &Hub, handle: &str) -> Result<(Vec<Message>, Option<Curs
     for channel in &meta.channels {
         let conv = format!("#{}", channel.name);
         let start = cursors.notified.get(&conv).copied().unwrap_or(0);
-        let messages = hub.messages(&conv, start)?;
-        cursors.notified.insert(conv, start + messages.len());
-        pending.extend(messages.into_iter().filter(|m| {
+        let slice = hub.messages_from_offset(&conv, start, cursors.notified_offset(&conv), None)?;
+        cursors.set_notified(&conv, start + slice.messages.len(), slice.next_byte_offset);
+        pending.extend(slice.messages.into_iter().filter(|m| {
             m.from != handle
                 && m.ts_unix_ms >= joined_ms
                 && m.mentions.iter().any(|h| h == handle || h == HERE_MENTION)
@@ -980,6 +1154,78 @@ pub fn reply_as_person(
     post_person_draft(hub, person, to, text, &[], Some(reply_to))
 }
 
+/// Purpose: Pin a channel message for every member, as the person.
+/// Input: The hub, the person's preferred handle, the `#channel`, and the
+///     message id.
+/// Output: True when the message is now pinned. False when it was pinned
+///     already, which takes no new pin slot.
+/// Note: The checks and the write hold the hub lock. No message is written,
+///     no cursor moves, and nobody wakes.
+pub fn pin_as_person(hub: &Hub, person: &str, channel: &str, message_id: &str) -> Result<bool> {
+    let name = pin_channel_name(channel)?;
+    let message_id = message_id.trim();
+    hub.update_meta(|meta| -> Result<bool> {
+        if meta.archived {
+            bail!("hub {:?} is archived (read-only)", meta.name);
+        }
+        let Some(found) = meta.channel(&name) else {
+            bail!("unknown channel #{name}");
+        };
+        if found.is_pinned(message_id) {
+            return Ok(false);
+        }
+        store::check_pin_room(meta, &name)?;
+        let conv = format!("#{name}");
+        if !hub.messages(&conv, 0)?.iter().any(|m| m.id == message_id) {
+            bail!("{message_id:?} is not a message in {conv}");
+        }
+        let pinned_by = person_handle_in(meta, person);
+        let found = meta
+            .channels
+            .iter_mut()
+            .find(|c| c.name == name)
+            .expect("the channel exists");
+        found.pins.push(store::PinnedMessage {
+            message_id: message_id.to_string(),
+            pinned_by,
+            pinned_ms: store::now_ms(),
+        });
+        Ok(true)
+    })?
+}
+
+/// Purpose: Unpin a channel message, as the person.
+/// Input: The hub, the `#channel`, and the message id.
+/// Output: True when the pin is removed. False when the message was not pinned.
+/// Note: The change holds the hub lock. The channel log does not change.
+pub fn unpin_as_person(hub: &Hub, channel: &str, message_id: &str) -> Result<bool> {
+    let name = pin_channel_name(channel)?;
+    let message_id = message_id.trim();
+    hub.update_meta(|meta| -> Result<bool> {
+        if meta.archived {
+            bail!("hub {:?} is archived (read-only)", meta.name);
+        }
+        let Some(found) = meta.channels.iter_mut().find(|c| c.name == name) else {
+            bail!("unknown channel #{name}");
+        };
+        let before = found.pins.len();
+        found.pins.retain(|pin| pin.message_id != message_id);
+        Ok(found.pins.len() < before)
+    })?
+}
+
+/// The channel name of a pin command, or an error for a DM or a bad name.
+fn pin_channel_name(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.starts_with('@') || raw.contains(',') {
+        bail!("pins are supported on #channels only, not DMs");
+    }
+    match store::normalize_channel(raw) {
+        Some(name) => Ok(name),
+        None => bail!("invalid channel {raw:?}"),
+    }
+}
+
 fn post_person_draft(
     hub: &Hub,
     person: &str,
@@ -1002,6 +1248,7 @@ fn post_person_draft(
         text,
         reply_to,
         images,
+        pin: false,
     };
     let id = post(hub, &person, &draft)?;
     hub.update_meta(|meta| meta.agent_wake_streak = 0)?;
@@ -1070,12 +1317,16 @@ struct Draft<'a> {
     text: &'a str,
     reply_to: Option<&'a str>,
     images: &'a [PathBuf],
+    /// Pin the message in its channel in the same write.
+    pin: bool,
 }
 
 /// Purpose: Validate and append one message.
 /// Input: The hub, the sender handle, and the draft.
 /// Output: The new message id.
 /// Note: Attached images are copied into the hub before the message is written.
+///     A pinned draft checks the pin room before the copy, and again under
+///     the hub lock when it writes.
 fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
     let text = draft.text.trim();
     if text.is_empty() {
@@ -1095,6 +1346,16 @@ fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
         bail!("a message can carry at most {} images", store::MAX_IMAGES);
     }
     let conv = resolve_target(&meta, from, draft.to)?;
+    let reply_to = match draft.reply_to.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(parent) => Some(canonical_reply_to(hub, &meta, from, &conv, parent)?),
+        None => None,
+    };
+    if draft.pin {
+        let Some(channel) = conv.strip_prefix('#') else {
+            bail!("pin works only for a #channel post, not a DM");
+        };
+        store::check_pin_room(&meta, channel)?;
+    }
     let mut mentions = store::parse_mentions(text, &meta.members);
     if alerts_all(&meta, from, &conv) && !mentions.iter().any(|h| h == HERE_MENTION) {
         mentions.push(HERE_MENTION.to_string());
@@ -1108,12 +1369,16 @@ fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
         conv,
         from: from.to_string(),
         text: text.to_string(),
-        reply_to: draft.reply_to.map(str::to_string),
+        reply_to,
         mentions,
         images,
         ts_unix_ms: store::now_ms(),
     };
-    hub.append(&message)?;
+    if draft.pin {
+        hub.append_pinned(&message, from)?;
+    } else {
+        hub.append(&message)?;
+    }
     Ok(message.id)
 }
 
@@ -1155,6 +1420,155 @@ fn resolve_target(meta: &HubMeta, from: &str, to: &str) -> Result<String> {
     }
 }
 
+/// Purpose: Check the parent of a reply and find the id to store.
+/// Input: The hub, its metadata, the sender, the conversation of the reply,
+///     and the parent id.
+/// Output: The thread root when the parent is in the same conversation, so
+///     threads stay flat. The parent id when the parent is in another
+///     conversation that the sender can read.
+/// Note: A parent that does not exist and a parent in a DM that the sender
+///     cannot read give the same error, so a reply cannot probe a private DM.
+fn canonical_reply_to(
+    hub: &Hub,
+    meta: &HubMeta,
+    from: &str,
+    conv: &str,
+    parent: &str,
+) -> Result<String> {
+    if let Some(root) = store::resolve_thread_root(&hub.messages(conv, 0)?, parent) {
+        return Ok(root);
+    }
+    for other in agent_convs(hub, meta, from)? {
+        if other != conv && hub.messages(&other, 0)?.iter().any(|m| m.id == parent) {
+            return Ok(parent.to_string());
+        }
+    }
+    bail!("unknown reply_to {parent:?}");
+}
+
+/// Purpose: Decide if an agent can read a conversation.
+/// Input: The agent handle and the conversation key.
+/// Output: True for a channel and for a DM that the agent is in. False for
+///     every DM of hub-bot and for the DMs between other members.
+fn can_agent_access_conv(handle: &str, conv: &str) -> bool {
+    if store::is_bot_conv(conv) {
+        return false;
+    }
+    if conv.starts_with('#') {
+        return true;
+    }
+    store::split_dm_conv(conv).is_some_and(|(a, b)| a == handle || b == handle)
+}
+
+/// The conversations that an agent can read: every channel, then its own DMs.
+fn agent_convs(hub: &Hub, meta: &HubMeta, handle: &str) -> Result<Vec<String>> {
+    let mut convs: Vec<String> = meta
+        .channels
+        .iter()
+        .map(|c| format!("#{}", c.name))
+        .collect();
+    for conv in hub.dm_convs_for(handle)? {
+        if can_agent_access_conv(handle, &conv) {
+            convs.push(conv);
+        }
+    }
+    Ok(convs)
+}
+
+/// True when a read target names a DM (`@handle` or `@a,@b`), not a channel.
+pub(super) fn is_dm_target(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.starts_with('@') || raw.contains(',')
+}
+
+/// Purpose: Find the conversation that an agent asks to read or search.
+/// Input: The hub metadata, the agent handle, and the target: `#channel`,
+///     `@handle`, `@a,@b`, or a bare channel name or member handle.
+/// Output: `#channel`, or the key of a DM that the agent is in.
+/// Note: A DM with self, a DM of hub-bot, and a DM between other members
+///     fail. The error does not depend on whether the DM holds messages.
+///     A DM with a member that is gone is still readable. A bare name is a
+///     channel first, then a member.
+fn resolve_read_conv(meta: &HubMeta, handle: &str, raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if !is_dm_target(raw) && !is_bare_member(meta, raw) {
+        let Some(name) = store::normalize_channel(raw) else {
+            bail!("invalid channel {raw:?}");
+        };
+        if !meta.has_channel(&name) {
+            bail!("unknown channel #{name}; call message_agents op list");
+        }
+        return Ok(format!("#{name}"));
+    }
+    let handles: Vec<Option<String>> = raw.split(',').map(store::normalize_handle).collect();
+    let conv = match handles.as_slice() {
+        [Some(peer)] if peer == handle => bail!("cannot read DM with self"),
+        [Some(peer)] => store::dm_conv(handle, peer),
+        [Some(a), Some(b)] if a != b => store::dm_conv(a, b),
+        _ => bail!("invalid DM {raw:?}: use @handle or @a,@b"),
+    };
+    if store::is_bot_conv(&conv) {
+        bail!("the DMs of @{BOT_HANDLE} are not readable");
+    }
+    if !can_agent_access_conv(handle, &conv) {
+        bail!("{raw} is not your DM; you can read only your own DMs");
+    }
+    Ok(conv)
+}
+
+/// True when a bare name (no `#`) is a member handle and not a channel name.
+fn is_bare_member(meta: &HubMeta, raw: &str) -> bool {
+    if raw.starts_with('#') || store::normalize_channel(raw).is_some_and(|c| meta.has_channel(&c)) {
+        return false;
+    }
+    store::normalize_handle(raw).is_some_and(|peer| meta.member(&peer).is_some())
+}
+
+/// Purpose: Read messages of one DM.
+/// Input: The hub, the DM key, the maximum count, and an optional start index.
+/// Output: The messages and the count of messages after them.
+/// Note: No cursor moves. Without `since`, this gives the latest `limit`
+///     messages, because `inbox` and wakes already move the DM read cursor.
+fn read_dm(
+    hub: &Hub,
+    handle: &str,
+    conv: &str,
+    limit: usize,
+    since: Option<usize>,
+) -> Result<(Vec<Message>, usize)> {
+    let mut messages = hub.messages(conv, 0)?;
+    let start = since
+        .unwrap_or_else(|| messages.len().saturating_sub(limit))
+        .min(messages.len());
+    let mut window = messages.split_off(start);
+    let remaining = window.len().saturating_sub(limit);
+    window.truncate(limit);
+    record_tokens(hub, handle, &window)?;
+    Ok((window, remaining))
+}
+
+/// Purpose: Cut one thread out of a conversation.
+/// Input: The messages of the conversation, oldest first, the id of any
+///     message of the thread, and the maximum count.
+/// Output: The root and its latest replies, oldest first, and the count of
+///     replies that were left out. `None` when the conversation does not
+///     hold `id`.
+/// Note: Legacy replies to a reply are in the thread of their root.
+fn thread_window(messages: &[Message], id: &str, limit: usize) -> Option<(Vec<Message>, usize)> {
+    assert!(limit >= 1, "a thread window holds at least its root");
+    let roots = store::thread_root_index(messages);
+    let root = *roots.get(id)?;
+    let mut thread: Vec<Message> = messages
+        .iter()
+        .filter(|m| roots.get(m.id.as_str()) == Some(&root))
+        .cloned()
+        .collect();
+    // The root comes first, because a parent comes before its replies.
+    let omitted = thread.len().saturating_sub(limit);
+    thread.drain(1..1 + omitted);
+    Some((thread, omitted))
+}
+
 /// Purpose: Frame messages for a model as information, not instructions.
 /// Input: The hub, its metadata and the messages.
 /// Output: One text block with the system header, a place line and one
@@ -1163,6 +1577,20 @@ fn resolve_target(meta: &HubMeta, from: &str, to: &str) -> Result<String> {
 ///     that a reply is optional, so that agents do not reply to each other
 ///     without end.
 pub fn format_messages(hub: &Hub, meta: &HubMeta, messages: &[Message]) -> String {
+    frame_messages(hub, meta, messages, DmPlace::Plain)
+}
+
+/// How a frame names the place of a DM message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmPlace {
+    /// `DM`, as a wake shows it. [`parse_delivery`] expects this form.
+    Plain,
+    /// `DM @a,@b`, for tool results that can hold DMs to several peers.
+    WithKey,
+}
+
+/// Frame messages as [`format_messages`] describes, with a choice of DM place.
+fn frame_messages(hub: &Hub, meta: &HubMeta, messages: &[Message], dm_place: DmPlace) -> String {
     let place = if meta.is_session_hub() {
         AGENT_HUB_MODEL_NAME.to_string()
     } else {
@@ -1173,10 +1601,10 @@ pub fn format_messages(hub: &Hub, meta: &HubMeta, messages: &[Message]) -> Strin
         messages.len()
     );
     for m in messages {
-        let conv = if store::split_dm_conv(&m.conv).is_some() {
-            "DM"
-        } else {
-            m.conv.as_str()
+        let conv = match (store::split_dm_conv(&m.conv), dm_place) {
+            (None, _) => m.conv.clone(),
+            (Some(_), DmPlace::Plain) => "DM".to_string(),
+            (Some(_), DmPlace::WithKey) => format!("DM {}", m.conv),
         };
         let person = if member_kind(meta, &m.from) == MemberKind::Person {
             " (person)"
@@ -1196,6 +1624,52 @@ pub fn format_messages(hub: &Hub, meta: &HubMeta, messages: &[Message]) -> Strin
             out.push_str(&format!("\n[image: {}]", hub.blob_path(image).display()));
         }
     }
+    out
+}
+
+/// Purpose: Frame the result of a channel `read` for a model.
+/// Input: The hub, its metadata, the `#channel` key, the pinned messages,
+///     and the messages that the read returned.
+/// Output: The text of `format_messages`, with a `Pinned in #channel:`
+///     section after the system header when the channel has pins.
+/// Note: The pins sit under the system header, so they are information too.
+pub fn format_read(
+    hub: &Hub,
+    meta: &HubMeta,
+    conv: &str,
+    pins: &[Message],
+    messages: &[Message],
+) -> String {
+    let framed = format_messages(hub, meta, messages);
+    if pins.is_empty() {
+        return framed;
+    }
+    let header = format!(
+        "{WAKE_SYSTEM_HEADER_OPEN}\n{WAKE_SYSTEM_HEADER_BODY}\n{WAKE_SYSTEM_HEADER_CLOSE}\n"
+    );
+    let rest = framed
+        .strip_prefix(&header)
+        .expect("format_messages starts with the system header");
+    let mut out = format!(
+        "{header}Pinned in {conv} ({}), the key decisions of the channel:",
+        pins.len()
+    );
+    for m in pins {
+        let person = if member_kind(meta, &m.from) == MemberKind::Person {
+            " (person)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\n--- pinned · from @{}{person} · id={} ---\n{}",
+            m.from, m.id, m.text
+        ));
+        for image in &m.images {
+            out.push_str(&format!("\n[image: {}]", hub.blob_path(image).display()));
+        }
+    }
+    out.push_str("\nEnd of pins.\n");
+    out.push_str(rest);
     out
 }
 
@@ -1219,11 +1693,16 @@ pub fn format_join_notice(view: &HubView) -> String {
     }
     let mut channels = Vec::new();
     for channel in &view.channels {
-        if channel.purpose.is_empty() {
-            channels.push(format!("#{}", channel.name));
-        } else {
-            channels.push(format!("#{} ({})", channel.name, channel.purpose));
+        let mut label = format!("#{}", channel.name);
+        if !channel.purpose.is_empty() {
+            label.push_str(&format!(" ({})", channel.purpose));
         }
+        match channel.pin_count {
+            0 => {}
+            1 => label.push_str(" (1 pin)"),
+            n => label.push_str(&format!(" ({n} pins)")),
+        }
+        channels.push(label);
     }
     let or_none = |items: Vec<String>| {
         if items.is_empty() {
@@ -1283,8 +1762,10 @@ pub fn image_paths(hub: &Hub, messages: &[Message]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Add the estimated context cost of delivered messages to the hub's counts.
-fn record_tokens(hub: &Hub, messages: &[Message]) -> Result<()> {
+/// Add the estimated context cost of delivered messages to the token file of
+/// the member. The caller holds the member's cursor lock; `hub.json` and the
+/// hub lock are not touched.
+fn record_tokens(hub: &Hub, handle: &str, messages: &[Message]) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
@@ -1296,11 +1777,7 @@ fn record_tokens(hub: &Hub, messages: &[Message]) -> Result<()> {
             + xai_token_estimation::estimate_image_tokens(m.images.len() as u64);
         *costs.entry(store::tokens_key(&m.conv)).or_default() += cost;
     }
-    hub.update_meta(|meta| {
-        for (key, cost) in costs {
-            *meta.tokens.entry(key).or_default() += cost;
-        }
-    })
+    hub.add_member_tokens(handle, &costs)
 }
 
 fn open_with_suggestion(hubs_root: &Path, name: &str) -> Result<Hub> {
@@ -1442,13 +1919,29 @@ pub fn person_handle_in(meta: &HubMeta, person: &str) -> String {
 /// Input: The hub, the member handle, the conversation key, and the message count read.
 /// Output: Ok when the cursor is saved. A cursor never moves back.
 pub fn mark_read(hub: &Hub, handle: &str, conv: &str, count: usize) -> Result<()> {
+    mark_read_at(hub, handle, conv, count, None)
+}
+
+/// Purpose: Move a member's read cursor forward, with its byte offset.
+/// Input: As `mark_read`, plus the byte offset after `count` complete lines
+///     of the conversation file, when the caller knows it.
+/// Output: Ok when the cursor is saved. A cursor never moves back. An equal
+///     count can replace a missing offset or an obsolete file stamp.
+pub fn mark_read_at(
+    hub: &Hub,
+    handle: &str,
+    conv: &str,
+    count: usize,
+    offset: Option<store::LineOffset>,
+) -> Result<()> {
     let _lock = hub.lock_cursors(handle)?;
     let mut cursors = hub.cursors(handle)?;
-    let read = cursors.read.entry(conv.to_string()).or_default();
-    if *read >= count {
+    let read = cursors.read.get(conv).copied().unwrap_or(0);
+    let saved_offset = cursors.read_offset(conv);
+    if read > count || (read == count && (offset.is_none() || saved_offset == offset)) {
         return Ok(());
     }
-    *read = count;
+    cursors.set_read(conv, count, offset);
     hub.save_cursors(handle, &cursors)
 }
 
@@ -1649,6 +2142,370 @@ mod tests {
         assert_eq!(texts(&old), vec!["a"]);
         let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
         assert_eq!(hub.cursors(&handle).unwrap().read.get("#general"), Some(&3));
+    }
+
+    fn delivered(outcome: SendOutcome) -> String {
+        outcome.into_result().expect("send is delivered")
+    }
+
+    fn stored(hub: &Hub, conv: &str, id: &str) -> Message {
+        let messages = hub.messages(conv, 0).unwrap();
+        messages
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("message is stored")
+    }
+
+    /// A reply as an older binary wrote it: `reply_to` is not the root.
+    fn legacy_reply(conv: &str, from: &str, text: &str, parent: &str) -> Message {
+        Message {
+            id: new_message_id(),
+            conv: conv.to_string(),
+            from: from.to_string(),
+            text: text.to_string(),
+            reply_to: Some(parent.to_string()),
+            mentions: Vec::new(),
+            images: Vec::new(),
+            ts_unix_ms: store::now_ms(),
+        }
+    }
+
+    /// A session hub with Main, @a, @b, the person @me, and posts about auth
+    /// in #general, the bot DM, the DM of @a and @b, and the DM of Main and @a.
+    fn bus_with_private_dms(root: &Path) -> AgentBus {
+        let bus = session_bus(root, "s1");
+        for id in [MAIN_PEER_ID, "a", "b"] {
+            bus.register(id, id, None);
+        }
+        let hub = bus.hub();
+        post_as_person(&hub, "me", "#general", "auth plan: use tokens", &[]).unwrap();
+        ask_bot(&hub, "me", "auth secret for the bot").unwrap();
+        delivered(bus.send("a", "b", "auth secret between a and b", None, &[]));
+        delivered(bus.send("a", MAIN_PEER_ID, "auth note for Main", None, &[]));
+        delivered(bus.send(MAIN_PEER_ID, "a", "auth reply from Main", None, &[]));
+        bus
+    }
+
+    #[test]
+    fn agent_search_covers_channels_and_own_dms_only() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_with_private_dms(root.path());
+        let hub = bus.hub();
+        let cursors = hub.cursors(MAIN_PEER_ID).unwrap();
+        let tokens = |hub: &Hub| {
+            hub.tokens(&hub.meta().unwrap())
+                .unwrap()
+                .values()
+                .sum::<u64>()
+        };
+        let tokens_before = tokens(&hub);
+        // The two newer private hits drop out before the limit of 3.
+        let hits = bus.search(MAIN_PEER_ID, "AUTH", None, 3).unwrap();
+        assert_eq!(
+            texts(&hits),
+            [
+                "auth reply from Main",
+                "auth note for Main",
+                "auth plan: use tokens"
+            ]
+        );
+        assert_eq!(hub.cursors(MAIN_PEER_ID).unwrap(), cursors);
+        assert!(tokens(&hub) > tokens_before);
+        assert!(
+            bus.search(MAIN_PEER_ID, "secret", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let by_sender = bus.search(MAIN_PEER_ID, "@a", None, 10).unwrap();
+        assert_eq!(texts(&by_sender), ["auth note for Main"]);
+
+        let in_general = bus.search(MAIN_PEER_ID, "auth", Some("#general"), 10);
+        assert_eq!(texts(&in_general.unwrap()), ["auth plan: use tokens"]);
+        assert_eq!(
+            bus.search(MAIN_PEER_ID, "auth", Some("@a"), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        for scope in ["@a,@b", "@me,@hub-bot", "@hub-bot", "#missing"] {
+            let result = bus.search(MAIN_PEER_ID, "auth", Some(scope), 10);
+            assert!(result.is_err(), "{scope} is refused");
+        }
+    }
+
+    #[test]
+    fn agent_reads_its_own_dm_after_inbox_and_after_the_peer_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_with_private_dms(root.path());
+        let hub = bus.hub();
+        let drained = bus.inbox(MAIN_PEER_ID).unwrap();
+        assert!(texts(&drained).contains(&"auth note for Main"));
+        bus.mark_gone("a");
+        let cursors = hub.cursors(MAIN_PEER_ID).unwrap();
+        for target in ["@a", "@Main,@a", "@a,@Main", "a"] {
+            let (messages, remaining) = bus.read(MAIN_PEER_ID, target, 10, None).unwrap();
+            assert_eq!(
+                texts(&messages),
+                ["auth note for Main", "auth reply from Main"],
+                "{target}"
+            );
+            assert_eq!(remaining, 0);
+        }
+        let (latest, _) = bus.read(MAIN_PEER_ID, "@a", 1, None).unwrap();
+        assert_eq!(texts(&latest), ["auth reply from Main"]);
+        let (first, remaining) = bus.read(MAIN_PEER_ID, "@a", 1, Some(0)).unwrap();
+        assert_eq!(texts(&first), ["auth note for Main"]);
+        assert_eq!(remaining, 1);
+        assert_eq!(hub.cursors(MAIN_PEER_ID).unwrap(), cursors);
+
+        // Tool results name the DM. Wakes keep the place that parse_delivery reads.
+        let (framed, _) = bus.frame(&latest).unwrap();
+        assert!(framed.contains("--- DM @Main,@a · from @Main"), "{framed}");
+        let wake = format_messages(&hub, &hub.meta().unwrap(), &latest);
+        assert_eq!(parse_delivery(&wake).unwrap().messages[0].place, "DM");
+    }
+
+    #[test]
+    fn agent_cannot_read_other_dms_the_bot_dm_or_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_with_private_dms(root.path());
+        for target in [
+            "@hub-bot",
+            "@me,@hub-bot",
+            "@a,@b",
+            "@b,@me",
+            "@Main",
+            "@b,@b",
+        ] {
+            let result = bus.read(MAIN_PEER_ID, target, 10, None);
+            assert!(result.is_err(), "{target} is refused");
+        }
+        // The same error for a DM with messages and a DM without any.
+        let error = |target: &str| {
+            let error = bus.read(MAIN_PEER_ID, target, 10, None).unwrap_err();
+            error.to_string().replace(target, "<dm>")
+        };
+        assert_eq!(error("@a,@b"), error("@b,@me"));
+    }
+
+    #[test]
+    fn a_thread_read_resolves_any_message_to_its_root_and_moves_no_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_with_private_dms(root.path());
+        let hub = bus.hub();
+        let first = delivered(bus.send("a", "#general", "root", None, &[]));
+        let reply = legacy_reply("#general", "b", "reply", &first);
+        let nested = legacy_reply("#general", "a", "nested", &reply.id);
+        hub.append(&reply).unwrap();
+        delivered(bus.send("b", "#general", "unrelated", None, &[]));
+        hub.append(&nested).unwrap();
+        let cursors = hub.cursors(MAIN_PEER_ID).unwrap();
+        for id in [first.as_str(), &reply.id, &nested.id] {
+            let (thread, omitted) = bus.read_thread(MAIN_PEER_ID, id, 20).unwrap();
+            assert_eq!(texts(&thread), ["root", "reply", "nested"]);
+            assert_eq!(omitted, 0);
+        }
+        let (short, omitted) = bus.read_thread(MAIN_PEER_ID, &reply.id, 2).unwrap();
+        assert_eq!(texts(&short), ["root", "nested"], "the root stays first");
+        assert_eq!(omitted, 1);
+        assert_eq!(hub.cursors(MAIN_PEER_ID).unwrap(), cursors);
+
+        let private = delivered(bus.send("a", "b", "private", None, &[]));
+        let question = ask_bot(&hub, "me", "question").unwrap().id;
+        for id in [private.as_str(), &question, "nope"] {
+            let error = bus.read_thread(MAIN_PEER_ID, id, 20).unwrap_err();
+            assert_eq!(error.to_string(), format!("unknown message id {id:?}"));
+        }
+        let (dm_thread, _) = bus.read_thread("b", &private, 20).unwrap();
+        assert_eq!(texts(&dm_thread), ["private"]);
+    }
+
+    #[test]
+    fn a_reply_to_a_reply_joins_the_thread_of_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_with_private_dms(root.path());
+        let hub = bus.hub();
+        let first = delivered(bus.send("a", "#general", "root", None, &[]));
+        let reply = delivered(bus.send("b", "#general", "reply", Some(&first), &[]));
+        let nested = delivered(bus.send(MAIN_PEER_ID, "#general", "nested", Some(&reply), &[]));
+        let person = reply_as_person(&hub, "me", "#general", "person", &nested).unwrap();
+        for id in [&reply, &nested, &person] {
+            let message = stored(&hub, "#general", id);
+            assert_eq!(message.reply_to.as_deref(), Some(first.as_str()));
+        }
+        // A legacy chain on disk also resolves to its root on write.
+        let legacy = legacy_reply("#general", "a", "legacy", &reply);
+        hub.append(&legacy).unwrap();
+        let after = delivered(bus.send("b", "#general", "after", Some(&legacy.id), &[]));
+        let after = stored(&hub, "#general", &after);
+        assert_eq!(after.reply_to.as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
+    fn reply_to_must_name_a_message_that_the_sender_can_read() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_with_private_dms(root.path());
+        let hub = bus.hub();
+        let status = delivered(bus.send("a", "#general", "status", None, &[]));
+        let private = delivered(bus.send("a", "b", "private", None, &[]));
+        let question = ask_bot(&hub, "me", "question").unwrap().id;
+        for parent in ["nope", private.as_str(), &question] {
+            let reason = bus
+                .send(MAIN_PEER_ID, "#general", "x", Some(parent), &[])
+                .into_result()
+                .unwrap_err();
+            assert_eq!(reason, format!("unknown reply_to {parent:?}"));
+        }
+        // A DM can point at a channel message, and keeps that id.
+        let dm = delivered(bus.send(MAIN_PEER_ID, "a", "about that", Some(&status), &[]));
+        let dm = stored(&hub, &store::dm_conv(MAIN_PEER_ID, "a"), &dm);
+        assert_eq!(dm.reply_to.as_deref(), Some(status.as_str()));
+        // A member of the private DM can point at it from another DM.
+        let forward = delivered(bus.send("b", MAIN_PEER_ID, "fyi", Some(&private), &[]));
+        let forward = stored(&hub, &store::dm_conv(MAIN_PEER_ID, "b"), &forward);
+        assert_eq!(forward.reply_to.as_deref(), Some(private.as_str()));
+        // An empty reply_to is no reply.
+        let plain = delivered(bus.send("a", "#general", "plain", Some("  "), &[]));
+        assert_eq!(stored(&hub, "#general", &plain).reply_to, None);
+    }
+
+    #[test]
+    fn read_with_a_limit_saves_the_offset_after_the_last_returned_message() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        for text in ["a", "b", "c"] {
+            post_as_person(&hub, "me", "#general", text, &[]).unwrap();
+        }
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let (first, remaining) = bus.read(MAIN_PEER_ID, "general", 2, None).unwrap();
+        assert_eq!((texts(&first), remaining), (vec!["a", "b"], 1));
+        let cursors = hub.cursors(&handle).unwrap();
+        let after_two = hub
+            .messages_from_offset("#general", 0, None, Some(2))
+            .unwrap()
+            .next_byte_offset;
+        assert_eq!(cursors.read["#general"], 2);
+        assert_eq!(cursors.read_offset("#general"), after_two);
+
+        post_as_person(&hub, "me", "#general", "d", &[]).unwrap();
+        let (rest, remaining) = bus.read(MAIN_PEER_ID, "general", 10, None).unwrap();
+        assert_eq!((texts(&rest), remaining), (vec!["c", "d"], 0));
+        let cursors = hub.cursors(&handle).unwrap();
+        assert_eq!(cursors.read["#general"], 4);
+        let len = std::fs::metadata(hub.dir().join("channels/general.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            cursors.read_offset("#general").map(|offset| offset.bytes),
+            Some(len)
+        );
+    }
+
+    /// Purpose: Check that an equal read count can save a replacement file stamp.
+    /// Input: A hub with one read message and an atomic file replacement.
+    /// Output: None. The test fails if the old file stamp remains on disk.
+    #[test]
+    fn an_equal_read_count_updates_the_replacement_file_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        post_as_person(&hub, "me", "#general", "hello", &[]).unwrap();
+        let before = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        mark_read_at(&hub, "me", "#general", 1, before.next_byte_offset).unwrap();
+        let path = hub.dir().join("channels/general.jsonl");
+        let replacement = path.with_extension("replacement");
+        let _original = std::fs::File::open(&path).unwrap();
+        std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        assert_ne!(before.stamp, after.stamp);
+        mark_read_at(&hub, "me", "#general", 1, after.next_byte_offset).unwrap();
+        assert_eq!(
+            hub.cursors("me").unwrap().read_offset("#general"),
+            after.next_byte_offset
+        );
+    }
+
+    #[test]
+    fn legacy_notify_cursors_do_not_deliver_old_messages_again() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        for text in ["@a one", "@a two"] {
+            bus.send("b", "#general", text, None, &[])
+                .into_result()
+                .unwrap();
+        }
+        let hub = bus.hub();
+        // A cursor file from before byte offsets: counts only.
+        let legacy = r##"{"read": {}, "notified": {"#general": 1}}"##;
+        std::fs::write(hub.dir().join("cursors/a.json"), legacy).unwrap();
+        assert_eq!(texts(&bus.inbox("a").unwrap()), vec!["@a two"]);
+        let cursors = hub.cursors("a").unwrap();
+        assert_eq!(cursors.notified["#general"], 2);
+        assert!(
+            cursors
+                .notified_offset("#general")
+                .is_some_and(|offset| offset.bytes > 0)
+        );
+        bus.send("b", "#general", "@a three", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(texts(&bus.inbox("a").unwrap()), vec!["@a three"]);
+    }
+
+    #[test]
+    fn inbox_read_and_delivery_do_not_take_the_hub_lock() {
+        use fs2::FileExt;
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("c", "c", None);
+        let hub = bus.hub();
+        hub.update_meta(|meta| {
+            meta.tokens.insert("#general".to_string(), 1000);
+        })
+        .unwrap();
+        // A person post wakes every member, so `a` and `c` both have mail.
+        for text in ["one", "two", "three"] {
+            post_as_person(&hub, "me", "#general", text, &[]).unwrap();
+        }
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let wake: PeerWakeFn = Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let hub_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(hub.dir().join("hub.lock"))
+            .unwrap();
+        hub_lock.lock_exclusive().unwrap();
+        let worker_bus = bus.clone();
+        let worker_hub = hub.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            deliver(&worker_hub, &[("a".to_string(), wake)]).unwrap();
+            let read = worker_bus.read("a", "general", 10, None).unwrap().0.len();
+            let inbox = worker_bus.inbox("c").unwrap().len();
+            done_tx.send((read, inbox)).unwrap();
+        });
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        // Release the lock before any assert, so a blocked worker can end.
+        hub_lock.unlock().unwrap();
+        worker.join().unwrap();
+        assert_eq!(done.expect("no read path waits for hub.lock"), (3, 3));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+
+        let meta = hub.meta().unwrap();
+        assert_eq!(
+            meta.tokens["#general"], 1000,
+            "hub.json keeps the old count"
+        );
+        let view = bus.view("a").unwrap();
+        // Three reads of three messages, each about 20 tokens or more.
+        assert!(view.channels[0].tokens >= 1000 + 9 * 20);
     }
 
     #[test]
@@ -2741,6 +3598,90 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_hub_skips_delivery_and_a_change_delivers_on_the_next_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let hub = bus.hub();
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = bodies.clone();
+        let wake: PeerWakeFn = Arc::new(move |body, _| sink.lock().unwrap().push(body));
+        let targets = vec![("a".to_string(), wake)];
+        let delivered = || std::mem::take(&mut *bodies.lock().unwrap());
+
+        bus.send("b", "@a", "first", None, &[]);
+        let stamp = deliver_if_changed(&hub, &targets, None).unwrap();
+        assert_eq!(delivered().len(), 1);
+        // The loop guard of that delivery wrote hub.json after the stamp, so
+        // one more tick runs and finds nothing new.
+        let stamp = deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+        assert!(delivered().is_empty());
+
+        // No file changed: the tick takes no cursor lock, so it does not wait.
+        let cursor_lock = hub.lock_cursors("a").unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let hub = hub.clone();
+            let targets = targets.clone();
+            let stamp = stamp.clone();
+            move || {
+                let next = deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+                done_tx.send(next).unwrap();
+            }
+        });
+        let unchanged = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(cursor_lock);
+        worker.join().unwrap();
+        assert_eq!(unchanged.expect("an idle tick never waits"), stamp);
+
+        // An append by another process: a raw write to the DM file.
+        let dm = store::dm_conv("a", "b");
+        let message = Message {
+            id: new_message_id(),
+            conv: dm.clone(),
+            from: "b".to_string(),
+            text: "second".to_string(),
+            reply_to: None,
+            mentions: Vec::new(),
+            images: Vec::new(),
+            ts_unix_ms: store::now_ms(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&message).unwrap());
+        let path = std::fs::read_dir(hub.dir().join("dms"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+        let stamp = deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+        let bodies_now = delivered();
+        assert_eq!(bodies_now.len(), 1);
+        assert!(bodies_now[0].contains("second"), "{}", bodies_now[0]);
+
+        // A truncated file changes the stamp. The line-count cursor (2)
+        // still holds, so only the third line of the new file is new.
+        std::fs::write(&path, "").unwrap();
+        for text in ["skip-one", "skip-two", "third"] {
+            let mut next = message.clone();
+            next.id = new_message_id();
+            next.text = text.to_string();
+            hub.append(&next).unwrap();
+        }
+        deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+        let bodies_now = delivered();
+        assert_eq!(bodies_now.len(), 1);
+        assert!(bodies_now[0].contains("third"), "{}", bodies_now[0]);
+        assert!(!bodies_now[0].contains("skip-two"), "{}", bodies_now[0]);
+        assert_eq!(hub.cursors("a").unwrap().notified[&dm], 3);
+    }
+
+    #[test]
     fn images_travel_with_messages() {
         let root = tempfile::tempdir().unwrap();
         let bus = session_bus(root.path(), "s1");
@@ -2776,5 +3717,190 @@ mod tests {
         bus.send("a", "b", "async hi", None, &[]);
         let msgs = h.await.unwrap().unwrap();
         assert_eq!(texts(&msgs), vec!["async hi"]);
+    }
+
+    fn pin_reason(outcome: SendOutcome) -> String {
+        outcome.into_result().unwrap_err()
+    }
+
+    #[test]
+    fn send_and_pin_pins_channel_posts_and_rejects_dms_and_full_channels() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let id = bus
+            .send_and_pin("a", "#general", "API spec: docs/api.md", None, &[])
+            .into_result()
+            .unwrap();
+        let hub = bus.hub();
+        let pins = hub.channel_pins("general").unwrap();
+        assert_eq!(pins[0].0.message_id, id);
+        assert_eq!(pins[0].0.pinned_by, "a");
+        assert_eq!(bus.view("b").unwrap().channels[0].pin_count, 1);
+
+        let reason = pin_reason(bus.send_and_pin("a", "@b", "secret", None, &[]));
+        assert!(reason.contains("not a DM"), "{reason}");
+        assert!(
+            hub.dm_convs_for("a").unwrap().is_empty(),
+            "no DM is written"
+        );
+
+        for i in 1..store::MAX_CHANNEL_PINS {
+            bus.send_and_pin("b", "#general", &format!("p{i}"), None, &[])
+                .into_result()
+                .unwrap();
+        }
+        let before = hub.messages("#general", 0).unwrap().len();
+        let reason = pin_reason(bus.send_and_pin("a", "#general", "one more", None, &[]));
+        assert!(reason.contains("already has 15 pins"), "{reason}");
+        assert_eq!(hub.messages("#general", 0).unwrap().len(), before);
+        // A plain post still works in a full channel.
+        bus.send("a", "#general", "plain", None, &[])
+            .into_result()
+            .unwrap();
+    }
+
+    #[test]
+    fn send_and_pin_fails_in_an_archived_hub() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "lead", true).unwrap();
+        bus.hub().update_meta(|meta| meta.archived = true).unwrap();
+        let reason = pin_reason(bus.send_and_pin(MAIN_PEER_ID, "#general", "x", None, &[]));
+        assert!(reason.contains("archived"), "{reason}");
+    }
+
+    #[test]
+    fn person_pins_and_unpins_with_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        hub.update_meta(|meta| {
+            meta.channels.push(store::Channel {
+                name: "api".to_string(),
+                purpose: String::new(),
+                pins: Vec::new(),
+                created_ms: 0,
+            })
+        })
+        .unwrap();
+        let general = post_as_person(&hub, "me", "#general", "general note", &[]).unwrap();
+        let api = post_as_person(&hub, "me", "#api", "use REST", &[]).unwrap();
+        let dm = post_as_person(&hub, "me", "@me", "self", &[]).unwrap_or_default();
+        let streak_before = hub.meta().unwrap().agent_wake_streak;
+
+        assert!(pin_as_person(&hub, "me", "#api", &api).unwrap());
+        assert!(
+            !pin_as_person(&hub, "me", "api", &api).unwrap(),
+            "idempotent"
+        );
+        let meta = hub.meta().unwrap();
+        let pins = &meta.channel("api").unwrap().pins;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].pinned_by, "me");
+        assert_eq!(meta.agent_wake_streak, streak_before);
+        assert_eq!(hub.messages("#api", 0).unwrap().len(), 1, "no message");
+
+        for (channel, id, expected) in [
+            ("#api", general.as_str(), "not a message in #api"),
+            ("#api", "nope", "not a message"),
+            ("#nope", api.as_str(), "unknown channel"),
+            ("@me", dm.as_str(), "#channels only"),
+            ("@a,@b", "x", "#channels only"),
+        ] {
+            let error = pin_as_person(&hub, "me", channel, id).unwrap_err();
+            assert!(error.to_string().contains(expected), "{channel}: {error}");
+        }
+
+        assert!(!unpin_as_person(&hub, "#api", &general).unwrap());
+        assert!(unpin_as_person(&hub, "#api", &api).unwrap());
+        assert!(hub.channel_pins("#api").unwrap().is_empty());
+
+        pin_as_person(&hub, "me", "#api", &api).unwrap();
+        hub.update_meta(|meta| meta.archived = true).unwrap();
+        let error = pin_as_person(&hub, "me", "#general", &general).unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+        let error = unpin_as_person(&hub, "#api", &api).unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+        assert_eq!(
+            hub.channel_pins("#api").unwrap().len(),
+            1,
+            "pins stay readable"
+        );
+    }
+
+    #[test]
+    fn person_pins_stop_at_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        for i in 0..=store::MAX_CHANNEL_PINS {
+            let id = post_as_person(&hub, "me", "#general", &format!("m{i}"), &[]).unwrap();
+            let result = pin_as_person(&hub, "me", "#general", &id);
+            if i < store::MAX_CHANNEL_PINS {
+                assert!(result.unwrap());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("already has 15 pins"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_pins_move_no_cursor_and_count_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        bus.send_and_pin("a", "#general", "decision: use REST", None, &[])
+            .into_result()
+            .unwrap();
+        bus.send("a", "#general", "chatter", None, &[])
+            .into_result()
+            .unwrap();
+        let hub = bus.hub();
+        let before = hub.cursors("b").unwrap();
+        let tokens = |hub: &Hub| {
+            hub.tokens(&hub.meta().unwrap())
+                .unwrap()
+                .get("#general")
+                .copied()
+                .unwrap_or(0)
+        };
+        let tokens_before = tokens(&hub);
+        let pins = bus.read_pins("b", "#general").unwrap();
+        assert_eq!(texts(&pins), vec!["decision: use REST"]);
+        assert_eq!(hub.cursors("b").unwrap(), before);
+        assert!(tokens(&hub) > tokens_before);
+
+        let (messages, _) = bus.read("b", "general", 1, None).unwrap();
+        let (framed, _) = bus.frame_read("general", &pins, &messages).unwrap();
+        assert!(framed.starts_with(WAKE_SYSTEM_HEADER_OPEN), "{framed}");
+        let pinned_at = framed.find("Pinned in #general (1)").expect("pins section");
+        let message_at = framed.find("1 message(s).").expect("messages");
+        assert!(pinned_at < message_at, "{framed}");
+        assert!(framed.contains("--- pinned · from @a · id="), "{framed}");
+        assert_eq!(hub.cursors("b").unwrap().read.get("#general"), Some(&1));
+    }
+
+    #[test]
+    fn join_notice_shows_pin_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "lead", true).unwrap();
+        bus.create_channel("api", "contracts").unwrap();
+        for text in ["one", "two"] {
+            bus.send_and_pin(MAIN_PEER_ID, "#api", text, None, &[])
+                .into_result()
+                .unwrap();
+        }
+        bus.send_and_pin(MAIN_PEER_ID, "#general", "only", None, &[])
+            .into_result()
+            .unwrap();
+        let notice = format_join_notice(&bus.view(MAIN_PEER_ID).unwrap());
+        assert!(notice.contains("#api (contracts) (2 pins)"), "{notice}");
+        assert!(notice.contains("(1 pin)"), "{notice}");
+        assert!(parse_membership_notice(&notice).is_some());
     }
 }

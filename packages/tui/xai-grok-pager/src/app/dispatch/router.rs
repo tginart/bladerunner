@@ -332,13 +332,19 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::AskReviewChat(req) => crate::app::review_chat::dispatch_ask(app, req),
         Action::AskHubBot { hub, request } => crate::app::hub_bot::dispatch_ask(app, hub, request),
         Action::ForwardReviewRequest(text) => {
-            let ActiveView::Agent(id) = app.active_view else {
+            let Some(id) = app.visible_agent_id() else {
                 return vec![];
             };
             let Some(agent) = app.agents.get(&id) else {
                 return vec![];
             };
-            let chat = agent.review_chat.clone();
+            let chat = match &agent.active_modal {
+                Some(crate::views::modal::ActiveModal::PullRequest) => agent
+                    .pull_request
+                    .as_ref()
+                    .and_then(|state| state.chat.clone()),
+                _ => agent.review_chat.clone(),
+            };
             if app.reconnect_pending || agent.session.session_id.is_none() {
                 if let Some(chat) = chat {
                     chat.borrow_mut().message = Some("Not sent. Retry when connected.".into());
@@ -346,7 +352,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             }
             let queued_before = agent.session.pending_prompts.len();
+            // The prompt dispatcher targets an agent tab. Keep the popup visible after the send.
+            let saved_view = app.active_view;
+            app.active_view = ActiveView::Agent(id);
             let effects = dispatch_send_prompt_inner(app, text, false, true, false);
+            app.active_view = saved_view;
             let accepted = !effects.is_empty()
                 || app.agents[&id].session.pending_prompts.len() > queued_before;
             if let Some(chat) = chat {
@@ -1669,6 +1679,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             });
             vec![]
         }
+        Action::OpenPullRequest(target) => super::pull_request::open(app, target),
+        Action::PullRequestControl(control) => super::pull_request::control(app, control),
         Action::OpenFileBrowser => {
             with_active_agent(app, |agent| agent.open_file_browser());
             vec![]

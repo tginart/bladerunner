@@ -95,6 +95,18 @@ fn apply_model_picker_filter(
         .collect()
 }
 
+fn review_chat_input(out: crate::views::review_chat::ReviewChatOutcome) -> InputOutcome {
+    use crate::views::review_chat::ReviewChatOutcome;
+    match out {
+        ReviewChatOutcome::Changed => InputOutcome::Changed,
+        ReviewChatOutcome::Ask(req) => InputOutcome::Action(Action::AskReviewChat(req)),
+        ReviewChatOutcome::Forward(text) => {
+            InputOutcome::Action(Action::ForwardReviewRequest(text))
+        }
+        ReviewChatOutcome::Cancel(id) => InputOutcome::Action(Action::KillSubagent(id)),
+    }
+}
+
 impl AgentView {
     /// `suggest_args` falls back to model rows when the query is not in effort
     /// phase. Model-phase reasoning rows use a trailing space in `insert_text`;
@@ -479,6 +491,12 @@ impl AgentView {
             }
         }
 
+        if matches!(modal, ActiveModal::PullRequest)
+            && let Some(state) = &mut self.pull_request
+        {
+            let out = state.key(key);
+            return self.pull_request_outcome(out);
+        }
         // Changes review: chrome for close/shortcut clicks, then delegate.
         if let ActiveModal::Changes { state } = modal {
             let shortcuts = crate::views::changes_modal::build_shortcuts(state);
@@ -500,23 +518,7 @@ impl AgentView {
                     Out::Closed => (true, InputOutcome::Changed),
                     Out::Act(kind) => (false, InputOutcome::Action(Action::ChangesAction(kind))),
                     Out::Refresh => (false, InputOutcome::Action(Action::OpenChanges)),
-                    Out::Review(out) => (
-                        false,
-                        match out {
-                            crate::views::review_chat::ReviewChatOutcome::Changed => {
-                                InputOutcome::Changed
-                            }
-                            crate::views::review_chat::ReviewChatOutcome::Ask(req) => {
-                                InputOutcome::Action(Action::AskReviewChat(req))
-                            }
-                            crate::views::review_chat::ReviewChatOutcome::Forward(text) => {
-                                InputOutcome::Action(Action::ForwardReviewRequest(text))
-                            }
-                            crate::views::review_chat::ReviewChatOutcome::Cancel(id) => {
-                                InputOutcome::Action(Action::KillSubagent(id))
-                            }
-                        },
-                    ),
+                    Out::Review(out) => (false, review_chat_input(out)),
                 }
             }
             let (close, out) = if state.chat_focused()
@@ -655,11 +657,24 @@ impl AgentView {
             | ActiveModal::DocViewer { .. }
             | ActiveModal::ShortcutsHelp { .. }
             | ActiveModal::MemoryBrowser { .. }
+            | ActiveModal::PullRequest
             | ActiveModal::Changes { .. }
             | ActiveModal::Settings { .. }
             | ActiveModal::UsageInfo { .. }
             | ActiveModal::ResetSettingsConfirm { .. }
             | ActiveModal::RememberNoteReview { .. } => unreachable!(),
+        }
+    }
+
+    fn pull_request_outcome(&mut self, out: crate::views::pull_request::Outcome) -> InputOutcome {
+        use crate::views::pull_request::Outcome;
+        match out {
+            Outcome::Close => {
+                self.active_modal = None;
+                InputOutcome::Changed
+            }
+            Outcome::Changed => InputOutcome::Changed,
+            Outcome::Chat(out) => review_chat_input(out),
         }
     }
 
@@ -670,6 +685,16 @@ impl AgentView {
     ) -> InputOutcome {
         use crate::views::modal::ActiveModal;
 
+        if matches!(self.active_modal, Some(ActiveModal::PullRequest))
+            && let Some(state) = &mut self.pull_request
+        {
+            if let Some(chat) = &state.chat
+                && chat.borrow().focused
+            {
+                chat.borrow_mut().paste(text);
+            }
+            return InputOutcome::Changed;
+        }
         if let Some(ActiveModal::Changes { state }) = self.active_modal.as_mut()
             && state.chat_focused()
             && let Some(chat) = &state.review_chat
@@ -1811,6 +1836,12 @@ impl AgentView {
             }
         }
 
+        if matches!(self.active_modal, Some(ActiveModal::PullRequest))
+            && let Some(state) = &mut self.pull_request
+        {
+            let out = state.mouse(mouse);
+            return self.pull_request_outcome(out);
+        }
         // Changes review (mouse): chrome handles close + footer shortcut clicks.
         if let Some(ActiveModal::Changes { state }) = &mut self.active_modal {
             if let Some(shared) = &state.review_chat {
@@ -1889,20 +1920,7 @@ impl AgentView {
                         InputOutcome::Action(Action::OpenChanges)
                     }
                     Some(crate::views::changes_modal::ChangesModalOutcome::Review(out)) => {
-                        match out {
-                            crate::views::review_chat::ReviewChatOutcome::Changed => {
-                                InputOutcome::Changed
-                            }
-                            crate::views::review_chat::ReviewChatOutcome::Ask(req) => {
-                                InputOutcome::Action(Action::AskReviewChat(req))
-                            }
-                            crate::views::review_chat::ReviewChatOutcome::Forward(text) => {
-                                InputOutcome::Action(Action::ForwardReviewRequest(text))
-                            }
-                            crate::views::review_chat::ReviewChatOutcome::Cancel(id) => {
-                                InputOutcome::Action(Action::KillSubagent(id))
-                            }
-                        }
+                        review_chat_input(out)
                     }
                     _ => InputOutcome::Changed,
                 },
@@ -2798,6 +2816,13 @@ impl AgentView {
                 );
             } else if let modal::ActiveModal::MemoryBrowser { state: mem_state } = active_modal {
                 crate::views::memory_modal::render_memory_modal(buf, area, mem_state, compact);
+            } else if matches!(active_modal, modal::ActiveModal::PullRequest)
+                && let Some(state) = &mut self.pull_request
+            {
+                if let Some(chat) = &state.chat {
+                    chat.borrow_mut().sync_model_name(&self.session.models);
+                }
+                state.render(buf, area, &theme);
             } else if let modal::ActiveModal::Changes { state } = active_modal {
                 if let Some(chat) = &state.review_chat {
                     chat.borrow_mut().sync_model_name(&self.session.models);

@@ -700,6 +700,8 @@ pub struct GoalTracker {
     session_dir: PathBuf,
     active_since: Option<Instant>,
     planner_run: Option<GoalPlannerRunState>,
+    /// Cancels retry sleeps when this goal attempt ends or the goal changes.
+    retry_cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug)]
@@ -715,6 +717,7 @@ impl GoalTracker {
             session_dir,
             active_since: None,
             planner_run: None,
+            retry_cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -787,11 +790,17 @@ impl GoalTracker {
             session_dir,
             active_since,
             planner_run: None,
+            retry_cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
     pub fn snapshot(&self) -> Option<&GoalOrchestration> {
         self.orchestration.as_ref()
+    }
+
+    /// Return the cancellation signal for this active goal attempt.
+    pub(crate) fn retry_cancel(&self) -> Option<tokio_util::sync::CancellationToken> {
+        (self.status() == Some(GoalStatus::Active)).then(|| self.retry_cancel.clone())
     }
 
     pub(crate) fn start_planner_run(&mut self, cancel: tokio_util::sync::CancellationToken) {
@@ -944,6 +953,8 @@ impl GoalTracker {
         created_at: String,
         baseline_commit: Option<String>,
     ) {
+        self.retry_cancel.cancel();
+        self.retry_cancel = tokio_util::sync::CancellationToken::new();
         let _ = std::fs::create_dir_all(self.goal_dir());
         // Replacing a still-active goal: same rescue-then-remove contract
         // as the terminal transitions (the prior goal's details path may
@@ -1077,6 +1088,7 @@ impl GoalTracker {
             false
         };
         if applied {
+            self.retry_cancel.cancel();
             self.record_event(
                 GoalEvent::GoalPaused,
                 Some(reason.history_detail().to_owned()),
@@ -1102,6 +1114,7 @@ impl GoalTracker {
             o.reset_classifier_stall_fields();
             o.reset_evaluator_blocker_fields();
             self.active_since = Some(Instant::now());
+            self.retry_cancel = tokio_util::sync::CancellationToken::new();
             self.record_event(GoalEvent::GoalResumed, None);
             return true;
         }
@@ -1120,6 +1133,7 @@ impl GoalTracker {
                     .saturating_add(since.elapsed().as_millis() as u64);
             }
             o.status = GoalStatus::Complete;
+            self.retry_cancel.cancel();
             o.phase = GoalPhase::Idle;
             o.current_subagent_id = None;
             o.current_subagent_role = None;
@@ -1159,6 +1173,7 @@ impl GoalTracker {
                     .saturating_add(since.elapsed().as_millis() as u64);
             }
             o.status = GoalStatus::BudgetLimited;
+            self.retry_cancel.cancel();
             o.phase = GoalPhase::Idle;
             o.current_subagent_id = None;
             o.current_subagent_role = None;
@@ -1187,6 +1202,7 @@ impl GoalTracker {
     /// the root explicitly first (mirrors the `complete` / `budget_limit`
     /// cleanup).
     pub fn clear(&mut self) {
+        self.retry_cancel.cancel();
         self.rescue_classifier_details();
         self.remove_scratch_root();
         self.orchestration = None;

@@ -736,8 +736,11 @@ pub(super) fn dispatch_kill_bg_task(app: &mut AppView, task_id: String) -> Vec<E
     }]
 }
 
+/// Purpose: Cancel a subagent of the visible session, including a dashboard popup.
+/// Input: The application state and the subagent ID.
+/// Output: A cancel effect and the pending cancel state for a known subagent.
 pub(super) fn dispatch_kill_subagent(app: &mut AppView, subagent_id: String) -> Vec<Effect> {
-    let ActiveView::Agent(id) = app.active_view else {
+    let Some(id) = app.visible_agent_id() else {
         return vec![];
     };
     let Some(agent) = app.agents.get_mut(&id) else {
