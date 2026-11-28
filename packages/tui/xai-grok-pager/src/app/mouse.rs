@@ -846,10 +846,28 @@ impl AgentView {
                 if self.active_pane == AgentPane::Scrollback {
                     if let Some((click_col, click_row)) = self.pending_scrollback_click.take() {
                         let now = Instant::now();
+                        let exact_text_hit = self
+                            .last_scrollback_selection_model
+                            .hit_test_text_exact(click_col, click_row);
+                        if let Some(hit) = &exact_text_hit
+                            && hit.block_line_idx == 0
+                            && self.scrollback.entry(hit.entry_idx).is_some_and(|entry| {
+                                matches!(
+                                    entry.block,
+                                    crate::scrollback::block::RenderBlock::HubCard(_)
+                                )
+                            })
+                        {
+                            self.persistent_text_selection = None;
+                            self.table_selection_geometry = None;
+                            self.selection_created_at = None;
+                            self.scrollback.set_selected(Some(hit.entry_idx));
+                            self.scrollback.toggle_fold_selected();
+                            self.last_click = None;
+                            self.last_text_click = None;
+                            return InputOutcome::Changed;
+                        }
                         if is_text_selection_on_double_click() {
-                            let exact_text_hit = self
-                                .last_scrollback_selection_model
-                                .hit_test_text_exact(click_col, click_row);
                             if let Some(hit) = exact_text_hit {
                                 let text_click_count = self.count_text_click(now, &hit);
                                 let handled = match text_click_count {
