@@ -408,16 +408,6 @@ impl SessionActor {
         }
     }
 
-    /// Whether a turn error is transient infra worth a goal retry. Keys on the
-    /// JSON-RPC code only (unlike `stop_failure_error_type`), so `-32603` counts
-    /// as infra.
-    pub(super) fn is_infra_turn_error(err: &acp::Error) -> bool {
-        matches!(
-            i32::from(err.code),
-            crate::sampling::error::RATE_LIMITED_ERROR_CODE | -32000 | -32603
-        )
-    }
-
     /// `(turn_succeeded, suppress_goal_continuation, infra_pause_message)`.
     /// StationarityEnded is success for the streak but skips GoalSummary re-queue.
     /// `infra_pause_message` is extracted before `handle_completion` consumes `result`.
@@ -441,11 +431,7 @@ impl SessionActor {
             .as_ref()
             .ok()
             .is_some_and(|ok| !turn_cancelled && ok.stop_reason != acp::StopReason::Refusal);
-        let infra_pause_message = result
-            .as_ref()
-            .err()
-            .filter(|err| Self::is_infra_turn_error(err))
-            .map(Self::format_turn_error_message);
+        let infra_pause_message = result.as_ref().err().map(Self::format_turn_error_message);
         (
             turn_succeeded,
             suppress_goal_continuation,

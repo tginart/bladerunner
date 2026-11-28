@@ -1363,7 +1363,7 @@ impl SessionActor {
                 crate::sampling::error::RATE_LIMITED_ERROR_CODE,
                 "Rate limited".to_string(),
             )
-            .data(detailed_message);
+            .data(Self::goal_sampling_error_data(&error, detailed_message));
             return Err(acp_err);
         }
         let (failed_model_id, failed_base_url, failed_adapter_kind) = self
@@ -1907,13 +1907,26 @@ impl SessionActor {
             },
         ))
         .await;
-        Err(
-            acp::Error::internal_error().data(crate::sampling::error::terminal_error_data(
-                detailed_message,
-                error.status_code,
-                error.kind,
-            )),
-        )
+        Err(acp::Error::internal_error()
+            .data(Self::goal_sampling_error_data(&error, detailed_message)))
+    }
+
+    /// Purpose: Keep sampler retry decisions available to the goal controller.
+    /// Input: The sampler failure and its final display message.
+    /// Output: Error data with the original classification and retry veto.
+    fn goal_sampling_error_data(
+        error: &xai_grok_sampler::SamplingErrorInfo,
+        message: String,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "message": message,
+            "http_status": error.status_code,
+            "error_kind": error.kind.as_str(),
+            "is_retryable": error.is_retryable
+                && !xai_grok_sampling_types::is_context_length_error(&error.message)
+                && error.error_code != Some(xai_grok_sampling_types::ApiErrorCode::InvalidImage),
+            "should_retry": error.should_retry,
+        })
     }
     /// Drive a single turn through the sampler-based path.
     ///
