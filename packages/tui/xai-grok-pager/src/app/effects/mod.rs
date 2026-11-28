@@ -134,6 +134,19 @@ pub(crate) fn execute(
                 }
             });
         }
+        Effect::RefreshHubBrowser {
+            agent_id,
+            subagent,
+            job,
+        } => {
+            let generation = job.generation;
+            tasks.spawn_blocking(move || TaskResult::HubBrowserRefreshed {
+                agent_id,
+                subagent,
+                generation,
+                result: job.run().map(Box::new).map_err(|error| format!("{error:#}")),
+            });
+        }
         Effect::FetchChanges {
             agent_id,
             session_id,

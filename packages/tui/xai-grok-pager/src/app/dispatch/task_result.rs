@@ -1545,6 +1545,18 @@ fn dispatch_task_result_inner(result: TaskResult, app: &mut AppView) -> Vec<Effe
             }
             vec![]
         }
+        TaskResult::HubBrowserRefreshed {
+            agent_id,
+            subagent,
+            generation,
+            result,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                let result = result.map(|refresh| *refresh);
+                agent.finish_hub_browser_refresh(subagent.as_deref(), generation, result);
+            }
+            vec![]
+        }
         TaskResult::ReviewChatAnswered {
             agent_id,
             parent_session_id,

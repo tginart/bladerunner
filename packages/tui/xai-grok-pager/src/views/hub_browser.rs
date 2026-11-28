@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use chrono::{DateTime, Local, NaiveDate};
@@ -87,6 +88,123 @@ pub struct HubSnapshot {
     pub read: BTreeMap<String, usize>,
     /// What each agent reported that it does now, by handle.
     pub presences: BTreeMap<String, store::Presence>,
+    /// Estimated tokens to agents by token key: `hub.json` plus member files.
+    pub tokens: BTreeMap<String, u64>,
+}
+
+/// Incremental read state of the hub files, so that a reload reads only the
+/// bytes that were appended since the last read.
+#[derive(Debug, Clone, Default)]
+pub struct HubReadCache {
+    /// The member whose counts `unread` holds.
+    perspective: String,
+    /// Unread state per conversation key.
+    unread: BTreeMap<String, UnreadTail>,
+    /// Every message of the last feed conversation.
+    feed: Option<FeedTail>,
+}
+
+#[derive(Debug, Clone)]
+struct UnreadTail {
+    /// The read count that `unread` counts from.
+    read: usize,
+    tail: store::ConvTail,
+    /// Messages after `read` that other members sent.
+    unread: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FeedTail {
+    conv: String,
+    tail: store::ConvTail,
+    messages: Vec<store::Message>,
+}
+
+/// A read position of the person that waits to be saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadMark {
+    pub conv: String,
+    pub count: usize,
+    /// The byte offset after `count` complete lines.
+    pub offset: Option<store::LineOffset>,
+}
+
+/// The inputs of a background refresh. It holds no reference to the browser.
+#[derive(Debug)]
+pub struct HubRefreshJob {
+    pub generation: u64,
+    hub: store::Hub,
+    person_name: String,
+    person: String,
+    perspective: String,
+    unsaved_read: BTreeMap<String, usize>,
+    /// The conversation of the selected row.
+    conv: Option<String>,
+    cache: HubReadCache,
+}
+
+/// The result of a background refresh.
+#[derive(Debug)]
+pub struct HubRefresh {
+    person: String,
+    /// The unsaved read positions that the refresh saved.
+    saved_read: BTreeMap<String, usize>,
+    snapshot: HubSnapshot,
+    cache: HubReadCache,
+}
+
+impl HubRefreshJob {
+    /// Purpose: Read the hub for a background refresh, off the UI thread.
+    /// Input: The job.
+    /// Output: The new snapshot, and the read cache with the feed conversation.
+    /// Note: Like `reload_snapshot`, it saves the unsaved read positions of
+    ///     the person once the person is a member. It moves no other cursor.
+    pub fn run(mut self) -> Result<HubRefresh> {
+        let meta = self.hub.meta()?;
+        let person = agent_hub::person_handle_in(&meta, &self.person_name);
+        let perspective = if self.perspective == self.person {
+            person.clone()
+        } else {
+            self.perspective
+        };
+        let mut saved_read = BTreeMap::new();
+        if is_person_member(&meta, &person) {
+            for (conv, count) in std::mem::take(&mut self.unsaved_read) {
+                agent_hub::mark_read(&self.hub, &person, &conv, count)?;
+                saved_read.insert(conv, count);
+            }
+        }
+        let read_floor = if perspective == person {
+            self.unsaved_read
+        } else {
+            BTreeMap::new()
+        };
+        let snapshot = load_snapshot(
+            &self.hub,
+            &perspective,
+            &person,
+            &read_floor,
+            &mut self.cache,
+        )?;
+        if let Some(conv) = &self.conv {
+            let cached = self.cache.feed.take();
+            self.cache.feed = Some(load_conv(&self.hub, conv, cached)?);
+        }
+        Ok(HubRefresh {
+            person,
+            saved_read,
+            snapshot,
+            cache: self.cache,
+        })
+    }
+}
+
+/// A new refresh generation. Every local load takes one, so a background
+/// refresh that started before it is stale. The values are unique in the
+/// process, so a result never applies to a browser that opened later.
+fn next_refresh_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl HubSnapshot {
@@ -347,6 +465,15 @@ pub struct HubBrowserState {
     /// True while hub-bot works on a question of the person.
     pub is_bot_thinking: bool,
     hits: HitAreas,
+    /// What the last reads saw, so the next reload reads only new bytes.
+    cache: HubReadCache,
+    /// The generation of the last local load. See `next_refresh_generation`.
+    refresh_generation: u64,
+    /// The generation of the background refresh that runs now, if any.
+    refresh_in_flight: Option<u64>,
+    /// `Some` while a background refresh applies: the feed uses the cache
+    /// as it is, and read positions wait here instead of a disk write.
+    deferred_marks: Option<Vec<ReadMark>>,
 }
 
 impl HubBrowserState {
@@ -355,7 +482,8 @@ impl HubBrowserState {
     /// Output: The state, or an error when the hub files cannot be read.
     pub fn open(hub: store::Hub, person_name: &str, channel: Option<&str>) -> Result<Self> {
         let person = agent_hub::person_handle_in(&hub.meta()?, person_name);
-        let snapshot = load_snapshot(&hub, &person, &person, &BTreeMap::new())?;
+        let mut cache = HubReadCache::default();
+        let snapshot = load_snapshot(&hub, &person, &person, &BTreeMap::new(), &mut cache)?;
         let mut state = Self {
             hub,
             person_name: person_name.to_string(),
@@ -390,6 +518,10 @@ impl HubBrowserState {
             scroll_to_focus: false,
             is_bot_thinking: false,
             hits: HitAreas::default(),
+            cache,
+            refresh_generation: next_refresh_generation(),
+            refresh_in_flight: None,
+            deferred_marks: None,
         };
         let rows = state.rows();
         let target = channel.and_then(store::normalize_channel).map(Row::Channel);
@@ -435,6 +567,80 @@ impl HubBrowserState {
         let previous_index = self.selected_index(&self.rows()).unwrap_or(0);
         self.reload_snapshot()?;
         self.reselect(previous_index)
+    }
+
+    /// Purpose: Start a background refresh, the off-thread form of `reload`.
+    /// Input: The browser state.
+    /// Output: The job to run off the UI thread, or `None` while one runs.
+    /// Note: The job takes the read cache and gives it back in its result.
+    pub fn begin_refresh(&mut self) -> Option<HubRefreshJob> {
+        if self.refresh_in_flight.is_some() {
+            return None;
+        }
+        self.refresh_in_flight = Some(self.refresh_generation);
+        Some(HubRefreshJob {
+            generation: self.refresh_generation,
+            hub: self.hub.clone(),
+            person_name: self.person_name.clone(),
+            person: self.person.clone(),
+            perspective: self.perspective.clone(),
+            unsaved_read: self.unsaved_read.clone(),
+            conv: self.selected_row().and_then(|row| row.conv()),
+            cache: std::mem::take(&mut self.cache),
+        })
+    }
+
+    /// Purpose: Apply the result of a background refresh, as `reload` does.
+    /// Input: The generation of the job and its result.
+    /// Output: The read positions of the person for the caller to save off
+    ///     the UI thread. `None` when the result is stale, because a local
+    ///     load (a new row, perspective, thread, post or reload) ran after
+    ///     the job started, or when the refresh failed.
+    /// Note: This reads no hub file, unless the selected row is gone and the
+    ///     fallback row shows another conversation.
+    pub fn finish_refresh(
+        &mut self,
+        generation: u64,
+        result: Result<HubRefresh, String>,
+    ) -> Option<Vec<ReadMark>> {
+        if self.refresh_in_flight == Some(generation) {
+            self.refresh_in_flight = None;
+        }
+        if generation != self.refresh_generation {
+            return None;
+        }
+        let refresh = match result {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                tracing::warn!(%error, "hub browser: refresh failed");
+                return None;
+            }
+        };
+        let previous_index = self.selected_index(&self.rows()).unwrap_or(0);
+        if refresh.person != self.person {
+            if self.is_person_view() {
+                self.perspective = refresh.person.clone();
+            }
+            self.person = refresh.person;
+        }
+        for (conv, count) in refresh.saved_read {
+            if self
+                .unsaved_read
+                .get(&conv)
+                .is_some_and(|read| *read <= count)
+            {
+                self.unsaved_read.remove(&conv);
+            }
+        }
+        self.snapshot = refresh.snapshot;
+        self.cache = refresh.cache;
+        self.deferred_marks = Some(Vec::new());
+        let result = self.reselect(previous_index);
+        let marks = self.deferred_marks.take().unwrap_or_default();
+        if let Err(error) = result {
+            tracing::warn!(%error, "hub browser: feed load failed");
+        }
+        Some(marks)
     }
 
     /// Purpose: Switch the DM section between all members and active members.
@@ -522,6 +728,7 @@ impl HubBrowserState {
     /// Note: If an agent took the person handle, the person gets the next free
     ///     handle, so the browser never writes the read cursor of an agent.
     fn reload_snapshot(&mut self) -> Result<()> {
+        self.refresh_generation = next_refresh_generation();
         let meta = self.hub.meta()?;
         let person = agent_hub::person_handle_in(&meta, &self.person_name);
         if person != self.person {
@@ -541,7 +748,13 @@ impl HubBrowserState {
         } else {
             BTreeMap::new()
         };
-        self.snapshot = load_snapshot(&self.hub, &self.perspective, &self.person, &read_floor)?;
+        self.snapshot = load_snapshot(
+            &self.hub,
+            &self.perspective,
+            &self.person,
+            &read_floor,
+            &mut self.cache,
+        )?;
         Ok(())
     }
 
@@ -1474,25 +1687,52 @@ impl HubBrowserState {
     /// Input: Whether to place the unread marker again.
     /// Output: Ok, or the read error. In the person view, the read cursor moves to the end.
     fn load_feed(&mut self, is_new_selection: bool) -> Result<()> {
+        self.refresh_generation = next_refresh_generation();
         let Some(conv) = self.selected_row().and_then(|row| row.conv()) else {
             self.feed.clear();
             self.first_unread = None;
             return Ok(());
         };
-        let mut messages = self.hub.messages(&conv, 0)?;
-        let total = messages.len();
-        if let Some(root) = &self.thread {
-            // Filter before the limit, so an old root keeps its replies.
-            messages.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
-        }
-        let skip = feed_window_start(&messages, self.focus_message.as_deref());
-        let mut feed = messages.split_off(skip);
+        let loaded = match self.cache.feed.take() {
+            // The background refresh read this file a moment ago.
+            Some(feed) if feed.conv == conv && self.deferred_marks.is_some() => feed,
+            cached => load_conv(&self.hub, &conv, cached)?,
+        };
+        let result = self.show_feed(&conv, &loaded, is_new_selection);
+        self.cache.feed = Some(loaded);
+        result
+    }
+
+    /// Purpose: Show the loaded messages of the selected conversation.
+    /// Input: The conversation, all of its messages, and whether to place the
+    ///     unread marker again.
+    /// Output: Ok, or the cursor write error. In the person view, the read
+    ///     cursor moves to the end.
+    fn show_feed(&mut self, conv: &str, loaded: &FeedTail, is_new_selection: bool) -> Result<()> {
+        let total = loaded.messages.len();
+        debug_assert_eq!(total, loaded.tail.message_count);
+        let thread_messages: Vec<store::Message>;
+        let messages: &[store::Message] = match &self.thread {
+            Some(root) => {
+                // Filter before the limit, so an old root keeps its replies.
+                thread_messages = loaded
+                    .messages
+                    .iter()
+                    .filter(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()))
+                    .cloned()
+                    .collect();
+                &thread_messages
+            }
+            None => &loaded.messages,
+        };
+        let skip = feed_window_start(messages, self.focus_message.as_deref());
+        let mut feed = messages[skip..].to_vec();
         // A thread longer than the window still shows its root first.
         if let Some(root) = &self.thread
             && !feed.iter().any(|m| m.id == *root)
-            && let Some(root) = messages.into_iter().find(|m| m.id == *root)
+            && let Some(root) = messages[..skip].iter().find(|m| m.id == *root)
         {
-            feed.insert(0, root);
+            feed.insert(0, root.clone());
         }
         // A drop or replacement can move text under the stored line indices.
         if self.feed_selection.is_some() && !feed.starts_with(&self.feed) {
@@ -1503,7 +1743,7 @@ impl HubBrowserState {
             // Feed indices of a thread are not conversation positions.
             self.first_unread = None;
         } else if is_new_selection {
-            let read = self.snapshot.read.get(&conv).copied().unwrap_or(0);
+            let read = self.snapshot.read.get(conv).copied().unwrap_or(0);
             self.first_unread = self
                 .feed
                 .iter()
@@ -1518,15 +1758,104 @@ impl HubBrowserState {
         if self.is_person_view() && self.thread.is_none() && self.search.is_none() {
             let count = total;
             if is_person_member(&self.snapshot.meta, &self.person) {
-                agent_hub::mark_read(&self.hub, &self.person, &conv, count)?;
+                self.save_read(conv, count, Some(loaded.tail.offset()))?;
             } else {
-                self.unsaved_read.insert(conv.clone(), count);
+                self.unsaved_read.insert(conv.to_string(), count);
             }
-            self.snapshot.read.insert(conv.clone(), count);
-            self.snapshot.unread_counts.insert(conv, 0);
+            self.snapshot.read.insert(conv.to_string(), count);
+            self.snapshot.unread_counts.insert(conv.to_string(), 0);
         }
         Ok(())
     }
+
+    /// Purpose: Save a read position of the person.
+    /// Input: The conversation, the message count, and its byte offset.
+    /// Output: Ok, or the write error. While a background refresh applies,
+    ///     a forward move waits in `deferred_marks` and nothing is written.
+    fn save_read(
+        &mut self,
+        conv: &str,
+        count: usize,
+        offset: Option<store::LineOffset>,
+    ) -> Result<()> {
+        let Some(marks) = self.deferred_marks.as_mut() else {
+            return agent_hub::mark_read_at(&self.hub, &self.person, conv, count, offset);
+        };
+        if self
+            .snapshot
+            .read
+            .get(conv)
+            .is_none_or(|read| *read < count)
+        {
+            marks.push(ReadMark {
+                conv: conv.to_string(),
+                count,
+                offset,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Purpose: Read every message of one conversation, from the cache when it can.
+/// Input: The hub, the conversation, and the cached feed, if any.
+/// Output: The cache for `conv`, with the appended messages added. A cache
+///     of another conversation, or of a shorter or replaced file, is read
+///     again from line 0.
+fn load_conv(hub: &store::Hub, conv: &str, cached: Option<FeedTail>) -> Result<FeedTail> {
+    let mut feed = cached
+        .filter(|feed| feed.conv == conv)
+        .unwrap_or_else(|| FeedTail {
+            conv: conv.to_string(),
+            tail: store::ConvTail::default(),
+            messages: Vec::new(),
+        });
+    match hub.read_tail(conv, &mut feed.tail)? {
+        store::TailRead::Unchanged => {}
+        store::TailRead::Appended(messages) => feed.messages.extend(messages),
+        store::TailRead::Reset(messages) => feed.messages = messages,
+    }
+    Ok(feed)
+}
+
+/// Purpose: Count the unread messages of one conversation for a member.
+/// Input: The hub, the conversation, the member, its read count, the byte
+///     offset of that count when it is known, and the cached state.
+/// Output: The state with the unread count, or `None` when the file has
+///     fewer messages than the read count (then nothing is unread).
+/// Method:
+///     1. With a cache for the same read count, read only the new bytes.
+///     2. If not, read from the read cursor, with a seek when the offset
+///        is known.
+fn unread_tail(
+    hub: &store::Hub,
+    conv: &str,
+    perspective: &str,
+    read: usize,
+    read_offset: Option<store::LineOffset>,
+    cached: Option<UnreadTail>,
+) -> Result<Option<UnreadTail>> {
+    let from_others = |messages: &[store::Message]| {
+        messages
+            .iter()
+            .filter(|message| message.from != perspective)
+            .count()
+    };
+    if let Some(mut state) = cached.filter(|state| state.read == read) {
+        match hub.read_tail(conv, &mut state.tail)? {
+            store::TailRead::Unchanged => {}
+            store::TailRead::Appended(messages) => state.unread += from_others(&messages),
+            store::TailRead::Reset(messages) if messages.len() < read => return Ok(None),
+            store::TailRead::Reset(messages) => state.unread = from_others(&messages[read..]),
+        }
+        return Ok(Some(state));
+    }
+    let slice = hub.messages_from_offset(conv, read, read_offset, None)?;
+    Ok(slice.tail(read).map(|tail| UnreadTail {
+        read,
+        tail,
+        unread: from_others(&slice.messages),
+    }))
 }
 
 /// Purpose: Find the first message that the feed shows.
@@ -1545,22 +1874,26 @@ fn feed_window_start(messages: &[store::Message], focus: Option<&str>) -> usize 
 }
 
 /// Purpose: Read the hub as one member sees it.
-/// Input: The hub, the perspective handle, the person handle, and read
-///     positions that the cursor file does not have yet.
+/// Input: The hub, the perspective handle, the person handle, read
+///     positions that the cursor file does not have yet, and the read cache.
 /// Output: A snapshot with a count for every channel and every DM row.
 /// Note: The person sees every member as a DM row. Another member sees only
-///     the DMs that it is in.
+///     the DMs that it is in. The unread counts read only the bytes after
+///     the cache or after the read cursor. The cache of another perspective
+///     is dropped.
 pub fn load_snapshot(
     hub: &store::Hub,
     perspective: &str,
     person: &str,
     read_floor: &BTreeMap<String, usize>,
+    cache: &mut HubReadCache,
 ) -> Result<HubSnapshot> {
     let mut meta = hub.meta()?;
     for member in &mut meta.members {
         member.active = member.is_live();
     }
-    let mut read = hub.cursors(perspective)?.read;
+    let cursors = hub.cursors(perspective)?;
+    let mut read = cursors.read.clone();
     for (conv, count) in read_floor {
         let position = read.entry(conv.clone()).or_default();
         *position = (*position).max(*count);
@@ -1579,15 +1912,22 @@ pub fn load_snapshot(
         conv_peers.insert(peer.to_string());
         convs.push(conv.clone());
     }
+    if cache.perspective != perspective {
+        cache.perspective = perspective.to_string();
+        cache.unread.clear();
+    }
+    let mut cached = std::mem::take(&mut cache.unread);
     let mut unread_counts = BTreeMap::new();
     for conv in convs {
         let start = read.get(&conv).copied().unwrap_or(0);
-        let unread = hub
-            .messages(&conv, start)?
-            .iter()
-            .filter(|message| message.from != perspective)
-            .count();
-        unread_counts.insert(conv, unread);
+        // A read floor above the cursor has no saved byte offset.
+        let is_cursor = cursors.read.get(&conv).copied().unwrap_or(0) == start;
+        let offset = is_cursor.then(|| cursors.read_offset(&conv)).flatten();
+        let state = unread_tail(hub, &conv, perspective, start, offset, cached.remove(&conv))?;
+        unread_counts.insert(conv.clone(), state.as_ref().map_or(0, |state| state.unread));
+        if let Some(state) = state {
+            cache.unread.insert(conv, state);
+        }
     }
     let mut dm_peers = Vec::new();
     for member in &meta.members {
@@ -1607,6 +1947,7 @@ pub fn load_snapshot(
         dm_peers.insert(0, store::BOT_HANDLE.to_string());
     }
     Ok(HubSnapshot {
+        tokens: hub.tokens(&meta)?,
         meta,
         dm_peers,
         unread_counts,
@@ -2311,7 +2652,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, the
         }
         state.hits.rows.push((y, rows[idx].clone()));
     }
-    let tokens: u64 = state.snapshot.meta.tokens.values().sum();
+    let tokens: u64 = state.snapshot.tokens.values().sum();
     if tokens == 0 {
         return;
     }
@@ -2580,7 +2921,12 @@ fn render_conversation_header(
                 .find(|c| &c.name == name)
                 .map(|c| c.purpose.clone())
                 .unwrap_or_default();
-            let tokens = meta.tokens.get(&format!("#{name}")).copied().unwrap_or(0);
+            let tokens = state
+                .snapshot
+                .tokens
+                .get(&format!("#{name}"))
+                .copied()
+                .unwrap_or(0);
             if tokens > 0 {
                 if !detail.is_empty() {
                     detail.push_str(" · ");
@@ -3797,6 +4143,119 @@ mod tests {
         assert_eq!(state.first_unread, Some(0));
         assert!(hub.cursors("front").unwrap().read.is_empty());
         assert!(hub.cursors("back").unwrap().read.is_empty());
+    }
+
+    fn texts(state: &HubBrowserState) -> Vec<&str> {
+        state.feed.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    fn post(hub: &store::Hub, from: &str, conv: &str, text: &str) {
+        hub.append(&message(from, conv.to_string(), text, store::now_ms()))
+            .unwrap();
+    }
+
+    /// Run one background refresh the way the event loop does.
+    fn refresh(state: &mut HubBrowserState) -> Option<Vec<ReadMark>> {
+        let job = state.begin_refresh().expect("no refresh in flight");
+        let generation = job.generation;
+        let result = job.run().map_err(|error| error.to_string());
+        state.finish_refresh(generation, result)
+    }
+
+    #[test]
+    fn a_background_refresh_shows_new_messages_and_returns_the_read_position() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+        post(&hub, "front", "#general", "news");
+        post(&hub, "back", &store::dm_conv("me", "back"), "ping");
+
+        let job = state.begin_refresh().unwrap();
+        assert!(state.begin_refresh().is_none(), "one refresh at a time");
+        let generation = job.generation;
+        let marks = state
+            .finish_refresh(generation, job.run().map_err(|e| e.to_string()))
+            .expect("the result is current");
+        assert_eq!(texts(&state), vec!["hello", "news"]);
+        assert_eq!(state.snapshot.unread(&store::dm_conv("me", "back")), 1);
+        let len = std::fs::metadata(hub.dir().join("channels/general.jsonl"))
+            .unwrap()
+            .len();
+        let offset = hub
+            .messages_from_offset("#general", 0, None, None)
+            .unwrap()
+            .next_byte_offset;
+        assert_eq!(offset.map(|offset| offset.bytes), Some(len));
+        let mark = ReadMark {
+            conv: "#general".to_string(),
+            count: 2,
+            offset,
+        };
+        assert_eq!(marks, vec![mark]);
+        // The apply wrote no cursor: the caller saves the marks off-thread.
+        assert_eq!(hub.cursors("me").unwrap().read.get("#general"), Some(&1));
+        assert!(state.begin_refresh().is_some(), "the flag clears on apply");
+    }
+
+    #[test]
+    fn a_refresh_result_is_dropped_after_a_local_change() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+        post(&hub, "front", "#general", "news");
+        let job = state.begin_refresh().unwrap();
+        let generation = job.generation;
+        let result = job.run().map_err(|e| e.to_string());
+        // The person picks another conversation while the job runs.
+        state.select(Some(dm("front", "me")));
+        let feed_before = state.feed.clone();
+        assert_eq!(state.finish_refresh(generation, result), None);
+        assert_eq!(state.feed, feed_before);
+        assert!(state.begin_refresh().is_some(), "the flag still clears");
+
+        // A browser that opened later never takes the result of an older one.
+        let mut old = HubBrowserState::open(hub.clone(), "me", None).unwrap();
+        let job = old.begin_refresh().unwrap();
+        let generation = job.generation;
+        let mut reopened = HubBrowserState::open(hub, "me", None).unwrap();
+        let result = job.run().map_err(|e| e.to_string());
+        assert_eq!(reopened.finish_refresh(generation, result), None);
+    }
+
+    #[test]
+    fn incremental_reloads_match_a_full_reload_after_appends_and_truncation() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+        let fresh = |hub: &store::Hub| {
+            let fresh = HubBrowserState::open(hub.clone(), "me", Some("#general")).unwrap();
+            (fresh.feed.clone(), fresh.snapshot.unread_counts.clone())
+        };
+        for round in 0..3 {
+            post(&hub, "front", "#general", &format!("round {round}"));
+            post(
+                &hub,
+                "back",
+                &store::dm_conv("me", "back"),
+                &format!("dm {round}"),
+            );
+            refresh(&mut state).unwrap();
+            let (feed, unread) = fresh(&hub);
+            assert_eq!(state.feed, feed);
+            assert_eq!(state.snapshot.unread_counts, unread);
+        }
+        assert_eq!(state.snapshot.unread(&store::dm_conv("me", "back")), 3);
+
+        // Another writer replaces the channel file with a shorter one.
+        let path = hub.dir().join("channels/general.jsonl");
+        let line = serde_json::to_string(&message(
+            "front",
+            "#general".to_string(),
+            "only line",
+            store::now_ms(),
+        ))
+        .unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        state.reload().unwrap();
+        assert_eq!(texts(&state), vec!["only line"]);
+        assert_eq!(state.feed, fresh(&hub).0);
     }
 
     #[test]
