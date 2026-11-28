@@ -1630,6 +1630,7 @@ Note: Each sequence sets a mode, so a second send is a no-op when the mode is
     already on. Something outside the pager can turn a mode off, for example a
     `$EDITOR` child that resets mouse tracking at exit. Without mouse tracking,
     a terminal such as Apple Terminal scrolls its own view on the wheel.
+    The callers are the child handoff, FocusGained, and the frame presenter.
 */
 pub(crate) fn reassert_terminal_input_modes() {
     let is_mouse_capture_on = MOUSE_CAPTURE_ENABLED.load(Ordering::Acquire);
