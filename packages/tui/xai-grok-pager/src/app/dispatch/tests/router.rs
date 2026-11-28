@@ -2329,6 +2329,14 @@ fn stop_hub_member_cancels_a_turn_of_another_tab_in_place() {
         ),
         "{effects:?}"
     );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CancelTurn { trigger: Some(trigger), .. }
+                if trigger.as_wire_str() == "hub_stop"
+        )),
+        "a hub stop must arm the shell wake barrier: {effects:?}"
+    );
     assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
     let agent = &app.agents[&other];
     assert!(
@@ -2342,6 +2350,37 @@ fn stop_hub_member_cancels_a_turn_of_another_tab_in_place() {
     let effects = stop_hub_member(&mut app, "other-root", "backend");
     assert!(effects.is_empty(), "{effects:?}");
     assert_eq!(hub_notice(&app).as_deref(), Some("@backend is idle."));
+}
+
+/// Purpose: Check the stop gesture for a hidden wake or compact.
+/// Input: A background session with a wake or compact.
+/// Output: A cancel effect with the hub stop gesture.
+#[test]
+fn stop_hub_member_marks_hidden_wakes_and_compacts_as_stop_gestures() {
+    for is_compact in [false, true] {
+        let (_hubs, mut app) = app_with_hub_browser_and_other_tab();
+        let agent = app.agents.get_mut(&AgentId(1)).unwrap();
+        if is_compact {
+            agent
+                .session
+                .start_command(crate::app::agent::AgentCommand::Compact);
+        } else {
+            agent.running_wake_turn = Some(crate::app::agent_view::RunningWakeTurn {
+                prompt_id: "task-completed-bg1".into(),
+                cancel_sent: false,
+            });
+        }
+        let effects = stop_hub_member(&mut app, "other-root", "backend");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::CancelTurn { trigger: Some(trigger), .. }
+                    if trigger.as_wire_str() == "hub_stop"
+            )),
+            "a hub stop must arm the shell wake barrier: {effects:?}"
+        );
+        assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    }
 }
 
 /// The stop of a hidden tab follows the always-stop preference.

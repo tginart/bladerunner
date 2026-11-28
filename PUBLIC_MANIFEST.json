@@ -5350,8 +5350,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/acp_session_tests/cancel_running_task_tests.rs",
-      "bytes": 142128,
-      "sha256": "2476da51cba9f8247b119e8aca1278c6dc1ccf492004fb4a7c18e7ff5fc8855b",
+      "bytes": 142272,
+      "sha256": "1d594c7a632005ea1d366422272e44080d3f9393f0fda2b4533c781ed3454ad2",
       "mode": "0644"
     },
     {
@@ -14560,8 +14560,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/actions.rs",
-      "bytes": 141529,
-      "sha256": "a4f75a147e50ffd3bd5e6293eafcc59c7d648785da94c50f2473ea8887d5ebe3",
+      "bytes": 141647,
+      "sha256": "cd051e30d5ed4619b29b3dcd30e1961826bd6ba92ef175b7e47952091acbee35",
       "mode": "0644"
     },
     {
@@ -15022,8 +15022,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/tests/router.rs",
-      "bytes": 116664,
-      "sha256": "13d26999503a1960f5a81eeb73df1de8078852f660e286e2aef996c15bf2fc0d",
+      "bytes": 118196,
+      "sha256": "3cbe3cb419157ae30326bbd7fdebd74155fda2d97f830135abf831a31d78d212",
       "mode": "0644"
     },
     {
@@ -15112,8 +15112,8 @@
     },
     {
       "path": "packages/tui/xai-grok-pager/src/app/dispatch/turn.rs",
-      "bytes": 41621,
-      "sha256": "73902cab45e30d1ccc45112ce5c243dd2ec848d52fa6cce4b0ca753aee7d4c2a",
+      "bytes": 41788,
+      "sha256": "3a2caf837febd7f39883208486c23f532c1e407b6dc1b0dcf11a1ed049479644",
       "mode": "0644"
     },
     {

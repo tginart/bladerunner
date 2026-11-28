@@ -864,6 +864,8 @@ fn cancel_turn_in_place(
     agent.cancel_turn_buttons.clear();
     drain_permission_queue(agent);
     agent.clear_send_now_expectation();
+    // The hub stop is a user gesture, so the shell must suppress later task wakes.
+    agent.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::HubStop);
     Some(emit_cancel_turn(
         agent,
         session_id,

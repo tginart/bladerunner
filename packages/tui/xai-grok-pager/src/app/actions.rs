@@ -1309,6 +1309,8 @@ pub enum CancelTrigger {
     /// The dashboard's stop key (Ctrl+X), from the overlay or a busy row,
     /// downgraded to a turn cancel.
     DashboardStop,
+    /// The hub browser's stop key for a member in another tab.
+    HubStop,
 }
 impl CancelTrigger {
     /// Snake_case wire string sent as `_meta.cancelTrigger`.
@@ -1318,6 +1320,7 @@ impl CancelTrigger {
             Self::CtrlC => "ctrl_c",
             Self::Mouse => "mouse",
             Self::DashboardStop => "dashboard_stop",
+            Self::HubStop => "hub_stop",
         }
     }
 }
