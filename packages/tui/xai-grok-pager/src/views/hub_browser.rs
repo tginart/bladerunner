@@ -187,6 +187,16 @@ pub enum HubKeyOutcome {
     GoToMember(String),
     /// Stop the running turn of a member.
     StopMember(String),
+    /// Pin a message of a channel, as the person.
+    Pin {
+        channel: String,
+        message_id: String,
+    },
+    /// Unpin a message of a channel, as the person.
+    Unpin {
+        channel: String,
+        message_id: String,
+    },
 }
 
 /// What a clickable feed span points to.
@@ -237,6 +247,12 @@ enum HoverKey {
     SearchRow(u16),
     /// A feed line of a message, by the feed index of the message.
     FeedMessage(usize),
+    /// The `[📌 N]` pill of a channel header.
+    PinPill,
+    /// The pin or unpin button of the hovered feed message.
+    PinChip,
+    /// A row of the pinned-messages drawer, by its screen row.
+    PinRow(u16),
 }
 
 /// Screen areas of the last frame, for mouse hits.
@@ -279,6 +295,16 @@ struct HitAreas {
     /// The "go to session" and "stop" buttons of a DM header.
     header_go: Rect,
     header_stop: Rect,
+    /// The `[📌 N]` pill of a channel header.
+    pin_pill: Rect,
+    /// The pin or unpin button of the hovered message, and that message id.
+    pin_chip: Option<(Rect, String)>,
+    /// The open pinned-messages drawer.
+    pin_drawer: Rect,
+    /// Screen row and message id of each visible drawer row.
+    pin_rows: Vec<(u16, String)>,
+    /// The `[unpin]` button and message id of each visible drawer row.
+    pin_unpins: Vec<(Rect, String)>,
 }
 
 /// Purpose: Hold the hub browser state for one perspective.
@@ -346,6 +372,12 @@ pub struct HubBrowserState {
     scroll_to_focus: bool,
     /// True while hub-bot works on a question of the person.
     pub is_bot_thinking: bool,
+    /// The pinned messages of the selected channel, in pin order.
+    pub pinned: Vec<store::Message>,
+    /// True while the pinned-messages drawer is open.
+    pub show_pins: bool,
+    /// The highlighted row of the drawer.
+    pins_selected: usize,
     hits: HitAreas,
 }
 
@@ -389,6 +421,9 @@ impl HubBrowserState {
             focus_message: None,
             scroll_to_focus: false,
             is_bot_thinking: false,
+            pinned: Vec::new(),
+            show_pins: false,
+            pins_selected: 0,
             hits: HitAreas::default(),
         };
         let rows = state.rows();
@@ -578,6 +613,11 @@ impl HubBrowserState {
         if self.search.is_some() {
             return self.handle_search_key(key);
         }
+        if self.show_pins
+            && let Some(outcome) = self.handle_pins_key(key)
+        {
+            return outcome;
+        }
         let rows = self.rows();
         let pending_stop = self.pending_stop.take();
         match key.code {
@@ -613,6 +653,7 @@ impl HubBrowserState {
             KeyCode::PageDown => self.feed_scroll = self.feed_scroll.saturating_sub(PAGE_LINES),
             KeyCode::End => self.feed_scroll = 0,
             KeyCode::Char('p') => self.open_picker(),
+            KeyCode::Char('P') => self.toggle_pins(),
             KeyCode::Char('a') => {
                 if let Err(error) = self.toggle_dm_filter() {
                     tracing::warn!(%error, "hub browser: feed load failed");
@@ -692,7 +733,7 @@ impl HubBrowserState {
                 if self.picker.is_none()
                     && !self.show_help
                     && contains(self.hits.feed, col, row)
-                    && !self.is_on_reply_chip(col, row) =>
+                    && !self.is_on_feed_button(col, row) =>
             {
                 self.is_dragging_scrollbar = false;
                 let point = self.feed_point_at(col, row);
@@ -761,6 +802,20 @@ impl HubBrowserState {
         }
         if contains(hits.chip, col, row) {
             return Some(HoverKey::Chip);
+        }
+        if contains(hits.pin_drawer, col, row) {
+            let is_row = hits.pin_rows.iter().any(|(y, _)| *y == row);
+            return is_row.then_some(HoverKey::PinRow(row));
+        }
+        if contains(hits.pin_pill, col, row) {
+            return Some(HoverKey::PinPill);
+        }
+        if hits
+            .pin_chip
+            .as_ref()
+            .is_some_and(|(rect, _)| contains(*rect, col, row))
+        {
+            return Some(HoverKey::PinChip);
         }
         if contains(hits.header_go, col, row) {
             return Some(HoverKey::HeaderGo);
@@ -1174,6 +1229,133 @@ impl HubBrowserState {
         }
     }
 
+    /// Open or close the pinned-messages drawer of the selected channel.
+    fn toggle_pins(&mut self) {
+        if !matches!(self.selected_row(), Some(Row::Channel(_))) {
+            self.notice = Some("Only channels have pinned messages.".to_string());
+            return;
+        }
+        self.show_pins = !self.show_pins;
+        self.pins_selected = 0;
+    }
+
+    /// Purpose: Apply one key press to the open pinned-messages drawer.
+    /// Input: The key event.
+    /// Output: The outcome of a drawer key. `None` for another key, which
+    ///     closes the drawer and then works as usual.
+    fn handle_pins_key(&mut self, key: &KeyEvent) -> Option<HubKeyOutcome> {
+        let last = self.pinned.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('P') => self.show_pins = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.pins_selected = self.pins_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.pins_selected = (self.pins_selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                if let Some(id) = self.pinned.get(self.pins_selected).map(|m| m.id.clone()) {
+                    self.jump_to_pin(&id);
+                }
+            }
+            KeyCode::Char('u') => {
+                let id = self.pinned.get(self.pins_selected).map(|m| m.id.clone())?;
+                return Some(self.pin_outcome(&id).unwrap_or(HubKeyOutcome::Changed));
+            }
+            _ => {
+                self.show_pins = false;
+                return None;
+            }
+        }
+        Some(HubKeyOutcome::Changed)
+    }
+
+    /// Purpose: Close the drawer and show a pinned message in the feed.
+    /// Input: The message id.
+    /// Output: None. An old message outside the feed window loads with some
+    ///     context, and a thread of the channel closes.
+    fn jump_to_pin(&mut self, id: &str) {
+        self.show_pins = false;
+        self.leave_thread();
+        self.focus_message = Some(id.to_string());
+        self.scroll_to_focus = true;
+        if let Err(error) = self.load_feed(false) {
+            tracing::warn!(%error, "hub browser: feed load failed");
+        }
+    }
+
+    /// Purpose: Ask the caller to pin or unpin a message of the shown channel.
+    /// Input: The message id.
+    /// Output: `Unpin` for a pinned message, `Pin` for another one, or `None`
+    ///     outside the person view or outside a channel, which are read only.
+    fn pin_outcome(&self, message_id: &str) -> Option<HubKeyOutcome> {
+        let Some(Row::Channel(name)) = self.selected_row() else {
+            return None;
+        };
+        if !self.is_person_view() {
+            return None;
+        }
+        let channel = format!("#{name}");
+        let message_id = message_id.to_string();
+        if self.pinned.iter().any(|m| m.id == message_id) {
+            Some(HubKeyOutcome::Unpin {
+                channel,
+                message_id,
+            })
+        } else {
+            Some(HubKeyOutcome::Pin {
+                channel,
+                message_id,
+            })
+        }
+    }
+
+    /// Purpose: Apply a click while the drawer is open.
+    /// Input: The screen position.
+    /// Output: The outcome of a click on the drawer. `None` for a click
+    ///     outside it, which closes the drawer and then works as usual.
+    fn click_pins(&mut self, col: u16, row: u16) -> Option<HubKeyOutcome> {
+        let unpin = self
+            .hits
+            .pin_unpins
+            .iter()
+            .find(|(rect, _)| contains(*rect, col, row))
+            .map(|(_, id)| id.clone());
+        if let Some(id) = unpin {
+            return Some(self.pin_outcome(&id).unwrap_or(HubKeyOutcome::Changed));
+        }
+        let hit = self
+            .hits
+            .pin_rows
+            .iter()
+            .find(|(y, _)| *y == row)
+            .map(|(_, id)| id.clone());
+        if contains(self.hits.pin_drawer, col, row) {
+            if let Some(id) = hit {
+                self.jump_to_pin(&id);
+            }
+            return Some(HubKeyOutcome::Changed);
+        }
+        if contains(self.hits.pin_pill, col, row) {
+            self.show_pins = false;
+            return Some(HubKeyOutcome::Changed);
+        }
+        self.show_pins = false;
+        None
+    }
+
+    /// True on a button over the feed: the reply chip, the pin chip, or the drawer.
+    fn is_on_feed_button(&self, col: u16, row: u16) -> bool {
+        let is_on_pin_chip = self
+            .hits
+            .pin_chip
+            .as_ref()
+            .is_some_and(|(rect, _)| contains(*rect, col, row));
+        self.is_on_reply_chip(col, row)
+            || is_on_pin_chip
+            || contains(self.hits.pin_drawer, col, row)
+    }
+
     /// The peer of the selected DM when it is a live agent, the target of
     /// the member actions.
     fn selected_agent_peer(&self) -> Option<String> {
@@ -1227,6 +1409,20 @@ impl HubBrowserState {
         if let Some(id) = self.search_row_at(col, row) {
             self.jump_to_message(&id);
             return HubKeyOutcome::Changed;
+        }
+        if self.show_pins
+            && let Some(outcome) = self.click_pins(col, row)
+        {
+            return outcome;
+        }
+        if contains(self.hits.pin_pill, col, row) {
+            self.toggle_pins();
+            return HubKeyOutcome::Changed;
+        }
+        if let Some((rect, id)) = self.hits.pin_chip.clone()
+            && contains(rect, col, row)
+        {
+            return self.pin_outcome(&id).unwrap_or(HubKeyOutcome::Changed);
         }
         if let Some((rect, id)) = self.hits.reply_chip.clone()
             && contains(rect, col, row)
@@ -1463,6 +1659,7 @@ impl HubBrowserState {
                 self.reply_to = thread.or_else(|| self.reply_to.take());
             }
             self.focus_message = None;
+            self.show_pins = false;
         }
         self.selected = row;
         self.feed_scroll = 0;
@@ -1481,6 +1678,17 @@ impl HubBrowserState {
         };
         let mut messages = self.hub.messages(&conv, 0)?;
         let total = messages.len();
+        let channel = conv
+            .strip_prefix('#')
+            .and_then(|name| self.snapshot.meta.channel(name));
+        self.pinned = match channel {
+            Some(channel) => store::resolve_pins(&channel.pins, &messages)
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect(),
+            None => Vec::new(),
+        };
+        self.pins_selected = self.pins_selected.min(self.pinned.len().saturating_sub(1));
         if let Some(root) = &self.thread {
             // Filter before the limit, so an old root keeps its replies.
             messages.retain(|m| m.id == *root || m.reply_to.as_deref() == Some(root.as_str()));
@@ -1729,6 +1937,8 @@ enum Part {
     Quote,
     /// The "N replies" link under a message. A click opens the thread.
     Thread,
+    /// The badge of a pinned message.
+    Pin,
     Muted,
     Rule,
     NewRule,
@@ -1759,7 +1969,8 @@ struct FeedLayout {
 
 /// Purpose: Lay out feed messages as chat lines, oldest first.
 /// Input: The messages, the width, the index of the first unread message,
-///     the names to highlight, the local date of today, and the feed mode.
+///     the names to highlight, the local date of today, the feed mode, and
+///     the ids of the pinned messages.
 /// Output: Lines of (text, part) spans and the message of each line. No line
 ///     is wider than `width`.
 /// Method:
@@ -1767,7 +1978,8 @@ struct FeedLayout {
 ///     2. Put a "new" rule before the first unread message. If a day rule is
 ///        already there, end the day rule with the "new" label.
 ///     3. Start a group with a sender and time header when the sender changes,
-///        after a gap of GROUP_GAP_MS, or after a rule.
+///        after a gap of GROUP_GAP_MS, after a rule, or at a pinned message.
+///        The header of a pinned message ends with a pin badge.
 ///     4. In a conversation, put a quote of the parent above a reply.
 ///     5. Indent and wrap each message body under its group header.
 ///     6. In a conversation, put a "N replies" link under a message with replies.
@@ -1778,6 +1990,7 @@ fn feed_layout(
     names: &FeedNames<'_>,
     today: NaiveDate,
     mode: FeedMode,
+    pinned: &BTreeSet<String>,
 ) -> FeedLayout {
     let mut layout = FeedLayout {
         lines: Vec::new(),
@@ -1808,9 +2021,11 @@ fn feed_layout(
             lines.push(new_rule(width));
         }
         let is_reply = mode == FeedMode::Conversation && message.reply_to.is_some();
+        let is_pinned = pinned.contains(&message.id);
         let continues_group = !is_new_day
             && !is_first_unread
             && !is_reply
+            && !is_pinned
             && prev.is_some_and(|p| {
                 p.from == message.from
                     && message.ts_unix_ms.saturating_sub(p.ts_unix_ms) < GROUP_GAP_MS
@@ -1820,7 +2035,11 @@ fn feed_layout(
         }
         layout.messages.resize(lines.len(), None);
         if !continues_group {
-            lines.push(sender_header(message, &time, width, names));
+            let mut header = sender_header(message, &time, width, names);
+            if is_pinned {
+                push_pin_badge(&mut header, width);
+            }
+            lines.push(header);
         }
         if is_reply {
             lines.push(quote_line(messages, message, width));
@@ -1860,8 +2079,18 @@ fn feed_lines(
         names,
         today,
         FeedMode::Conversation,
+        &BTreeSet::new(),
     )
     .lines
+}
+
+/// End a sender header with the pin badge when the line has room for it.
+fn push_pin_badge(header: &mut FeedLine, width: usize) {
+    const BADGE: &str = "  📌 pinned";
+    let used: usize = header.iter().map(|(text, _)| text.width()).sum();
+    if used + BADGE.width() <= width {
+        header.push((BADGE.to_string(), Part::Pin));
+    }
 }
 
 /// Replies per parent message id, over the feed.
@@ -2503,6 +2732,9 @@ fn render_main(
         ..feed
     };
     render_feed(buf, feed, scrollbar, &row, state, theme);
+    if state.show_pins {
+        render_pins_drawer(buf, feed, state, theme);
+    }
     if let Some(notice) = &state.notice {
         let style = if notice.starts_with("Not posted") {
             Style::default().fg(theme.accent_error)
@@ -2555,6 +2787,7 @@ fn render_conversation_header(
     } else {
         render_member_buttons(buf, area, state, theme)
     };
+    let buttons_x = render_pin_pill(buf, area, buttons_x, state, theme);
     let area = Rect {
         width: buttons_x.saturating_sub(area.x),
         ..area
@@ -2620,6 +2853,37 @@ fn render_conversation_header(
     );
 }
 
+/// Purpose: Draw the `[📌 N]` pill of a channel header that has pins.
+/// Input: The buffer, the header area, the x where the right buttons start,
+///     the state, and the theme.
+/// Output: The x of the pill, or `right_x` when no pill is drawn. A click on
+///     the pill opens the pinned-messages drawer.
+fn render_pin_pill(
+    buf: &mut Buffer,
+    area: Rect,
+    right_x: u16,
+    state: &mut HubBrowserState,
+    theme: &Theme,
+) -> u16 {
+    let is_channel = matches!(state.selected_row(), Some(Row::Channel(_)));
+    if !is_channel || state.thread.is_some() || state.pinned.is_empty() {
+        return right_x;
+    }
+    let label = format!("[📌 {}]", state.pinned.len());
+    let width = label.width() as u16;
+    let x = right_x.saturating_sub(width);
+    if x <= area.x + 10 {
+        return right_x;
+    }
+    let mut style = Style::default().fg(theme.accent_verify);
+    if state.show_pins || state.hover == Some(HoverKey::PinPill) {
+        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    span_at(buf, x, area.y + 1, &label, style, right_x);
+    state.hits.pin_pill = Rect::new(x, area.y + 1, width, 1);
+    x.saturating_sub(1)
+}
+
 /// Draw the "back" button of a thread header. Return the x of the button.
 fn render_thread_back(
     buf: &mut Buffer,
@@ -2675,6 +2939,7 @@ fn render_feed(
         Some(_) => FeedMode::Thread,
         None => FeedMode::Conversation,
     };
+    let pinned: BTreeSet<String> = state.pinned.iter().map(|m| m.id.clone()).collect();
     let FeedLayout {
         lines,
         messages: line_messages,
@@ -2685,6 +2950,7 @@ fn render_feed(
         &names,
         today,
         mode,
+        &pinned,
     );
     if lines.is_empty() {
         let text = empty_feed_text(row, state);
@@ -2884,6 +3150,7 @@ fn part_style(part: &Part, theme: &Theme) -> Style {
         Part::Thread => Style::default()
             .fg(theme.accent_user)
             .add_modifier(Modifier::BOLD),
+        Part::Pin => Style::default().fg(theme.accent_verify),
         Part::Muted => Style::default().fg(theme.gray),
         Part::Rule => Style::default().fg(theme.gray_dim),
         Part::NewRule => Style::default().fg(theme.accent_error),
@@ -3035,6 +3302,17 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
             HintItem::paired(key!(Up), key!(Down), "choose"),
         ];
     }
+    if state.show_pins {
+        let mut hints = vec![HintItem::new(key!(Enter), "jump")];
+        if state.is_person_view() {
+            hints.push(HintItem::new(key!('u'), "unpin"));
+        }
+        hints.extend([
+            HintItem::new(key!(Esc), "close pins"),
+            HintItem::paired(key!(Up), key!(Down), "choose"),
+        ]);
+        return hints;
+    }
     // Clickable hints come first, so a narrow footer keeps them.
     let mut hints = Vec::new();
     if state.is_person_view() {
@@ -3058,6 +3336,11 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
         HintItem::new(key!('a'), "all/active DMs"),
         HintItem::new(key!(Esc), esc_label),
         HintItem::new(key!('?'), "keys"),
+    ]);
+    if matches!(state.selected_row(), Some(Row::Channel(_))) {
+        hints.push(HintItem::new(key!('P'), "pins"));
+    }
+    hints.extend([
         HintItem::paired(key!(Up), key!(Down), "conversations"),
         HintItem::paired(key!(PageUp), key!(PageDown), "scroll"),
     ]);
@@ -3371,7 +3654,141 @@ fn render_reply_chip(
         style = style.bg(theme.bg_hover).add_modifier(Modifier::UNDERLINED);
     }
     span_at(buf, rect.x, py, label, style, rect.right());
-    state.hits.reply_chip = Some((rect, state.feed[idx].id.clone()));
+    let id = state.feed[idx].id.clone();
+    state.hits.reply_chip = Some((rect, id.clone()));
+    if !matches!(state.selected_row(), Some(Row::Channel(_))) {
+        return;
+    }
+    let pin_label = if state.pinned.iter().any(|m| m.id == id) {
+        " 📌 unpin "
+    } else {
+        " 📌 pin "
+    };
+    let pin_width = pin_label.width() as u16;
+    let pin_x = rect.x.saturating_sub(pin_width + 1);
+    if pin_x < area.x {
+        return;
+    }
+    let pin_rect = Rect::new(pin_x, py, pin_width, 1);
+    let mut style = Style::default()
+        .fg(theme.text_primary)
+        .bg(theme.bg_highlight);
+    if contains(pin_rect, px, py) {
+        style = style.bg(theme.bg_hover).add_modifier(Modifier::UNDERLINED);
+    }
+    span_at(buf, pin_x, py, pin_label, style, pin_rect.right());
+    state.hits.pin_chip = Some((pin_rect, id));
+}
+
+/// Purpose: Draw the pinned messages of the channel over the top of the feed.
+/// Input: The buffer, the feed area, the state, and the theme.
+/// Output: None. Each pin row and each `[unpin]` button becomes a mouse
+///     target. The person view alone gets the buttons.
+fn render_pins_drawer(buf: &mut Buffer, feed: Rect, state: &mut HubBrowserState, theme: &Theme) {
+    let Some(Row::Channel(name)) = state.selected_row() else {
+        return;
+    };
+    let content_rows = state.pinned.len().max(1) as u16;
+    let height = (content_rows + 2).min(feed.height);
+    if height < 3 || feed.width < 20 {
+        return;
+    }
+    let rect = Rect { height, ..feed };
+    Clear.render(rect, buf);
+    fill(buf, rect, Style::default().bg(theme.bg_base));
+    let border = Style::default()
+        .fg(theme.prompt_border_active)
+        .bg(theme.bg_base);
+    let is_person = state.is_person_view();
+    let keys = if is_person {
+        "Enter jump · u unpin · Esc close"
+    } else {
+        "Enter jump · Esc close"
+    };
+    let title = format!(" 📌 Pinned in #{name} · {keys} ");
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let top_fill = inner_w.saturating_sub(title.width() + 1);
+    span_at(
+        buf,
+        rect.x,
+        rect.y,
+        &format!("╭─{title}{}╮", "─".repeat(top_fill)),
+        border,
+        rect.right(),
+    );
+    for y in rect.y + 1..rect.bottom() - 1 {
+        span_at(buf, rect.x, y, "│", border, rect.right());
+        span_at(buf, rect.right() - 1, y, "│", border, rect.right());
+    }
+    span_at(
+        buf,
+        rect.x,
+        rect.bottom() - 1,
+        &format!("╰{}╯", "─".repeat(inner_w)),
+        border,
+        rect.right(),
+    );
+    state.hits.pin_drawer = rect;
+    let inner_x = rect.x + 2;
+    let inner_right = rect.right() - 2;
+    if state.pinned.is_empty() {
+        let text = "No pinned messages. Hover a message and click 📌 pin.";
+        span_at(buf, inner_x, rect.y + 1, text, theme.muted(), inner_right);
+        return;
+    }
+    let visible = (height - 2) as usize;
+    let first = (state.pins_selected + 1).saturating_sub(visible);
+    let unpin_label = "[unpin]";
+    let unpin_w = unpin_label.width() as u16;
+    let mut rows = Vec::new();
+    let mut unpins = Vec::new();
+    for (offset, message) in state.pinned.iter().enumerate().skip(first).take(visible) {
+        let y = rect.y + 1 + (offset - first) as u16;
+        let row_rect = Rect::new(rect.x + 1, y, rect.width.saturating_sub(2), 1);
+        let is_hovered = state.hover == Some(HoverKey::PinRow(y));
+        let bg = if offset == state.pins_selected {
+            theme.bg_highlight
+        } else if is_hovered {
+            theme.bg_hover
+        } else {
+            theme.bg_base
+        };
+        fill(buf, row_rect, Style::default().bg(bg));
+        let text_right = if is_person {
+            inner_right.saturating_sub(unpin_w + 1)
+        } else {
+            inner_right
+        };
+        let x = span_at(
+            buf,
+            inner_x,
+            y,
+            &format!("@{}", message.from),
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+            text_right,
+        );
+        let snippet = message.text.lines().next().unwrap_or_default();
+        span_at(
+            buf,
+            x,
+            y,
+            &format!(" · {snippet}"),
+            Style::default().fg(theme.gray_bright).bg(bg),
+            text_right,
+        );
+        if is_person {
+            let unpin_x = inner_right.saturating_sub(unpin_w);
+            let unpin = Style::default().fg(theme.command).bg(bg);
+            span_at(buf, unpin_x, y, unpin_label, unpin, inner_right);
+            unpins.push((Rect::new(unpin_x, y, unpin_w, 1), message.id.clone()));
+        }
+        rows.push((y, message.id.clone()));
+    }
+    state.hits.pin_rows = rows;
+    state.hits.pin_unpins = unpins;
 }
 
 /// Purpose: Draw a one-line card about the member under the pointer.
@@ -3508,7 +3925,7 @@ fn render_search(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, them
 /// Input: The buffer, the browser area, and the theme.
 /// Output: None. Any key or click closes it.
 fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
-    const KEYS: [(&str, &str); 17] = [
+    const KEYS: [(&str, &str); 19] = [
         ("↑ ↓ / j k", "choose a conversation"),
         ("] [", "next / previous unread conversation"),
         ("Tab / i / Enter", "write a post"),
@@ -3521,6 +3938,8 @@ fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
         ("x x", "stop the DM agent"),
         ("p", "view the hub as another member"),
         ("a", "all or active DMs"),
+        ("P", "pinned messages of the channel"),
+        ("click 📌 pin", "pin or unpin a channel message"),
         ("PgUp PgDn End", "scroll the feed"),
         ("click @name", "open the DM with that member"),
         ("click ↩ / quote", "reply / open the thread"),
@@ -3872,6 +4291,7 @@ mod tests {
                         store::Channel {
                             name: "alerts".to_string(),
                             purpose: String::new(),
+                            pins: Vec::new(),
                             created_ms: 0,
                         },
                     );
@@ -4563,6 +4983,7 @@ mod tests {
             meta.channels.push(store::Channel {
                 name: "ops".to_string(),
                 purpose: String::new(),
+                pins: Vec::new(),
                 created_ms: 0,
             });
         })
@@ -5591,5 +6012,160 @@ mod tests {
             span_target(text, part, &meta),
             Some(SpanTarget::Member(from.to_string()))
         );
+    }
+
+    /// A hub whose #general has one old pinned message and more than
+    /// FEED_LIMIT newer messages.
+    fn hub_with_old_pin() -> (tempfile::TempDir, store::Hub, store::Message) {
+        let (root, hub) = hub_with_dms();
+        let old = message("front", "#general".to_string(), "decided: REST", 1);
+        hub.append(&old).unwrap();
+        for i in 0..FEED_LIMIT + 10 {
+            let text = format!("filler {i}");
+            hub.append(&message(
+                "back",
+                "#general".to_string(),
+                &text,
+                store::now_ms(),
+            ))
+            .unwrap();
+        }
+        agent_hub::pin_as_person(&hub, "me", "#general", &old.id).unwrap();
+        (root, hub, old)
+    }
+
+    #[test]
+    fn the_pin_pill_opens_a_drawer_that_jumps_to_an_old_pin() {
+        let (_root, hub, old) = hub_with_old_pin();
+        let mut state = open(hub);
+        assert_eq!(state.pinned.len(), 1);
+        assert!(
+            state.feed.iter().all(|m| m.id != old.id),
+            "outside the window"
+        );
+        let buf = render(&mut state);
+        let pill = state.hits.pin_pill;
+        assert!(pill.width > 0, "the header shows the pill");
+        assert!(buffer_text(&buf).contains("1]"));
+
+        click(&mut state, (pill.x + 1, pill.y));
+        assert!(state.show_pins, "a click on the pill opens the drawer");
+        let buf = render(&mut state);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Pinned in #general"), "{text}");
+        assert!(text.contains("@front · decided: REST"), "{text}");
+        assert!(text.contains("[unpin]"), "{text}");
+
+        state.handle_key(&key(KeyCode::Enter));
+        assert!(!state.show_pins);
+        assert_eq!(state.focus_message.as_deref(), Some(old.id.as_str()));
+        assert!(
+            state.feed.iter().any(|m| m.id == old.id),
+            "the old pin loads"
+        );
+        let text = buffer_text(&render(&mut state));
+        assert!(text.contains("decided: REST"), "{text}");
+        assert!(text.contains("pinned"), "the feed marks the pin:\n{text}");
+
+        state.handle_key(&key(KeyCode::Char('P')));
+        assert!(state.show_pins);
+        state.handle_key(&key(KeyCode::Down));
+        assert!(state.show_pins, "a drawer key keeps the drawer");
+        state.handle_key(&key(KeyCode::Char('/')));
+        assert!(!state.show_pins, "another key closes the drawer");
+        assert!(state.search.is_some(), "and then works as usual");
+    }
+
+    #[test]
+    fn p_on_a_dm_opens_no_drawer() {
+        let (_root, hub) = hub_with_dms();
+        let mut state = open(hub);
+        state.handle_key(&key(KeyCode::Down));
+        state.handle_key(&key(KeyCode::Char('P')));
+        assert!(!state.show_pins);
+        assert!(state.notice.as_deref().unwrap().contains("Only channels"));
+    }
+
+    #[test]
+    fn the_hover_pin_chip_asks_to_pin_or_unpin_in_the_person_view_only() {
+        let (_root, mut state) = open_with_general_post("ready");
+        let id = state.feed.last().unwrap().id.clone();
+        render(&mut state);
+        let (x, y) = span_cell(&state, &SpanTarget::Member("front".to_string()));
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        let (rect, chip_id) = state.hits.pin_chip.clone().expect("pin chip on hover");
+        assert_eq!(chip_id, id);
+        let outcome = state.handle_mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert_eq!(
+            outcome,
+            HubKeyOutcome::Pin {
+                channel: "#general".to_string(),
+                message_id: id.clone(),
+            }
+        );
+        assert!(state.feed_selection.is_none(), "no text selection starts");
+
+        agent_hub::pin_as_person(&state.hub, "me", "#general", &id).unwrap();
+        state.reload().unwrap();
+        render(&mut state);
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        let (rect, _) = state.hits.pin_chip.clone().expect("unpin chip");
+        let outcome = state.handle_mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(
+            matches!(outcome, HubKeyOutcome::Unpin { .. }),
+            "{outcome:?}"
+        );
+
+        state.set_perspective("front").unwrap();
+        render(&mut state);
+        state.handle_mouse(MouseEventKind::Moved, x, y);
+        render(&mut state);
+        assert!(
+            state.hits.pin_chip.is_none(),
+            "a read-only view has no chip"
+        );
+        state.handle_key(&key(KeyCode::Char('P')));
+        assert!(state.show_pins, "a read-only view still shows the pins");
+        assert_eq!(
+            state.handle_key(&key(KeyCode::Char('u'))),
+            HubKeyOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn a_pinned_message_gets_its_own_header_with_a_badge() {
+        let persons = BTreeSet::new();
+        let mentions = BTreeSet::new();
+        let names = FeedNames {
+            persons: &persons,
+            mentions: &mentions,
+        };
+        let first = message("front", "#general".to_string(), "one", 1_000);
+        let second = message("front", "#general".to_string(), "two", 2_000);
+        let pinned = BTreeSet::from([second.id.clone()]);
+        let today = local_time(0).date_naive();
+        let layout = feed_layout(
+            &[first, second],
+            60,
+            None,
+            &names,
+            today,
+            FeedMode::Conversation,
+            &pinned,
+        );
+        let headers: Vec<&FeedLine> = layout
+            .lines
+            .iter()
+            .filter(|line| line.iter().any(|(_, part)| matches!(part, Part::Agent(..))))
+            .collect();
+        assert_eq!(headers.len(), 2, "the pin starts a new group");
+        assert!(
+            headers[1]
+                .iter()
+                .any(|(text, part)| { *part == Part::Pin && text.contains("📌") })
+        );
+        assert!(!headers[0].iter().any(|(_, part)| *part == Part::Pin));
     }
 }

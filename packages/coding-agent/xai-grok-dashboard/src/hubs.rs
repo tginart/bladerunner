@@ -24,6 +24,7 @@ pub struct HubSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedMessage {
+    pub id: String,
     /// `#channel` or `DM @a/@b`.
     pub place: String,
     pub from: String,
@@ -31,6 +32,14 @@ pub struct FeedMessage {
     pub text: String,
     pub ts_unix_ms: u64,
     pub images: usize,
+    pub pinned: bool,
+}
+
+/// One pinned channel message, as the page shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedFeedMessage {
+    pub pinned_by: String,
+    pub message: FeedMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +48,8 @@ pub struct HubPage {
     /// Selected channel, or `None` for all channels and DMs.
     pub channel: Option<String>,
     pub messages: Vec<FeedMessage>,
+    /// Pins of the selected channel, or of every channel. Read only.
+    pub pinned: Vec<PinnedFeedMessage>,
     pub tokens: u64,
 }
 
@@ -63,7 +74,8 @@ pub fn list(grok_home: &Path) -> Result<Vec<HubSummary>> {
 
 /// Purpose: Load one hub page.
 /// Input: The grok home, the hub name, and an optional channel filter.
-/// Output: The hub metadata and its latest messages, oldest first.
+/// Output: The hub metadata, its latest messages oldest first, and the
+///     pinned messages of the selected channel or of every channel.
 pub fn page(grok_home: &Path, name: &str, channel: Option<&str>) -> Result<HubPage> {
     let hub = store::Hub::open(&hubs_root(grok_home), name)?;
     let mut meta = hub.meta()?;
@@ -73,26 +85,51 @@ pub fn page(grok_home: &Path, name: &str, channel: Option<&str>) -> Result<HubPa
     }
     let messages = store::recent_messages(&hub, channel, FEED_LIMIT)?
         .into_iter()
-        .map(|m| FeedMessage {
-            place: match store::split_dm_conv(&m.conv) {
-                Some((a, b)) => format!("DM @{a}/@{b}"),
-                None => m.conv.clone(),
-            },
-            is_person: meta
-                .member(&m.from)
-                .is_some_and(|member| member.kind == MemberKind::Person),
-            from: m.from,
-            text: m.text,
-            ts_unix_ms: m.ts_unix_ms,
-            images: m.images.len(),
-        })
+        .map(|m| feed_message(&meta, m))
         .collect();
+    let mut pinned = Vec::new();
+    for listed in &meta.channels {
+        let is_shown = channel.is_none_or(|c| c.trim_start_matches('#') == listed.name);
+        if !is_shown || listed.pins.is_empty() {
+            continue;
+        }
+        for (pin, message) in hub.channel_pins(&listed.name)? {
+            pinned.push(PinnedFeedMessage {
+                pinned_by: pin.pinned_by,
+                message: feed_message(&meta, message),
+            });
+        }
+    }
     Ok(HubPage {
         tokens: meta.tokens.values().sum(),
         channel: channel.map(|c| c.trim_start_matches('#').to_string()),
         meta,
         messages,
+        pinned,
     })
+}
+
+fn feed_message(meta: &store::HubMeta, m: store::Message) -> FeedMessage {
+    let pinned = m
+        .conv
+        .strip_prefix('#')
+        .and_then(|name| meta.channel(name))
+        .is_some_and(|c| c.is_pinned(&m.id));
+    FeedMessage {
+        place: match store::split_dm_conv(&m.conv) {
+            Some((a, b)) => format!("DM @{a}/@{b}"),
+            None => m.conv.clone(),
+        },
+        is_person: meta
+            .member(&m.from)
+            .is_some_and(|member| member.kind == MemberKind::Person),
+        id: m.id,
+        from: m.from,
+        text: m.text,
+        ts_unix_ms: m.ts_unix_ms,
+        images: m.images.len(),
+        pinned,
+    }
 }
 
 /// Post `text` to `#channel` or `@handle` as the person at this machine.
@@ -121,5 +158,29 @@ mod tests {
         assert!(page.messages[0].is_person);
         assert!(post(home.path(), "api", "#nope", "x").is_err());
         assert!(super::page(home.path(), "missing", None).is_err());
+    }
+
+    #[test]
+    fn page_marks_and_lists_pins_read_only() {
+        let home = tempfile::tempdir().unwrap();
+        let hub = store::Hub::create(&hubs_root(home.path()), "api").unwrap();
+        let id = post(home.path(), "api", "#general", "decided: REST").unwrap();
+        post(home.path(), "api", "#general", "chatter").unwrap();
+        agent_hub::pin_as_person(&hub, "me", "#general", &id).unwrap();
+        let meta_before = hub.meta().unwrap();
+
+        let all = page(home.path(), "api", None).unwrap();
+        assert_eq!(all.pinned.len(), 1);
+        assert_eq!(all.pinned[0].message.id, id);
+        assert_eq!(all.pinned[0].pinned_by, "me");
+        let flags: Vec<bool> = all.messages.iter().map(|m| m.pinned).collect();
+        assert_eq!(flags, vec![true, false]);
+        let general = page(home.path(), "api", Some("general")).unwrap();
+        assert_eq!(general.pinned.len(), 1);
+        assert_eq!(
+            hub.meta().unwrap(),
+            meta_before,
+            "a page read writes nothing"
+        );
     }
 }

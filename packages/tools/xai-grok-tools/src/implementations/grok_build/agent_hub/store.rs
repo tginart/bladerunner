@@ -48,6 +48,8 @@ const PRESENCE_DIR: &str = "presence";
 pub const MAX_TASK_CHARS: usize = 120;
 /// Age after which an unused session hub of an ended session is removed.
 const IDLE_SESSION_HUB_MS: u64 = 60 * 60 * 1000;
+/// Most messages that one channel can have pinned.
+pub const MAX_CHANNEL_PINS: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,12 +83,29 @@ impl Member {
     }
 }
 
+/// One pinned message of a channel. The text stays in the channel log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedMessage {
+    pub message_id: String,
+    pub pinned_by: String,
+    pub pinned_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub name: String,
     #[serde(default)]
     pub purpose: String,
+    /// Pinned messages, oldest pin first. Hubs saved before pins load with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<PinnedMessage>,
     pub created_ms: u64,
+}
+
+impl Channel {
+    pub fn is_pinned(&self, message_id: &str) -> bool {
+        self.pins.iter().any(|pin| pin.message_id == message_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +142,11 @@ impl HubMeta {
 
     pub fn has_channel(&self, name: &str) -> bool {
         self.channels.iter().any(|c| c.name == name)
+    }
+
+    /// The channel `name` (without `#`), or `None`.
+    pub fn channel(&self, name: &str) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.name == name)
     }
 
     pub fn is_session_hub(&self) -> bool {
@@ -314,6 +338,59 @@ impl Hub {
         Ok(())
     }
 
+    /// Purpose: Append a channel message and pin it in one hold of the hub lock.
+    /// Input: The message, whose `conv` is a `#channel`, and the pinning handle.
+    /// Output: Ok, or an error before any write when the pin is not allowed.
+    /// Note: The pin check runs under the lock, so a full pin list never
+    ///     leaves an unpinned message behind.
+    pub fn append_pinned(&self, message: &Message, pinned_by: &str) -> Result<()> {
+        let Some(channel) = message.conv.strip_prefix('#') else {
+            bail!("pins are supported on #channels only");
+        };
+        let path = self.conv_path(&message.conv)?;
+        let mut line = serde_json::to_string(message)?;
+        line.push('\n');
+        let _lock = self.lock()?;
+        let mut meta = self.meta()?;
+        check_pin_room(&meta, channel)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.write_all(line.as_bytes())?;
+        let found = meta
+            .channels
+            .iter_mut()
+            .find(|c| c.name == channel)
+            .expect("check_pin_room found the channel");
+        found.pins.push(PinnedMessage {
+            message_id: message.id.clone(),
+            pinned_by: pinned_by.to_string(),
+            pinned_ms: message.ts_unix_ms,
+        });
+        write_json_atomic(&self.dir.join(META_FILE), &meta)
+    }
+
+    /// Purpose: Read the pinned messages of one channel.
+    /// Input: The channel name, with or without `#`.
+    /// Output: Each pin with its message, in pin order. No cursor moves.
+    /// Note: A pin whose message is not in the channel log is skipped.
+    pub fn channel_pins(&self, channel: &str) -> Result<Vec<(PinnedMessage, Message)>> {
+        let Some(name) = normalize_channel(channel) else {
+            bail!("invalid channel {channel:?}");
+        };
+        let meta = self.meta()?;
+        let Some(found) = meta.channel(&name) else {
+            bail!("unknown channel #{name}");
+        };
+        if found.pins.is_empty() {
+            return Ok(Vec::new());
+        }
+        let messages = self.messages(&format!("#{name}"), 0)?;
+        Ok(resolve_pins(&found.pins, &messages))
+    }
+
     /// Messages of `conv` from index `start` on. A partial last line is skipped.
     pub fn messages(&self, conv: &str, start: usize) -> Result<Vec<Message>> {
         let path = self.conv_path(conv)?;
@@ -449,6 +526,7 @@ impl Hub {
             channels: vec![Channel {
                 name: GENERAL_CHANNEL.to_string(),
                 purpose: "Status and coordination for everyone in the hub".to_string(),
+                pins: Vec::new(),
                 created_ms: now,
             }],
             members: Vec::new(),
@@ -624,6 +702,37 @@ pub fn recent_messages(hub: &Hub, channel: Option<&str>, limit: usize) -> Result
     messages.sort_by_key(|m| m.ts_unix_ms);
     let skip = messages.len().saturating_sub(limit);
     Ok(messages.split_off(skip))
+}
+
+/// Purpose: Check that one more message can be pinned in a channel.
+/// Input: The hub metadata and the channel name, without `#`.
+/// Output: Ok, or an error for an archived hub, an unknown channel, or a
+///     channel that has MAX_CHANNEL_PINS pins.
+pub fn check_pin_room(meta: &HubMeta, channel: &str) -> Result<()> {
+    if meta.archived {
+        bail!("hub {:?} is archived (read-only)", meta.name);
+    }
+    let Some(found) = meta.channel(channel) else {
+        bail!("unknown channel #{channel}");
+    };
+    if found.pins.len() >= MAX_CHANNEL_PINS {
+        bail!("#{channel} already has {MAX_CHANNEL_PINS} pins; a person must unpin one first");
+    }
+    Ok(())
+}
+
+/// Purpose: Find the message of each pin.
+/// Input: The pins of a channel and the messages of that channel.
+/// Output: Each pin with its message, in pin order. Pins without a message are skipped.
+pub fn resolve_pins(pins: &[PinnedMessage], messages: &[Message]) -> Vec<(PinnedMessage, Message)> {
+    let by_id: BTreeMap<&str, &Message> = messages.iter().map(|m| (m.id.as_str(), m)).collect();
+    let mut out = Vec::new();
+    for pin in pins {
+        if let Some(message) = by_id.get(pin.message_id.as_str()) {
+            out.push((pin.clone(), (*message).clone()));
+        }
+    }
+    out
 }
 
 /// The handle a person posts under: the OS user name, or `person`.
@@ -1217,6 +1326,82 @@ mod tests {
             worker.join().unwrap();
             assert!(hub.dir.exists(), "{change} keeps the hub alive");
         }
+    }
+
+    #[test]
+    fn hub_json_without_pins_loads_with_no_pins_and_saves_without_the_field() {
+        let legacy = r#"{
+            "name": "h",
+            "created_ms": 1,
+            "channels": [{"name": "general", "purpose": "talk", "created_ms": 1}]
+        }"#;
+        let meta: HubMeta = serde_json::from_str(legacy).unwrap();
+        assert!(meta.channels[0].pins.is_empty());
+        let saved = serde_json::to_string(&meta).unwrap();
+        assert!(!saved.contains("pins"), "{saved}");
+    }
+
+    #[test]
+    fn append_pinned_writes_the_message_and_the_pin_together() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        hub.append(&message("#general", "a", "noise")).unwrap();
+        hub.append_pinned(&message("#general", "a", "decision"), "a")
+            .unwrap();
+        let pins = hub.channel_pins("#general").unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].0.message_id, "id-decision");
+        assert_eq!(pins[0].0.pinned_by, "a");
+        assert_eq!(pins[0].1.text, "decision");
+        assert_eq!(hub.messages("#general", 0).unwrap().len(), 2);
+        let dm = message(&dm_conv("a", "b"), "a", "secret");
+        let error = hub.append_pinned(&dm, "a").unwrap_err();
+        assert!(error.to_string().contains("#channels only"), "{error}");
+        assert!(hub.channel_pins("#nope").is_err());
+    }
+
+    #[test]
+    fn a_full_or_archived_channel_rejects_a_pinned_append_before_any_write() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        for i in 0..MAX_CHANNEL_PINS {
+            hub.append_pinned(&message("#general", "a", &format!("p{i}")), "a")
+                .unwrap();
+        }
+        let error = hub
+            .append_pinned(&message("#general", "a", "one more"), "a")
+            .unwrap_err();
+        assert!(error.to_string().contains("already has 15 pins"), "{error}");
+        assert_eq!(hub.messages("#general", 0).unwrap().len(), MAX_CHANNEL_PINS);
+
+        let other = Hub::create(root.path(), "old").unwrap();
+        other.update_meta(|meta| meta.archived = true).unwrap();
+        let error = other
+            .append_pinned(&message("#general", "a", "late"), "a")
+            .unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+        assert!(other.messages("#general", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pins_whose_message_is_missing_are_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        hub.append(&message("#general", "a", "kept")).unwrap();
+        hub.update_meta(|meta| {
+            for id in ["id-gone", "id-kept"] {
+                meta.channels[0].pins.push(PinnedMessage {
+                    message_id: id.to_string(),
+                    pinned_by: "me".to_string(),
+                    pinned_ms: 0,
+                });
+            }
+        })
+        .unwrap();
+        let pins = hub.channel_pins("general").unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].1.text, "kept");
+        assert!(hub.meta().unwrap().channels[0].is_pinned("id-gone"));
     }
 
     #[test]

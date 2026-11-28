@@ -101,6 +101,7 @@ pub struct ChannelView {
     pub unread: usize,
     /// Estimated tokens that this channel put into agents' context.
     pub tokens: u64,
+    pub pin_count: usize,
 }
 
 /// Result of [`AgentBus::join`].
@@ -429,6 +430,7 @@ impl AgentBus {
                 messages,
                 unread: messages - read,
                 tokens: meta.tokens.get(&conv).copied().unwrap_or(0),
+                pin_count: channel.pins.len(),
             });
         }
         Ok(HubView {
@@ -452,18 +454,45 @@ impl AgentBus {
         reply_to: Option<&str>,
         images: &[PathBuf],
     ) -> SendOutcome {
+        let draft = Draft {
+            to,
+            text,
+            reply_to,
+            images,
+            pin: false,
+        };
+        self.send_draft(from, &draft)
+    }
+
+    /// Purpose: Post to a `#channel` and pin the new message in one write.
+    /// Input: As for `send`. The target must be a `#channel`.
+    /// Output: The message id, or a failure before any write when the target
+    ///     is a DM, the hub is archived, or the channel has MAX_CHANNEL_PINS pins.
+    pub fn send_and_pin(
+        &self,
+        from: &str,
+        to: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        images: &[PathBuf],
+    ) -> SendOutcome {
+        let draft = Draft {
+            to,
+            text,
+            reply_to,
+            images,
+            pin: true,
+        };
+        self.send_draft(from, &draft)
+    }
+
+    fn send_draft(&self, from: &str, draft: &Draft<'_>) -> SendOutcome {
         let outcome = match self.peer_context(from) {
             Ok((hub, handle, _)) => {
                 if let Err(reason) = self.take_rate_slot(from) {
                     return SendOutcome::Failed { reason };
                 }
-                let draft = Draft {
-                    to,
-                    text,
-                    reply_to,
-                    images,
-                };
-                post(&hub, &handle, &draft)
+                post(&hub, &handle, draft)
             }
             Err(e) => Err(e),
         };
@@ -550,6 +579,37 @@ impl AgentBus {
         Ok((messages, remaining))
     }
 
+    /// Purpose: Read the pinned messages of one channel for peer `id`.
+    /// Input: The peer id and the channel name.
+    /// Output: The pinned messages in pin order. A pin without its message is skipped.
+    /// Note: No cursor moves. The token count grows by the returned pins only.
+    pub fn read_pins(&self, id: &str, channel: &str) -> Result<Vec<Message>> {
+        let (hub, _, _) = self.peer_context(id)?;
+        let pins: Vec<Message> = hub
+            .channel_pins(channel)?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect();
+        record_tokens(&hub, &pins)?;
+        Ok(pins)
+    }
+
+    /// Channel `read` output framed for a model, with the absolute paths of the
+    /// images of the pins and the messages.
+    pub fn frame_read(
+        &self,
+        channel: &str,
+        pins: &[Message],
+        messages: &[Message],
+    ) -> Result<(String, Vec<PathBuf>)> {
+        let hub = self.lock().hub.clone();
+        let meta = hub.meta()?;
+        let conv = format!("#{}", channel.trim().trim_start_matches('#'));
+        let mut images = image_paths(&hub, pins);
+        images.extend(image_paths(&hub, messages));
+        Ok((format_read(&hub, &meta, &conv, pins, messages), images))
+    }
+
     /// Purpose: Create a channel in the current hub under the metadata lock.
     /// Input: The channel name and its purpose.
     /// Output: The normalized name, or an error for archived hubs or duplicate channels.
@@ -568,6 +628,7 @@ impl AgentBus {
             meta.channels.push(Channel {
                 name: name.clone(),
                 purpose: purpose.trim().to_string(),
+                pins: Vec::new(),
                 created_ms: store::now_ms(),
             });
             Ok(())
@@ -974,6 +1035,78 @@ pub fn reply_as_person(
     post_person_draft(hub, person, to, text, &[], Some(reply_to))
 }
 
+/// Purpose: Pin a channel message for every member, as the person.
+/// Input: The hub, the person's preferred handle, the `#channel`, and the
+///     message id.
+/// Output: True when the message is now pinned. False when it was pinned
+///     already, which takes no new pin slot.
+/// Note: The checks and the write hold the hub lock. No message is written,
+///     no cursor moves, and nobody wakes.
+pub fn pin_as_person(hub: &Hub, person: &str, channel: &str, message_id: &str) -> Result<bool> {
+    let name = pin_channel_name(channel)?;
+    let message_id = message_id.trim();
+    hub.update_meta(|meta| -> Result<bool> {
+        if meta.archived {
+            bail!("hub {:?} is archived (read-only)", meta.name);
+        }
+        let Some(found) = meta.channel(&name) else {
+            bail!("unknown channel #{name}");
+        };
+        if found.is_pinned(message_id) {
+            return Ok(false);
+        }
+        store::check_pin_room(meta, &name)?;
+        let conv = format!("#{name}");
+        if !hub.messages(&conv, 0)?.iter().any(|m| m.id == message_id) {
+            bail!("{message_id:?} is not a message in {conv}");
+        }
+        let pinned_by = person_handle_in(meta, person);
+        let found = meta
+            .channels
+            .iter_mut()
+            .find(|c| c.name == name)
+            .expect("the channel exists");
+        found.pins.push(store::PinnedMessage {
+            message_id: message_id.to_string(),
+            pinned_by,
+            pinned_ms: store::now_ms(),
+        });
+        Ok(true)
+    })?
+}
+
+/// Purpose: Unpin a channel message, as the person.
+/// Input: The hub, the `#channel`, and the message id.
+/// Output: True when the pin is removed. False when the message was not pinned.
+/// Note: The change holds the hub lock. The channel log does not change.
+pub fn unpin_as_person(hub: &Hub, channel: &str, message_id: &str) -> Result<bool> {
+    let name = pin_channel_name(channel)?;
+    let message_id = message_id.trim();
+    hub.update_meta(|meta| -> Result<bool> {
+        if meta.archived {
+            bail!("hub {:?} is archived (read-only)", meta.name);
+        }
+        let Some(found) = meta.channels.iter_mut().find(|c| c.name == name) else {
+            bail!("unknown channel #{name}");
+        };
+        let before = found.pins.len();
+        found.pins.retain(|pin| pin.message_id != message_id);
+        Ok(found.pins.len() < before)
+    })?
+}
+
+/// The channel name of a pin command, or an error for a DM or a bad name.
+fn pin_channel_name(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.starts_with('@') || raw.contains(',') {
+        bail!("pins are supported on #channels only, not DMs");
+    }
+    match store::normalize_channel(raw) {
+        Some(name) => Ok(name),
+        None => bail!("invalid channel {raw:?}"),
+    }
+}
+
 fn post_person_draft(
     hub: &Hub,
     person: &str,
@@ -996,6 +1129,7 @@ fn post_person_draft(
         text,
         reply_to,
         images,
+        pin: false,
     };
     let id = post(hub, &person, &draft)?;
     hub.update_meta(|meta| meta.agent_wake_streak = 0)?;
@@ -1064,12 +1198,16 @@ struct Draft<'a> {
     text: &'a str,
     reply_to: Option<&'a str>,
     images: &'a [PathBuf],
+    /// Pin the message in its channel in the same write.
+    pin: bool,
 }
 
 /// Purpose: Validate and append one message.
 /// Input: The hub, the sender handle, and the draft.
 /// Output: The new message id.
 /// Note: Attached images are copied into the hub before the message is written.
+///     A pinned draft checks the pin room before the copy, and again under
+///     the hub lock when it writes.
 fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
     let text = draft.text.trim();
     if text.is_empty() {
@@ -1089,6 +1227,12 @@ fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
         bail!("a message can carry at most {} images", store::MAX_IMAGES);
     }
     let conv = resolve_target(&meta, from, draft.to)?;
+    if draft.pin {
+        let Some(channel) = conv.strip_prefix('#') else {
+            bail!("pin works only for a #channel post, not a DM");
+        };
+        store::check_pin_room(&meta, channel)?;
+    }
     let mut mentions = store::parse_mentions(text, &meta.members);
     if alerts_all(&meta, from, &conv) && !mentions.iter().any(|h| h == HERE_MENTION) {
         mentions.push(HERE_MENTION.to_string());
@@ -1107,7 +1251,11 @@ fn post(hub: &Hub, from: &str, draft: &Draft<'_>) -> Result<String> {
         images,
         ts_unix_ms: store::now_ms(),
     };
-    hub.append(&message)?;
+    if draft.pin {
+        hub.append_pinned(&message, from)?;
+    } else {
+        hub.append(&message)?;
+    }
     Ok(message.id)
 }
 
@@ -1193,6 +1341,52 @@ pub fn format_messages(hub: &Hub, meta: &HubMeta, messages: &[Message]) -> Strin
     out
 }
 
+/// Purpose: Frame the result of a channel `read` for a model.
+/// Input: The hub, its metadata, the `#channel` key, the pinned messages,
+///     and the messages that the read returned.
+/// Output: The text of `format_messages`, with a `Pinned in #channel:`
+///     section after the system header when the channel has pins.
+/// Note: The pins sit under the system header, so they are information too.
+pub fn format_read(
+    hub: &Hub,
+    meta: &HubMeta,
+    conv: &str,
+    pins: &[Message],
+    messages: &[Message],
+) -> String {
+    let framed = format_messages(hub, meta, messages);
+    if pins.is_empty() {
+        return framed;
+    }
+    let header = format!(
+        "{WAKE_SYSTEM_HEADER_OPEN}\n{WAKE_SYSTEM_HEADER_BODY}\n{WAKE_SYSTEM_HEADER_CLOSE}\n"
+    );
+    let rest = framed
+        .strip_prefix(&header)
+        .expect("format_messages starts with the system header");
+    let mut out = format!(
+        "{header}Pinned in {conv} ({}), the key decisions of the channel:",
+        pins.len()
+    );
+    for m in pins {
+        let person = if member_kind(meta, &m.from) == MemberKind::Person {
+            " (person)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\n--- pinned · from @{}{person} · id={} ---\n{}",
+            m.from, m.id, m.text
+        ));
+        for image in &m.images {
+            out.push_str(&format!("\n[image: {}]", hub.blob_path(image).display()));
+        }
+    }
+    out.push_str("\nEnd of pins.\n");
+    out.push_str(rest);
+    out
+}
+
 /// Purpose: Tell Main that the user moved its session tree into a named hub.
 /// Input: The hub view as Main sees it after the join.
 /// Output: One system header block with the hub, Main's handle, the other
@@ -1213,11 +1407,16 @@ pub fn format_join_notice(view: &HubView) -> String {
     }
     let mut channels = Vec::new();
     for channel in &view.channels {
-        if channel.purpose.is_empty() {
-            channels.push(format!("#{}", channel.name));
-        } else {
-            channels.push(format!("#{} ({})", channel.name, channel.purpose));
+        let mut label = format!("#{}", channel.name);
+        if !channel.purpose.is_empty() {
+            label.push_str(&format!(" ({})", channel.purpose));
         }
+        match channel.pin_count {
+            0 => {}
+            1 => label.push_str(" (1 pin)"),
+            n => label.push_str(&format!(" ({n} pins)")),
+        }
+        channels.push(label);
     }
     let or_none = |items: Vec<String>| {
         if items.is_empty() {
@@ -2684,5 +2883,183 @@ mod tests {
         bus.send("a", "b", "async hi", None, &[]);
         let msgs = h.await.unwrap().unwrap();
         assert_eq!(texts(&msgs), vec!["async hi"]);
+    }
+
+    fn pin_reason(outcome: SendOutcome) -> String {
+        outcome.into_result().unwrap_err()
+    }
+
+    #[test]
+    fn send_and_pin_pins_channel_posts_and_rejects_dms_and_full_channels() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let id = bus
+            .send_and_pin("a", "#general", "API spec: docs/api.md", None, &[])
+            .into_result()
+            .unwrap();
+        let hub = bus.hub();
+        let pins = hub.channel_pins("general").unwrap();
+        assert_eq!(pins[0].0.message_id, id);
+        assert_eq!(pins[0].0.pinned_by, "a");
+        assert_eq!(bus.view("b").unwrap().channels[0].pin_count, 1);
+
+        let reason = pin_reason(bus.send_and_pin("a", "@b", "secret", None, &[]));
+        assert!(reason.contains("not a DM"), "{reason}");
+        assert!(
+            hub.dm_convs_for("a").unwrap().is_empty(),
+            "no DM is written"
+        );
+
+        for i in 1..store::MAX_CHANNEL_PINS {
+            bus.send_and_pin("b", "#general", &format!("p{i}"), None, &[])
+                .into_result()
+                .unwrap();
+        }
+        let before = hub.messages("#general", 0).unwrap().len();
+        let reason = pin_reason(bus.send_and_pin("a", "#general", "one more", None, &[]));
+        assert!(reason.contains("already has 15 pins"), "{reason}");
+        assert_eq!(hub.messages("#general", 0).unwrap().len(), before);
+        // A plain post still works in a full channel.
+        bus.send("a", "#general", "plain", None, &[])
+            .into_result()
+            .unwrap();
+    }
+
+    #[test]
+    fn send_and_pin_fails_in_an_archived_hub() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "lead", true).unwrap();
+        bus.hub().update_meta(|meta| meta.archived = true).unwrap();
+        let reason = pin_reason(bus.send_and_pin(MAIN_PEER_ID, "#general", "x", None, &[]));
+        assert!(reason.contains("archived"), "{reason}");
+    }
+
+    #[test]
+    fn person_pins_and_unpins_with_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        hub.update_meta(|meta| {
+            meta.channels.push(Channel {
+                name: "api".to_string(),
+                purpose: String::new(),
+                pins: Vec::new(),
+                created_ms: 0,
+            })
+        })
+        .unwrap();
+        let general = post_as_person(&hub, "me", "#general", "general note", &[]).unwrap();
+        let api = post_as_person(&hub, "me", "#api", "use REST", &[]).unwrap();
+        let dm = post_as_person(&hub, "me", "@me", "self", &[]).unwrap_or_default();
+        let streak_before = hub.meta().unwrap().agent_wake_streak;
+
+        assert!(pin_as_person(&hub, "me", "#api", &api).unwrap());
+        assert!(
+            !pin_as_person(&hub, "me", "api", &api).unwrap(),
+            "idempotent"
+        );
+        let meta = hub.meta().unwrap();
+        let pins = &meta.channel("api").unwrap().pins;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].pinned_by, "me");
+        assert_eq!(meta.agent_wake_streak, streak_before);
+        assert_eq!(hub.messages("#api", 0).unwrap().len(), 1, "no message");
+
+        for (channel, id, expected) in [
+            ("#api", general.as_str(), "not a message in #api"),
+            ("#api", "nope", "not a message"),
+            ("#nope", api.as_str(), "unknown channel"),
+            ("@me", dm.as_str(), "#channels only"),
+            ("@a,@b", "x", "#channels only"),
+        ] {
+            let error = pin_as_person(&hub, "me", channel, id).unwrap_err();
+            assert!(error.to_string().contains(expected), "{channel}: {error}");
+        }
+
+        assert!(!unpin_as_person(&hub, "#api", &general).unwrap());
+        assert!(unpin_as_person(&hub, "#api", &api).unwrap());
+        assert!(hub.channel_pins("#api").unwrap().is_empty());
+
+        pin_as_person(&hub, "me", "#api", &api).unwrap();
+        hub.update_meta(|meta| meta.archived = true).unwrap();
+        let error = pin_as_person(&hub, "me", "#general", &general).unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+        let error = unpin_as_person(&hub, "#api", &api).unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+        assert_eq!(
+            hub.channel_pins("#api").unwrap().len(),
+            1,
+            "pins stay readable"
+        );
+    }
+
+    #[test]
+    fn person_pins_stop_at_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        for i in 0..=store::MAX_CHANNEL_PINS {
+            let id = post_as_person(&hub, "me", "#general", &format!("m{i}"), &[]).unwrap();
+            let result = pin_as_person(&hub, "me", "#general", &id);
+            if i < store::MAX_CHANNEL_PINS {
+                assert!(result.unwrap());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("already has 15 pins"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_pins_move_no_cursor_and_count_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        bus.send_and_pin("a", "#general", "decision: use REST", None, &[])
+            .into_result()
+            .unwrap();
+        bus.send("a", "#general", "chatter", None, &[])
+            .into_result()
+            .unwrap();
+        let hub = bus.hub();
+        let before = hub.cursors("b").unwrap();
+        let tokens_before = hub.meta().unwrap().tokens.get("#general").copied();
+        let pins = bus.read_pins("b", "#general").unwrap();
+        assert_eq!(texts(&pins), vec!["decision: use REST"]);
+        assert_eq!(hub.cursors("b").unwrap(), before);
+        assert!(hub.meta().unwrap().tokens.get("#general").copied() > tokens_before);
+
+        let (messages, _) = bus.read("b", "general", 1, None).unwrap();
+        let (framed, _) = bus.frame_read("general", &pins, &messages).unwrap();
+        assert!(framed.starts_with(WAKE_SYSTEM_HEADER_OPEN), "{framed}");
+        let pinned_at = framed.find("Pinned in #general (1)").expect("pins section");
+        let message_at = framed.find("1 message(s).").expect("messages");
+        assert!(pinned_at < message_at, "{framed}");
+        assert!(framed.contains("--- pinned · from @a · id="), "{framed}");
+        assert_eq!(hub.cursors("b").unwrap().read.get("#general"), Some(&1));
+    }
+
+    #[test]
+    fn join_notice_shows_pin_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.join("team", None, "lead", true).unwrap();
+        bus.create_channel("api", "contracts").unwrap();
+        for text in ["one", "two"] {
+            bus.send_and_pin(MAIN_PEER_ID, "#api", text, None, &[])
+                .into_result()
+                .unwrap();
+        }
+        bus.send_and_pin(MAIN_PEER_ID, "#general", "only", None, &[])
+            .into_result()
+            .unwrap();
+        let notice = format_join_notice(&bus.view(MAIN_PEER_ID).unwrap());
+        assert!(notice.contains("#api (contracts) (2 pins)"), "{notice}");
+        assert!(notice.contains("(1 pin)"), "{notice}");
+        assert!(parse_membership_notice(&notice).is_some());
     }
 }

@@ -10,12 +10,13 @@ use anyhow::{Result, bail};
 use xai_grok_sampling_types::conversation::{ConversationItem, SyntheticReason};
 use xai_grok_tools::implementations::grok_build::agent_hub::{
     AgentBus, HubView, MAIN_PEER_ID, MemberKind, ensure_person, format_join_notice,
-    format_leave_notice, parse_membership_notice, person_handle_in, store,
+    format_leave_notice, parse_membership_notice, person_handle_in, pin_as_person, store,
+    unpin_as_person,
 };
 
 use crate::util::grok_home::grok_home;
 
-const USAGE: &str = "Usage: /hub [list | new <name> [as @handle] | join <name> [as @handle] | leave | open [name] [#channel] | channel <#name> [purpose] | post <#channel|@handle> <text> [--image <path>]... | here [on|off] | archive <name>]";
+const USAGE: &str = "Usage: /hub [list | new <name> [as @handle] | join <name> [as @handle] | leave | open [name] [#channel] | channel <#name> [purpose] | post <#channel|@handle> <text> [--image <path>]... | pin <#channel> <message_id> | unpin <#channel> <message_id> | pins <#channel> | here [on|off] | archive <name>]";
 /// Content-chunk meta key that marks a `/hub` reply. Its value is the card title.
 pub const HUB_CARD_META_KEY: &str = "hubCard";
 /// Messages that `/hub open` shows.
@@ -477,6 +478,8 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
                 Err(reason) => bail!("{reason}"),
             }
         }
+        "pin" | "unpin" => change_pin(bus, command, rest),
+        "pins" => pins(bus, rest),
         "here" => set_person_alerts(bus, rest),
         "archive" => {
             if rest.is_empty() {
@@ -490,6 +493,60 @@ fn dispatch(bus: &AgentBus, args: &str, default_handle: &str) -> Result<String> 
         }
         _ => bail!("{USAGE}"),
     }
+}
+
+/// Purpose: Pin or unpin one channel message as the person.
+/// Input: The session's bus, `pin` or `unpin`, and `<#channel> <message_id>`.
+/// Output: A line that states the result. Nobody wakes and no cursor moves.
+fn change_pin(bus: &AgentBus, command: &str, args: &str) -> Result<String> {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let [raw_channel, message_id] = words.as_slice() else {
+        bail!("{USAGE}");
+    };
+    let hub = bus.hub();
+    let channel = format!("#{}", raw_channel.trim_start_matches('#'));
+    if command == "pin" {
+        let is_new = pin_as_person(&hub, &store::person_handle(), raw_channel, message_id)?;
+        return Ok(if is_new {
+            format!("Pinned `{message_id}` in **{channel}**.")
+        } else {
+            format!("`{message_id}` is already pinned in **{channel}**.")
+        });
+    }
+    Ok(if unpin_as_person(&hub, raw_channel, message_id)? {
+        format!("Unpinned `{message_id}` in **{channel}**.")
+    } else {
+        format!("`{message_id}` is not pinned in **{channel}**.")
+    })
+}
+
+/// Purpose: List the pinned messages of one channel.
+/// Input: The session's bus and `<#channel>`.
+/// Output: One line per pin, in pin order. No cursor moves.
+fn pins(bus: &AgentBus, args: &str) -> Result<String> {
+    let channel = args.trim();
+    if channel.is_empty() {
+        bail!("{USAGE}");
+    }
+    if channel.starts_with('@') {
+        bail!("pins are supported on #channels only, not DMs");
+    }
+    let channel = format!("#{}", channel.trim_start_matches('#'));
+    let pinned = bus.hub().channel_pins(&channel)?;
+    if pinned.is_empty() {
+        return Ok(format!(
+            "No pinned messages in **{channel}**. Use `/hub pin {channel} <message_id>`."
+        ));
+    }
+    let mut out = format!("Pinned in **{channel}**:\n");
+    for (pin, message) in &pinned {
+        let first_line = message.text.lines().next().unwrap_or_default();
+        out.push_str(&format!(
+            "\n- `{}` **@{}** · pinned by @{}  \n  {first_line}",
+            message.id, message.from, pin.pinned_by
+        ));
+    }
+    Ok(out)
 }
 
 /// Purpose: Show or change whether person channel posts wake every member.
@@ -548,8 +605,12 @@ fn format_view(view: &HubView) -> String {
         } else {
             format!(" · {}", c.purpose)
         };
+        let pins = match c.pin_count {
+            0 => String::new(),
+            n => format!(", {}", plural(n, "pin")),
+        };
         out.push_str(&format!(
-            "\n- **#{}** · {}, {} unread{purpose}",
+            "\n- **#{}** · {}, {} unread{pins}{purpose}",
             c.name,
             plural(c.messages, "message"),
             c.unread,
@@ -626,9 +687,16 @@ fn feed(bus: &AgentBus, args: &str) -> Result<String> {
             1 => " · 1 image".to_string(),
             n => format!(" · {n} images"),
         };
+        // The id lets the person pin the message with `/hub pin`.
+        let is_pinned = m
+            .conv
+            .strip_prefix('#')
+            .and_then(|name| meta.channel(name))
+            .is_some_and(|c| c.is_pinned(&m.id));
+        let pin = if is_pinned { " · 📌" } else { "" };
         out.push_str(&format!(
-            "\n- **@{}** in {place} · {time}{images}  \n  {}",
-            m.from, m.text
+            "\n- **@{}** in {place} · {time}{images} · `{}`{pin}  \n  {}",
+            m.from, m.id, m.text
         ));
     }
     Ok(out)
@@ -1101,6 +1169,89 @@ mod tests {
         dispatch(&bus, "post #general now everyone", "x").unwrap();
         assert_eq!(bus.inbox(MAIN_PEER_ID).unwrap().len(), 1);
         assert!(dispatch(&bus, "here maybe", "x").is_err());
+    }
+
+    #[test]
+    fn pin_unpin_and_pins_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = bus_in(root.path(), "s1");
+        dispatch(&bus, "new team", "lead").unwrap();
+        dispatch(&bus, "channel #api contracts", "x").unwrap();
+        let hub = bus.hub();
+        let person = store::person_handle();
+        let api = xai_grok_tools::implementations::grok_build::agent_hub::post_as_person(
+            &hub,
+            &person,
+            "#api",
+            "use REST",
+            &[],
+        )
+        .unwrap();
+        let general = xai_grok_tools::implementations::grok_build::agent_hub::post_as_person(
+            &hub,
+            &person,
+            "#general",
+            "hello",
+            &[],
+        )
+        .unwrap();
+        bus.inbox(MAIN_PEER_ID).unwrap();
+
+        assert!(
+            dispatch(&bus, "pins #api", "x")
+                .unwrap()
+                .contains("No pinned messages")
+        );
+        let out = dispatch(&bus, &format!("pin #api {api}"), "x").unwrap();
+        assert_eq!(out, format!("Pinned `{api}` in **#api**."));
+        let out = dispatch(&bus, &format!("pin api {api}"), "x").unwrap();
+        assert!(out.contains("already pinned"), "{out}");
+        let out = dispatch(&bus, "pins #api", "x").unwrap();
+        assert!(out.contains(&format!("`{api}`")), "{out}");
+        assert!(out.contains("use REST"), "{out}");
+        let out = dispatch(&bus, "", "x").unwrap();
+        assert!(
+            out.contains("**#api** · 1 message, 1 unread, 1 pin"),
+            "{out}"
+        );
+        let feed = dispatch(&bus, "open #api", "x").unwrap();
+        assert!(feed.contains(&format!("`{api}` · 📌")), "{feed}");
+        assert!(
+            bus.inbox(MAIN_PEER_ID).unwrap().is_empty(),
+            "a pin wakes nobody"
+        );
+
+        for (args, expected) in [
+            (format!("pin #api {general}"), "not a message in #api"),
+            ("pin #api nope".to_string(), "not a message"),
+            (format!("pin @lead {api}"), "#channels only"),
+            ("pins @lead".to_string(), "#channels only"),
+            (format!("pin #nope {api}"), "unknown channel"),
+            ("pin #api".to_string(), "Usage"),
+        ] {
+            let error = dispatch(&bus, &args, "x").unwrap_err().to_string();
+            assert!(error.contains(expected), "{args}: {error}");
+        }
+
+        let out = dispatch(&bus, &format!("unpin #api {general}"), "x").unwrap();
+        assert!(out.contains("not pinned"), "{out}");
+        let out = dispatch(&bus, &format!("unpin #api {api}"), "x").unwrap();
+        assert_eq!(out, format!("Unpinned `{api}` in **#api**."));
+
+        dispatch(&bus, &format!("pin #api {api}"), "x").unwrap();
+        hub.update_meta(|meta| meta.archived = true).unwrap();
+        for args in [
+            format!("pin #general {general}"),
+            format!("unpin #api {api}"),
+        ] {
+            let error = dispatch(&bus, &args, "x").unwrap_err().to_string();
+            assert!(error.contains("archived"), "{args}: {error}");
+        }
+        assert!(
+            dispatch(&bus, "pins #api", "x")
+                .unwrap()
+                .contains("use REST")
+        );
     }
 
     #[test]

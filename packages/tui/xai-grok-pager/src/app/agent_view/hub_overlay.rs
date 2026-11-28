@@ -95,6 +95,34 @@ impl AgentView {
                 );
                 finish_hub_post(browser, &to, result);
             }
+            HubKeyOutcome::Pin {
+                channel,
+                message_id,
+            } => {
+                let result = agent_hub::pin_as_person(
+                    &browser.hub,
+                    browser.person_name(),
+                    &channel,
+                    &message_id,
+                );
+                let notice = match result {
+                    Ok(true) => format!("Pinned in {channel}."),
+                    Ok(false) => format!("Already pinned in {channel}."),
+                    Err(error) => format!("Not pinned: {error}"),
+                };
+                finish_hub_pin_change(browser, notice);
+            }
+            HubKeyOutcome::Unpin {
+                channel,
+                message_id,
+            } => {
+                let notice = match agent_hub::unpin_as_person(&browser.hub, &channel, &message_id) {
+                    Ok(true) => format!("Unpinned in {channel}."),
+                    Ok(false) => format!("Not pinned in {channel}."),
+                    Err(error) => format!("Not unpinned: {error}"),
+                };
+                finish_hub_pin_change(browser, notice);
+            }
         }
         Some(InputOutcome::Changed)
     }
@@ -258,6 +286,14 @@ fn finish_hub_post(browser: &mut HubBrowserState, to: &str, result: anyhow::Resu
     browser.finish_post(to, result);
 }
 
+/// Read the hub again after a pin or unpin, then show the result.
+fn finish_hub_pin_change(browser: &mut HubBrowserState, notice: String) {
+    if let Err(error) = browser.reload() {
+        tracing::warn!(%error, "hub browser: reload failed");
+    }
+    browser.notice = Some(notice);
+}
+
 /// Purpose: Open the hub of a session for the browser.
 /// Input: The hubs root and the session id.
 /// Output: The named hub where the session is a member, or else the private
@@ -403,6 +439,66 @@ mod tests {
 
     fn key_event(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn the_pin_chip_pins_and_the_drawer_unpins() {
+        let (_root, mut view, bus) = browser_with_agent();
+        let hub = bus.hub();
+        let id = agent_hub::post_as_person(&hub, "me", "#general", "decided: REST", &[]).unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let browser = view.hub_browser.as_mut().unwrap();
+        browser.reload().unwrap();
+        crate::views::hub_browser::render_hub_browser(&mut buf, area, browser);
+        let (x, y) = text_cell(&buf, "decided: REST");
+        let mouse = |kind, column, row| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        view.handle_hub_browser_input(&mouse(crossterm::event::MouseEventKind::Moved, x, y));
+        let browser = view.hub_browser.as_mut().unwrap();
+        crate::views::hub_browser::render_hub_browser(&mut buf, area, browser);
+        let (px, py) = text_cell(&buf, "📌");
+        let down = crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left);
+        view.handle_hub_browser_input(&mouse(down, px, py));
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert_eq!(browser.notice.as_deref(), Some("Pinned in #general."));
+        assert_eq!(browser.pinned.len(), 1, "the browser reloads");
+        assert_eq!(hub.channel_pins("#general").unwrap()[0].1.id, id);
+
+        view.handle_hub_browser_input(&key_event(KeyCode::Char('P')));
+        assert!(view.hub_browser.as_ref().unwrap().show_pins);
+        view.handle_hub_browser_input(&key_event(KeyCode::Char('u')));
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert_eq!(browser.notice.as_deref(), Some("Unpinned in #general."));
+        assert!(browser.pinned.is_empty());
+        assert!(hub.channel_pins("#general").unwrap().is_empty());
+    }
+
+    /// The screen cell where `needle` starts in the buffer.
+    fn text_cell(buf: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let area = buf.area;
+        for y in area.y..area.bottom() {
+            let mut line = String::new();
+            let mut columns = Vec::new();
+            for x in area.x..area.right() {
+                let symbol = buf[(x, y)].symbol();
+                for _ in symbol.chars() {
+                    columns.push(x);
+                }
+                line.push_str(symbol);
+            }
+            if let Some(byte) = line.find(needle) {
+                let char_index = line[..byte].chars().count();
+                return (columns[char_index], y);
+            }
+        }
+        panic!("{needle:?} is not on the screen");
     }
 
     #[test]

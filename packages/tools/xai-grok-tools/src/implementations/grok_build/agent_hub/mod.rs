@@ -12,8 +12,8 @@ pub use bus::{
     AgentBus, ChannelView, DeliveredMessage, Delivery, HubView, JoinOutcome, LOOP_GUARD_WAKES,
     MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, answer_as_bot, ask_bot,
     ensure_person, format_join_notice, format_leave_notice, format_messages, image_paths,
-    mark_read, parse_delivery, parse_membership_notice, person_handle_in, post_as_person,
-    reply_as_person,
+    mark_read, parse_delivery, parse_membership_notice, person_handle_in, pin_as_person,
+    post_as_person, reply_as_person, unpin_as_person,
 };
 pub use bus::{InputGuard, TurnGuard};
 pub use read_tool::{HUB_READ_TOOL_NAME, HubReadInput, HubReadOp, HubReadOutput, HubReadTool};
@@ -109,6 +109,11 @@ pub struct AgentHubInput {
         description = "Read from this message index instead of your read cursor (read only)"
     )]
     pub since: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Pin this #channel post so every member keeps seeing it (send only). Use only for key decisions; max 15 pins per channel."
+    )]
+    pub pin: Option<bool>,
 }
 
 impl AgentHubInput {
@@ -145,6 +150,12 @@ pub struct AgentHubChannelRow {
     pub purpose: String,
     pub unread: usize,
     pub tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pin_count: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,11 +290,11 @@ impl crate::types::tool_metadata::ToolMetadata for AgentHubTool {
 You are always in a hub with Main and the running subagents of this session. A person can move this session into a named hub (`/hub join`) that other agent threads share; then `list` shows their @handles.
 
 Ops:
-- list: members (@handle, label, status) and channels with unread counts
-- send: post to `#channel` or DM `@handle` (plain prose, max 8KiB; optional `images`, absolute paths). `@handle` in a channel post wakes that member. `@here` in a channel post wakes every member; use it only when all of them must act.
+- list: members (@handle, label, status) and channels with unread and pin counts
+- send: post to `#channel` or DM `@handle` (plain prose, max 8KiB; optional `images`, absolute paths). `@handle` in a channel post wakes that member. `@here` in a channel post wakes every member; use it only when all of them must act. `pin: true` on a channel post pins a key decision for everyone.
 - inbox: drain your unread DMs and mentions (non-blocking)
 - wait: block until a DM or mention arrives, or timeout_ms (max 30000)
-- read: read a channel after your read cursor (`channel`, optional `limit`, `since`)
+- read: read a channel after your read cursor (`channel`, optional `limit`, `since`); the channel's pinned messages come first
 - channel: create a channel (`channel`, optional `purpose`)
 
 This tool does not start agents; use `spawn_subagent` for that and `get_command_or_subagent_output` for final results.
@@ -361,6 +372,11 @@ impl xai_tool_runtime::Tool for AgentHubTool {
             (bus, self_id)
         };
         let bus = bus.0;
+        if input.pin == Some(true) && input.op != AgentHubOp::Send {
+            return Ok(AgentHubOutput::fail(
+                "`pin` works only with op send to a #channel",
+            ));
+        }
         let out = match input.op {
             AgentHubOp::List => run_list(&bus, &self_id),
             AgentHubOp::Send => run_send(&bus, &self_id, &input),
@@ -442,6 +458,7 @@ fn run_list(bus: &AgentBus, self_id: &str) -> anyhow::Result<AgentHubOutput> {
             purpose: c.purpose.clone(),
             unread: c.unread,
             tokens: c.tokens,
+            pin_count: c.pin_count,
         })
         .collect();
     let place = if view.is_session_hub {
@@ -492,17 +509,23 @@ fn run_send(
         .flatten()
         .map(|p| resolve_image_path(p))
         .collect();
-    Ok(
-        match bus.send(self_id, to, text, input.reply_to.as_deref(), &images) {
-            SendOutcome::Delivered { message_id } => AgentHubOutput {
-                ok: true,
-                summary: format!("delivered to {to} as {message_id}"),
-                message_id: Some(message_id),
-                ..Default::default()
-            },
-            SendOutcome::Failed { reason } => AgentHubOutput::fail(reason),
+    let reply_to = input.reply_to.as_deref();
+    let is_pin = input.pin == Some(true);
+    let outcome = if is_pin {
+        bus.send_and_pin(self_id, to, text, reply_to, &images)
+    } else {
+        bus.send(self_id, to, text, reply_to, &images)
+    };
+    let pinned = if is_pin { " and pinned it" } else { "" };
+    Ok(match outcome {
+        SendOutcome::Delivered { message_id } => AgentHubOutput {
+            ok: true,
+            summary: format!("delivered to {to} as {message_id}{pinned}"),
+            message_id: Some(message_id),
+            ..Default::default()
         },
-    )
+        SendOutcome::Failed { reason } => AgentHubOutput::fail(reason),
+    })
 }
 
 /// A relative image path is taken from the process working directory.
@@ -526,12 +549,29 @@ fn run_read(
     };
     let limit = input.limit.unwrap_or(20).clamp(1, 200);
     let (msgs, remaining) = bus.read(self_id, channel, limit, input.since)?;
-    let summary = match (msgs.len(), remaining) {
+    let mut summary = match (msgs.len(), remaining) {
         (0, _) => format!("no new messages in {channel}"),
         (n, 0) => format!("read {n} message(s) from {channel}; caught up"),
         (n, r) => format!("read {n} message(s) from {channel}; {r} more unread"),
     };
-    Ok(AgentHubOutput::with_messages(summary, bus, msgs))
+    // A page read with `since` skips the pins, so paging does not repeat them.
+    let pins = match input.since {
+        Some(_) => Vec::new(),
+        None => bus.read_pins(self_id, channel)?,
+    };
+    if pins.is_empty() {
+        return Ok(AgentHubOutput::with_messages(summary, bus, msgs));
+    }
+    summary.push_str(&format!("; {} pinned message(s) shown first", pins.len()));
+    let (framed, image_paths) = bus.frame_read(channel, &pins, &msgs)?;
+    Ok(AgentHubOutput {
+        ok: true,
+        summary,
+        messages: Some(msg_rows(msgs)),
+        framed: Some(framed),
+        image_paths,
+        ..Default::default()
+    })
 }
 
 impl AgentHubOutput {
@@ -548,8 +588,12 @@ impl AgentHubOutput {
         }
         if let Some(channels) = &self.channels {
             for c in channels {
+                let pins = match c.pin_count {
+                    0 => String::new(),
+                    n => format!(" pins={n}"),
+                };
                 out.push_str(&format!(
-                    "\n- #{} unread={} tokens={} {}",
+                    "\n- #{} unread={} tokens={}{pins} {}",
                     c.name, c.unread, c.tokens, c.purpose
                 ));
             }
@@ -865,5 +909,115 @@ mod tool_tests {
         assert_eq!(msgs[0].from, "b");
         assert_eq!(msgs[0].text, "acked");
         assert_eq!(msgs[0].reply_to, sent.message_id);
+    }
+
+    async fn run_tool(resources: &SharedResources, input: AgentHubInput) -> AgentHubOutput {
+        xai_tool_runtime::Tool::run(&AgentHubTool, test_ctx(resources.clone()), input)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pin_on_send_shows_in_list_and_read_without_moving_the_cursor() {
+        let (_root, bus) = temp_bus();
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let a = hub_resources("a", bus.clone());
+        let sent = run_tool(
+            &a,
+            AgentHubInput {
+                op: AgentHubOp::Send,
+                to: Some("#general".into()),
+                text: Some("API spec lives in docs/api.md".into()),
+                pin: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(sent.ok, "{}", sent.summary);
+        assert!(sent.summary.contains("pinned"), "{}", sent.summary);
+        for i in 0..3 {
+            bus.send("a", "#general", &format!("chatter {i}"), None, &[]);
+        }
+
+        let b = hub_resources("b", bus.clone());
+        let list = run_tool(&b, AgentHubInput::default()).await;
+        assert_eq!(list.channels.as_ref().unwrap()[0].pin_count, 1);
+        assert!(
+            list.prompt_text().contains("pins=1"),
+            "{}",
+            list.prompt_text()
+        );
+
+        let read = |since| AgentHubInput {
+            op: AgentHubOp::Read,
+            channel: Some("#general".into()),
+            limit: Some(1),
+            since,
+            ..Default::default()
+        };
+        let first = run_tool(&b, read(None)).await;
+        let text = first.prompt_text();
+        assert!(text.contains("Pinned in #general (1)"), "{text}");
+        assert!(text.contains("API spec lives in docs/api.md"), "{text}");
+        assert!(text.contains("3 more unread"), "{text}");
+        assert_eq!(first.messages.as_ref().unwrap().len(), 1);
+        let handle = bus.view("b").unwrap().handle;
+        let read_cursor = || {
+            bus.hub()
+                .cursors(&handle)
+                .unwrap()
+                .read
+                .get("#general")
+                .copied()
+        };
+        assert_eq!(read_cursor(), Some(1), "the pins move no cursor");
+        let page = run_tool(&b, read(Some(2))).await;
+        assert!(
+            !page.prompt_text().contains("Pinned in"),
+            "a page skips pins"
+        );
+        assert_eq!(read_cursor(), Some(3));
+        let value = serde_json::to_value(&first).unwrap();
+        let rebuilt: AgentHubOutput = serde_json::from_value(value).unwrap();
+        assert!(rebuilt.prompt_text().contains("Pinned in #general"));
+    }
+
+    #[tokio::test]
+    async fn pin_is_refused_on_other_ops_and_on_dms() {
+        let (_root, bus) = temp_bus();
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let a = hub_resources("a", bus.clone());
+        let read = run_tool(
+            &a,
+            AgentHubInput {
+                op: AgentHubOp::Read,
+                channel: Some("#general".into()),
+                pin: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!read.ok);
+        assert!(
+            read.summary.contains("only with op send"),
+            "{}",
+            read.summary
+        );
+        let dm = run_tool(
+            &a,
+            AgentHubInput {
+                op: AgentHubOp::Send,
+                to: Some("@b".into()),
+                text: Some("secret".into()),
+                pin: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!dm.ok);
+        assert!(dm.summary.contains("not a DM"), "{}", dm.summary);
+        assert!(bus.inbox("b").unwrap().is_empty());
     }
 }
