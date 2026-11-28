@@ -5,9 +5,10 @@ This directory holds **upstream source** vendored into the repository. It is
 
 ## Why vendor
 
-These crates sit on the path that renders **untrusted model output** (diagram
-source → SVG). Vendoring gives a full audit surface, pins exact source, and
-avoids crates.io yanks. Local patches and upgrade checklists live in each
+The diagram crates render **untrusted model output** (diagram source → SVG).
+The Google auth crate needs a local token timeout and HTTP error patch.
+Vendoring pins exact source and keeps these patches reproducible.
+Local patches and upgrade checklists live in each
 crate’s `Cargo.toml` header comments — treat those as the source of truth when
 re-vendoring.
 
@@ -31,6 +32,14 @@ xai-grok-mermaid
         └── graphlib_rust     (Apache-2.0)
               └── ordered_hashmap
 ```
+
+## Google authentication
+
+[`gcloud-auth`](./gcloud-auth/) 1.3.0 (MIT) comes from
+[yoshidan/google-cloud-rust](https://github.com/yoshidan/google-cloud-rust/tree/main/foundation/auth).
+Its local patches raise token HTTP timeouts from 3 to 30 seconds and preserve
+HTTP errors from authorized-user token refreshes. The sampler ADC tests cover
+these patches. See its `Cargo.toml` header and [`LICENSE`](./gcloud-auth/LICENSE).
 
 ## Notices and ancestry
 

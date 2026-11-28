@@ -154,6 +154,8 @@ mod sampler_turn;
 use sampler_turn::*;
 #[path = "acp_session_impl/transient_retry.rs"]
 mod transient_retry;
+#[path = "acp_session_impl/goal_retry.rs"]
+mod goal_retry;
 #[path = "acp_session_impl/length_salvage.rs"]
 mod length_salvage;
 use transient_retry::*;

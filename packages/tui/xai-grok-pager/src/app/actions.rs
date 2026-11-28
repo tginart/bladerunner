@@ -1116,6 +1116,8 @@ pub enum Action {
     OpenShots,
     /// Open the local file tree and read-only preview for the active session.
     OpenFileBrowser,
+    OpenPullRequest(String),
+    PullRequestControl(crate::views::pull_request::summary::Control),
     /// Open the hub browser on a named hub (or this session's hub), optionally
     /// on a `#channel`.
     OpenHubBrowser {
@@ -1527,6 +1529,12 @@ pub enum AfterSessionDelete {
 /// [`TaskResult`] as `Action::TaskComplete`.
 #[derive(Debug)]
 pub enum Effect {
+    FetchPullRequest {
+        agent_id: AgentId,
+        request_id: uuid::Uuid,
+        cwd: std::path::PathBuf,
+        target: String,
+    },
     AskReviewChat {
         agent_id: AgentId,
         request: xai_grok_shell::extensions::review_chat::AskRequest,
@@ -2467,6 +2475,11 @@ impl TaskResult {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    PullRequestLoaded {
+        agent_id: AgentId,
+        request_id: uuid::Uuid,
+        result: Result<crate::views::pull_request::github::Snapshot, String>,
+    },
     HubBotAnswered {
         agent_id: AgentId,
         hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
