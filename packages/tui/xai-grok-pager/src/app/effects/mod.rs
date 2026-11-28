@@ -93,6 +93,13 @@ pub(crate) fn execute(
             ulog::info("pager quit", None, None);
             return (true, meta);
         }
+        Effect::FetchPullRequest { agent_id, request_id, cwd, target } => {
+            tasks.spawn(async move {
+                let result = crate::views::pull_request::github::load(&cwd, &target)
+                    .await.map_err(|error| format!("{error:#}"));
+                TaskResult::PullRequestLoaded { agent_id, request_id, result }
+            });
+        }
         Effect::AskReviewChat { agent_id, request } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move {

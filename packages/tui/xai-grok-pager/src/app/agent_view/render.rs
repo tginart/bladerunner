@@ -26,7 +26,7 @@ use crate::views::shortcuts_bar::{HintItem, PendingHint, ShortcutsBar};
 use crate::views::{agent, turn_status};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use std::collections::HashSet;
@@ -925,6 +925,9 @@ impl AgentView {
             crate::views::announcements::promo_cta(banner_announcements, hidden_announcement_ids)
                 .is_some_and(|(owner, _, _)| !crate::views::announcements::is_dismissible(owner));
         self.frame_occluder_rects.clear();
+        if let Some(pr) = &mut self.pull_request {
+            pr.summary.clear_hits();
+        }
         self.clear_scrollback_selection_state();
         self.refresh_prompt_suggestion_gate();
         let theme = Theme::current();
@@ -3588,6 +3591,14 @@ impl AgentView {
             self.draw_active_modal(area, buf, theme, compact);
             self.pane_areas = layout.pane_areas();
             let cursor = match self.active_modal.as_ref() {
+                Some(crate::views::modal::ActiveModal::PullRequest) => self
+                    .pull_request
+                    .as_ref()
+                    .and_then(|state| state.chat.as_ref())
+                    .and_then(|chat| {
+                        let chat = chat.borrow();
+                        chat.focused.then_some(chat.cursor_pos).flatten()
+                    }),
                 Some(crate::views::modal::ActiveModal::Changes { state })
                     if state.chat_focused() =>
                 {
@@ -4605,6 +4616,27 @@ impl AgentView {
         {
             let clear = crate::terminal::overlay::clear_kitty();
             prompt_post_flush = Some(clear.into());
+        }
+        if !dropdown_active
+            && !self.is_minimal_mode()
+            && self.no_input_overlay_pending()
+            && !self.show_goal_detail
+            && !self.show_workflows
+            && self.hub_browser.is_none()
+            && !self.file_browser_is_open()
+            && let Some(viewer) = &mut self.pull_request
+            && let Some(covered) = viewer.draw_summary(buf, layout.scrollback_content, &theme)
+        {
+            if let Some((button, _)) = mouse_pos.and_then(|pos| viewer.summary.button_at(pos)) {
+                buf.set_style(
+                    button,
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .bg(theme.bg_highlight)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                );
+            }
+            self.frame_occluder_rects.push(covered);
         }
         if self.show_goal_detail
             && let Some(ref goal) = self.goal_state

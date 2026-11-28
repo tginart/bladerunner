@@ -29,6 +29,7 @@ strip-ansi-escapes = { workspace = true }
 enum_delegate = { workspace = true }
 
 # Markdown / syntax highlighting
+htmd = { workspace = true }
 xai-grok-markdown = { workspace = true }
 # Inline Mermaid rendering engine. Always compiled (no feature gate): the
 # dagre-based vendored engine renders detected ```mermaid fences out of process,
