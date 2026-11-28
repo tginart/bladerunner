@@ -121,7 +121,7 @@ struct LocalPeer {
     is_turn_running: bool,
     /// Open prompts that wait for a person (permission, question, plan), in
     /// open order. The newest open prompt gives the shown reason.
-    input_reasons: Vec<InputReason>,
+    input_reasons: Vec<(Arc<()>, InputReason)>,
     /// The prompt of the last turn that a person or a parent started.
     task: Option<String>,
     /// The presence in the file, so an unchanged state is not written again.
@@ -163,7 +163,7 @@ impl LocalPeer {
 
     /// Why the peer waits for a person: the reason of the newest open prompt.
     fn input_reason(&self) -> Option<InputReason> {
-        self.input_reasons.last().copied()
+        self.input_reasons.last().map(|(_, reason)| *reason)
     }
 }
 
@@ -344,11 +344,12 @@ impl AgentBus {
     /// Output: A guard. The presence shows `needs_input` until every guard drops.
     ///     The newest open guard gives the shown `input_reason`.
     pub fn input_guard(&self, id: &str, reason: InputReason) -> InputGuard {
-        self.change_peer(id, |peer| peer.input_reasons.push(reason));
+        let entry = Arc::new(());
+        self.change_peer(id, |peer| peer.input_reasons.push((entry.clone(), reason)));
         InputGuard {
             bus: self.clone(),
             id: id.to_string(),
-            reason,
+            entry,
         }
     }
 
@@ -803,16 +804,19 @@ impl Drop for WaitingGuard<'_> {
 pub struct InputGuard {
     bus: AgentBus,
     id: String,
-    reason: InputReason,
+    entry: Arc<()>,
 }
 
 impl Drop for InputGuard {
     fn drop(&mut self) {
-        // Guards can drop out of order, so remove the newest entry of this
-        // reason. The other open prompts keep their order.
-        let reason = self.reason;
+        // Guards can drop out of order and share a reason. Remove only this
+        // guard's entry, so the other open prompts keep their order.
         self.bus.change_peer(&self.id, |peer| {
-            if let Some(idx) = peer.input_reasons.iter().rposition(|r| *r == reason) {
+            if let Some(idx) = peer
+                .input_reasons
+                .iter()
+                .position(|(entry, _)| Arc::ptr_eq(entry, &self.entry))
+            {
                 peer.input_reasons.remove(idx);
             }
         });
@@ -1785,6 +1789,31 @@ mod tests {
         drop(question);
         assert_eq!(shown(), (Activity::Working, None));
         bus.turn_ended(MAIN_PEER_ID);
+        assert_eq!(shown(), (Activity::Idle, None));
+    }
+
+    #[test]
+    fn overlapping_guards_with_the_same_reason_keep_the_newest_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let shown = || {
+            let presence = hub.presence(&handle).unwrap();
+            (presence.activity, presence.input_reason)
+        };
+        let older = bus.input_guard(MAIN_PEER_ID, InputReason::Permission);
+        let question = bus.input_guard(MAIN_PEER_ID, InputReason::Question);
+        let newer = bus.input_guard(MAIN_PEER_ID, InputReason::Permission);
+        drop(older);
+        assert_eq!(
+            shown(),
+            (Activity::NeedsInput, Some(InputReason::Permission))
+        );
+        drop(newer);
+        assert_eq!(shown(), (Activity::NeedsInput, Some(InputReason::Question)));
+        drop(question);
         assert_eq!(shown(), (Activity::Idle, None));
     }
 

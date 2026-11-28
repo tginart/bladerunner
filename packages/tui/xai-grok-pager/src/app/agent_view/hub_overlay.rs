@@ -196,7 +196,14 @@ impl AgentView {
     /// Input: The member handle.
     /// Output: The outcome. A subagent of this view opens full screen, this
     ///     session closes the hub, and another session goes to the app to focus.
+    ///     An unfinished draft blocks the jump with a notice.
     fn go_to_hub_member(&mut self, handle: &str) -> InputOutcome {
+        if let Some(browser) = self.hub_browser.as_mut()
+            && !browser.composer.is_empty()
+        {
+            browser.notice = Some("Send or clear your draft before going to a member.".to_string());
+            return InputOutcome::Changed;
+        }
         let Some(session_id) = self.hub_member_session(handle) else {
             return InputOutcome::Changed;
         };
@@ -554,6 +561,30 @@ mod tests {
         view.handle_hub_browser_input(&key_event(KeyCode::Enter));
         assert!(view.hub_browser.as_ref().unwrap().composer.is_empty());
         assert_eq!(bus.inbox(MAIN_PEER_ID).unwrap()[0].text, "please check");
+    }
+
+    #[test]
+    fn a_member_jump_keeps_a_paused_draft_and_its_destination() {
+        for session_id in ["root", "other"] {
+            let (_root, mut view, _bus) = browser_with_agent();
+            view.session.session_id = Some(agent_client_protocol::SessionId::new(session_id));
+            view.handle_hub_browser_input(&key_event(KeyCode::Tab));
+            view.handle_hub_browser_input(&Event::Paste("unfinished post".to_string()));
+            view.handle_hub_browser_input(&key_event(KeyCode::Esc));
+            assert!(!view.hub_browser.as_ref().unwrap().is_composing);
+
+            assert!(matches!(
+                view.go_to_hub_member("worker"),
+                InputOutcome::Changed
+            ));
+            let browser = view.hub_browser.as_ref().unwrap();
+            assert_eq!(browser.composer.text(), "unfinished post");
+            assert_eq!(browser.post_target().as_deref(), Some("#general"));
+            assert_eq!(
+                browser.notice.as_deref(),
+                Some("Send or clear your draft before going to a member.")
+            );
+        }
     }
 
     #[test]
