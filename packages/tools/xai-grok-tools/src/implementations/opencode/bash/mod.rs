@@ -222,6 +222,8 @@ impl From<BashInput> for ToolInput {
             timeout: value.timeout,
             description: value.description,
             is_background: false,
+            progress_pattern: None,
+            progress_total: None,
         })
     }
 }

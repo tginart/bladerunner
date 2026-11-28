@@ -37,6 +37,7 @@ const COMBINE_QUEUED_PROMPTS_DEFAULT: bool = false;
 const HOOKS_MUTED_DEFAULT: bool = false;
 /// Inference-speed status chip defaults OFF (opt-in).
 const SHOW_INFERENCE_SPEED_DEFAULT: bool = false;
+const TASK_PROGRESS_BARS_DEFAULT: bool = true;
 const SIMPLE_MODE_DEFAULT: bool = true;
 /// Vim-mode scrollback default — matches the previous on-disk default.
 const VIM_MODE_DEFAULT: bool = false;
@@ -254,6 +255,35 @@ pub fn load_show_inference_speed() -> bool {
 pub fn set_show_inference_speed(enabled: bool) {
     SHOW_INFERENCE_SPEED_CURRENT.with(|c| c.set(enabled));
     SHOW_INFERENCE_SPEED_LOADED.with(|l| l.set(true));
+}
+
+// -- Task progress bars -------------------------------------------------------
+
+thread_local! {
+    static TASK_PROGRESS_BARS_CURRENT: Cell<bool> =
+        const { Cell::new(TASK_PROGRESS_BARS_DEFAULT) };
+    static TASK_PROGRESS_BARS_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cached `task_progress_bars`, seeding from `[ui]` on first call.
+pub fn load_task_progress_bars() -> bool {
+    TASK_PROGRESS_BARS_LOADED.with(|loaded| {
+        if !loaded.get() {
+            TASK_PROGRESS_BARS_CURRENT.with(|c| {
+                c.set(load_bool_from_effective_config(
+                    "task_progress_bars",
+                    TASK_PROGRESS_BARS_DEFAULT,
+                ))
+            });
+            loaded.set(true);
+        }
+    });
+    TASK_PROGRESS_BARS_CURRENT.with(|c| c.get())
+}
+
+pub fn set_task_progress_bars(enabled: bool) {
+    TASK_PROGRESS_BARS_CURRENT.with(|c| c.set(enabled));
+    TASK_PROGRESS_BARS_LOADED.with(|l| l.set(true));
 }
 
 // -- Simple mode --------------------------------------------------------------
@@ -676,6 +706,7 @@ pub fn prime(ui: &UiConfig) {
         ui.show_inference_speed
             .unwrap_or(SHOW_INFERENCE_SPEED_DEFAULT),
     );
+    set_task_progress_bars(ui.task_progress_bars_enabled());
     set_simple_mode(ui.simple_mode.unwrap_or(SIMPLE_MODE_DEFAULT));
     set_keep_text_selection(text_selection_from_ui(ui));
     // Layered-config keys (not the `UiConfig` arg) — seed so the first frame
@@ -802,6 +833,7 @@ mod tests {
             ui.show_inference_speed
                 .unwrap_or(SHOW_INFERENCE_SPEED_DEFAULT)
         );
+        assert_eq!(TASK_PROGRESS_BARS_DEFAULT, ui.task_progress_bars_enabled());
         assert_eq!(SIMPLE_MODE_DEFAULT, ui.simple_mode.unwrap_or(true));
         assert_eq!(VIM_MODE_DEFAULT, ui.vim_mode.unwrap_or(false));
         assert_eq!(

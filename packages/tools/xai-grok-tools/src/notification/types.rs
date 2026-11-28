@@ -368,6 +368,22 @@ pub struct MonitorEvent {
     pub owner_session_id: Option<String>,
 }
 
+/// Progress of a background task or of a subagent. The client shows the value
+/// as a progress bar on the row of the task.
+#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TaskProgress {
+    /// `Some`: the ID of a background task or of a subagent that the sender
+    /// session started. `None`: the sender session is a subagent and reports
+    /// its own progress.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub task_id: Option<String>,
+    /// Units of work that are done.
+    pub completed: u64,
+    /// Total units of work. A total of 100 means `completed` is a percentage.
+    pub total: u64,
+}
+
 /// A background subagent reached a terminal state while the parent held a handle.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -449,6 +465,9 @@ pub enum ToolNotification {
 
     /// A streaming event from a monitor background process.
     MonitorEvent(MonitorEvent),
+
+    /// New progress value for a background task or a subagent.
+    TaskProgress(TaskProgress),
 }
 
 /// Single source of truth for the `(variant tag => payload type)` mapping of
@@ -511,6 +530,7 @@ notification_variants! {
     ScheduledTaskRemoved => ScheduledTaskRemoved,
     ScheduledTaskCreated => ScheduledTaskCreated,
     MonitorEvent => MonitorEvent,
+    TaskProgress => TaskProgress,
 }
 
 #[cfg(test)]

@@ -30,6 +30,8 @@ use xai_grok_config::shell::AmpersandSemantics;
 
 use crate::DEFAULT_TOOL_OUTPUT_CHARS;
 use crate::computer::types::{ComputerError, TerminalRunRequest};
+use crate::implementations::grok_build::progress::pipeline::spawn_progress_pipeline;
+use crate::implementations::grok_build::progress::rule::ProgressRule;
 use crate::notification::types::{
     BashExecutionBackgrounded, BashExecutionComplete, BashExecutionFailed, BashExecutionTimeout,
     BashNotificationBase, BashOutputChunk, PerCallNotificationSink, ToolNotification,
@@ -304,6 +306,36 @@ pub struct BashToolInput {
         deserialize_with = "crate::types::schema::deserialize_lenient_bool"
     )]
     pub is_background: bool,
+
+    /// Regex that fills the progress bar of a background command from its
+    /// output. Removed from the schema when progress bars are disabled.
+    #[schemars(
+        description = "Optional, background commands only. A regex, matched against each output line, that fills a progress bar for the user. Two capture groups mean completed and total (`(\\d+)/(\\d+)`). One capture group means a percentage (`(\\d+)%`), or the completed count when progress_total is set. No capture group counts the matching lines toward progress_total. Set it only when the command prints progress you can match."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_pattern: Option<String>,
+
+    /// Fixed total for `progress_pattern`.
+    #[schemars(
+        description = "Optional total for progress_pattern, when the output does not print the total itself (for example the number of test files or build steps)."
+    )]
+    #[serde(
+        default,
+        deserialize_with = "crate::types::schema::deserialize_lenient_u64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub progress_total: Option<u64>,
+}
+
+/// Input properties that exist only when progress bars are enabled.
+const PROGRESS_INPUT_PROPERTIES: [&str; 2] = ["progress_pattern", "progress_total"];
+
+/// Whether the toolset has the progress tool. Decides if the model sees the
+/// progress properties of this tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressBars {
+    Enabled,
+    Disabled,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1377,6 +1409,34 @@ impl BashTool {
         Some(wait_ms.div_ceil(1000))
     }
 
+    /// Purpose: Compile the progress rule of this call, if there is one.
+    /// Input: The session resources and the tool input.
+    /// Output: `None` when the call has no pattern, or when progress bars are
+    /// disabled for this agent. An error when the pattern is not valid.
+    async fn resolve_progress_rule(
+        resources: &SharedResources,
+        input: &BashToolInput,
+    ) -> Result<Option<ProgressRule>, xai_tool_runtime::ToolError> {
+        let Some(pattern) = input
+            .progress_pattern
+            .as_deref()
+            .filter(|pattern| !pattern.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let is_enabled = resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .is_some_and(crate::implementations::grok_build::progress::is_progress_enabled);
+        if !is_enabled {
+            return Ok(None);
+        }
+        ProgressRule::new(pattern, input.progress_total)
+            .map(Some)
+            .map_err(xai_tool_runtime::ToolError::invalid_arguments)
+    }
+
     /// Background retrieval hint naming the get-output tool and its task-ids
     /// param. Kind-wide resolution is correct here: this names *another*
     /// tool's param (the get-output tool), not this bash tool's own schema
@@ -1407,10 +1467,19 @@ impl BashTool {
         input_schema: &serde_json::Value,
         params: &BashParams,
         timeout_param_name: &str,
+        progress: ProgressBars,
     ) -> serde_json::Value {
         let background_enabled = Self::background_enabled(params);
         let auto_bg = Self::auto_background_on_timeout_enabled(params);
-        let mut schema = input_schema.clone();
+        // A progress pattern applies to background commands only.
+        let mut schema = if progress == ProgressBars::Enabled && background_enabled {
+            input_schema.clone()
+        } else {
+            crate::implementations::grok_build::progress::schema_without_properties(
+                input_schema,
+                &PROGRESS_INPUT_PROPERTIES,
+            )
+        };
         if let Some(obj) = schema.as_object_mut() {
             if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
                 if !background_enabled {
@@ -1502,6 +1571,9 @@ ${%- else %}
 - Without an explicit ${{ params.execute.timeout }}, the command stops after ${{ default_timeout_ms | default(120000) }}ms. A positive timeout, up to ${{ max_timeout_ms | default(300000) }}ms, terminates the command when reached.
 ${%- endif %}
 - With `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true`, an omitted or zero timeout runs until stopped, and a positive timeout stops the command when reached.${%- if system_reminders_enabled %} Completion is reported automatically.${%- elif tools.by_kind.background_task_action %} Check it with ${{ tools.by_kind.background_task_action }}.${%- endif %}
+${%- if tools.by_kind.progress_update %}
+- When a background command prints its progress (test counts, percentages, numbered steps), set `progress_pattern` so the user sees a progress bar on the row of the command. This is optional: leave it out when the output has no progress you can match.
+${%- endif %}
 - Output over {max_output_bytes} characters is shortened and includes a path to the complete log.
 ${%- if shell_uses_semicolon %}
   - '&&' is not supported in this shell; chain sequential commands with ';'.
@@ -1625,8 +1697,14 @@ impl crate::types::tool_metadata::ToolMetadata for BashTool {
             .get("timeout")
             .map(String::as_str)
             .unwrap_or("timeout");
+        let progress = if crate::implementations::grok_build::progress::is_progress_enabled(renderer)
+        {
+            ProgressBars::Enabled
+        } else {
+            ProgressBars::Disabled
+        };
         let exported_schema =
-            Self::exported_input_schema(input_schema, &params, timeout_param_name);
+            Self::exported_input_schema(input_schema, &params, timeout_param_name, progress);
         let remapped_schema = if param_map.is_empty() {
             exported_schema
         } else {
@@ -1900,6 +1978,9 @@ impl xai_tool_runtime::Tool for BashTool {
 
         let config_timeout = Duration::from_millis(Self::effective_default_timeout_ms(&params));
         let background_enabled = Self::background_enabled(&params);
+        // Compile the rule before the command starts: a bad pattern must fail
+        // the call, not a process that already runs.
+        let progress_rule = Self::resolve_progress_rule(&resources, &input).await?;
 
         let config_output_byte_limit = params
             .output_byte_limit
@@ -2071,6 +2152,15 @@ impl xai_tool_runtime::Tool for BashTool {
                 monitor_description: None,
                 description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
             });
+            if let Some(rule) = progress_rule {
+                spawn_progress_pipeline(
+                    task_id.clone(),
+                    rule,
+                    std::sync::Arc::downgrade(&backend),
+                    notification_handle.clone(),
+                    bg_output_file.clone(),
+                );
+            }
 
             let retrieval_hint = Self::background_retrieval_hint(&resources, &task_id).await?;
 
@@ -2166,6 +2256,15 @@ impl xai_tool_runtime::Tool for BashTool {
                     monitor_description: None,
                     description: Some(input.description.clone()).filter(|d| !d.trim().is_empty()),
                 });
+                if let Some(rule) = progress_rule {
+                    spawn_progress_pipeline(
+                        tool_call_id.as_str().to_owned(),
+                        rule,
+                        std::sync::Arc::downgrade(&backend),
+                        notification_handle.clone(),
+                        output_file.clone(),
+                    );
+                }
 
                 let retrieval_hint =
                     Self::background_retrieval_hint(&resources, tool_call_id.as_str()).await?;
@@ -2604,6 +2703,8 @@ mod tests {
             timeout: None,
             description: "test".to_string(),
             is_background: false,
+            progress_pattern: None,
+            progress_total: None,
         }
     }
 
@@ -2613,6 +2714,8 @@ mod tests {
             timeout: None,
             description: "test".to_string(),
             is_background: true,
+            progress_pattern: None,
+            progress_total: None,
         }
     }
 
@@ -4133,7 +4236,12 @@ mod tests {
         }
 
         fn timeout_desc(params: &BashParams) -> String {
-            let schema = BashTool::exported_input_schema(&base_schema(), params, "timeout");
+            let schema = BashTool::exported_input_schema(
+                &base_schema(),
+                params,
+                "timeout",
+                ProgressBars::Disabled,
+            );
             schema["properties"]["timeout"]["description"]
                 .as_str()
                 .expect("timeout description")
@@ -4241,7 +4349,12 @@ mod tests {
                 desc.contains("Default: 30000") || desc.contains("30000"),
                 "default must track config: {desc}"
             );
-            let schema = BashTool::exported_input_schema(&base_schema(), &params, "timeout");
+            let schema = BashTool::exported_input_schema(
+                &base_schema(),
+                &params,
+                "timeout",
+                ProgressBars::Disabled,
+            );
             assert_eq!(
                 schema["properties"]["timeout"]["maximum"].as_u64(),
                 Some(60_000)
@@ -4277,7 +4390,12 @@ mod tests {
             let param_map =
                 std::collections::HashMap::from([("timeout".to_string(), "max_wait".to_string())]);
             let exported =
-                BashTool::exported_input_schema(&base_schema(), &BashParams::default(), "max_wait");
+                BashTool::exported_input_schema(
+                &base_schema(),
+                &BashParams::default(),
+                "max_wait",
+                ProgressBars::Disabled,
+            );
             let remapped = crate::util::remap::remap_schema_properties(&exported, &param_map);
             let desc = remapped["properties"]["max_wait"]["description"]
                 .as_str()

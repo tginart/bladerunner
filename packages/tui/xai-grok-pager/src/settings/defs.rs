@@ -1354,6 +1354,34 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: true,
         },
+        // SHARED: `[ui].task_progress_bars` + process-wide cache. Default ON.
+        // The cache gates the bars at render. The shell reads the key when it
+        // builds the agent of a new session, so it also gates the agent's
+        // progress tool. Shown in minimal mode too, because it changes what
+        // the agent can do and not only what the TUI draws.
+        SettingMeta {
+            key: "task_progress_bars",
+            category: SettingCategory::Appearance,
+            owner: SettingOwner::Shared,
+            label: "Task progress bars",
+            description: "Let agents show a progress bar on background commands and \
+                          subagents in the tasks pane. Off hides the bars now and removes \
+                          the feature from agents in new sessions.",
+            keywords: &[
+                "progress",
+                "bar",
+                "tasks",
+                "subagent",
+                "background",
+                "percent",
+                "checkpoints",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.task_progress_bars_enabled(),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned: `[ui.display_refresh].auto_cadence_enabled`. Restart-
         // required (cadence pinned at startup); hidden in minimal.
         SettingMeta {

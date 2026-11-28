@@ -14,7 +14,8 @@ use xai_acp_lib::AcpClientMessage;
 
 use super::actions::Effect;
 use xai_grok_shell::extensions::notification::{
-    SessionNotification, SessionUpdate as XaiSessionUpdate, is_reauthable_failure,
+    SessionNotification, SessionUpdate as XaiSessionUpdate, TASK_PROGRESS_METHOD,
+    TaskProgressNotification, is_reauthable_failure,
 };
 use xai_grok_shell::tools::todo::todo_item_from_plan_entry;
 use xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights;
@@ -22,6 +23,7 @@ use xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlight
 use crate::acp::meta::NotificationMeta;
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::acp::tracker::TurnActivity;
+use crate::app::task_progress::TaskProgressValue;
 use crate::app::agent::{
     AgentId, AgentSession, AgentState, BgTaskState, BgTaskStatus, GoalDisplayPhase,
     GoalDisplayState, GoalDisplayStatus,
@@ -90,7 +92,7 @@ use background::{
     derive_child_cwd, handle_git_head_changed, handle_monitor_event, handle_scheduled_task_created,
     handle_scheduled_task_deleted, handle_scheduled_task_fired,
     handle_scheduled_task_inject_prompt, handle_task_backgrounded, handle_task_completed,
-    route_bg_task_stdout,
+    handle_task_progress, route_bg_task_stdout,
 };
 use follow_ups::handle_follow_ups;
 pub(crate) use interactions::handle_ask_user_question;
@@ -777,6 +779,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/session/prompt_complete" => handle_prompt_complete(notif, app),
         "x.ai/session/interjection" => handle_interjection(notif, app),
         "x.ai/monitor_event" => handle_monitor_event(notif, app),
+        TASK_PROGRESS_METHOD => handle_task_progress(notif, app),
         "x.ai/scheduled_task_created" => handle_scheduled_task_created(notif, app),
         "x.ai/scheduled_task_fired" => handle_scheduled_task_fired(notif, app),
         "x.ai/scheduled_task_deleted" => handle_scheduled_task_deleted(notif, app),

@@ -105,6 +105,14 @@ pub struct TaskToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Ordered milestones of the task, for a progress bar on the subagent's
+    /// row. Removed from the schema when progress bars are disabled.
+    #[schemars(
+        description = "Optional. 2 to 20 short checkpoint names, in the order the subagent will complete them. The user sees a progress bar on the subagent's row that fills as each checkpoint is done. Use it for tasks with clear milestones; omit it for short or open-ended tasks."
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_checkpoints: Vec<String>,
+
     /// Server-injected before execution. Becomes the subagent's session ID.
     #[schemars(skip)]
     #[serde(default)]
@@ -1795,6 +1803,7 @@ mod tests {
             cwd: None,
             model: None,
             task_id: None,
+            progress_checkpoints: Vec::new(),
         };
         let value = serde_json::to_value(&input).unwrap();
         assert!(value.get("model").is_none());

@@ -1237,6 +1237,40 @@ pub(in crate::app::dispatch) fn set_show_inference_speed(
     }]
 }
 
+/// State-only mutation for `task_progress_bars`.
+pub(super) fn set_task_progress_bars_inner(app: &mut AppView, new: bool) {
+    app.current_ui.task_progress_bars = Some(new);
+    crate::appearance::cache::set_task_progress_bars(new);
+}
+
+/// SHARED: cache + `[ui].task_progress_bars` via `Effect::PersistSetting`.
+///
+/// The cache hides or shows the bars at once. The shell reads the saved
+/// value when it builds the agent of a new session.
+pub(in crate::app::dispatch) fn set_task_progress_bars(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_task_progress_bars();
+    let label = setting_label_l10n("task_progress_bars", "Task progress bars");
+    app.show_toast(&save_success_toast(&label, new));
+    if prev == new {
+        return vec![];
+    }
+    set_task_progress_bars_inner(app, new);
+    tracing::info!(
+        target: "settings",
+        key = "task_progress_bars",
+        value = new,
+        "setting changed"
+    );
+    vec![Effect::PersistSetting {
+        key: "task_progress_bars",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 /// State-only mutation for `simple_mode`.
 ///
 /// Propagates to every agent's `input_mode` so the toggle takes

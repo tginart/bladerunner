@@ -23,6 +23,12 @@ ${%- if tools.by_kind.execute and tools.by_kind.background_task_action %}
 For long-running commands, use `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true` in ${{ tools.by_kind.execute }}, then continue independent work; use `${{ tools.by_kind.background_task_action }}` for a snapshot or one bounded wait — do not poll repeatedly.
 </background_tasks>
 ${%- endif %}
+${%- if tools.by_kind.progress_update %}
+
+<progress_bars>
+The user sees a row for your task. If the task has steps you can count, call `${{ tools.by_kind.progress_update }}` without a task id as you complete them, and the row shows a progress bar. This is optional: skip it for short or open-ended tasks.
+</progress_bars>
+${%- endif %}
 ${%- if tools.by_kind.edit %}
 
 <making_code_changes>

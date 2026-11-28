@@ -1781,6 +1781,10 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let away = !crate::appearance::cache::load_show_inference_speed();
             let _ = dispatch(Action::SetShowInferenceSpeed(away), app);
         }
+        "task_progress_bars" => {
+            let away = !crate::appearance::cache::load_task_progress_bars();
+            let _ = dispatch(Action::SetTaskProgressBars(away), app);
+        }
         "prompt_suggestions" => {
             let _ = dispatch(Action::SetPromptSuggestions(false), app);
         }

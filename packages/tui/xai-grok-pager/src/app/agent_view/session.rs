@@ -367,6 +367,7 @@ impl AgentView {
             timeline_hover_preview: None,
             session_agent_name: None,
             subagent_sessions: HashMap::new(),
+            task_progress: HashMap::new(),
             review_chat: None,
             subagent_views: HashMap::new(),
             active_subagent: None,

@@ -58,6 +58,10 @@ hooks_muted = false                    # 在对话记录中隐藏钩子结果；
                                        # 工具调用（默认：false；/hooks mute、/settings）
 show_inference_speed = false           # 在状态栏显示最近一次响应的 tok/s 与首个 token
                                        # 延迟 TTFT（默认：false；仅全屏模式）
+task_progress_bars = true              # 允许智能体在任务面板中为后台命令和子智能体显示
+                                       # 进度条（默认：true）；设为 false 会立即隐藏进度条，
+                                       # 并在新会话中对智能体移除此功能
+                                       # （环境变量：GROK_TASK_PROGRESS_BARS）
 page_flip_on_send = true               # 刚发送的提示钉在视口顶部，使
                                        # 回复从新页开始（默认：true）；设为 false
                                        # 则发送时从不移动滚动位置

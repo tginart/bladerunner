@@ -284,6 +284,7 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
             // DAP adapter stub (inert until a real adapter is wired).
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::DapDebugTool).into(),
@@ -315,6 +316,7 @@ fn grok_build_concise_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
             #[cfg(not(feature = "bladerunner-product"))]
             (&grok_build::DapDebugTool).into(),
             task_output_tool_config(),
@@ -345,6 +347,7 @@ pub fn grok_build_hashline_toolset(
         kill_task_tool_config(),
         (&grok_build::TodoWriteTool).into(),
         agent_hub_tool_config(),
+        (&grok_build::UpdateProgressTool).into(),
         task_output_tool_config(),
         wait_tasks_tool_config(),
         task_tool_config(),
@@ -397,6 +400,7 @@ fn explore_toolset() -> ToolServerConfig {
             (&grok_build::GrepTool).into(),
             // Peer messaging among Main + live subagents (read-only coordination).
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
         ],
         behavior_preset: None,
     }
@@ -418,6 +422,7 @@ fn plan_toolset() -> ToolServerConfig {
             // (&grok_build::SkillTool).into(),
             (&grok_build::TodoWriteTool).into(),
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
             // search_replace + run_terminal_command intentionally omitted (read-only)
         ],
         behavior_preset: None,
@@ -444,6 +449,7 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
             task_output_tool_config(),
             task_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
@@ -491,6 +497,7 @@ fn orchestrator_toolset() -> ToolServerConfig {
         // Planning and user interaction
         (&grok_build::TodoWriteTool).into(),
         agent_hub_tool_config(),
+        (&grok_build::UpdateProgressTool).into(),
         (&grok_build::EnterPlanModeTool).into(),
         (&grok_build::ExitPlanModeTool).into(),
         (&grok_build::AskUserQuestionTool).into(),
@@ -544,6 +551,7 @@ fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
             task_output_tool_config(),
             (&grok_build::SchedulerCreateTool).into(),
             (&grok_build::SchedulerDeleteTool).into(),
@@ -581,6 +589,7 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             agent_hub_tool_config(),
+            (&grok_build::UpdateProgressTool).into(),
             task_output_tool_config(),
             wait_tasks_tool_config(),
             task_tool_config(),
@@ -2282,6 +2291,8 @@ Agent.
             ToolConfig::from(&grok_build::GrepTool).id,
             // Peer messaging among Main + live subagents (read-only coordination).
             ToolConfig::from(&grok_build::AgentHubTool).id,
+            // Reports the progress bar value of its own row (read-only).
+            ToolConfig::from(&grok_build::UpdateProgressTool).id,
         ];
         assert_eq!(
             actual,

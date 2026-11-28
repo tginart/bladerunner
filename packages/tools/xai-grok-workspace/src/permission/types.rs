@@ -634,6 +634,8 @@ mod tests {
             timeout: None,
             description: "run tests".into(),
             is_background: false,
+            progress_pattern: None,
+            progress_total: None,
         });
         let access = AccessKind::from(&input);
         assert!(

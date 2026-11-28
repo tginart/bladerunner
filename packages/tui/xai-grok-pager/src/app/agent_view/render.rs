@@ -2164,6 +2164,7 @@ impl AgentView {
                 &self.session.bg_tasks,
                 &self.subagent_sessions,
                 &self.session.scheduled_tasks,
+                &self.task_progress,
             );
             let close_rect = agent::render_todo_chrome(
                 buf,

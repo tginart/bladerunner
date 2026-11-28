@@ -31,6 +31,13 @@ ${%- endif %}
 - Wait for actual results instead of predicting them.
 </background_tasks>
 ${%- endif %}
+${%- if tools.by_kind.progress_update %}
+
+<progress_bars>
+- The user sees a row for each background command and subagent. When such work has a size you can count (N files, N tests, N steps) and runs long enough to watch, give its row a progress bar: a progress pattern on a background command, progress checkpoints on a subagent, or `${{ tools.by_kind.progress_update }}` for a value you set yourself.
+- Progress bars are optional. Skip them for short or open-ended work, and never invent numbers.
+</progress_bars>
+${%- endif %}
 ${%- if tools.by_kind.execute %}
 
 <scratch_files>

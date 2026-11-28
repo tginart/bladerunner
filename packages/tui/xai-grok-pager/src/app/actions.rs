@@ -625,6 +625,12 @@ pub enum Action {
     /// model's tok/s (the TTFT readout is disabled for now). SHARED-owned: updates the process-wide cache (read at render)
     /// and persists to `[ui].show_inference_speed` via `Effect::PersistSetting`.
     SetShowInferenceSpeed(bool),
+    /// Set whether background-command and subagent rows can show a progress
+    /// bar. SHARED-owned: updates the process-wide cache (read at render) and
+    /// persists to `[ui].task_progress_bars` via `Effect::PersistSetting`.
+    /// The shell reads the value again for each new session, so agents in
+    /// new sessions get or lose the progress tool.
+    SetTaskProgressBars(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).

@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::agent::{BgTaskState, BgTaskStatus, ScheduledTaskInfo};
 use crate::app::subagent::{SubagentInfo, format_context_badge, format_subagent_label};
+use crate::app::task_progress::{TaskProgressMap, TaskProgressValue};
 use crate::appearance::LayoutConfig;
 use crate::scrollback::layout::HorizontalLayout;
 use crate::syntax::get_syntect;
@@ -36,6 +37,15 @@ use super::overlay::OverlayState;
 // ---------------------------------------------------------------------------
 
 const SPINNER_DIVISOR: u64 = 4;
+
+// ---------------------------------------------------------------------------
+// Progress bar
+// ---------------------------------------------------------------------------
+
+/// Bar widths to try, widest first. Zero means only the label (`3/8`).
+const PROGRESS_BAR_CELL_OPTIONS: [u16; 3] = [10, 6, 0];
+/// Cells that a row keeps for the description when it has a progress bar.
+const PROGRESS_MIN_LABEL_CELLS: u16 = 24;
 
 // ---------------------------------------------------------------------------
 // Shell command syntax highlighting (used by other modules too)
@@ -937,6 +947,68 @@ fn clear_overlay_area(buf: &mut Buffer, area: Rect, y: u16, overlay_w: u16) {
     }
 }
 
+/// Purpose: This struct is the layout of the progress bar of one task row:
+/// a bar, a space, a label (`45%` or `3/8`), and a space.
+///
+/// The bar is the leftmost item of the right cluster. It is to the right of
+/// the description and to the left of the counters, the time and the buttons.
+struct ProgressBarLayout {
+    /// Width of the bar in cells. Zero means the row shows only the label.
+    bar_cells: u16,
+    fraction: f32,
+    label: String,
+}
+
+impl ProgressBarLayout {
+    /// Purpose: Select the widest bar that the row has space for.
+    /// Input: The progress value, the row width, and the width of the other
+    /// items of the right cluster.
+    /// Output: The layout, or `None` when the row is too narrow.
+    /// Method:
+    ///     1. Try the full bar, then the short bar, then only the label.
+    ///     2. Accept the first one that keeps `PROGRESS_MIN_LABEL_CELLS`
+    ///        cells for the description.
+    fn fit(value: &TaskProgressValue, row_w: u16, fixed_w: u16) -> Option<Self> {
+        let label = value.label();
+        let label_w = label.width() as u16 + 1;
+        let free_w = row_w.saturating_sub(fixed_w + PROGRESS_MIN_LABEL_CELLS);
+        let bar_cells = PROGRESS_BAR_CELL_OPTIONS.into_iter().find(|cells| {
+            let gap = u16::from(*cells > 0);
+            cells + gap + label_w <= free_w
+        })?;
+        Some(Self {
+            bar_cells,
+            fraction: value.fraction(),
+            label,
+        })
+    }
+
+    fn width(&self) -> u16 {
+        let gap = u16::from(self.bar_cells > 0);
+        self.bar_cells + gap + self.label.width() as u16 + 1
+    }
+
+    /// Draw the bar and the label. The left edge is at `x`.
+    fn render(&self, buf: &mut Buffer, x: u16, y: u16, theme: &Theme) {
+        let mut label_x = x;
+        if self.bar_cells > 0 {
+            crate::views::progress_bar::render_progress_bar(
+                buf,
+                x,
+                y,
+                self.bar_cells,
+                self.fraction,
+                theme.accent_running,
+                theme.bg_highlight,
+            );
+            label_x += self.bar_cells + 1;
+        }
+        let label_w = self.label.width() as u16;
+        let style = Style::default().fg(theme.gray);
+        buf.set_span(label_x, y, &Span::styled(self.label.as_str(), style), label_w);
+    }
+}
+
 /// Draw a single scroll indicator glyph centered on row `y`, blanking the rest
 /// of the row so it reads as a dedicated, easy-to-see indicator row — the same
 /// ▲/▼ as the corner indicators, just centered for visibility.
@@ -1392,7 +1464,8 @@ impl TasksPane {
         layout_cfg: &LayoutConfig,
         bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
         subagents: &HashMap<String, SubagentInfo>,
-        scheduled: &HashMap<String, ScheduledTaskInfo>,
+        _scheduled: &HashMap<String, ScheduledTaskInfo>,
+        progress: &TaskProgressMap,
     ) {
         let inner = Self::content_area(area, layout_cfg);
         if self.entries.is_empty() {
@@ -1498,7 +1571,15 @@ impl TasksPane {
             height: list_area.height.saturating_sub(bar_height),
             ..list_area
         };
-        self.render_overlay(overlay_area, buf, bg_tasks, subagents, scheduled);
+        // An empty map draws no bar: the `[ui] task_progress_bars` setting
+        // turns the bars off here and nowhere else.
+        let no_progress = TaskProgressMap::new();
+        let progress = if crate::appearance::cache::load_task_progress_bars() {
+            progress
+        } else {
+            &no_progress
+        };
+        self.render_overlay(overlay_area, buf, bg_tasks, subagents, progress);
     }
 
     fn render_overlay(
@@ -1507,7 +1588,7 @@ impl TasksPane {
         buf: &mut Buffer,
         bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
         subagents: &HashMap<String, SubagentInfo>,
-        _scheduled: &HashMap<String, ScheduledTaskInfo>,
+        progress: &TaskProgressMap,
     ) {
         let theme = Theme::current();
         let scroll_offset = self.list_state.scroll_offset();
@@ -1551,13 +1632,17 @@ impl TasksPane {
                     let Some(task) = bg_tasks.get(task_id) else {
                         continue;
                     };
-                    self.render_bg_task_overlay(area, buf, y, task_id, task, &theme);
+                    let bar = progress
+                        .get(task_id)
+                        .filter(|_| task.status == BgTaskStatus::Running);
+                    self.render_bg_task_overlay(area, buf, y, task_id, task, bar, &theme);
                 }
                 OverlayEntryData::Agent(ref subagent_id, ref child_session_id) => {
                     let Some(info) = subagents.get(child_session_id) else {
                         continue;
                     };
-                    self.render_agent_overlay(area, buf, y, subagent_id, info, &theme);
+                    let bar = progress.get(subagent_id).filter(|_| info.is_running());
+                    self.render_agent_overlay(area, buf, y, subagent_id, info, bar, &theme);
                 }
                 OverlayEntryData::Scheduled(ref task_id, ref linked_subagent) => {
                     self.render_scheduled_overlay(
@@ -1656,6 +1741,7 @@ impl TasksPane {
         y: u16,
         task_id: &str,
         task: &BgTaskState,
+        progress: Option<&TaskProgressValue>,
         theme: &Theme,
     ) {
         let (icon, icon_style, right_text, right_style) = if task.pending_kill {
@@ -1725,8 +1811,10 @@ impl TasksPane {
         } else {
             0
         };
-        let bg_overlay_w = bg_kill_w + 3 + right_text_w + lines_w + 1;
-        clear_overlay_area(buf, area, y, bg_overlay_w);
+        let fixed_w = bg_kill_w + 3 + right_text_w + lines_w + 1;
+        let bar = progress.and_then(|value| ProgressBarLayout::fit(value, area.width, fixed_w));
+        let bar_w = bar.as_ref().map_or(0, ProgressBarLayout::width);
+        clear_overlay_area(buf, area, y, fixed_w + bar_w);
 
         let mut rx = area.x + area.width;
 
@@ -1792,6 +1880,11 @@ impl TasksPane {
             );
         }
 
+        if let Some(bar) = &bar {
+            rx = rx.saturating_sub(bar.width());
+            bar.render(buf, rx, y, theme);
+        }
+
         if rx > area.x {
             buf.set_span(rx - 1, y, &Span::raw(" "), 1);
         }
@@ -1804,6 +1897,7 @@ impl TasksPane {
         y: u16,
         subagent_id: &str,
         info: &SubagentInfo,
+        progress: Option<&TaskProgressValue>,
         theme: &Theme,
     ) {
         let (icon, icon_style, right_text, right_style) = if info.pending_kill {
@@ -1871,8 +1965,10 @@ impl TasksPane {
         } else {
             metrics_text.width() as u16 + 1
         };
-        let overlay_w = kill_w + 3 + right_text_w + model_w + metrics_w + badge_w + 1;
-        clear_overlay_area(buf, area, y, overlay_w);
+        let fixed_w = kill_w + 3 + right_text_w + model_w + metrics_w + badge_w + 1;
+        let bar = progress.and_then(|value| ProgressBarLayout::fit(value, area.width, fixed_w));
+        let bar_w = bar.as_ref().map_or(0, ProgressBarLayout::width);
+        clear_overlay_area(buf, area, y, fixed_w + bar_w);
 
         let mut rx = area.x + area.width;
 
@@ -1957,6 +2053,11 @@ impl TasksPane {
             rx = rx.saturating_sub(badge_w);
             let bstyle = Style::default().fg(theme.gray).add_modifier(Modifier::DIM);
             buf.set_span(rx, y, &Span::styled(format!("{badge} "), bstyle), badge_w);
+        }
+
+        if let Some(bar) = &bar {
+            rx = rx.saturating_sub(bar.width());
+            bar.render(buf, rx, y, theme);
         }
 
         if rx > area.x {
@@ -2440,6 +2541,25 @@ mod tests {
         width: u16,
         height: u16,
     ) -> Vec<String> {
+        render_pane_with_progress(
+            pane,
+            bg_tasks,
+            &HashMap::new(),
+            &TaskProgressMap::new(),
+            width,
+            height,
+        )
+    }
+
+    /// Same as `render_pane_to_strings`, with subagents and progress values.
+    fn render_pane_with_progress(
+        pane: &mut TasksPane,
+        bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
+        subagents: &HashMap<String, SubagentInfo>,
+        progress: &TaskProgressMap,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
         let layout = crate::appearance::LayoutConfig::default();
@@ -2449,8 +2569,9 @@ mod tests {
             false,
             &layout,
             bg_tasks,
+            subagents,
             &HashMap::new(),
-            &HashMap::new(),
+            progress,
         );
         (0..height)
             .map(|y| {
@@ -2459,6 +2580,133 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// One running background command with the given progress value,
+    /// rendered at `width`. Returns the row of the command.
+    fn render_bg_row_with_progress(completed: u64, total: u64, width: u16) -> String {
+        let mut pane = TasksPane::new();
+        let mut bg_tasks = std::collections::BTreeMap::new();
+        bg_tasks.insert(
+            "t1".to_string(),
+            make_bg_task("t1", "cargo test", BgTaskStatus::Running),
+        );
+        pane.sync(
+            &bg_tasks,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+            &[],
+        );
+        let mut progress = TaskProgressMap::new();
+        progress.insert(
+            "t1".to_string(),
+            TaskProgressValue::new(completed, total).unwrap(),
+        );
+        let lines =
+            render_pane_with_progress(&mut pane, &bg_tasks, &HashMap::new(), &progress, width, 16);
+        lines
+            .into_iter()
+            .find(|line| line.contains("cargo test"))
+            .expect("the command row is rendered")
+    }
+
+    #[test]
+    fn progress_bar_sits_between_the_description_and_the_buttons() {
+        crate::appearance::cache::set_task_progress_bars(true);
+        let row = render_bg_row_with_progress(3, 8, 100);
+        let label_at = row.find("cargo test").unwrap();
+        let bar_at = row.find('\u{2588}').expect("a filled bar cell");
+        let value_at = row.find("3/8").expect("the progress label");
+        let kill_at = row.rfind(crate::glyphs::ballot_x_button()).unwrap();
+        assert!(
+            label_at < bar_at && bar_at < value_at && value_at < kill_at,
+            "expected description, bar, label, buttons in that order: {row:?}"
+        );
+    }
+
+    #[test]
+    fn percent_progress_shows_a_percent_label() {
+        crate::appearance::cache::set_task_progress_bars(true);
+        let row = render_bg_row_with_progress(45, 100, 100);
+        assert!(row.contains("45%"), "{row:?}");
+    }
+
+    #[test]
+    fn progress_bar_is_hidden_when_the_setting_is_off() {
+        crate::appearance::cache::set_task_progress_bars(false);
+        let row = render_bg_row_with_progress(3, 8, 100);
+        crate::appearance::cache::set_task_progress_bars(true);
+        assert!(!row.contains("3/8"), "{row:?}");
+    }
+
+    #[test]
+    fn row_without_a_progress_value_has_no_bar() {
+        crate::appearance::cache::set_task_progress_bars(true);
+        let mut pane = TasksPane::new();
+        let mut bg_tasks = std::collections::BTreeMap::new();
+        bg_tasks.insert(
+            "t1".to_string(),
+            make_bg_task("t1", "cargo test", BgTaskStatus::Running),
+        );
+        pane.sync(
+            &bg_tasks,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+            &[],
+        );
+        let joined = render_pane_to_strings(&mut pane, &bg_tasks, 100, 16).join("\n");
+        assert!(!joined.contains('\u{2588}'), "{joined}");
+    }
+
+    #[test]
+    fn running_subagent_row_shows_its_progress_bar() {
+        crate::appearance::cache::set_task_progress_bars(true);
+        let info = make_info();
+        let subagent_id = info.subagent_id.to_string();
+        let mut subagents = HashMap::new();
+        subagents.insert(info.child_session_id.to_string(), info);
+        let mut pane = TasksPane::new();
+        pane.sync(
+            &std::collections::BTreeMap::new(),
+            &subagents,
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+            &[],
+        );
+        let mut progress = TaskProgressMap::new();
+        progress.insert(subagent_id, TaskProgressValue::new(2, 5).unwrap());
+        let joined = render_pane_with_progress(
+            &mut pane,
+            &std::collections::BTreeMap::new(),
+            &subagents,
+            &progress,
+            120,
+            16,
+        )
+        .join("\n");
+        assert!(joined.contains("2/5"), "{joined}");
+    }
+
+    #[test]
+    fn progress_bar_layout_gets_narrower_then_goes_away() {
+        let value = TaskProgressValue::new(3, 8).unwrap();
+        let fixed_w = 20;
+        let cells = |row_w: u16| {
+            ProgressBarLayout::fit(&value, row_w, fixed_w).map(|layout| layout.bar_cells)
+        };
+        // Label `3/8` plus a space is 4 cells; a bar adds its cells and a gap.
+        let base = fixed_w + PROGRESS_MIN_LABEL_CELLS + 4;
+        assert_eq!(cells(base + 11), Some(10));
+        assert_eq!(cells(base + 10), Some(6));
+        assert_eq!(cells(base + 7), Some(6));
+        assert_eq!(cells(base + 6), Some(0));
+        assert_eq!(cells(base), Some(0));
+        assert_eq!(cells(base - 1), None);
     }
 
     #[test]
@@ -2757,6 +3005,7 @@ mod tests {
             &BTreeMap::new(),
             &HashMap::new(),
             &scheduled,
+            &TaskProgressMap::new(),
         );
 
         // Locate the `✗` kill glyph; every cell past the closing `]` must be
