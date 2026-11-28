@@ -21,10 +21,11 @@ pub const HUB_CARD_HEADER_LINES: usize = 2;
 /// Output: Card content for the scrollback.
 #[derive(Debug, Clone)]
 pub struct HubCardBlock {
-    /// The hub name, `hubs`, or `hub`.
+    /// The command title or `agent messages` for deliveries.
     pub title: String,
     /// Short muted text after the title, such as `2 new messages`.
     pub detail: Option<String>,
+    message_count: Option<usize>,
     content: MarkdownContent,
 }
 
@@ -34,6 +35,7 @@ impl HubCardBlock {
         Self {
             title: title.into(),
             detail: None,
+            message_count: None,
             content: MarkdownContent::new(markdown),
         }
     }
@@ -42,21 +44,31 @@ impl HubCardBlock {
     /// Input: The parsed wake.
     /// Output: A card with one section per message.
     pub fn delivery(delivery: &Delivery) -> Self {
-        let title = delivery
-            .hub
-            .clone()
-            .unwrap_or_else(|| "agent messages".to_string());
         let count = delivery.messages.len();
-        let detail = if count == 1 {
-            "1 new message".to_string()
-        } else {
-            format!("{count} new messages")
-        };
         Self {
-            title,
-            detail: Some(detail),
+            title: "agent messages".to_string(),
+            detail: Some(delivery_detail(count)),
+            message_count: Some(count),
             content: MarkdownContent::new(delivery_markdown(delivery)),
         }
+    }
+
+    /// Purpose: Combine two delivery cards and separate their messages with a rule.
+    /// Input: The next delivery card.
+    /// Output: True if both cards contain deliveries. Command cards remain separate.
+    pub fn append_delivery(&mut self, next: &Self) -> bool {
+        let (Some(count), Some(next_count)) = (self.message_count, next.message_count) else {
+            return false;
+        };
+        let count = count + next_count;
+        self.message_count = Some(count);
+        self.detail = Some(delivery_detail(count));
+        self.content = MarkdownContent::new(format!(
+            "{}\n\n---\n\n{}",
+            self.content.text(),
+            next.content.text()
+        ));
+        true
     }
 
     pub fn content(&self) -> &MarkdownContent {
@@ -68,9 +80,24 @@ impl HubCardBlock {
     }
 }
 
-/// Lay out the messages of a wake as markdown sections.
+fn delivery_detail(count: usize) -> String {
+    if count == 1 {
+        "1 new message".to_string()
+    } else {
+        format!("{count} new messages")
+    }
+}
+
+/// Purpose: Format the messages of a wake as separate markdown sections.
+/// Input: A delivery with its source hub and messages.
+/// Output: The sender, location, text, and image count for each message.
 fn delivery_markdown(delivery: &Delivery) -> String {
     let mut sections = Vec::new();
+    let hub = delivery
+        .hub
+        .as_ref()
+        .map(|hub| format!(" · hub {hub}"))
+        .unwrap_or_default();
     for message in &delivery.messages {
         let place = if message.place == "DM" {
             "DM".to_string()
@@ -79,7 +106,7 @@ fn delivery_markdown(delivery: &Delivery) -> String {
         };
         let person = if message.is_person { " · person" } else { "" };
         let mut section = format!(
-            "**@{}** · {place}{person}\n\n{}",
+            "**@{}** · {place}{person}{hub}\n\n{}",
             message.from, message.text
         );
         match message.image_count {
@@ -89,7 +116,7 @@ fn delivery_markdown(delivery: &Delivery) -> String {
         }
         sections.push(section);
     }
-    sections.join("\n\n")
+    sections.join("\n\n---\n\n")
 }
 
 impl BlockContent for HubCardBlock {
@@ -150,7 +177,7 @@ impl BlockContent for HubCardBlock {
     }
 
     fn default_display_mode(&self) -> DisplayMode {
-        if self.detail.is_some() {
+        if self.message_count.is_some() {
             DisplayMode::Collapsed
         } else {
             DisplayMode::Expanded
@@ -229,15 +256,17 @@ mod tests {
         assert_eq!(collapsed.lines.len(), 1);
         assert_eq!(
             collapsed.lines[0].content.to_string(),
-            "◆ hub · team  2 new messages  ▸"
+            "◆ hub · agent messages  2 new messages  ▸"
         );
         let lines = plain(&block);
-        assert_eq!(lines[0], "◆ hub · team  2 new messages  ▾");
+        assert_eq!(lines[0], "◆ hub · agent messages  2 new messages  ▾");
         let body = lines.join("\n");
         assert!(body.contains("@front · in #general"), "{body}");
         assert!(body.contains("build is green"), "{body}");
         assert!(body.contains("2 images"), "{body}");
         assert!(body.contains("@me · DM · person"), "{body}");
+        assert!(body.contains("hub team"), "{body}");
+        assert_eq!(lines.iter().filter(|line| line.trim() == "───").count(), 1);
     }
 
     #[test]

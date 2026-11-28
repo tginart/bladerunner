@@ -1445,6 +1445,12 @@ mod tests {
                     --- DM · from @backend · id=m1 ---\nthe build is green";
         let card = crate::acp::tracker::hub_delivery_card(wake).expect("hub delivery");
         agent.scrollback.push_block(card);
+        let next_wake = "[message_agents · hub team] 1 message(s).\n\
+                         --- DM · from @frontend · id=m2 ---\nthe UI is ready";
+        agent.scrollback.push_block(
+            crate::acp::tracker::hub_delivery_card(next_wake).expect("next hub delivery"),
+        );
+        assert_eq!(agent.scrollback.len(), 1);
         assert_eq!(
             agent.scrollback.get(0).unwrap().display_mode,
             DisplayMode::Collapsed
