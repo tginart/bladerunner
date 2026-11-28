@@ -159,6 +159,7 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
             | SamplingError::InvalidConfiguration(_)
             | SamplingError::Serialization(_)
             | SamplingError::IdleTimeout { .. } => true,
+            SamplingError::CredentialRefresh { retryable, .. } => !retryable,
             SamplingError::Api { status, .. } => {
                 status.is_client_error()
                     && *status != StatusCode::REQUEST_TIMEOUT
