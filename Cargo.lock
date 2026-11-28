@@ -16415,7 +16415,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager"
-version = "1.1.36"
+version = "1.1.37"
 dependencies = [
  "agent-client-protocol",
  "alacritty_terminal",
@@ -16517,7 +16517,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager-bin"
-version = "1.1.36"
+version = "1.1.37"
 dependencies = [
  "anyhow",
  "clap",
@@ -16798,7 +16798,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-shell"
-version = "1.1.36"
+version = "1.1.37"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -17224,7 +17224,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-version"
-version = "1.1.36"
+version = "1.1.37"
 dependencies = [
  "semver",
 ]

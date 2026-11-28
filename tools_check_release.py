@@ -24,6 +24,7 @@ SYNTHETIC_FIXTURES = {
     "packages/coding-agent/xai-grok-shell/src/auth/device_code.rs": "95e9592d625ef228ff9b5d5981f0724cfbf1f77993eda7045f03655ab7c03116",
     "packages/coding-agent/xai-grok-shell/src/auth/flow.rs": "22f3af6de64ad06e763a193db2c5092d3c836c533bd08c04758fdf2ba22c1803",
     "packages/platform/xai-grok-secrets/src/sanitizer.rs": "446e92a068e3bda23becca3e48b611bfea975cb4670bd128c8e08fa84347f07b",
+    "third_party/gcloud-auth/src/credentials.rs": "f3668b6c1d9696a1a132e78152212a61aecd398b55902cfbd43bde974fee7507",
 }
 PRIMARY_DOCS = {"README.md", "CONTRIBUTING.md", "SECURITY.md",
                 "docs/foundry-app.md", "docs/privacy.md", "docs/updates.md"}
