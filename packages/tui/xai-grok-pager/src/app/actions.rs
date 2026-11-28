@@ -155,6 +155,13 @@ pub enum Action {
         session_id: String,
         handle: String,
     },
+    /// Stop a hub member from the hub browser: a turn of another tab of this
+    /// window, or a subagent that another tab owns. A session that is not
+    /// open here gets a notice, because another process runs it.
+    StopHubMember {
+        session_id: String,
+        handle: String,
+    },
     /// Welcome Local workspace ACK confirmed (y); write ack + start session.
     #[cfg(feature = "local-workspace")]
     ConfirmWelcomeLocalWorkspaceAck,
@@ -1304,6 +1311,8 @@ pub enum CancelTrigger {
     /// The dashboard's stop key (Ctrl+X), from the overlay or a busy row,
     /// downgraded to a turn cancel.
     DashboardStop,
+    /// The hub browser's stop key for a member in another tab.
+    HubStop,
 }
 impl CancelTrigger {
     /// Snake_case wire string sent as `_meta.cancelTrigger`.
@@ -1313,6 +1322,7 @@ impl CancelTrigger {
             Self::CtrlC => "ctrl_c",
             Self::Mouse => "mouse",
             Self::DashboardStop => "dashboard_stop",
+            Self::HubStop => "hub_stop",
         }
     }
 }

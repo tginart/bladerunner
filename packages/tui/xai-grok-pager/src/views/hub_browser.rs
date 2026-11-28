@@ -30,6 +30,9 @@ use crate::theme::Theme;
 use crate::views::hub_composer::{CompletionNames, ComposerKey, HubComposer};
 use crate::views::shortcuts_bar::{HintItem, ShortcutsBar};
 
+mod mission;
+pub use mission::{ChannelForm, HubChoice, HubPicker, toggle_person_alerts};
+
 /// Messages that one feed shows.
 const FEED_LIMIT: usize = 300;
 /// Older messages that the feed also shows above a focused old message.
@@ -315,6 +318,15 @@ pub enum HubKeyOutcome {
         channel: String,
         message_id: String,
     },
+    /// Create a channel in the shown hub, from the new-channel form.
+    CreateChannel {
+        name: String,
+        purpose: String,
+    },
+    /// Show another hub in the browser, by its `Hub::name`.
+    SwitchHub(String),
+    /// Flip `/hub here` (`person_posts_alert_all`) of the shown hub.
+    ToggleHere,
 }
 
 /// What a clickable feed span points to.
@@ -371,6 +383,11 @@ enum HoverKey {
     PinChip,
     /// A row of the pinned-messages drawer, by its screen row.
     PinRow(u16),
+    /// The hub name chip, the fleet `needs you` count, and the `/hub here`
+    /// badge of the top bar.
+    HubChip,
+    NeedsChip,
+    HereChip,
 }
 
 /// Screen areas of the last frame, for mouse hits.
@@ -423,6 +440,14 @@ struct HitAreas {
     pin_rows: Vec<(u16, String)>,
     /// The `[unpin]` button and message id of each visible drawer row.
     pin_unpins: Vec<(Rect, String)>,
+    /// The hub name chip, the `needs you` count, and the `/hub here` badge.
+    hub_chip: Rect,
+    needs_chip: Rect,
+    here_chip: Rect,
+    /// Rows of the open hub switcher, by choice index.
+    hub_picker: Vec<(Rect, usize)>,
+    /// The open new-channel form.
+    channel_form: Rect,
 }
 
 /// Purpose: Hold the hub browser state for one perspective.
@@ -496,6 +521,13 @@ pub struct HubBrowserState {
     pub show_pins: bool,
     /// The highlighted row of the drawer.
     pins_selected: usize,
+    /// The open new-channel form (`c`).
+    pub channel_form: Option<ChannelForm>,
+    /// The open hub switcher (`H`).
+    pub hub_picker: Option<HubPicker>,
+    /// The `Hub::name` of the private hub of this session, if it has one.
+    /// The hub switcher lists it.
+    pub session_hub: Option<String>,
     hits: HitAreas,
     /// What the last reads saw, so the next reload reads only new bytes.
     cache: HubReadCache,
@@ -552,6 +584,9 @@ impl HubBrowserState {
             pinned: Vec::new(),
             show_pins: false,
             pins_selected: 0,
+            channel_form: None,
+            hub_picker: None,
+            session_hub: None,
             hits: HitAreas::default(),
             cache,
             refresh_generation: next_refresh_generation(),
@@ -820,6 +855,12 @@ impl HubBrowserState {
         if self.picker.is_some() {
             return self.handle_picker_key(key);
         }
+        if self.hub_picker.is_some() {
+            return self.handle_hub_picker_key(key);
+        }
+        if self.channel_form.is_some() {
+            return self.handle_channel_form_key(key);
+        }
         if self.is_composing {
             return self.handle_compose_key(key);
         }
@@ -867,6 +908,10 @@ impl HubBrowserState {
             KeyCode::End => self.feed_scroll = 0,
             KeyCode::Char('p') => self.open_picker(),
             KeyCode::Char('P') => self.toggle_pins(),
+            KeyCode::Char('n') => return self.jump_to_needs_input(),
+            KeyCode::Char('c') => self.open_channel_form(),
+            KeyCode::Char('H') => self.open_hub_picker(),
+            KeyCode::Char('h') => return self.request_toggle_here(),
             KeyCode::Char('a') => {
                 if let Err(error) = self.toggle_dm_filter() {
                     tracing::warn!(%error, "hub browser: feed load failed");
@@ -879,6 +924,10 @@ impl HubBrowserState {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if let Some(form) = self.channel_form.as_mut() {
+            form.paste(text);
+            return;
+        }
         if self.is_composing {
             let names = self.completion_names();
             self.composer.paste(text, &names);
@@ -914,6 +963,9 @@ impl HubBrowserState {
     /// Note: The hit areas come from the last frame.
     pub fn handle_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> HubKeyOutcome {
         self.pointer = Some((col, row));
+        if let Some(outcome) = self.handle_mission_overlay_mouse(kind, col, row) {
+            return outcome;
+        }
         if self.is_composing && self.composer.popup_contains(col, row) {
             return match self.composer.handle_mouse(kind, col, row) {
                 true => HubKeyOutcome::Changed,
@@ -1029,6 +1081,9 @@ impl HubBrowserState {
             .is_some_and(|(rect, _)| contains(*rect, col, row))
         {
             return Some(HoverKey::PinChip);
+        }
+        if let Some(key) = self.top_bar_hover_at(col, row) {
+            return Some(key);
         }
         if contains(hits.header_go, col, row) {
             return Some(HoverKey::HeaderGo);
@@ -1666,6 +1721,9 @@ impl HubBrowserState {
         if contains(self.hits.thread_back, col, row) {
             self.close_thread();
             return HubKeyOutcome::Changed;
+        }
+        if let Some(outcome) = self.click_top_bar(col, row) {
+            return outcome;
         }
         let pending_stop = self.pending_stop.take();
         if self.picker.is_none()
@@ -2792,49 +2850,25 @@ pub fn render_hub_browser(buf: &mut Buffer, area: Rect, state: &mut HubBrowserSt
     if state.picker.is_some() {
         render_picker(buf, area, state, &theme);
     }
+    if state.hub_picker.is_some() {
+        mission::render_hub_picker(buf, area, state, &theme);
+    }
+    if state.channel_form.is_some() {
+        mission::render_channel_form(buf, area, state, &theme);
+    }
     if state.show_help {
         render_help(buf, area, &theme);
     }
     area
 }
 
+/// Purpose: Draw the top bar: the hub chip, the fleet strip, and the controls.
+/// Input: The buffer, the bar area, the state, and the theme.
+/// Output: None. The chips become mouse targets.
+/// Note: The right side draws first, so the fleet strip fits in the gap.
 fn render_top_bar(buf: &mut Buffer, bar: Rect, state: &mut HubBrowserState, theme: &Theme) {
     let bar_bg = theme.bg_dark;
     fill(buf, bar, Style::default().bg(bar_bg));
-    let meta = &state.snapshot.meta;
-    let live = meta.members.iter().filter(|m| m.active).count();
-    let mut x = bar.x + 1;
-    x = span_at(
-        buf,
-        x,
-        bar.y,
-        "◆ ",
-        Style::default().fg(theme.accent_verify).bg(bar_bg),
-        bar.right(),
-    );
-    let title = if meta.is_session_hub() {
-        "this session (private)"
-    } else {
-        meta.name.as_str()
-    };
-    x = span_at(
-        buf,
-        x,
-        bar.y,
-        title,
-        Style::default()
-            .fg(theme.text_primary)
-            .bg(bar_bg)
-            .add_modifier(Modifier::BOLD),
-        bar.right(),
-    );
-    let stats = format!(
-        "   {} · {} · {live} live",
-        plural(meta.channels.len(), "channel"),
-        plural(meta.members.len(), "member"),
-    );
-    span_at(buf, x, bar.y, &stats, theme.muted().bg(bar_bg), bar.right());
-
     let who = if state.is_person_view() {
         "You".to_string()
     } else {
@@ -2871,6 +2905,19 @@ fn render_top_bar(buf: &mut Buffer, bar: Rect, state: &mut HubBrowserState, them
         width: label_w + chip_w,
         height: 1,
     };
+    let controls_x = mission::render_here_badge(buf, bar, label_x, state, theme);
+    let x = mission::render_hub_chip(buf, bar, controls_x, state, theme);
+    let strip_end = controls_x.saturating_sub(2);
+    let x = mission::render_fleet_strip(buf, x + 3, bar.y, strip_end, state, theme);
+    let meta = &state.snapshot.meta;
+    let stats = format!(
+        "   {} · {}",
+        plural(meta.channels.len(), "channel"),
+        plural(meta.members.len(), "member"),
+    );
+    if x + stats.width() as u16 <= strip_end {
+        span_at(buf, x, bar.y, &stats, theme.muted().bg(bar_bg), strip_end);
+    }
 }
 
 fn render_sidebar(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, theme: &Theme) {
@@ -3028,6 +3075,7 @@ fn render_sidebar_row(
         };
         (right, Style::default().fg(fg).bg(bg))
     };
+    let right_text = mission::fit_sidebar_word(right_text, name.width(), area.width);
     let right_x = area.right().saturating_sub(right_text.width() as u16 + 1);
     span_at(buf, x, area.y, &name, name_style, right_x.saturating_sub(1));
     span_at(buf, right_x, area.y, &right_text, right_style, area.right());
@@ -3663,6 +3711,20 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
             HintItem::new(key!(Esc), "cancel"),
         ];
     }
+    if state.hub_picker.is_some() {
+        return vec![
+            HintItem::paired(key!(Up), key!(Down), "choose"),
+            HintItem::new(key!(Enter), "show hub"),
+            HintItem::new(key!(Esc), "cancel"),
+        ];
+    }
+    if state.channel_form.is_some() {
+        return vec![
+            HintItem::new(key!(Enter), "create"),
+            HintItem::new(key!(Tab), "name / purpose"),
+            HintItem::new(key!(Esc), "cancel"),
+        ];
+    }
     if state.is_composing {
         return vec![
             HintItem::new(key!(Enter), "send"),
@@ -3689,6 +3751,9 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
     }
     // Clickable hints come first, so a narrow footer keeps them.
     let mut hints = Vec::new();
+    if mission::fleet_counts(&state.snapshot).needs_input > 0 {
+        hints.push(HintItem::new(key!('n'), "next needs-you"));
+    }
     if state.is_person_view() {
         hints.push(HintItem::new(key!(Tab), "write"));
     }
@@ -3717,6 +3782,9 @@ fn footer_hints(state: &HubBrowserState) -> Vec<HintItem> {
     hints.extend([
         HintItem::paired(key!(Up), key!(Down), "conversations"),
         HintItem::paired(key!(PageUp), key!(PageDown), "scroll"),
+        HintItem::new(key!('c'), "new channel"),
+        HintItem::new(key!('H'), "hubs"),
+        HintItem::new(key!('h'), "here on/off"),
     ]);
     hints
 }
@@ -3859,7 +3927,7 @@ fn picker_label(handle: &str, state: &HubBrowserState) -> (String, String) {
 struct MemberState {
     glyph: &'static str,
     color: Color,
-    /// Such as `working 3m`, `idle 12m`, `needs you`, or `gone`.
+    /// Such as `working 3m`, `idle 12m`, `needs you (permission)`, or `gone`.
     word: String,
     task: Option<String>,
 }
@@ -3916,7 +3984,11 @@ fn member_state(snapshot: &HubSnapshot, handle: &str, now_ms: u64, theme: &Theme
         store::Activity::Working => ("● ", theme.running, format!("working {age}")),
         store::Activity::Idle => ("● ", theme.accent_success, format!("idle {age}")),
         store::Activity::Waiting => ("◌ ", theme.accent_verify, "waiting".to_string()),
-        store::Activity::NeedsInput => ("● ", theme.accent_error, "needs you".to_string()),
+        store::Activity::NeedsInput => (
+            "● ",
+            theme.accent_error,
+            mission::needs_input_word(presence.input_reason).to_string(),
+        ),
     };
     MemberState {
         glyph,
@@ -4299,7 +4371,7 @@ fn render_search(buf: &mut Buffer, area: Rect, state: &mut HubBrowserState, them
 /// Input: The buffer, the browser area, and the theme.
 /// Output: None. Any key or click closes it.
 fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
-    const KEYS: [(&str, &str); 19] = [
+    const KEYS: [(&str, &str); 23] = [
         ("↑ ↓ / j k", "choose a conversation"),
         ("] [", "next / previous unread conversation"),
         ("Tab / i / Enter", "write a post"),
@@ -4310,7 +4382,11 @@ fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme) {
         ("@hub-bot DM", "ask a helper about the hub"),
         ("g", "go to the session of the DM agent"),
         ("x x", "stop the DM agent"),
+        ("n", "go to the next agent that needs you"),
         ("p", "view the hub as another member"),
+        ("H", "show another hub"),
+        ("c", "create a channel"),
+        ("h", "/hub here on or off"),
         ("a", "all or active DMs"),
         ("P", "pinned messages of the channel"),
         ("click 📌 pin", "pin or unpin a channel message"),
@@ -5638,6 +5714,7 @@ mod tests {
             activity,
             since_ms: store::now_ms().saturating_sub(180_000),
             task: Some(task.to_string()),
+            input_reason: None,
         };
         hub.save_presence(handle, &presence).unwrap();
     }

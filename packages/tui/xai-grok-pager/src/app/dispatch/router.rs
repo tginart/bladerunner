@@ -120,6 +120,7 @@ use super::transcript::{
 use super::turn::{
     dispatch_cancel_scheduled_task, dispatch_cancel_turn, dispatch_cancel_turn_choice,
     dispatch_demote_to_background, dispatch_kill_bg_task, dispatch_kill_subagent,
+    dispatch_stop_hub_member,
 };
 use super::voice::{dispatch_enable_voice_mode, dispatch_voice_stop, dispatch_voice_toggle};
 use crate::app::actions::{Action, Effect};
@@ -405,6 +406,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::FocusHubMember { session_id, handle } => {
             dispatch_focus_hub_member(app, session_id, handle)
+        }
+        Action::StopHubMember { session_id, handle } => {
+            dispatch_stop_hub_member(app, session_id, handle)
         }
         Action::NewSessionWithId(session_id) => dispatch_new_session_with_id(app, session_id),
         Action::StartupForkSession {

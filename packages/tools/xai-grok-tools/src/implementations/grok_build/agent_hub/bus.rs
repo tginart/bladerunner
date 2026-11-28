@@ -19,8 +19,8 @@ use tokio::sync::Notify;
 
 use super::AGENT_HUB_MODEL_NAME;
 use super::store::{
-    self, Activity, BOT_HANDLE, Channel, Cursors, HERE_MENTION, Hub, HubMeta, Member, MemberKind,
-    Message, Presence,
+    self, Activity, BOT_HANDLE, Cursors, HERE_MENTION, Hub, HubMeta, InputReason, Member,
+    MemberKind, Message, Presence,
 };
 
 /// Soft cap on message body size (UTF-8 bytes).
@@ -122,13 +122,18 @@ struct LocalPeer {
     waiting: u32,
     /// True while a turn runs.
     is_turn_running: bool,
-    /// Open prompts that wait for a person (permission, question, plan).
-    needs_input: u32,
+    /// Open prompts that wait for a person (permission, question, plan), in
+    /// open order. The newest open prompt gives the shown reason.
+    input_reasons: Vec<(Arc<()>, InputReason)>,
     /// The prompt of the last turn that a person or a parent started.
     task: Option<String>,
     /// The presence in the file, so an unchanged state is not written again.
-    published: Option<(Activity, Option<String>)>,
+    published: Option<ShownPresence>,
 }
+
+/// The parts of a presence file that a change can alter: activity, task, and
+/// input reason. The time is left out.
+type ShownPresence = (Activity, Option<String>, Option<InputReason>);
 
 impl LocalPeer {
     fn new(label: String, handle: String, wake: Option<PeerWakeFn>) -> Self {
@@ -139,7 +144,7 @@ impl LocalPeer {
             wake,
             waiting: 0,
             is_turn_running: false,
-            needs_input: 0,
+            input_reasons: Vec::new(),
             task: None,
             published: None,
         }
@@ -148,7 +153,7 @@ impl LocalPeer {
     /// The activity that the presence file shows. Prompts for a person win,
     /// then waits, then the turn state.
     fn activity(&self) -> Activity {
-        if self.needs_input > 0 {
+        if !self.input_reasons.is_empty() {
             Activity::NeedsInput
         } else if self.waiting > 0 {
             Activity::Waiting
@@ -157,6 +162,11 @@ impl LocalPeer {
         } else {
             Activity::Idle
         }
+    }
+
+    /// Why the peer waits for a person: the reason of the newest open prompt.
+    fn input_reason(&self) -> Option<InputReason> {
+        self.input_reasons.last().map(|(_, reason)| *reason)
     }
 }
 
@@ -335,13 +345,16 @@ impl AgentBus {
     }
 
     /// Purpose: Mark a local peer as blocked on a person while a prompt is open.
-    /// Input: The peer id.
+    /// Input: The peer id and why the prompt waits for a person.
     /// Output: A guard. The presence shows `needs_input` until every guard drops.
-    pub fn input_guard(&self, id: &str) -> InputGuard {
-        self.change_peer(id, |peer| peer.needs_input += 1);
+    ///     The newest open guard gives the shown `input_reason`.
+    pub fn input_guard(&self, id: &str, reason: InputReason) -> InputGuard {
+        let entry = Arc::new(());
+        self.change_peer(id, |peer| peer.input_reasons.push((entry.clone(), reason)));
         InputGuard {
             bus: self.clone(),
             id: id.to_string(),
+            entry,
         }
     }
 
@@ -358,7 +371,7 @@ impl AgentBus {
             return;
         };
         change(peer);
-        let shown = (peer.activity(), peer.task.clone());
+        let shown = (peer.activity(), peer.task.clone(), peer.input_reason());
         if peer.published.as_ref() == Some(&shown) {
             return;
         }
@@ -366,6 +379,7 @@ impl AgentBus {
             activity: shown.0,
             since_ms: store::now_ms(),
             task: shown.1.clone(),
+            input_reason: shown.2,
         };
         match hub.save_presence(&peer.handle, &presence) {
             Ok(()) => peer.published = Some(shown),
@@ -681,25 +695,7 @@ impl AgentBus {
     /// Output: The normalized name, or an error for archived hubs or duplicate channels.
     pub fn create_channel(&self, channel: &str, purpose: &str) -> Result<String> {
         let hub = self.lock().hub.clone();
-        let Some(name) = store::normalize_channel(channel) else {
-            bail!("invalid channel name {channel:?}: use lowercase letters, digits, - or _");
-        };
-        hub.update_meta(|meta| -> Result<()> {
-            if meta.archived {
-                bail!("hub {:?} is archived (read-only)", meta.name);
-            }
-            if meta.has_channel(&name) {
-                bail!("channel #{name} already exists");
-            }
-            meta.channels.push(Channel {
-                name: name.clone(),
-                purpose: purpose.trim().to_string(),
-                pins: Vec::new(),
-                created_ms: store::now_ms(),
-            });
-            Ok(())
-        })??;
-        Ok(name)
+        hub.create_channel(channel, purpose)
     }
 
     /// Purpose: Move every local peer to a named hub.
@@ -934,12 +930,21 @@ impl Drop for WaitingGuard<'_> {
 pub struct InputGuard {
     bus: AgentBus,
     id: String,
+    entry: Arc<()>,
 }
 
 impl Drop for InputGuard {
     fn drop(&mut self) {
+        // Guards can drop out of order and share a reason. Remove only this
+        // guard's entry, so the other open prompts keep their order.
         self.bus.change_peer(&self.id, |peer| {
-            peer.needs_input = peer.needs_input.saturating_sub(1);
+            if let Some(idx) = peer
+                .input_reasons
+                .iter()
+                .position(|(entry, _)| Arc::ptr_eq(entry, &self.entry))
+            {
+                peer.input_reasons.remove(idx);
+            }
         });
     }
 }
@@ -2538,7 +2543,7 @@ mod tests {
             Some("fix the login bug")
         );
         {
-            let _guard = bus.input_guard(MAIN_PEER_ID);
+            let _guard = bus.input_guard(MAIN_PEER_ID, InputReason::Permission);
             assert_eq!(activity(), Some(Activity::NeedsInput));
             let _wait = WaitingGuard::new(&bus, MAIN_PEER_ID);
             assert_eq!(activity(), Some(Activity::NeedsInput), "a prompt wins");
@@ -2606,6 +2611,92 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         bus.turn_started(MAIN_PEER_ID, Some("task"));
         assert_eq!(bus.hub().presence(&handle).unwrap(), first);
+    }
+
+    #[test]
+    fn nested_input_guards_restore_the_outer_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let shown = || {
+            let presence = hub.presence(&handle).unwrap();
+            (presence.activity, presence.input_reason)
+        };
+        bus.turn_started(MAIN_PEER_ID, Some("task"));
+        let plan = bus.input_guard(MAIN_PEER_ID, InputReason::PlanApproval);
+        assert_eq!(
+            shown(),
+            (Activity::NeedsInput, Some(InputReason::PlanApproval))
+        );
+        let question = bus.input_guard(MAIN_PEER_ID, InputReason::Question);
+        assert_eq!(shown(), (Activity::NeedsInput, Some(InputReason::Question)));
+        {
+            let _permission = bus.input_guard(MAIN_PEER_ID, InputReason::Permission);
+            assert_eq!(
+                shown(),
+                (Activity::NeedsInput, Some(InputReason::Permission))
+            );
+        }
+        assert_eq!(shown(), (Activity::NeedsInput, Some(InputReason::Question)));
+        // An outer guard that drops first leaves the inner reason shown.
+        drop(plan);
+        assert_eq!(shown(), (Activity::NeedsInput, Some(InputReason::Question)));
+        drop(question);
+        assert_eq!(shown(), (Activity::Working, None));
+        bus.turn_ended(MAIN_PEER_ID);
+        assert_eq!(shown(), (Activity::Idle, None));
+    }
+
+    #[test]
+    fn overlapping_guards_with_the_same_reason_keep_the_newest_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let shown = || {
+            let presence = hub.presence(&handle).unwrap();
+            (presence.activity, presence.input_reason)
+        };
+        let older = bus.input_guard(MAIN_PEER_ID, InputReason::Permission);
+        let question = bus.input_guard(MAIN_PEER_ID, InputReason::Question);
+        let newer = bus.input_guard(MAIN_PEER_ID, InputReason::Permission);
+        drop(older);
+        assert_eq!(
+            shown(),
+            (Activity::NeedsInput, Some(InputReason::Permission))
+        );
+        drop(newer);
+        assert_eq!(shown(), (Activity::NeedsInput, Some(InputReason::Question)));
+        drop(question);
+        assert_eq!(shown(), (Activity::Idle, None));
+    }
+
+    #[test]
+    fn each_prompt_kind_writes_its_own_input_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let path = hub.dir().join("presence").join(format!("{handle}.json"));
+        for (reason, text) in [
+            (InputReason::Permission, "\"permission\""),
+            (InputReason::Question, "\"question\""),
+            (InputReason::PlanApproval, "\"plan_approval\""),
+        ] {
+            let guard = bus.input_guard(MAIN_PEER_ID, reason);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(raw.contains(text), "{raw}");
+            drop(guard);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !raw.contains("input_reason"),
+                "a cleared reason is left out: {raw}"
+            );
+        }
     }
 
     #[test]
@@ -3686,7 +3777,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let hub = Hub::create(root.path(), "team").unwrap();
         hub.update_meta(|meta| {
-            meta.channels.push(Channel {
+            meta.channels.push(store::Channel {
                 name: "api".to_string(),
                 purpose: String::new(),
                 pins: Vec::new(),

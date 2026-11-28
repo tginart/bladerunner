@@ -351,6 +351,18 @@ impl Activity {
     }
 }
 
+/// Why a live agent waits for a person, while its activity is `needs_input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputReason {
+    /// A tool permission prompt.
+    Permission,
+    /// An `ask_user_question` dialog.
+    Question,
+    /// An `exit_plan_mode` plan approval.
+    PlanApproval,
+}
+
 /// The contents of one presence file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
@@ -360,6 +372,10 @@ pub struct Presence {
     /// The prompt of the last turn that a person or a parent agent started.
     #[serde(default)]
     pub task: Option<String>,
+    /// Why the agent waits for a person. Only the TUI reads it. Files from
+    /// older binaries do not have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reason: Option<InputReason>,
 }
 
 /// A handle to one hub directory.
@@ -464,6 +480,31 @@ impl Hub {
         let out = change(&mut meta);
         write_json_atomic(&self.dir.join(META_FILE), &meta)?;
         Ok(out)
+    }
+
+    /// Purpose: Create a channel in this hub under the metadata lock.
+    /// Input: The channel name, with or without `#`, and its purpose.
+    /// Output: The normalized name, or an error for archived hubs or duplicate channels.
+    pub fn create_channel(&self, channel: &str, purpose: &str) -> Result<String> {
+        let Some(name) = normalize_channel(channel) else {
+            bail!("invalid channel name {channel:?}: use lowercase letters, digits, - or _");
+        };
+        self.update_meta(|meta| -> Result<()> {
+            if meta.archived {
+                bail!("hub {:?} is archived (read-only)", meta.name);
+            }
+            if meta.has_channel(&name) {
+                bail!("channel #{name} already exists");
+            }
+            meta.channels.push(Channel {
+                name: name.clone(),
+                purpose: purpose.trim().to_string(),
+                pins: Vec::new(),
+                created_ms: now_ms(),
+            });
+            Ok(())
+        })??;
+        Ok(name)
     }
 
     /// Append one message under the hub lock.
@@ -1532,6 +1573,50 @@ fn is_process_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_input_reason_round_trips_and_legacy_files_still_load() {
+        let legacy = r#"{"activity":"needs_input","since_ms":5,"task":"fix"}"#;
+        let presence: Presence = serde_json::from_str(legacy).unwrap();
+        assert_eq!(presence.activity, Activity::NeedsInput);
+        assert_eq!(presence.input_reason, None);
+        let written = serde_json::to_string(&presence).unwrap();
+        assert!(!written.contains("input_reason"), "{written}");
+        for (reason, wire) in [
+            (InputReason::Permission, "permission"),
+            (InputReason::Question, "question"),
+            (InputReason::PlanApproval, "plan_approval"),
+        ] {
+            let presence = Presence {
+                input_reason: Some(reason),
+                ..presence.clone()
+            };
+            let json = serde_json::to_string(&presence).unwrap();
+            assert!(
+                json.contains(&format!(r#""input_reason":"{wire}""#)),
+                "{json}"
+            );
+            assert_eq!(serde_json::from_str::<Presence>(&json).unwrap(), presence);
+        }
+    }
+
+    #[test]
+    fn create_channel_normalizes_and_rejects_duplicates_and_archived_hubs() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "team").unwrap();
+        assert_eq!(
+            hub.create_channel("#auth-fix", "  login work ").unwrap(),
+            "auth-fix"
+        );
+        let meta = hub.meta().unwrap();
+        let channel = meta.channels.iter().find(|c| c.name == "auth-fix").unwrap();
+        assert_eq!(channel.purpose, "login work");
+        assert!(hub.create_channel("auth-fix", "").is_err());
+        assert!(hub.create_channel("Bad Name", "").is_err());
+        hub.update_meta(|meta| meta.archived = true).unwrap();
+        let error = hub.create_channel("later", "").unwrap_err();
+        assert!(error.to_string().contains("archived"), "{error}");
+    }
 
     fn message(conv: &str, from: &str, text: &str) -> Message {
         Message {

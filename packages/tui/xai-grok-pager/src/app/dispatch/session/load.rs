@@ -55,12 +55,16 @@ pub(in crate::app::dispatch) fn dispatch_load_session(
 /// Input: The app, the member session id, and its handle for the toast.
 /// Output: No effects. The view switches to the agent, or to the subagent
 ///     view of another tab that has it. Otherwise a toast says why not.
+/// Note: A switch closes the hub browser of the tab it leaves too, so the
+///     person does not come back to a browser over that tab.
 pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
     app: &mut AppView,
     session_id: String,
     handle: String,
 ) -> Vec<Effect> {
+    let origin = app.active_view;
     if let Some(id) = focus_if_session_already_open(app, &session_id, false) {
+        close_origin_hub_browser(app, origin);
         // An open hub browser in that tab would cover the session.
         if let Some(agent) = app.agents.get_mut(&id) {
             agent.hub_browser = None;
@@ -78,6 +82,7 @@ pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
         ));
         return vec![];
     };
+    close_origin_hub_browser(app, origin);
     switch_to_agent(app, owner, SwitchCause::Picker);
     if let Some(agent) = app.agents.get_mut(&owner) {
         agent.hub_browser = None;
@@ -88,6 +93,25 @@ pub(in crate::app::dispatch) fn dispatch_focus_hub_member(
         agent.open_subagent_fullscreen(session_id);
     }
     vec![]
+}
+
+/// Close the hub browser of the view that a hub jump leaves: the shown
+/// subagent view of the tab, and the tab itself.
+fn close_origin_hub_browser(app: &mut AppView, origin: crate::app::app_view::ActiveView) {
+    let crate::app::app_view::ActiveView::Agent(id) = origin else {
+        return;
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return;
+    };
+    if let Some(child) = agent
+        .active_subagent
+        .clone()
+        .and_then(|sid| agent.subagent_views.get_mut(&sid))
+    {
+        child.close_hub_browser();
+    }
+    agent.close_hub_browser();
 }
 
 /// Clear `session_id` from any existing agent that already owns the given

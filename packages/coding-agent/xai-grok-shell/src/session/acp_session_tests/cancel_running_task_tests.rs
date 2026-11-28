@@ -2066,7 +2066,8 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
             }
             let barrier = actor
                 .cancel_running_task(crate::session::CancelOptions {
-                    cancel_subagents: true,
+                    // A stop must suppress wakes even when subagents can continue.
+                    cancel_subagents: false,
                     trigger: Some(crate::session::CancelTrigger::from_client(trigger)),
                     user_initiated: true,
                     ..Default::default()
@@ -2145,7 +2146,13 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
 }
 #[tokio::test(flavor = "current_thread")]
 async fn stop_gestures_arm_wake_barrier() {
-    for trigger in ["esc", "mouse", "dashboard_stop", "some_future_gesture"] {
+    for trigger in [
+        "esc",
+        "mouse",
+        "dashboard_stop",
+        "hub_stop",
+        "some_future_gesture",
+    ] {
         assert_stop_trigger_arms_wake_barrier(trigger).await;
     }
 }
