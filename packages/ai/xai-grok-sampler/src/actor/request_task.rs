@@ -126,6 +126,7 @@ pub(crate) async fn run_request_task(
 
     let mut request = request;
     let mut retry_count: u32 = 0;
+    let mut primary_transient_error = None;
     // Doom-loop recovery keeps its own resample budget, independent of the
     // transport/empty budget above.
     let doom_policy = (max_retries > 0)
@@ -234,6 +235,7 @@ pub(crate) async fn run_request_task(
                 }
             }
             AttemptOutcome::Failed { error } => {
+                let error = preserve_transient_failure(error, &mut primary_transient_error);
                 // Doom-loop resamples run on their own budget and never
                 // consult the transport classifier, so no classifier change
                 // can silently debit the transport budget for a doom failure.
@@ -291,6 +293,7 @@ pub(crate) async fn run_request_task(
                 return request_id;
             }
             AttemptOutcome::InitFailed { error } => {
+                let error = preserve_transient_failure(error, &mut primary_transient_error);
                 if !apply_retry_decision(
                     &error,
                     &mut retry_count,
@@ -311,6 +314,36 @@ pub(crate) async fn run_request_task(
             }
         }
     }
+}
+
+/// Purpose: Keep a transient cause when a later attempt cannot initialize its credentials.
+/// Input: The current error and the first transient error for this request.
+/// Output: The primary transient error if retry setup fails with an auth or configuration error.
+/// Note: A primary auth or configuration error remains terminal.
+fn preserve_transient_failure(
+    error: SamplingError,
+    primary_transient_error: &mut Option<SamplingError>,
+) -> SamplingError {
+    if matches!(
+        error,
+        SamplingError::InvalidConfiguration(_) | SamplingError::Auth { .. }
+    ) && let Some(primary) = primary_transient_error.as_ref()
+    {
+        tracing::warn!(secondary_error = %error, primary_error = %primary,
+            "retry credential setup failed; retaining the primary transient failure");
+        return clone_error(primary);
+    }
+    if error.is_retryable()
+        && !error.is_retry_vetoed()
+        && !matches!(
+            error,
+            SamplingError::EmptyResponse { .. } | SamplingError::DoomLoopDetected { .. }
+        )
+        && primary_transient_error.is_none()
+    {
+        *primary_transient_error = Some(clone_error(&error));
+    }
+    error
 }
 
 /// True when the server named the images as the cause with the coded
@@ -1104,6 +1137,44 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use xai_grok_sampling_types::ApiErrorCode;
+
+    #[test]
+    fn primary_server_error_survives_unconfigured_adc_retry() {
+        let mut primary = None;
+        let error = SamplingError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            message: "Server error".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(preserve_transient_failure(error, &mut primary).is_retryable());
+        for secondary in [
+            SamplingError::InvalidConfiguration("Google ADC is not set up"),
+            SamplingError::InvalidConfiguration("Could not get a Google ADC access token"),
+            SamplingError::auth_unknown("fallback authentication failed"),
+        ] {
+            let retained = preserve_transient_failure(secondary, &mut primary);
+            let info = SamplingErrorInfo::from(&retained);
+            assert_eq!(info.status_code, Some(503));
+            assert!(info.is_retryable);
+            assert!(info.message.contains("Server error"));
+        }
+    }
+
+    #[test]
+    fn primary_configuration_and_auth_errors_remain_terminal() {
+        for error in [
+            SamplingError::InvalidConfiguration("Google ADC is not set up"),
+            SamplingError::auth_unknown("primary authentication failed"),
+        ] {
+            let mut primary = None;
+            let retained = preserve_transient_failure(error, &mut primary);
+            assert!(!retained.is_retryable());
+            assert!(primary.is_none());
+        }
+    }
 
     #[test]
     fn synthesize_idle_timeout_extracts_elapsed_secs() {
