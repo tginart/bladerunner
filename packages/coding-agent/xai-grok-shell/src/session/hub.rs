@@ -327,7 +327,8 @@ fn person_mentions(hub: &store::Hub, person_name: &str) -> Result<Vec<HubMention
     let mut out = Vec::new();
     for (conv, is_dm) in convs {
         let read = cursors.read.get(&conv).copied().unwrap_or(0);
-        for message in hub.messages(&conv, read)? {
+        let slice = hub.messages_from_offset(&conv, read, cursors.read_offset(&conv), None)?;
+        for message in slice.messages {
             let is_for_person = is_dm
                 || message
                     .mentions
@@ -367,8 +368,8 @@ fn unread_count(hub: &store::Hub, handle: &str) -> Result<usize> {
     let mut unread = 0;
     for conv in convs {
         let read = cursors.read.get(&conv).copied().unwrap_or(0);
-        let messages = hub.messages(&conv, read)?;
-        unread += messages.iter().filter(|m| m.from != handle).count();
+        let slice = hub.messages_from_offset(&conv, read, cursors.read_offset(&conv), None)?;
+        unread += slice.messages.iter().filter(|m| m.from != handle).count();
     }
     Ok(unread)
 }
@@ -1077,6 +1078,43 @@ mod tests {
             with_counts("hub api".into(), 3, 2),
             "hub api \u{b7} 3 unread \u{b7} 2 @you"
         );
+    }
+
+    #[test]
+    fn unread_count_reads_from_byte_offsets_and_legacy_counts() {
+        use xai_grok_tools::implementations::grok_build::agent_hub::{mark_read, mark_read_at};
+        let root = tempfile::tempdir().unwrap();
+        let hub = store::Hub::create(root.path(), "api").unwrap();
+        for text in ["a", "b", "c"] {
+            xai_grok_tools::implementations::grok_build::agent_hub::post_as_person(
+                &hub,
+                "me",
+                "#general",
+                text,
+                &[],
+            )
+            .unwrap();
+        }
+        // A cursor from before byte offsets has only a count.
+        mark_read(&hub, "other", "#general", 1).unwrap();
+        assert_eq!(hub.cursors("other").unwrap().read_offset("#general"), None);
+        assert_eq!(unread_count(&hub, "other").unwrap(), 2);
+
+        let offset = hub
+            .messages_from_offset("#general", 0, None, Some(2))
+            .unwrap()
+            .next_byte_offset;
+        mark_read_at(&hub, "other", "#general", 2, offset).unwrap();
+        assert_eq!(
+            hub.cursors("other").unwrap().read_offset("#general"),
+            offset
+        );
+        assert_eq!(unread_count(&hub, "other").unwrap(), 1);
+        // An offset for another count is not used.
+        let mut cursors = hub.cursors("other").unwrap();
+        cursors.read.insert("#general".to_string(), 1);
+        hub.save_cursors("other", &cursors).unwrap();
+        assert_eq!(unread_count(&hub, "other").unwrap(), 2);
     }
 
     #[test]

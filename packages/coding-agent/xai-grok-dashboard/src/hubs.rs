@@ -48,17 +48,19 @@ pub fn hubs_root(grok_home: &Path) -> std::path::PathBuf {
 
 /// Visible hubs, archived ones included, sorted by name.
 pub fn list(grok_home: &Path) -> Result<Vec<HubSummary>> {
-    let hubs = store::list_hubs(&hubs_root(grok_home), true)?;
-    Ok(hubs
-        .into_iter()
-        .map(|meta| HubSummary {
+    let root = hubs_root(grok_home);
+    let mut out = Vec::new();
+    for meta in store::list_hubs(&root, true)? {
+        let tokens = store::Hub::open(&root, &meta.name)?.tokens(&meta)?;
+        out.push(HubSummary {
             active_members: meta.members.iter().filter(|m| m.is_live()).count(),
             channels: meta.channels.len(),
-            tokens: meta.tokens.values().sum(),
+            tokens: tokens.values().sum(),
             archived: meta.archived,
             name: meta.name,
-        })
-        .collect())
+        });
+    }
+    Ok(out)
 }
 
 /// Purpose: Load one hub page.
@@ -88,7 +90,7 @@ pub fn page(grok_home: &Path, name: &str, channel: Option<&str>) -> Result<HubPa
         })
         .collect();
     Ok(HubPage {
-        tokens: meta.tokens.values().sum(),
+        tokens: hub.tokens(&meta)?.values().sum(),
         channel: channel.map(|c| c.trim_start_matches('#').to_string()),
         meta,
         messages,
@@ -121,5 +123,20 @@ mod tests {
         assert!(page.messages[0].is_person);
         assert!(post(home.path(), "api", "#nope", "x").is_err());
         assert!(super::page(home.path(), "missing", None).is_err());
+    }
+
+    #[test]
+    fn tokens_sum_legacy_hub_counts_and_member_files() {
+        let home = tempfile::tempdir().unwrap();
+        let hub = store::Hub::create(&hubs_root(home.path()), "api").unwrap();
+        hub.update_meta(|meta| {
+            meta.tokens.insert("#general".to_string(), 100);
+        })
+        .unwrap();
+        let costs = std::collections::BTreeMap::from([("dm".to_string(), 20)]);
+        hub.add_member_tokens("backend", &costs).unwrap();
+        hub.add_member_tokens("front", &costs).unwrap();
+        assert_eq!(list(home.path()).unwrap()[0].tokens, 140);
+        assert_eq!(page(home.path(), "api", None).unwrap().tokens, 140);
     }
 }

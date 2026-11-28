@@ -1536,6 +1536,13 @@ pub enum Effect {
         hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
         request: xai_grok_shell::extensions::hub_bot::AskRequest,
     },
+    /// Read the files of an open hub browser off the UI thread. `subagent`
+    /// names the subagent view whose browser it is (`None`: the agent view).
+    RefreshHubBrowser {
+        agent_id: AgentId,
+        subagent: Option<String>,
+        job: Box<crate::views::hub_browser::HubRefreshJob>,
+    },
     /// Fetch pending changes (files + hunks) for the review modal.
     /// `post_action`: this is a refetch after an action landed (must not
     /// reopen a closed modal).
@@ -2465,6 +2472,13 @@ pub enum TaskResult {
         hub: xai_grok_tools::implementations::grok_build::agent_hub::store::Hub,
         request: xai_grok_shell::extensions::hub_bot::AskRequest,
         response: Result<xai_grok_shell::extensions::hub_bot::AskResponse, String>,
+    },
+    /// A background hub browser refresh finished. See `Effect::RefreshHubBrowser`.
+    HubBrowserRefreshed {
+        agent_id: AgentId,
+        subagent: Option<String>,
+        generation: u64,
+        result: Result<Box<crate::views::hub_browser::HubRefresh>, String>,
     },
     ReviewChatAnswered {
         agent_id: AgentId,
