@@ -433,10 +433,10 @@ fn dashboard_popup_routes_pr_controls_to_the_attached_session() {
 }
 
 /// Purpose: Route dashboard review actions through the attached session.
-/// Input: A digest or typed question, an answer, and a handoff draft.
-/// Output: Both requests reach the session and preserve its main draft.
+/// Input: A digest or typed question, a cancel action, an answer, and a handoff draft.
+/// Output: Each action reaches the session and preserves its main draft.
 #[test]
-fn dashboard_review_questions_and_handoffs_reach_the_attached_session() {
+fn dashboard_review_actions_reach_the_attached_session() {
     use crate::views::pull_request::summary::Control;
     use xai_grok_shell::extensions::review_chat::AskResponse;
 
@@ -488,6 +488,16 @@ fn dashboard_review_questions_and_handoffs_reach_the_attached_session() {
             .clone()
             .unwrap();
         assert!(chat.borrow().busy);
+        let InputOutcome::Action(cancel @ Action::KillSubagent(_)) =
+            app.handle_input(&key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        else {
+            panic!("Ctrl+C must prepare review cancellation");
+        };
+        let effects = dispatch(cancel, &mut app);
+        assert!(
+            matches!(effects.as_slice(), [Effect::KillSubagent { session_id, subagent_id }]
+            if session_id.0.as_ref() == request.session_id && subagent_id == &request.child_id)
+        );
         dispatch_task_result(
             TaskResult::ReviewChatAnswered {
                 agent_id: id,
