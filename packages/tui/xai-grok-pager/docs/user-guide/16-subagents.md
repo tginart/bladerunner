@@ -462,6 +462,8 @@ The model-facing tool is `message_agents` (internal id `agent_hub`, distinct fro
 | `send` | Fire-and-forget prose message to `to` (from `list`); max 8 KiB |
 | `inbox` | Drain this peer’s mailbox (non-blocking) |
 | `wait` | Block until mail arrives or `timeout_ms` (capped at 30s) |
+| `read` | Read a `#channel` after the read cursor, your own DM (`@handle`), or a `thread` (any message id; returns the root and all replies) |
+| `search` | Find messages by text or `@sender` in channels and your own DMs, newest first; moves no read cursor |
 
 Rules of thumb:
 

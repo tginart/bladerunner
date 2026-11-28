@@ -14,7 +14,7 @@
 //! needed: a writer holds `hub.lock`, and a reader reads up to the last full line.
 //! A reader that saved a byte offset reads only the bytes after it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -971,6 +971,43 @@ pub fn split_dm_conv(conv: &str) -> Option<(&str, &str)> {
     Some((a.strip_prefix('@')?, b.strip_prefix('@')?))
 }
 
+/// True when `conv` is a DM of hub-bot. Only the person and hub-bot see it.
+pub fn is_bot_conv(conv: &str) -> bool {
+    split_dm_conv(conv).is_some_and(|(a, b)| a == BOT_HANDLE || b == BOT_HANDLE)
+}
+
+/// Purpose: Find the thread root of every message of one conversation.
+/// Input: The messages of one conversation, oldest first.
+/// Output: A map from each message id to the id of its thread root. A
+///     message that is not a reply in this conversation is its own root.
+/// Method:
+///     1. Go through the messages in order.
+///     2. If the parent of a message is an earlier message, use the root of
+///        that parent. If not, the message is a root.
+/// Note: A parent must come before its reply. Thus a corrupt `reply_to` that
+///     points forward, or a cycle, cannot cause a loop. A parent in another
+///     conversation stops the walk, so that message is a root here.
+pub fn thread_root_index(messages: &[Message]) -> HashMap<&str, &str> {
+    let mut roots: HashMap<&str, &str> = HashMap::with_capacity(messages.len());
+    for message in messages {
+        let root = message
+            .reply_to
+            .as_deref()
+            .and_then(|parent| roots.get(parent).copied())
+            .unwrap_or(message.id.as_str());
+        roots.entry(message.id.as_str()).or_insert(root);
+    }
+    roots
+}
+
+/// The thread root of message `id` in `messages`, or `None` when `messages`
+/// does not hold `id`. See [`thread_root_index`].
+pub fn resolve_thread_root(messages: &[Message], id: &str) -> Option<String> {
+    thread_root_index(messages)
+        .get(id)
+        .map(|root| root.to_string())
+}
+
 pub fn session_hub_name(root_session_id: &str) -> String {
     format!("{SESSION_HUB_PREFIX}{root_session_id}")
 }
@@ -1514,6 +1551,38 @@ mod tests {
         assert!(hub.store_image(&txt).is_err());
         assert_eq!(tokens_key("#general"), "#general");
         assert_eq!(tokens_key(&dm_conv("a", "b")), DM_TOKENS_KEY);
+    }
+
+    #[test]
+    fn thread_roots_follow_legacy_chains_and_stop_at_bad_links() {
+        let reply = |text: &str, parent: &str| Message {
+            reply_to: Some(parent.to_string()),
+            ..message("#general", "a", text)
+        };
+        let messages = vec![
+            message("#general", "a", "m1"),
+            reply("m2", "id-m1"),
+            reply("m3", "id-m2"),
+            // A parent in another conversation, and a parent that comes later.
+            reply("cross", "id-elsewhere"),
+            reply("forward", "id-later"),
+            reply("self", "id-self"),
+            message("#general", "a", "later"),
+        ];
+        let roots = thread_root_index(&messages);
+        assert_eq!(roots["id-m2"], "id-m1");
+        assert_eq!(roots["id-m3"], "id-m1");
+        for own in ["id-m1", "id-cross", "id-forward", "id-self", "id-later"] {
+            assert_eq!(roots[own], own);
+        }
+        assert_eq!(
+            resolve_thread_root(&messages, "id-m3").as_deref(),
+            Some("id-m1")
+        );
+        assert_eq!(resolve_thread_root(&messages, "id-missing"), None);
+        assert!(is_bot_conv(&dm_conv("me", BOT_HANDLE)));
+        assert!(!is_bot_conv(&dm_conv("me", "a")));
+        assert!(!is_bot_conv("#general"));
     }
 
     #[test]
