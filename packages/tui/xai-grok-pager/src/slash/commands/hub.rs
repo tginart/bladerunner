@@ -17,7 +17,7 @@ impl SlashCommand for HubCommand {
     }
 
     fn usage(&self) -> &str {
-        "/hub [list | new <name> | join <name> | leave | open [name] [#channel] | channel <#name> | post <#channel|@handle> <text> | archive <name>]"
+        "/hub [list | new <name> | join <name> | leave | open [name] [#channel] | channel <#name> | post <#channel|@handle> <text> | pin <#channel> <message_id> | unpin <#channel> <message_id> | pins <#channel> | archive <name>]"
     }
 
     fn mode_support(&self) -> ModeSupport {

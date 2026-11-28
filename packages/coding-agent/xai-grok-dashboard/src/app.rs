@@ -657,6 +657,23 @@ fn render_hub_page(result: Result<HubPage, ServerFnError>) -> AnyView {
                 <input name="text" placeholder="Post as you (a person); @handle wakes an agent" size="60" required=true/>
                 <button type="submit">"Post"</button>
             </form>
+            {(!page.pinned.is_empty()).then(|| view! {
+                <div class="card">
+                    <h3>"📌 Pinned"</h3>
+                    {page.pinned.into_iter().map(|pin| {
+                        let m = pin.message;
+                        let by = format!("@{} · pinned by @{}", m.from, pin.pinned_by);
+                        view! {
+                            <div class="log-row">
+                                <span>{format_epoch_ms(m.ts_unix_ms)}</span>
+                                <span class="mono">{m.place}</span>
+                                <span class="chat-role">{by}</span>
+                                <span class="chat-message">{m.text}</span>
+                            </div>
+                        }
+                    }).collect::<Vec<_>>()}
+                </div>
+            })}
             {if page.messages.is_empty() {
                 empty_view("No messages yet.")
             } else {
@@ -665,12 +682,13 @@ fn render_hub_page(result: Result<HubPage, ServerFnError>) -> AnyView {
                         {page.messages.into_iter().map(|m| {
                             let who = if m.is_person { format!("@{} (person)", m.from) } else { format!("@{}", m.from) };
                             let images = if m.images > 0 { format!(" [{} image(s)]", m.images) } else { String::new() };
+                            let pin = if m.pinned { "📌 " } else { "" };
                             view! {
                                 <div class="log-row">
                                     <span>{format_epoch_ms(m.ts_unix_ms)}</span>
                                     <span class="mono">{m.place}</span>
                                     <span class="chat-role">{who}</span>
-                                    <span class="chat-message">{m.text}{images}</span>
+                                    <span class="chat-message">{pin}{m.text}{images}</span>
                                 </div>
                             }
                         }).collect::<Vec<_>>()}

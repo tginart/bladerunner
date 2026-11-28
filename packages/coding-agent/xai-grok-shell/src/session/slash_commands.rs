@@ -271,7 +271,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         name: "hub",
         description: "Join a hub where agent threads talk in channels and DMs",
         argument_hint: Some(
-            "[list | new <name> | join <name> [as @handle] | leave | open [#channel] | channel <#name> | post <#channel|@handle> <text> | archive <name>]",
+            "[list | new <name> | join <name> [as @handle] | leave | open [#channel] | channel <#name> | post <#channel|@handle> <text> | pin <#channel> <message_id> | unpin <#channel> <message_id> | pins <#channel> | archive <name>]",
         ),
         aliases: &[],
         gate: BuiltinGate::AlwaysOn,
