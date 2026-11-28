@@ -368,6 +368,49 @@ mod tests {
         }
     }
 
+    /// Purpose: Keep temporary TPM throttles eligible for the goal retry budget.
+    /// Input: Size-error text with optional Retry-After and a server retry veto.
+    /// Output: A retry grant only when Retry-After is present and the server permits retries.
+    #[tokio::test]
+    async fn goal_retry_tpm_rate_limit_respects_retry_after() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (actor, _rx) = super::super::support::build_actor().await;
+                for (retry_after_secs, should_retry, expected) in [
+                    (Some(7), None, true),
+                    (Some(0), None, true),
+                    (None, None, false),
+                    (Some(7), Some(false), false),
+                ] {
+                    let sampling_error = xai_grok_sampling_types::SamplingError::Api {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        message: "Request too large for model test: tokens per min limit reached"
+                            .into(),
+                        model_metadata: None,
+                        retry_after_secs,
+                        should_retry,
+                        error_code: None,
+                    };
+                    let info = xai_grok_sampler::SamplingErrorInfo::from(&sampling_error);
+                    let error = actor
+                        .handle_sampling_failure(info)
+                        .await
+                        .err()
+                        .expect("the sampler reports the exhausted rate limit");
+                    let mut state = GoalRetryState {
+                        consecutive_retries: 0,
+                        max_retries: 1,
+                    };
+                    assert_eq!(
+                        state.try_retry(&error, 0.5).is_some(),
+                        expected,
+                        "{error:?}"
+                    );
+                }
+            })
+            .await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn goal_retry_user_cancel_aborts_backoff() {
         let cancel = CancellationToken::new();

@@ -1918,12 +1918,17 @@ impl SessionActor {
         error: &xai_grok_sampler::SamplingErrorInfo,
         message: String,
     ) -> serde_json::Value {
+        // TPM throttling can use size-error text while promising later capacity.
+        // Match SamplingError::is_context_length_error's Retry-After exception.
+        let rate_limit_with_retry_after =
+            error.status_code == Some(429) && error.retry_after_secs.is_some();
         serde_json::json!({
             "message": message,
             "http_status": error.status_code,
             "error_kind": error.kind.as_str(),
             "is_retryable": error.is_retryable
-                && !xai_grok_sampling_types::is_context_length_error(&error.message)
+                && (rate_limit_with_retry_after
+                    || !xai_grok_sampling_types::is_context_length_error(&error.message))
                 && error.error_code != Some(xai_grok_sampling_types::ApiErrorCode::InvalidImage),
             "should_retry": error.should_retry,
         })
