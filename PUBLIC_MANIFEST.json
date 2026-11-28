@@ -34,14 +34,14 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 414452,
-      "sha256": "e1feebe3506e20b542c77cfaf38b3a3aec54c44f26397f1dbe1f32b825316b25",
+      "bytes": 414292,
+      "sha256": "4734e77b0c294a29e27a88c835d7dd4c25e55a924376cc94657b9172748eb267",
       "mode": "0644"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 18181,
-      "sha256": "6078ccccb84d6ee8174f6e22596def47b49eaf9a53d61becdabe850619a567c0",
+      "bytes": 18270,
+      "sha256": "012ab1ed509f009ef08a1545617d41f9c7e9ed0d10622319f50823e5a1f0a288",
       "mode": "0644"
     },
     {
@@ -83,7 +83,7 @@
     {
       "path": "VERSION",
       "bytes": 7,
-      "sha256": "201d4fd98e4c46f7fc89a0b9f6d518323ca98476311a47dfeafee99277eeaf6d",
+      "sha256": "51fa819e127a14961ff10d59cdddd651d436b52b3103002b7a88121b321bd4da",
       "mode": "0644"
     },
     {
@@ -2224,8 +2224,8 @@
     },
     {
       "path": "packages/ai/xai-grok-sampler/Cargo.toml",
-      "bytes": 2071,
-      "sha256": "e2db6b35666d0e204142b06501d40dc3b6f0c6f7d266393dc8fd3756c8eaed6d",
+      "bytes": 2035,
+      "sha256": "48c4e8c2db90d1dd6d0d5b9730e04b2dad52acd066de3d325d80115b20ff5ef6",
       "mode": "0644"
     },
     {
@@ -2290,14 +2290,14 @@
     },
     {
       "path": "packages/ai/xai-grok-sampler/src/events.rs",
-      "bytes": 19575,
-      "sha256": "d04dee4f8111f34cbb816e2e468165bce4df6c34d8a3673cd81445b9885fda18",
+      "bytes": 19675,
+      "sha256": "899cbe1dbeaf299494faf84489bfbf6532d8ee4cf25b66dd427316b29988e570",
       "mode": "0644"
     },
     {
       "path": "packages/ai/xai-grok-sampler/src/google.rs",
-      "bytes": 41382,
-      "sha256": "ef1c25876379b29da09416300947218a50535ac0a68d7b972363496e5cef8b88",
+      "bytes": 54277,
+      "sha256": "a788f55f565341e73aa2e7bf10292ac520f2b64e0a3bb049257a1a8ba7d3b292",
       "mode": "0644"
     },
     {
@@ -2326,8 +2326,8 @@
     },
     {
       "path": "packages/ai/xai-grok-sampler/src/retry.rs",
-      "bytes": 42181,
-      "sha256": "2c77a0c5ed3b7c5729b237ad1c7748882031d4c35379572ec2b8bda385558ee7",
+      "bytes": 44165,
+      "sha256": "791240976dcf17acc93d54e6acec1837b5320b496896e22bcb7d2ac337df4d8c",
       "mode": "0644"
     },
     {
@@ -2458,8 +2458,8 @@
     },
     {
       "path": "packages/ai/xai-grok-sampling-types/src/error.rs",
-      "bytes": 65681,
-      "sha256": "5f8a5c8da6fd0bd26c9927b67bcbeecb29ccc2958ab3fa9dcded429c7b18277e",
+      "bytes": 66073,
+      "sha256": "ccb769a24c3620098d5ad18415dd1267f79073a11973681d337355cce05710df",
       "mode": "0644"
     },
     {
@@ -3431,7 +3431,7 @@
     {
       "path": "packages/coding-agent/xai-grok-pager-bin/Cargo.toml",
       "bytes": 4451,
-      "sha256": "670e86a7e8faafc809aeed6c69682eb75f339b4a2af566b50fd451326047cb17",
+      "sha256": "0ce467b15254edabb148410a1b40570a4b7476a13c389ef9ec0da3914046ca97",
       "mode": "0644"
     },
     {
@@ -3599,7 +3599,7 @@
     {
       "path": "packages/coding-agent/xai-grok-shell/Cargo.toml",
       "bytes": 10709,
-      "sha256": "7d471db91086a974db14f6731eb3d100647fa5593eda7b16f7d381044a838dee",
+      "sha256": "f85ac9fdec3c3d6a3427cadfdf9611e62c68a4c79b8303ed648daf6b3091beea",
       "mode": "0644"
     },
     {
@@ -4954,8 +4954,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/sampling/error.rs",
-      "bytes": 33490,
-      "sha256": "c63a277d497fa6d2d61bd8a158304317a1ce2f3d15447436e81c5a8fa7fae3c1",
+      "bytes": 33616,
+      "sha256": "b48ff10553aca251bc1aca04a3722e27b24c669b438d6f74cb5013973e5afe14",
       "mode": "0644"
     },
     {
@@ -5872,8 +5872,8 @@
     },
     {
       "path": "packages/coding-agent/xai-grok-shell/src/session/helpers/session_compact.rs",
-      "bytes": 117481,
-      "sha256": "15c18f7d035d210d6975e3eeb67214d6b3a742d6fd18647b93c811a1ca51269d",
+      "bytes": 117559,
+      "sha256": "24b4606cb86d1030185862ea46db6852a854f1c910a6051e455331004d161dc1",
       "mode": "0644"
     },
     {
@@ -8837,7 +8837,7 @@
     {
       "path": "packages/platform/xai-grok-version/Cargo.toml",
       "bytes": 221,
-      "sha256": "3f4ccd5f1b500c4a81404c8383066c7e89ef9070d9664477d892885cf1258bc0",
+      "sha256": "ae70ee4767e249133ccc3d429f4f3ab9bc537a0e6e59c6a89614b1cf48fddcbe",
       "mode": "0644"
     },
     {
@@ -13631,7 +13631,7 @@
     {
       "path": "packages/tui/xai-grok-pager/Cargo.toml",
       "bytes": 11640,
-      "sha256": "89ddcd753a0e502a23758238293ac1a2ddb85a0b2f85129802c17ed5b62cf5e4",
+      "sha256": "c64afdd17252d2c65a0aaa8e597c65077d9f58914adf55ac21bb88375c2267f7",
       "mode": "0644"
     },
     {
@@ -19678,14 +19678,14 @@
     },
     {
       "path": "third_party/NOTICE",
-      "bytes": 2831,
-      "sha256": "4122c27e9ad4b8e67e6f8a7869d11f389600a5d5f773fdec9d0b2ac9d7f21101",
+      "bytes": 3262,
+      "sha256": "e12bd7eba9d23afdc2e92f80011ddf9ce91793467af54e4150071cf8a3eaefd6",
       "mode": "0644"
     },
     {
       "path": "third_party/README.md",
-      "bytes": 2795,
-      "sha256": "636074e1dc10f93c4b786bec32585d30d7dff1228facbbb45fb0a7b51b804682",
+      "bytes": 3256,
+      "sha256": "9c206fce0392cc0187cbb9a1888dcc114ed27f8b30ddf8b3b67355b6273c81c9",
       "mode": "0644"
     },
     {
@@ -19842,6 +19842,144 @@
       "path": "third_party/dagre_rust/src/lib.rs",
       "bytes": 3737,
       "sha256": "c9d6dd6ac3ce38e0c87db5aa3a45ff67711e6493324cde8f5c1baacb33a77968",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/Cargo.toml",
+      "bytes": 3248,
+      "sha256": "1d9d4583f360921383b202cb03002a7ad191ec878205ad54aeac2729a7c29240",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/LICENSE",
+      "bytes": 1072,
+      "sha256": "682e8098ad1d2af0ab5fac830bcf3f9d437b5f9c1d9c9cd1e22a1299a395242a",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/README.md",
+      "bytes": 2588,
+      "sha256": "37ea0ca148bfcaf98e639b0784d0712ee2fea683249e35e33d3ee6b309ddbb98",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/credentials.rs",
+      "bytes": 10792,
+      "sha256": "f3668b6c1d9696a1a132e78152212a61aecd398b55902cfbd43bde974fee7507",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/error.rs",
+      "bytes": 1989,
+      "sha256": "e3619e8ec023584e54da88b76cca676cd99ca7c65acc20b388bc4f5ac595ba52",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/idtoken.rs",
+      "bytes": 3024,
+      "sha256": "8a420264b819208eee2fbfb30fcf519bcb468eaa2645d80636cbf50f627c5fc8",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/lib.rs",
+      "bytes": 419,
+      "sha256": "c02645e98ff6a6343483e6e2b7a27ce17b3adf3d510a538b97602dd9957d91f5",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/misc.rs",
+      "bytes": 317,
+      "sha256": "7289bda291028915465499f450bd4e62af88a03c4653b20038906c1427090d1b",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/project.rs",
+      "bytes": 7776,
+      "sha256": "ebfec01b44eb1a580302168e7576059e0eafed90e7bdbb9917b9af47e4c2f038",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token.rs",
+      "bytes": 3219,
+      "sha256": "fa9644bbd12479c8a3eb9f46b6a65c87ee78c43eba3cc63182d40fd8e71b50c4",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/authorized_user_token_source.rs",
+      "bytes": 2066,
+      "sha256": "a538ba603f917b9de43bf4c85520276dd833adbe8de6919d6cfb694f5ac4f2a8",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/compute_identity_source.rs",
+      "bytes": 2300,
+      "sha256": "14420ed5fd790eb30f6675bdb83ac4f1028d3fbf87f4357417690ac222fc4e9f",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/compute_token_source.rs",
+      "bytes": 1393,
+      "sha256": "e0c89532add05f9b786bb6f5f4ea2d2809352af61375d3f69801a47b533813e3",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/external_account_source/aws_subject_token_source.rs",
+      "bytes": 16238,
+      "sha256": "ee22b92552e7347fc277e32b7535a48b211aafb2f5fcbd919bb3c12831c9ec11",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/external_account_source/error.rs",
+      "bytes": 2201,
+      "sha256": "9e931d9165c4886778f42930c665e66598795d99e38b5980a9cc67e3c6301930",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/external_account_source/file_credential_source.rs",
+      "bytes": 1394,
+      "sha256": "3f26d1f39930b1bdc1683ae14e46214cde18057e862da69ba810ee6e7e81a7ec",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/external_account_source/mod.rs",
+      "bytes": 4534,
+      "sha256": "5954157eaf58a8130fecea90316d5d1b4b4dab295409d73784fc6712130d5a8f",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/external_account_source/subject_token_source.rs",
+      "bytes": 159,
+      "sha256": "979a7e6e765948ea1119d6afb09b5346e982d13faa0efea51d05294142e1d834",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/external_account_source/url_subject_token_source.rs",
+      "bytes": 2440,
+      "sha256": "23be4a6429f71433de37de86c214235f28e479d6b125d66752739198793b2fdb",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/impersonate_token_source.rs",
+      "bytes": 2412,
+      "sha256": "cc29ec116887143e2eec20951ed2e458ab696cb1182e777c9debcdabc3245641",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/mod.rs",
+      "bytes": 3150,
+      "sha256": "6bd9067a99700d97e1a0b0d82acf45bdce4e97b40ce28231d332ef87dadcfeb9",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/reuse_token_source.rs",
+      "bytes": 4180,
+      "sha256": "88f1c4a7ed82c826db17c09606bd0a9c747ab6a1874a5d38169c58b82e3d5848",
+      "mode": "0644"
+    },
+    {
+      "path": "third_party/gcloud-auth/src/token_source/service_account_token_source.rs",
+      "bytes": 8074,
+      "sha256": "74fb609e12c3237191026070c581a5a1d914742db3c1d4d95e0fcc76f3a7793a",
       "mode": "0644"
     },
     {
@@ -20140,8 +20278,8 @@
     },
     {
       "path": "tools_check_release.py",
-      "bytes": 5997,
-      "sha256": "f01a7c255f3f0e5909cf0c8307112a86bd242d01b28acebfff3118437e921ce5",
+      "bytes": 6115,
+      "sha256": "07ae4fcfbd0eda1765234eaf254c91c71a096dc685343d41c1f3a45d888ae8c9",
       "mode": "0644"
     },
     {
