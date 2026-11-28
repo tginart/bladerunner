@@ -578,6 +578,18 @@ impl AgentView {
             }
             return InputOutcome::Unchanged;
         }
+        if self.active_modal.is_none()
+            && self.no_input_overlay_pending()
+            && let Event::Mouse(mouse) = ev
+            && let Some(hit) = self
+                .pull_request
+                .as_ref()
+                .and_then(|viewer| viewer.summary.mouse(mouse))
+        {
+            return hit.map_or(InputOutcome::Changed, |control| {
+                InputOutcome::Action(Action::PullRequestControl(control))
+            });
+        }
         // A hint click must not reach the browser first: its mouse-down
         // outside the browser takes the focus away, and the pressed key then
         // misses the focused editor.

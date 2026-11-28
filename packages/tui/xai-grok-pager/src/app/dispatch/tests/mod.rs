@@ -9,6 +9,7 @@ mod modes;
 mod notes;
 mod permissions;
 mod prompt;
+mod pull_request;
 mod review_chat;
 mod rewind;
 mod router;

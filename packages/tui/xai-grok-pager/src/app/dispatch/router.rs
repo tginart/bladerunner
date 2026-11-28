@@ -337,7 +337,13 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get(&id) else {
                 return vec![];
             };
-            let chat = agent.review_chat.clone();
+            let chat = match &agent.active_modal {
+                Some(crate::views::modal::ActiveModal::PullRequest) => agent
+                    .pull_request
+                    .as_ref()
+                    .and_then(|state| state.chat.clone()),
+                _ => agent.review_chat.clone(),
+            };
             if app.reconnect_pending || agent.session.session_id.is_none() {
                 if let Some(chat) = chat {
                     chat.borrow_mut().message = Some("Not sent. Retry when connected.".into());
@@ -1665,6 +1671,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             });
             vec![]
         }
+        Action::OpenPullRequest(target) => super::pull_request::open(app, target),
+        Action::PullRequestControl(control) => super::pull_request::control(app, control),
         Action::OpenFileBrowser => {
             with_active_agent(app, |agent| agent.open_file_browser());
             vec![]

@@ -55,6 +55,20 @@ bladerunner agent stdio
 
 For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
+## Review a GitHub pull request
+
+In a fullscreen session, type `/pr`, `/pr 42`, or `/pr <GitHub PR URL>`.
+The corner card shows the PR state, changes, checks, and open thread count.
+Click **[-]** to minimize it to a chip or **[x]** to close it. Click the chip
+or type `/pr` to bring back the card. **Refresh** fetches the latest state.
+
+Choose **Fullscreen** (or type `/pr open`) to read the description, diffs, and
+review discussions alongside a dedicated review chat. Use ←/→ for tabs, ↑/↓ to
+select a file or thread, and `[` / `]` for diff hunks. Press `?` to ask about
+the selection, or `d` for an AI digest of the PR. Tab returns focus to the PR
+and Esc returns to the card. The viewer uses your GitHub CLI sign-in
+(`gh auth login`).
+
 ## Hubs
 
 Agent threads can talk to each other in a hub, with channels and DMs. In one

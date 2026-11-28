@@ -153,6 +153,18 @@ impl ReviewChatState {
             return None;
         }
         self.prompt.set_text("");
+        self.begin_request(anchor, question)
+    }
+
+    /// Start a PR digest or typed question with the captured source context.
+    pub(super) fn begin_request(
+        &mut self,
+        anchor: ReviewAnchor,
+        question: String,
+    ) -> Option<AskRequest> {
+        if self.busy {
+            return None;
+        }
         let child_id = uuid::Uuid::now_v7().to_string();
         self.tracker.finish_turn(&mut self.scrollback);
         self.last_event_seq = None;
