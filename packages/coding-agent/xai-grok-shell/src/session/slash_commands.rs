@@ -334,7 +334,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
             let trimmed = args.trim();
             match trimmed.to_lowercase().as_str() {
                 "" | "status" => BuiltinAction::GoalStatus,
-                "pause" => BuiltinAction::GoalPause,
+                "pause" | "stop" => BuiltinAction::GoalPause,
                 "resume" => BuiltinAction::GoalResume,
                 "clear" => BuiltinAction::GoalClear,
                 _ => {
@@ -1791,6 +1791,15 @@ fn first_text(prompt_blocks: &[acp::ContentBlock]) -> Option<&str> {
         _ => None,
     })
 }
+/// Identify goal pause commands before they can queue behind a retry sleep.
+pub(super) fn is_goal_pause_command(prompt_blocks: &[acp::ContentBlock]) -> bool {
+    let Some((name, args)) = parse_slash_prefix(prompt_blocks) else {
+        return false;
+    };
+    slash_key(name) == "goal"
+        && matches!(args.trim().to_ascii_lowercase().as_str(), "pause" | "stop")
+}
+
 /// Extract `(name, args)` if the first text block starts with `/`.
 ///
 /// - `"/compact keep auth"` → `Some(("compact", "keep auth"))`
@@ -3770,6 +3779,10 @@ mod tests {
     fn goal_pause_resolves_to_pause() {
         assert!(matches!(resolve_goal("pause"), BuiltinAction::GoalPause));
         assert!(matches!(resolve_goal("PAUSE"), BuiltinAction::GoalPause));
+        assert!(matches!(resolve_goal("stop"), BuiltinAction::GoalPause));
+        assert!(is_goal_pause_command(&[text_block("/goal STOP")]));
+        assert!(!is_goal_pause_command(&[text_block("explain /goal pause")]));
+        assert!(!is_goal_pause_command(&[text_block("/goal pause after deployment")]));
     }
     #[test]
     fn goal_resume_resolves_to_resume() {

@@ -52,6 +52,7 @@ pub mod nexus;
 pub mod personas;
 pub mod plan;
 pub mod plugin;
+pub mod pr;
 pub mod privacy;
 pub mod providers;
 pub mod queue;
@@ -118,6 +119,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(copy::CopyCommand),
         Arc::new(find::FindCommand),
         Arc::new(files::FilesCommand),
+        Arc::new(pr::PullRequestCommand),
         Arc::new(history::HistoryCommand),
         Arc::new(export::ExportCommand),
         Arc::new(transcript::TranscriptCommand),

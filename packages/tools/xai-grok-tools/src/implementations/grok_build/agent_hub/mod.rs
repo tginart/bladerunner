@@ -8,6 +8,7 @@ mod bus;
 mod read_tool;
 pub mod store;
 
+pub use bus::mark_read_at;
 pub use bus::{
     AgentBus, ChannelView, DeliveredMessage, Delivery, HubView, JoinOutcome, LOOP_GUARD_WAKES,
     MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, answer_as_bot, ask_bot,
@@ -69,23 +70,28 @@ pub enum AgentHubOp {
     Wait,
     Read,
     Channel,
+    Search,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentHubInput {
     #[schemars(
-        description = "Operation: list members and channels, send a message, drain your DMs and mentions, wait for one, read a channel, or create a channel"
+        description = "Operation: list members and channels, send a message, drain your DMs and mentions, wait for one, read a channel, your DM or a thread, search messages, or create a channel"
     )]
     pub op: AgentHubOp,
     #[serde(default)]
-    #[schemars(description = "Target for send: #channel, @handle, or a peer id from list")]
+    #[schemars(
+        description = "Target for send: #channel, @handle, or a peer id from list. For read and search, the same as `channel`."
+    )]
     pub to: Option<String>,
     #[serde(default)]
     #[schemars(description = "Message body for send (plain prose, max 8KiB)")]
     pub text: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional message id this send is replying to")]
+    #[schemars(
+        description = "Optional message id this send is replying to. A reply to a reply in the same conversation joins the thread of the root message."
+    )]
     pub reply_to: Option<String>,
     #[serde(default)]
     #[schemars(
@@ -96,19 +102,33 @@ pub struct AgentHubInput {
     #[schemars(description = "Wait timeout in ms (wait only). Capped at 30000. Default 5000.")]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
-    #[schemars(description = "Channel name for read and channel, such as #general")]
+    #[schemars(
+        description = "Channel name for read and channel, such as #general. For read and search, also @handle (your DM with that member) or @you,@peer."
+    )]
     pub channel: Option<String>,
     #[serde(default)]
     #[schemars(description = "Channel purpose (channel only)")]
     pub purpose: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Max messages for read. Default 20.")]
+    #[schemars(
+        description = "Max messages. Read default 20 (max 200); search default 20 (max 50)."
+    )]
     pub limit: Option<usize>,
     #[serde(default)]
     #[schemars(
-        description = "Read from this message index instead of your read cursor (read only)"
+        description = "Read from this message index instead of your read cursor (channel or DM read only)"
     )]
     pub since: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Text to find in message text or @sender (search only). Case is ignored."
+    )]
+    pub query: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Id of any message of a thread (read only). Read returns the thread root and its replies."
+    )]
+    pub thread: Option<String>,
     #[serde(default)]
     #[schemars(
         description = "Pin this #channel post so every member keeps seeing it (send only). Use only for key decisions; max 15 pins per channel."
@@ -125,8 +145,15 @@ impl AgentHubInput {
             AgentHubOp::Send => format!("Hub: message {}", target(&self.to)),
             AgentHubOp::Inbox => "Hub: check inbox".to_string(),
             AgentHubOp::Wait => "Hub: wait for messages".to_string(),
-            AgentHubOp::Read => format!("Hub: read {}", target(&self.channel)),
+            AgentHubOp::Read => match &self.thread {
+                Some(thread) => format!("Hub: read thread {thread}"),
+                None => format!(
+                    "Hub: read {}",
+                    target(&self.channel.clone().or(self.to.clone()))
+                ),
+            },
             AgentHubOp::Channel => format!("Hub: create channel {}", target(&self.channel)),
+            AgentHubOp::Search => format!("Hub: search {:?}", target(&self.query)),
         }
     }
 }
@@ -294,17 +321,27 @@ Ops:
 - send: post to `#channel` or DM `@handle` (plain prose, max 8KiB; optional `images`, absolute paths). `@handle` in a channel post wakes that member. `@here` in a channel post wakes every member; use it only when all of them must act. `pin: true` on a channel post pins a key decision for everyone.
 - inbox: drain your unread DMs and mentions (non-blocking)
 - wait: block until a DM or mention arrives, or timeout_ms (max 30000)
-- read: read a channel after your read cursor (`channel`, optional `limit`, `since`); the channel's pinned messages come first
+- read: read one of these (optional `limit`):
+  - `channel` = `#name`: the channel after your read cursor (optional `since`); pinned messages come first unless `since` is set
+  - `channel` = `@handle`: your DM with that member, its latest messages, also the ones you sent (optional `since`)
+  - `thread` = a message id: the thread of that message: the root, then all its replies. No read cursor moves.
+- search: find messages whose text or @sender contains `query`, newest first, in the channels and your own DMs (optional `limit`; optional `channel` or `@handle` to search only there). No read cursor moves.
 - channel: create a channel (`channel`, optional `purpose`)
+
+`reply_to` on send puts your message in the thread of that message. Threads are flat: a reply to a reply joins the thread of its root.
+
+You can read only channels and your own DMs, never the DMs of other members or of @hub-bot.
 
 This tool does not start agents; use `spawn_subagent` for that and `get_command_or_subagent_output` for final results.
 
 DMs and mentions also arrive on their own when you are idle. Channel posts without a mention do not interrupt you; use read to catch up.
 
-Related virtual paths (use read_file, not message_agents):
+Session-local virtual paths (use read_file, not message_agents). They cover only this session and the subagents it spawned:
 - agent://<id> — last completed subagent output
 - history:// — roster; history://<id> — concise transcript
 - conflict:// — merge-conflict regions (register via path:conflicts)
+
+Members of a named hub (`/hub join`) that belong to other sessions have no agent:// or history:// path. Reach them, and read what they posted, only with message_agents.
 
 Rules:
 - Use list before send; never invent handles
@@ -401,6 +438,7 @@ impl xai_tool_runtime::Tool for AgentHubTool {
                 })
             }
             AgentHubOp::Read => run_read(&bus, &self_id, &input),
+            AgentHubOp::Search => run_search(&bus, &self_id, &input),
             AgentHubOp::Channel => {
                 let Some(channel) = input.channel.as_deref() else {
                     return Ok(AgentHubOutput::fail("channel requires `channel`"));
@@ -539,39 +577,125 @@ fn resolve_image_path(raw: &str) -> PathBuf {
         .unwrap_or(path)
 }
 
+/// Purpose: Run `read` for a channel, an own DM, or a thread.
+/// Input: The bus, the caller id, and the tool input.
+/// Output: The messages, or a failure for a missing or ambiguous target.
 fn run_read(
     bus: &AgentBus,
     self_id: &str,
     input: &AgentHubInput,
 ) -> anyhow::Result<AgentHubOutput> {
-    let Some(channel) = input.channel.as_deref().or(input.to.as_deref()) else {
-        return Ok(AgentHubOutput::fail("read requires `channel`"));
-    };
     let limit = input.limit.unwrap_or(20).clamp(1, 200);
-    let (msgs, remaining) = bus.read(self_id, channel, limit, input.since)?;
-    let mut summary = match (msgs.len(), remaining) {
-        (0, _) => format!("no new messages in {channel}"),
-        (n, 0) => format!("read {n} message(s) from {channel}; caught up"),
-        (n, r) => format!("read {n} message(s) from {channel}; {r} more unread"),
+    let target = match conv_target(input) {
+        Ok(target) => target,
+        Err(reason) => return Ok(AgentHubOutput::fail(reason)),
     };
-    // A page read with `since` skips the pins, so paging does not repeat them.
-    let pins = match input.since {
-        Some(_) => Vec::new(),
-        None => bus.read_pins(self_id, channel)?,
-    };
-    if pins.is_empty() {
-        return Ok(AgentHubOutput::with_messages(summary, bus, msgs));
+    let thread = input
+        .thread
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    match (thread, target) {
+        (Some(_), Some(_)) => Ok(AgentHubOutput::fail(
+            "read takes `thread` or `channel`/`to`, not both",
+        )),
+        (None, None) => Ok(AgentHubOutput::fail(
+            "read requires `channel` (#channel or @handle) or `thread` (a message id)",
+        )),
+        (Some(thread), None) => {
+            let (msgs, omitted) = bus.read_thread(self_id, thread, limit)?;
+            let summary = match omitted {
+                0 => format!("read thread {thread}: {} message(s)", msgs.len()),
+                n => format!(
+                    "read thread {thread}: root and latest {} reply(ies); {n} older reply(ies) not shown",
+                    msgs.len() - 1
+                ),
+            };
+            Ok(AgentHubOutput::with_messages(summary, bus, msgs))
+        }
+        (None, Some(target)) if bus::is_dm_target(target) => {
+            let (msgs, remaining) = bus.read(self_id, target, limit, input.since)?;
+            let summary = match (msgs.len(), remaining) {
+                (0, _) => format!("no messages in your DM with {target}"),
+                (n, 0) => format!("read {n} message(s) from your DM with {target}"),
+                (n, r) => {
+                    format!("read {n} message(s) from your DM with {target}; {r} more after these")
+                }
+            };
+            Ok(AgentHubOutput::with_messages(summary, bus, msgs))
+        }
+        (None, Some(channel)) => {
+            let (msgs, remaining) = bus.read(self_id, channel, limit, input.since)?;
+            let mut summary = match (msgs.len(), remaining) {
+                (0, _) => format!("no new messages in {channel}"),
+                (n, 0) => format!("read {n} message(s) from {channel}; caught up"),
+                (n, r) => format!("read {n} message(s) from {channel}; {r} more unread"),
+            };
+            let pins = match input.since {
+                Some(_) => Vec::new(),
+                None => bus.read_pins(self_id, channel)?,
+            };
+            if pins.is_empty() {
+                return Ok(AgentHubOutput::with_messages(summary, bus, msgs));
+            }
+            summary.push_str(&format!("; {} pinned message(s) shown first", pins.len()));
+            let (framed, image_paths) = bus.frame_read(channel, &pins, &msgs)?;
+            Ok(AgentHubOutput {
+                ok: true,
+                summary,
+                messages: Some(msg_rows(msgs)),
+                framed: Some(framed),
+                image_paths,
+                ..Default::default()
+            })
+        }
     }
-    summary.push_str(&format!("; {} pinned message(s) shown first", pins.len()));
-    let (framed, image_paths) = bus.frame_read(channel, &pins, &msgs)?;
-    Ok(AgentHubOutput {
-        ok: true,
-        summary,
-        messages: Some(msg_rows(msgs)),
-        framed: Some(framed),
-        image_paths,
-        ..Default::default()
-    })
+}
+
+/// Purpose: Run `search` over the channels and the caller's own DMs.
+/// Input: The bus, the caller id, and the tool input.
+/// Output: The hits, newest first, or a failure for an empty query.
+fn run_search(
+    bus: &AgentBus,
+    self_id: &str,
+    input: &AgentHubInput,
+) -> anyhow::Result<AgentHubOutput> {
+    let Some(query) = input
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    else {
+        return Ok(AgentHubOutput::fail("search requires non-empty `query`"));
+    };
+    let scope = match conv_target(input) {
+        Ok(scope) => scope,
+        Err(reason) => return Ok(AgentHubOutput::fail(reason)),
+    };
+    let limit = input.limit.unwrap_or(20).clamp(1, 50);
+    let hits = bus.search(self_id, query, scope, limit)?;
+    let place = scope.map(|s| format!(" in {s}")).unwrap_or_default();
+    let summary = match hits.len() {
+        0 => format!("no messages match {query:?}{place}"),
+        n => format!("found {n} message(s) matching {query:?}{place}, newest first"),
+    };
+    Ok(AgentHubOutput::with_messages(summary, bus, hits))
+}
+
+/// The conversation that `channel` or `to` names, or `None` when neither is
+/// set. Two different values fail.
+fn conv_target(input: &AgentHubInput) -> Result<Option<&str>, &'static str> {
+    fn clean(raw: &Option<String>) -> Option<&str> {
+        raw.as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+    match (clean(&input.channel), clean(&input.to)) {
+        (Some(channel), Some(to)) if channel != to => {
+            Err("`channel` and `to` name different conversations; set only one")
+        }
+        (channel, to) => Ok(channel.or(to)),
+    }
 }
 
 impl AgentHubOutput {
@@ -837,6 +961,126 @@ mod tool_tests {
         assert!(empty.summary.contains("text"), "{}", empty.summary);
     }
 
+    async fn run_tool(resources: &SharedResources, input: AgentHubInput) -> AgentHubOutput {
+        xai_tool_runtime::Tool::run(&AgentHubTool, test_ctx(resources.clone()), input)
+            .await
+            .unwrap()
+    }
+
+    fn texts(output: &AgentHubOutput) -> Vec<&str> {
+        let messages = output.messages.as_deref().unwrap_or_default();
+        messages.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn search_and_dm_and_thread_reads_via_tool() {
+        let (_root, bus) = temp_bus();
+        bus.register(MAIN_PEER_ID, "main", None);
+        bus.register("a", "scout", None);
+        let send = |from: &str, to: &str, text: &str, reply_to: Option<&str>| {
+            bus.send(from, to, text, reply_to, &[])
+                .into_result()
+                .unwrap()
+        };
+        let first = send("a", "#general", "auth decision: tokens", None);
+        let reply = send(MAIN_PEER_ID, "#general", "agreed", Some(&first));
+        send("a", "#general", "nested", Some(&reply));
+        send("a", MAIN_PEER_ID, "auth in a DM", None);
+        let main = hub_resources(MAIN_PEER_ID, bus.clone());
+
+        let search = AgentHubInput {
+            op: AgentHubOp::Search,
+            query: Some("AUTH".into()),
+            ..Default::default()
+        };
+        assert_eq!(search.title(), "Hub: search \"AUTH\"");
+        let found = run_tool(&main, search).await;
+        assert!(found.ok, "{}", found.summary);
+        assert_eq!(texts(&found), ["auth in a DM", "auth decision: tokens"]);
+        assert!(
+            found.summary.starts_with("found 2 message(s)"),
+            "{}",
+            found.summary
+        );
+        assert!(found.prompt_text().contains("--- DM @Main,@a"));
+        let empty = AgentHubInput {
+            op: AgentHubOp::Search,
+            query: Some("  ".into()),
+            ..Default::default()
+        };
+        let empty = run_tool(&main, empty).await;
+        assert!(
+            !empty.ok && empty.summary.contains("query"),
+            "{}",
+            empty.summary
+        );
+
+        let thread = AgentHubInput {
+            op: AgentHubOp::Read,
+            thread: Some(reply.clone()),
+            ..Default::default()
+        };
+        assert_eq!(thread.title(), format!("Hub: read thread {reply}"));
+        let thread = run_tool(&main, thread).await;
+        assert!(thread.ok, "{}", thread.summary);
+        assert_eq!(
+            texts(&thread),
+            ["auth decision: tokens", "agreed", "nested"]
+        );
+
+        let dm = AgentHubInput {
+            op: AgentHubOp::Read,
+            channel: Some("@a".into()),
+            ..Default::default()
+        };
+        let dm = run_tool(&main, dm).await;
+        assert!(dm.ok, "{}", dm.summary);
+        assert_eq!(texts(&dm), ["auth in a DM"]);
+
+        for bad in [
+            AgentHubInput {
+                op: AgentHubOp::Read,
+                ..Default::default()
+            },
+            AgentHubInput {
+                op: AgentHubOp::Read,
+                thread: Some(first.clone()),
+                channel: Some("#general".into()),
+                ..Default::default()
+            },
+            AgentHubInput {
+                op: AgentHubOp::Read,
+                channel: Some("#general".into()),
+                to: Some("@a".into()),
+                ..Default::default()
+            },
+            AgentHubInput {
+                op: AgentHubOp::Read,
+                channel: Some("@hub-bot".into()),
+                ..Default::default()
+            },
+        ] {
+            let out = run_tool(&main, bad).await;
+            assert!(!out.ok, "{}", out.summary);
+        }
+    }
+
+    #[test]
+    fn description_names_search_threads_and_session_local_paths() {
+        let tool = AgentHubTool;
+        let text = crate::types::tool_metadata::ToolMetadata::description_template(&tool);
+        for needle in [
+            "- search:",
+            "`thread`",
+            "your DM with that member",
+            "Threads are flat",
+            "Session-local virtual paths",
+            "only with message_agents",
+        ] {
+            assert!(text.contains(needle), "{needle}");
+        }
+    }
+
     #[tokio::test]
     async fn peer_a_to_peer_b_then_main_sees_reply() {
         let (_root, bus) = temp_bus();
@@ -909,12 +1153,6 @@ mod tool_tests {
         assert_eq!(msgs[0].from, "b");
         assert_eq!(msgs[0].text, "acked");
         assert_eq!(msgs[0].reply_to, sent.message_id);
-    }
-
-    async fn run_tool(resources: &SharedResources, input: AgentHubInput) -> AgentHubOutput {
-        xai_tool_runtime::Tool::run(&AgentHubTool, test_ctx(resources.clone()), input)
-            .await
-            .unwrap()
     }
 
     #[tokio::test]

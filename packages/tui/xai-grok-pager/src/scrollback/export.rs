@@ -145,7 +145,7 @@ mod tests {
         ];
         let out = render_blocks_to_markdown(blocks.iter());
         assert!(
-            out.starts_with("## Hub · team (1 new message)\n\n"),
+            out.starts_with("## Hub · agent messages (1 new message)\n\n"),
             "{out}"
         );
         assert!(out.contains("please fix the build"), "{out}");

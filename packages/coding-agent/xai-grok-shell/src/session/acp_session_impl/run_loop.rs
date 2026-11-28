@@ -501,7 +501,7 @@ pub(super) async fn run_session(
                     // Drain any monitor events that were routed to the mid-turn buffer
                     // but arrived after the turn ended (race between is_turn_active and buffer push).
                     session.drain_monitor_buffer_to_pending().await;
-                    if let Some(message) = infra_pause_message {
+                    if owned_completion && let Some(message) = infra_pause_message {
                         session.apply_infra_pause_after_turn_err(message).await;
                     }
                     // Goal continuation (success) or back-off (non-success).

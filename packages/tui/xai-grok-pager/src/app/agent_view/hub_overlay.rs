@@ -5,11 +5,12 @@ use crossterm::event::{Event, KeyEventKind};
 use xai_grok_tools::implementations::grok_build::agent_hub::{self, store};
 
 use super::AgentView;
-use crate::app::actions::Action;
+use crate::app::actions::{Action, Effect};
+use crate::app::agent::AgentId;
 use crate::app::app_view::InputOutcome;
 use crate::key;
 use crate::scrollback::block::RenderBlock;
-use crate::views::hub_browser::{HubBrowserState, HubKeyOutcome};
+use crate::views::hub_browser::{HubBrowserState, HubKeyOutcome, HubRefresh, ReadMark};
 
 impl AgentView {
     /// Open the browser on a hub: the named hub, or this session's hub when
@@ -32,14 +33,65 @@ impl AgentView {
         }
     }
 
-    /// Read the open browser's hub again. Returns false when no browser is open.
-    pub(crate) fn refresh_hub_browser(&mut self) -> bool {
-        let Some(browser) = self.hub_browser.as_mut() else {
+    /// True when this view or one of its subagent views shows a hub browser.
+    pub(crate) fn has_hub_browser(&self) -> bool {
+        self.hub_browser.is_some()
+            || self
+                .subagent_views
+                .values()
+                .any(|view| view.hub_browser.is_some())
+    }
+
+    /// Purpose: Start a background refresh of each open hub browser: the
+    ///     browser of this view and those of its subagent views.
+    /// Input: The id of this agent view.
+    /// Output: One effect per browser that has no refresh in flight. The
+    ///     effects read the hub files off the UI thread.
+    pub(crate) fn hub_browser_refreshes(&mut self, agent_id: AgentId) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if let Some(job) = self.hub_browser.as_mut().and_then(|b| b.begin_refresh()) {
+            effects.push(Effect::RefreshHubBrowser {
+                agent_id,
+                subagent: None,
+                job: Box::new(job),
+            });
+        }
+        for (id, view) in &mut self.subagent_views {
+            if let Some(job) = view.hub_browser.as_mut().and_then(|b| b.begin_refresh()) {
+                effects.push(Effect::RefreshHubBrowser {
+                    agent_id,
+                    subagent: Some(id.clone()),
+                    job: Box::new(job),
+                });
+            }
+        }
+        effects
+    }
+
+    /// Purpose: Apply a background hub browser refresh.
+    /// Input: The subagent view that started it (`None` for this view), the
+    ///     job generation, and the result.
+    /// Output: True when the browser changed. A stale result, or one for a
+    ///     browser that was closed, changes nothing.
+    /// Note: The read positions that the refresh found are saved off the UI
+    ///     thread. A cursor never moves back, so their order does not matter.
+    pub(crate) fn finish_hub_browser_refresh(
+        &mut self,
+        subagent: Option<&str>,
+        generation: u64,
+        result: Result<HubRefresh, String>,
+    ) -> bool {
+        let view = match subagent {
+            None => Some(self),
+            Some(id) => self.subagent_views.get_mut(id).map(|view| &mut **view),
+        };
+        let Some(browser) = view.and_then(|view| view.hub_browser.as_mut()) else {
             return false;
         };
-        if let Err(error) = browser.reload() {
-            tracing::warn!(%error, "hub browser: reload failed");
-        }
+        let Some(marks) = browser.finish_refresh(generation, result) else {
+            return false;
+        };
+        save_read_marks(browser.hub.clone(), browser.person.clone(), marks);
         true
     }
 
@@ -315,6 +367,28 @@ fn open_hub_of_session(root: &std::path::Path, session_id: &str) -> anyhow::Resu
     Ok(hub)
 }
 
+/// Save read positions of the person on a blocking thread, or here when no
+/// runtime runs (tests).
+fn save_read_marks(hub: store::Hub, person: String, marks: Vec<ReadMark>) {
+    if marks.is_empty() {
+        return;
+    }
+    let save = move || {
+        for mark in marks {
+            let saved = agent_hub::mark_read_at(&hub, &person, &mark.conv, mark.count, mark.offset);
+            if let Err(error) = saved {
+                tracing::warn!(%error, "hub browser: could not save the read position");
+            }
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(save);
+        }
+        Err(_) => save(),
+    }
+}
+
 /// Open a hub by name, with a suggestion when the name does not exist.
 fn open_named_hub(root: &std::path::Path, name: &str) -> anyhow::Result<store::Hub> {
     if let Ok(hub) = store::Hub::open(root, name) {
@@ -340,6 +414,52 @@ mod tests {
         let mut view = crate::test_util::make_agent_view(None, "/tmp");
         view.hub_browser = Some(HubBrowserState::open(bus.hub(), "me", None).unwrap());
         (root, view, bus)
+    }
+
+    /// Run a refresh effect the way `effects::execute` does, then apply it.
+    fn run_refresh(view: &mut AgentView, effect: Effect) -> bool {
+        let Effect::RefreshHubBrowser { subagent, job, .. } = effect else {
+            panic!("expected a hub browser refresh");
+        };
+        let generation = job.generation;
+        let result = job.run().map_err(|error| error.to_string());
+        view.finish_hub_browser_refresh(subagent.as_deref(), generation, result)
+    }
+
+    #[test]
+    fn poll_refreshes_root_and_subagent_browsers_off_thread() {
+        let (_root, mut view, bus) = browser_with_agent();
+        let mut child = crate::test_util::make_agent_view(None, "/tmp");
+        child.hub_browser = Some(HubBrowserState::open(bus.hub(), "me", None).unwrap());
+        view.subagent_views
+            .insert("child".to_string(), Box::new(child));
+        assert!(view.has_hub_browser());
+
+        bus.send(MAIN_PEER_ID, "#general", "fresh news", None, &[])
+            .into_result()
+            .unwrap();
+        let effects = view.hub_browser_refreshes(AgentId(0));
+        assert_eq!(effects.len(), 2);
+        // A refresh in flight starts no second one.
+        assert!(view.hub_browser_refreshes(AgentId(0)).is_empty());
+        for effect in effects {
+            assert!(run_refresh(&mut view, effect));
+        }
+        let has_news =
+            |browser: &HubBrowserState| browser.feed.iter().any(|m| m.text == "fresh news");
+        assert!(has_news(view.hub_browser.as_ref().unwrap()));
+        assert!(has_news(
+            view.subagent_views["child"].hub_browser.as_ref().unwrap()
+        ));
+
+        // A browser that closed while the job ran drops the result.
+        let mut effects = view.hub_browser_refreshes(AgentId(0));
+        view.hub_browser = None;
+        let root_effect = effects.remove(0);
+        assert!(!run_refresh(&mut view, root_effect));
+        view.subagent_views.clear();
+        assert!(!run_refresh(&mut view, effects.remove(0)));
+        assert!(!view.has_hub_browser());
     }
 
     #[test]

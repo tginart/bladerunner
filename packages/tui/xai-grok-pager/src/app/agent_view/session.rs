@@ -39,6 +39,7 @@ impl AgentView {
         let mut effects = vec![];
         if self.session.session_id.as_ref() != Some(&session_id) {
             self.file_browser = None;
+            self.pull_request = None;
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
             self.last_seen_event_id = None;
             self.last_applied_event_seq = None;
@@ -48,7 +49,10 @@ impl AgentView {
             effects.extend(self.teardown_review_chat());
             if matches!(
                 self.active_modal,
-                Some(crate::views::modal::ActiveModal::Changes { .. })
+                Some(
+                    crate::views::modal::ActiveModal::Changes { .. }
+                        | crate::views::modal::ActiveModal::PullRequest
+                )
             ) {
                 self.active_modal = None;
             }
@@ -61,12 +65,16 @@ impl AgentView {
         let mut effects = vec![];
         if self.session.session_id.take().is_some() {
             self.file_browser = None;
+            self.pull_request = None;
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
             self.clear_minimal_btw_lifecycle();
             effects.extend(self.teardown_review_chat());
             if matches!(
                 self.active_modal,
-                Some(crate::views::modal::ActiveModal::Changes { .. })
+                Some(
+                    crate::views::modal::ActiveModal::Changes { .. }
+                        | crate::views::modal::ActiveModal::PullRequest
+                )
             ) {
                 self.active_modal = None;
             }
@@ -75,20 +83,20 @@ impl AgentView {
     }
     /// Capture the original parent/child identity before discarding UI state.
     pub(crate) fn teardown_review_chat(&mut self) -> Vec<crate::app::actions::Effect> {
-        let Some(shared) = self.review_chat.take() else {
-            return vec![];
-        };
-        let chat = shared.borrow();
-        if chat.busy
-            && let Some(child_id) = &chat.current_child_id
-        {
-            vec![crate::app::actions::Effect::KillSubagent {
-                session_id: chat.parent_session_id.clone().into(),
-                subagent_id: child_id.clone(),
-            }]
-        } else {
-            vec![]
-        }
+        self.review_chat
+            .take()
+            .into_iter()
+            .chain(self.pr_chats.drain().map(|(_, chat)| chat))
+            .filter_map(|shared| {
+                let chat = shared.borrow();
+                let child_id = chat.current_child_id.as_ref()?;
+                chat.busy
+                    .then(|| crate::app::actions::Effect::KillSubagent {
+                        session_id: chat.parent_session_id.clone().into(),
+                        subagent_id: child_id.clone(),
+                    })
+            })
+            .collect()
     }
     /// Record a prompt id this client originated (sent to the agent as the turn
     /// driver). Used by the ACP gate to keep `attached_as_viewer` per-turn
@@ -368,6 +376,8 @@ impl AgentView {
             session_agent_name: None,
             subagent_sessions: HashMap::new(),
             review_chat: None,
+            pull_request: None,
+            pr_chats: HashMap::new(),
             subagent_views: HashMap::new(),
             active_subagent: None,
             is_subagent_view: false,

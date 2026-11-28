@@ -296,6 +296,7 @@ pub enum ActiveModal {
     MemoryBrowser {
         state: Box<crate::views::memory_modal::MemoryModalState>,
     },
+    PullRequest,
     /// Changes review modal (A2): pending hunks with accept/reject.
     Changes {
         state: Box<crate::views::changes_modal::ChangesModalState>,
@@ -674,6 +675,7 @@ impl ActiveModal {
             | ActiveModal::DocViewer { .. }
             | ActiveModal::ShortcutsHelp { .. }
             | ActiveModal::MemoryBrowser { .. }
+            | ActiveModal::PullRequest
             | ActiveModal::Changes { .. }
             | ActiveModal::Settings { .. }
             | ActiveModal::UsageInfo { .. }
@@ -707,6 +709,7 @@ impl ActiveModal {
             ActiveModal::DocViewer { title, .. } => title.clone().into(),
             ActiveModal::ShortcutsHelp { .. } => rust_i18n::t!("modal.title.keyboard_shortcuts"),
             ActiveModal::MemoryBrowser { .. } => rust_i18n::t!("modal.title.memory"),
+            ActiveModal::PullRequest => "Pull request".into(),
             ActiveModal::Changes { .. } => rust_i18n::t!("changes.title"),
             ActiveModal::Settings { .. } => rust_i18n::t!("modal.title.settings"),
             ActiveModal::ResetSettingsConfirm { .. } => {

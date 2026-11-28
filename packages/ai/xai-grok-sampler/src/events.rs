@@ -254,6 +254,7 @@ impl From<&SamplingError> for SamplingErrorInfo {
             SamplingError::Auth { .. } => (SamplingErrorKind::Auth, None, None, None),
             SamplingError::InvalidConfiguration(_) => (SamplingErrorKind::Api, None, None, None),
             SamplingError::Http(_) => (SamplingErrorKind::Http, None, None, None),
+            SamplingError::CredentialRefresh { .. } => (SamplingErrorKind::Http, None, None, None),
             SamplingError::Serialization(_) => (SamplingErrorKind::Serialization, None, None, None),
             SamplingError::Api {
                 status,

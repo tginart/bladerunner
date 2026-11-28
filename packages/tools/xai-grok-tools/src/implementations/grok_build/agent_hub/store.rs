@@ -4,17 +4,24 @@
 //! - `hub.json`: the hub name, members, channels and the loop-guard streak.
 //! - `channels/<channel>.jsonl` and `dms/<a>__<b>.jsonl`: append-only messages.
 //! - `cursors/<handle>.json`: per-member read and notify positions.
+//! - `tokens/<handle>.json`: estimated context tokens that each member read.
 //! - `presence/<handle>.json`: what each agent does now (working, idle, ...).
 //! - `blobs/`: images attached to messages.
-//! - `hub.lock`: an advisory lock that every write holds.
+//! - `hub.lock`: an advisory lock that every write of `hub.json` or of a
+//!   conversation holds. Cursor and token files use per-member locks.
 //!
 //! Every member process reads and appends to the same directory. No daemon is
 //! needed: a writer holds `hub.lock`, and a reader reads up to the last full line.
+//! A reader that saved a byte offset reads only the bytes after it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -44,6 +51,7 @@ const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 /// Token-count key for all DMs of a hub.
 pub const DM_TOKENS_KEY: &str = "dm";
 const PRESENCE_DIR: &str = "presence";
+const TOKENS_DIR: &str = "tokens";
 /// Longest task text that a presence file keeps, in characters.
 pub const MAX_TASK_CHARS: usize = 120;
 /// Age after which an unused session hub of an ended session is removed.
@@ -173,6 +181,9 @@ pub struct Message {
 }
 
 /// Per-member positions, counted in messages (lines) per conversation.
+/// Note: A byte offset is a fast path. Its line count must match the cursor,
+///     and its file stamp must retain the same file prefix. Older cursor files
+///     without a stamp, or count-only changes, require a scan from line 0.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursors {
     /// Messages the member has read with `read` or `inbox`.
@@ -181,6 +192,138 @@ pub struct Cursors {
     /// Messages already checked for DMs and mentions to deliver.
     #[serde(default)]
     pub notified: BTreeMap<String, usize>,
+    /// Byte offset in `<conv>.jsonl` after the `read[conv]` complete lines.
+    #[serde(default)]
+    pub read_bytes: BTreeMap<String, LineOffset>,
+    /// Byte offset in `<conv>.jsonl` after the `notified[conv]` complete lines.
+    #[serde(default)]
+    pub notified_bytes: BTreeMap<String, LineOffset>,
+}
+
+/// The byte offset in a conversation file after its first `lines` lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineOffset {
+    pub lines: usize,
+    pub bytes: u64,
+    /// The file stamp that validates this offset. Older cursors have no stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<FileStamp>,
+}
+
+impl Cursors {
+    /// The byte offset after the read messages of `conv`, when it is known.
+    pub fn read_offset(&self, conv: &str) -> Option<LineOffset> {
+        known_offset(&self.read, &self.read_bytes, conv)
+    }
+
+    /// The byte offset after the notified messages of `conv`, when it is known.
+    pub fn notified_offset(&self, conv: &str) -> Option<LineOffset> {
+        known_offset(&self.notified, &self.notified_bytes, conv)
+    }
+
+    /// Set the read count of `conv`, with its byte offset when it is known.
+    pub fn set_read(&mut self, conv: &str, count: usize, offset: Option<LineOffset>) {
+        set_position(&mut self.read, &mut self.read_bytes, conv, count, offset);
+    }
+
+    /// Set the notified count of `conv`, with its byte offset when it is known.
+    pub fn set_notified(&mut self, conv: &str, count: usize, offset: Option<LineOffset>) {
+        set_position(
+            &mut self.notified,
+            &mut self.notified_bytes,
+            conv,
+            count,
+            offset,
+        );
+    }
+}
+
+/// Estimated context tokens that hub messages put into one member.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberTokens {
+    /// Tokens keyed by `#channel` or [`DM_TOKENS_KEY`].
+    #[serde(default)]
+    pub by_conv: BTreeMap<String, u64>,
+}
+
+/// The size, change time and identity of a file, from one `stat`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileStamp {
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
+    /// Device and inode on Unix. Other platforms use the creation time.
+    pub identity: Option<(u64, u64)>,
+}
+
+impl FileStamp {
+    /// Purpose: Check whether an append-only writer retains the saved prefix.
+    /// Input: The current and previous file stamps.
+    /// Output: True for an unchanged file or growth of the same file.
+    fn retains_prefix(self, previous: Self) -> bool {
+        self == previous
+            || (self.identity == previous.identity
+                && self.created == previous.created
+                && self.len > previous.len)
+    }
+}
+
+/// Messages of one conversation, read from a line index or a byte offset.
+#[derive(Debug, Clone, Default)]
+pub struct MessagesSlice {
+    pub messages: Vec<Message>,
+    /// Byte offset after the last returned message. `None` when the file
+    /// has fewer complete lines than the start line.
+    pub next_byte_offset: Option<LineOffset>,
+    /// Complete messages after the limit that were not returned.
+    pub remaining: usize,
+    /// The file stamp from before the read.
+    pub stamp: FileStamp,
+}
+
+impl MessagesSlice {
+    /// The tail after the returned messages, for a read from `start_line`.
+    pub fn tail(&self, start_line: usize) -> Option<ConvTail> {
+        Some(ConvTail {
+            byte_offset: self.next_byte_offset?.bytes,
+            message_count: start_line + self.messages.len(),
+            stamp: self.stamp,
+        })
+    }
+}
+
+/// Where an incremental reader of one conversation file stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConvTail {
+    /// Byte offset after the last complete message that was read.
+    pub byte_offset: u64,
+    /// Messages before `byte_offset`.
+    pub message_count: usize,
+    /// The file stamp of the last read. An equal stamp means no new bytes.
+    pub stamp: FileStamp,
+}
+
+impl ConvTail {
+    /// The file stamp and byte offset after the messages in this tail.
+    pub fn offset(&self) -> LineOffset {
+        LineOffset {
+            lines: self.message_count,
+            bytes: self.byte_offset,
+            stamp: Some(self.stamp),
+        }
+    }
+}
+
+/// The result of [`Hub::read_tail`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailRead {
+    /// The file did not change.
+    Unchanged,
+    /// The messages after the old tail.
+    Appended(Vec<Message>),
+    /// The file became shorter or was replaced: every message, from line 0.
+    Reset(Vec<Message>),
 }
 
 /// What a live agent does now, as its session reports it.
@@ -393,23 +536,178 @@ impl Hub {
 
     /// Messages of `conv` from index `start` on. A partial last line is skipped.
     pub fn messages(&self, conv: &str, start: usize) -> Result<Vec<Message>> {
-        let path = self.conv_path(conv)?;
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(self.messages_from_offset(conv, start, None, None)?.messages)
+    }
+
+    /// Purpose: Read the messages of `conv` from line `start_line` on.
+    /// Input: The conversation, the start line, the byte offset of that line
+    ///     when it is known, and an optional maximum count.
+    /// Output: The messages, the byte offset after the last of them, and the
+    ///     count of complete messages after the limit.
+    /// Method:
+    ///     1. If the saved stamp retains its prefix and the offset starts a line,
+    ///        seek to it.
+    ///     2. If not (a legacy cursor, or a shorter or replaced file), scan
+    ///        from byte 0 past `start_line` lines.
+    ///     3. Read complete lines up to `limit`. Stop at a line without a
+    ///        newline or with invalid JSON: that is a write in progress.
+    pub fn messages_from_offset(
+        &self,
+        conv: &str,
+        start_line: usize,
+        start_byte: Option<LineOffset>,
+        limit: Option<usize>,
+    ) -> Result<MessagesSlice> {
+        let Some((mut file, stamp)) = self.open_conv(conv)? else {
+            return Ok(MessagesSlice {
+                next_byte_offset: (start_line == 0).then_some(LineOffset::default()),
+                ..MessagesSlice::default()
+            });
+        };
+        let seek_to = match start_byte {
+            Some(offset)
+                if offset.lines == start_line
+                    && offset
+                        .stamp
+                        .is_some_and(|previous| stamp.retains_prefix(previous))
+                    && is_line_start(&mut file, offset.bytes, stamp.len)? =>
+            {
+                Some(offset.bytes)
+            }
+            _ => None,
+        };
+        let mut reader = BufReader::new(file);
+        let start = match seek_to {
+            Some(offset) => offset,
+            None => {
+                reader.seek(SeekFrom::Start(0))?;
+                let Some(offset) = skip_lines(&mut reader, start_line)? else {
+                    return Ok(MessagesSlice {
+                        stamp,
+                        ..MessagesSlice::default()
+                    });
+                };
+                offset
+            }
+        };
+        reader.seek(SeekFrom::Start(start))?;
+        let (messages, end, remaining) = read_messages(&mut reader, start, limit)?;
+        let next_byte_offset = Some(LineOffset {
+            lines: start_line + messages.len(),
+            bytes: end,
+            stamp: Some(stamp),
+        });
+        Ok(MessagesSlice {
+            messages,
+            next_byte_offset,
+            remaining,
+            stamp,
+        })
+    }
+
+    /// Purpose: Read the messages that were appended to `conv` after `tail`.
+    /// Input: The conversation and the tail of the last read.
+    /// Output: Nothing new when the file stamp did not change, the appended
+    ///     messages, or every message when the file became shorter or was
+    ///     replaced. The tail moves past the messages that were read.
+    pub fn read_tail(&self, conv: &str, tail: &mut ConvTail) -> Result<TailRead> {
+        let Some((mut file, stamp)) = self.open_conv(conv)? else {
+            let was_empty = tail.message_count == 0;
+            *tail = ConvTail::default();
+            return Ok(if was_empty {
+                TailRead::Unchanged
+            } else {
+                TailRead::Reset(Vec::new())
+            });
+        };
+        if stamp == tail.stamp {
+            return Ok(TailRead::Unchanged);
+        }
+        // Supported writers only append. A new inode or a changed file that
+        // did not grow cannot retain the previous file's cached messages.
+        let is_append = stamp.retains_prefix(tail.stamp)
+            && is_line_start(&mut file, tail.byte_offset, stamp.len)?;
+        let start = if is_append { tail.byte_offset } else { 0 };
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(start))?;
+        let (messages, end, _) = read_messages(&mut reader, start, None)?;
+        let base = if is_append { tail.message_count } else { 0 };
+        *tail = ConvTail {
+            byte_offset: end,
+            message_count: base + messages.len(),
+            stamp,
+        };
+        Ok(if is_append {
+            TailRead::Appended(messages)
+        } else {
+            TailRead::Reset(messages)
+        })
+    }
+
+    /// Purpose: Stat the files that a new message or a member change touches.
+    /// Input: The hub.
+    /// Output: The stamp of `hub.json` and of every conversation file, sorted
+    ///     by path. A file that cannot be read is left out.
+    /// Note: This opens no file and takes no lock.
+    pub fn file_stamps(&self) -> Vec<(PathBuf, FileStamp)> {
+        let mut paths = vec![self.dir.join(META_FILE)];
+        for sub in ["channels", "dms"] {
+            if let Ok(entries) = fs::read_dir(self.dir.join(sub)) {
+                paths.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        }
+        let mut out = Vec::new();
+        for path in paths {
+            if let Ok(metadata) = fs::metadata(&path) {
+                out.push((path, file_stamp(&metadata)));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Purpose: Add token costs to the token file of one member.
+    /// Input: The member handle and the costs by token key.
+    /// Output: Ok when the file is saved.
+    /// Note: The caller holds the member's cursor lock. No hub lock is taken
+    ///     and `hub.json` does not change.
+    pub fn add_member_tokens(&self, handle: &str, costs: &BTreeMap<String, u64>) -> Result<()> {
+        if costs.is_empty() {
+            return Ok(());
+        }
+        create_private_dir(&self.dir.join(TOKENS_DIR))?;
+        let path = self.tokens_path(handle);
+        let mut tokens: MemberTokens = if path.exists() {
+            read_json(&path)?
+        } else {
+            MemberTokens::default()
+        };
+        for (key, cost) in costs {
+            *tokens.by_conv.entry(key.clone()).or_default() += cost;
+        }
+        write_json_atomic(&path, &tokens)
+    }
+
+    /// Purpose: Sum the token counts of the hub.
+    /// Input: The hub metadata, which holds the counts from before token files.
+    /// Output: The counts by token key: `meta.tokens` plus every member file.
+    pub fn tokens(&self, meta: &HubMeta) -> Result<BTreeMap<String, u64>> {
+        let mut out = meta.tokens.clone();
+        let entries = match fs::read_dir(self.dir.join(TOKENS_DIR)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
-        for (i, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
-            if i < start {
+        for entry in entries {
+            let path = entry?.path();
+            // A temp file of a write in progress has another extension.
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            // A line without a closing brace is a write in progress.
-            let Ok(message) = serde_json::from_str::<Message>(&line) else {
-                break;
-            };
-            out.push(message);
+            let tokens: MemberTokens = read_json(&path)?;
+            for (key, cost) in tokens.by_conv {
+                *out.entry(key).or_default() += cost;
+            }
         }
         Ok(out)
     }
@@ -554,6 +852,18 @@ impl Hub {
         Ok(file)
     }
 
+    /// Open a conversation file and stat it, or `None` when it does not exist.
+    fn open_conv(&self, conv: &str) -> Result<Option<(File, FileStamp)>> {
+        let path = self.conv_path(conv)?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let stamp = file_stamp(&file.metadata()?);
+        Ok(Some((file, stamp)))
+    }
+
     fn conv_path(&self, conv: &str) -> Result<PathBuf> {
         if let Some(channel) = conv.strip_prefix('#') {
             return Ok(self.dir.join("channels").join(format!("{channel}.jsonl")));
@@ -626,6 +936,12 @@ impl Hub {
     fn cursor_path(&self, handle: &str) -> PathBuf {
         self.dir
             .join("cursors")
+            .join(format!("{}.json", encode_handle(handle)))
+    }
+
+    fn tokens_path(&self, handle: &str) -> PathBuf {
+        self.dir
+            .join(TOKENS_DIR)
             .join(format!("{}.json", encode_handle(handle)))
     }
 }
@@ -762,6 +1078,43 @@ pub fn dm_conv(a: &str, b: &str) -> String {
 pub fn split_dm_conv(conv: &str) -> Option<(&str, &str)> {
     let (a, b) = conv.split_once(',')?;
     Some((a.strip_prefix('@')?, b.strip_prefix('@')?))
+}
+
+/// True when `conv` is a DM of hub-bot. Only the person and hub-bot see it.
+pub fn is_bot_conv(conv: &str) -> bool {
+    split_dm_conv(conv).is_some_and(|(a, b)| a == BOT_HANDLE || b == BOT_HANDLE)
+}
+
+/// Purpose: Find the thread root of every message of one conversation.
+/// Input: The messages of one conversation, oldest first.
+/// Output: A map from each message id to the id of its thread root. A
+///     message that is not a reply in this conversation is its own root.
+/// Method:
+///     1. Go through the messages in order.
+///     2. If the parent of a message is an earlier message, use the root of
+///        that parent. If not, the message is a root.
+/// Note: A parent must come before its reply. Thus a corrupt `reply_to` that
+///     points forward, or a cycle, cannot cause a loop. A parent in another
+///     conversation stops the walk, so that message is a root here.
+pub fn thread_root_index(messages: &[Message]) -> HashMap<&str, &str> {
+    let mut roots: HashMap<&str, &str> = HashMap::with_capacity(messages.len());
+    for message in messages {
+        let root = message
+            .reply_to
+            .as_deref()
+            .and_then(|parent| roots.get(parent).copied())
+            .unwrap_or(message.id.as_str());
+        roots.entry(message.id.as_str()).or_insert(root);
+    }
+    roots
+}
+
+/// The thread root of message `id` in `messages`, or `None` when `messages`
+/// does not hold `id`. See [`thread_root_index`].
+pub fn resolve_thread_root(messages: &[Message], id: &str) -> Option<String> {
+    thread_root_index(messages)
+        .get(id)
+        .map(|root| root.to_string())
 }
 
 pub fn session_hub_name(root_session_id: &str) -> String {
@@ -972,6 +1325,115 @@ fn is_idle_session_hub(hub: &Hub) -> bool {
     is_old && !meta.members.iter().any(Member::is_live) && !hub.has_messages()
 }
 
+fn known_offset(
+    counts: &BTreeMap<String, usize>,
+    offsets: &BTreeMap<String, LineOffset>,
+    conv: &str,
+) -> Option<LineOffset> {
+    let count = counts.get(conv).copied().unwrap_or(0);
+    if count == 0 {
+        return Some(LineOffset::default());
+    }
+    offsets
+        .get(conv)
+        .filter(|offset| offset.lines == count && offset.stamp.is_some())
+        .copied()
+}
+
+fn set_position(
+    counts: &mut BTreeMap<String, usize>,
+    offsets: &mut BTreeMap<String, LineOffset>,
+    conv: &str,
+    count: usize,
+    offset: Option<LineOffset>,
+) {
+    counts.insert(conv.to_string(), count);
+    match offset {
+        Some(offset) => {
+            assert_eq!(offset.lines, count);
+            offsets.insert(conv.to_string(), offset);
+        }
+        None => {
+            offsets.remove(conv);
+        }
+    }
+}
+
+fn file_stamp(metadata: &fs::Metadata) -> FileStamp {
+    FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        identity: Some((metadata.dev(), metadata.ino())),
+        #[cfg(not(unix))]
+        identity: None,
+    }
+}
+
+/// True when `offset` is the start of a line: byte 0, or the byte after a newline.
+fn is_line_start(file: &mut File, offset: u64, len: u64) -> Result<bool> {
+    if offset == 0 {
+        return Ok(true);
+    }
+    if offset > len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(offset - 1))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)?;
+    Ok(byte[0] == b'\n')
+}
+
+/// The byte offset after `count` complete lines, or `None` when there are fewer.
+fn skip_lines(reader: &mut impl BufRead, count: usize) -> Result<Option<u64>> {
+    let mut offset = 0;
+    let mut line = Vec::new();
+    for _ in 0..count {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if line.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        offset += read as u64;
+    }
+    Ok(Some(offset))
+}
+
+/// Purpose: Read complete messages from a reader at byte `start`.
+/// Input: The reader, its byte offset in the file, and an optional limit.
+/// Output: Up to `limit` messages, the byte offset after the last of them,
+///     and the count of complete messages after the limit.
+/// Note: A line without a newline or a closing brace is a write in progress.
+///     The read stops before it, so the next read gets the line whole.
+fn read_messages(
+    reader: &mut impl BufRead,
+    start: u64,
+    limit: Option<usize>,
+) -> Result<(Vec<Message>, u64, usize)> {
+    let mut messages = Vec::new();
+    let mut end = start;
+    let mut remaining = 0;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        let Ok(message) = serde_json::from_slice::<Message>(&line) else {
+            break;
+        };
+        if limit.is_some_and(|limit| messages.len() >= limit) {
+            remaining += 1;
+            continue;
+        }
+        end += read as u64;
+        messages.push(message);
+    }
+    Ok((messages, end, remaining))
+}
+
 fn has_messages(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
@@ -1007,12 +1469,33 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
+/// Purpose: Replace a JSON file so that no reader sees a partial file.
+/// Input: The path and the value.
+/// Output: Ok when the new file is in place.
+/// Method:
+///     1. Write the value to a temp file next to `path`. Its name holds the
+///        process id and a sequence number, so no two writers share it, also
+///        two threads of one process.
+///     2. Rename the temp file to `path`.
+///     3. On failure, remove the temp file.
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
-    Ok(())
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("no file name in {}", path.display()))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!("{file_name}.tmp-{}-{sequence}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let result = fs::write(&tmp, bytes)
+        .with_context(|| format!("write {}", tmp.display()))
+        .and_then(|()| {
+            fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -1180,6 +1663,38 @@ mod tests {
     }
 
     #[test]
+    fn thread_roots_follow_legacy_chains_and_stop_at_bad_links() {
+        let reply = |text: &str, parent: &str| Message {
+            reply_to: Some(parent.to_string()),
+            ..message("#general", "a", text)
+        };
+        let messages = vec![
+            message("#general", "a", "m1"),
+            reply("m2", "id-m1"),
+            reply("m3", "id-m2"),
+            // A parent in another conversation, and a parent that comes later.
+            reply("cross", "id-elsewhere"),
+            reply("forward", "id-later"),
+            reply("self", "id-self"),
+            message("#general", "a", "later"),
+        ];
+        let roots = thread_root_index(&messages);
+        assert_eq!(roots["id-m2"], "id-m1");
+        assert_eq!(roots["id-m3"], "id-m1");
+        for own in ["id-m1", "id-cross", "id-forward", "id-self", "id-later"] {
+            assert_eq!(roots[own], own);
+        }
+        assert_eq!(
+            resolve_thread_root(&messages, "id-m3").as_deref(),
+            Some("id-m1")
+        );
+        assert_eq!(resolve_thread_root(&messages, "id-missing"), None);
+        assert!(is_bot_conv(&dm_conv("me", BOT_HANDLE)));
+        assert!(!is_bot_conv(&dm_conv("me", "a")));
+        assert!(!is_bot_conv("#general"));
+    }
+
+    #[test]
     fn cursors_round_trip() {
         let root = tempfile::tempdir().unwrap();
         let hub = Hub::create(root.path(), "h").unwrap();
@@ -1189,6 +1704,407 @@ mod tests {
         let _cursor_lock = hub.lock_cursors("a/b").unwrap();
         hub.save_cursors("a/b", &cursors).unwrap();
         assert_eq!(hub.cursors("a/b").unwrap(), cursors);
+    }
+
+    fn append_raw(hub: &Hub, conv: &str, bytes: &[u8]) {
+        let path = hub.conv_path(conv).unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    fn line(conv: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string(&message(conv, "a", text)).unwrap()
+        )
+    }
+
+    fn texts(messages: &[Message]) -> Vec<&str> {
+        messages.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn byte_offset_reads_return_only_appended_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        hub.append(&message("#general", "a", "one")).unwrap();
+        hub.append(&message("#general", "a", "two")).unwrap();
+        let first = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        assert_eq!(texts(&first.messages), vec!["one", "two"]);
+        let offset = first.next_byte_offset.unwrap();
+        assert_eq!(offset.bytes, first.stamp.len);
+
+        hub.append(&message("#general", "a", "three")).unwrap();
+        let next = hub
+            .messages_from_offset("#general", 2, Some(offset), None)
+            .unwrap();
+        assert_eq!(texts(&next.messages), vec!["three"]);
+        // A scan from line 0 finds the same messages and the same offset.
+        let scanned = hub.messages_from_offset("#general", 2, None, None).unwrap();
+        assert_eq!(scanned.messages, next.messages);
+        assert_eq!(scanned.next_byte_offset, next.next_byte_offset);
+        let tail = next.tail(2).unwrap();
+        assert_eq!(tail.message_count, 3);
+
+        let missing = hub.messages_from_offset("#none", 0, None, None).unwrap();
+        assert_eq!(missing.next_byte_offset.map(|offset| offset.bytes), Some(0));
+        let past_end = hub.messages_from_offset("#general", 9, None, None).unwrap();
+        assert!(past_end.messages.is_empty());
+        assert_eq!(past_end.next_byte_offset, None);
+    }
+
+    #[test]
+    fn a_partial_trailing_line_waits_for_its_newline() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        let full = line("#general", "one");
+        let partial = line("#general", "two");
+        let (head, rest) = partial.split_at(10);
+        append_raw(&hub, "#general", full.as_bytes());
+        append_raw(&hub, "#general", head.as_bytes());
+
+        let slice = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        assert_eq!(texts(&slice.messages), vec!["one"]);
+        assert_eq!(
+            slice.next_byte_offset.map(|offset| offset.bytes),
+            Some(full.len() as u64)
+        );
+        let mut tail = slice.tail(0).unwrap();
+        assert_eq!(
+            hub.read_tail("#general", &mut tail).unwrap(),
+            TailRead::Unchanged
+        );
+
+        append_raw(&hub, "#general", rest.as_bytes());
+        let read = hub.read_tail("#general", &mut tail).unwrap();
+        let TailRead::Appended(messages) = read else {
+            panic!("expected an append, got {read:?}");
+        };
+        assert_eq!(texts(&messages), vec!["two"]);
+        assert_eq!(tail.message_count, 2);
+        assert_eq!(tail.byte_offset, (full.len() + partial.len()) as u64);
+        assert_eq!(
+            hub.read_tail("#general", &mut tail).unwrap(),
+            TailRead::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_limit_stops_the_offset_after_the_last_returned_message() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        for text in ["a", "b", "c"] {
+            hub.append(&message("#general", "x", text)).unwrap();
+        }
+        let first = hub
+            .messages_from_offset("#general", 0, None, Some(1))
+            .unwrap();
+        assert_eq!(texts(&first.messages), vec!["a"]);
+        assert_eq!(first.remaining, 2);
+        assert_eq!(
+            first.next_byte_offset.map(|offset| offset.bytes),
+            Some(line("#general", "a").len() as u64)
+        );
+        let rest = hub
+            .messages_from_offset("#general", 1, first.next_byte_offset, None)
+            .unwrap();
+        assert_eq!(texts(&rest.messages), vec!["b", "c"]);
+        assert_eq!(rest.remaining, 0);
+    }
+
+    #[test]
+    fn a_shorter_or_replaced_file_reads_again_from_line_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        for text in ["a", "b", "c"] {
+            hub.append(&message("#general", "x", text)).unwrap();
+        }
+        let mut tail = ConvTail::default();
+        hub.read_tail("#general", &mut tail).unwrap();
+        let old_offset = tail.byte_offset;
+        let path = hub.conv_path("#general").unwrap();
+        fs::write(&path, line("#general", "new")).unwrap();
+
+        // A saved offset past the end falls back to a scan by line count.
+        let slice = hub
+            .messages_from_offset(
+                "#general",
+                0,
+                Some(LineOffset {
+                    lines: 0,
+                    bytes: old_offset,
+                    stamp: Some(tail.stamp),
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(texts(&slice.messages), vec!["new"]);
+        let read = hub.read_tail("#general", &mut tail).unwrap();
+        assert_eq!(read, TailRead::Reset(vec![slice.messages[0].clone()]));
+        assert_eq!(tail.message_count, 1);
+
+        // An offset that is not at a line start is not used either.
+        let mid_line = hub
+            .messages_from_offset(
+                "#general",
+                0,
+                Some(LineOffset {
+                    lines: 0,
+                    bytes: 3,
+                    stamp: Some(slice.stamp),
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(texts(&mid_line.messages), vec!["new"]);
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            hub.read_tail("#general", &mut tail).unwrap(),
+            TailRead::Reset(Vec::new())
+        );
+        assert_eq!(tail, ConvTail::default());
+    }
+
+    /// Purpose: Check that a same-size rewrite replaces the cached messages.
+    /// Input: A temporary hub with one message and a cached tail.
+    /// Output: None. The test fails if the old message remains.
+    #[test]
+    fn a_same_size_in_place_rewrite_resets_the_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        append_raw(&hub, "#general", line("#general", "old").as_bytes());
+        let mut tail = ConvTail::default();
+        hub.read_tail("#general", &mut tail).unwrap();
+        let path = hub.conv_path("#general").unwrap();
+        let replacement = line("#general", "new");
+        assert_eq!(replacement.len() as u64, tail.stamp.len);
+        fs::write(&path, replacement).unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(tail.stamp.modified.unwrap() + std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let TailRead::Reset(messages) = hub.read_tail("#general", &mut tail).unwrap() else {
+            panic!("a same-size rewrite must replace the cached messages");
+        };
+        assert_eq!(texts(&messages), ["new"]);
+        assert_eq!(tail.message_count, 1);
+        assert_eq!(
+            hub.read_tail("#general", &mut tail).unwrap(),
+            TailRead::Unchanged
+        );
+    }
+
+    /// Purpose: Check that file identity detects replacements of equal or greater size.
+    /// Input: A temporary hub with a cached tail and a replacement file.
+    /// Output: None. The test fails if the previous file's messages remain.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_identity_resets_same_size_and_longer_replacements() {
+        for extra in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let hub = Hub::create(root.path(), "h").unwrap();
+            append_raw(&hub, "#general", line("#general", "old").as_bytes());
+            let mut tail = ConvTail::default();
+            hub.read_tail("#general", &mut tail).unwrap();
+            let path = hub.conv_path("#general").unwrap();
+            let replacement_path = path.with_extension("replacement");
+            // Keep the old file open so its inode cannot be reused.
+            let _original = File::open(&path).unwrap();
+            let mut replacement = line("#general", "new");
+            assert_eq!(replacement.len() as u64, tail.byte_offset);
+            if extra {
+                replacement.push_str(&line("#general", "extra"));
+            }
+            fs::write(&replacement_path, replacement).unwrap();
+            File::open(&replacement_path)
+                .unwrap()
+                .set_modified(tail.stamp.modified.unwrap())
+                .unwrap();
+            fs::rename(&replacement_path, &path).unwrap();
+
+            let TailRead::Reset(messages) = hub.read_tail("#general", &mut tail).unwrap() else {
+                panic!("a replacement must discard the previous file's messages");
+            };
+            let expected = if extra {
+                vec!["new", "extra"]
+            } else {
+                vec!["new"]
+            };
+            assert_eq!(texts(&messages), expected);
+            assert_eq!(tail.message_count, expected.len());
+        }
+    }
+
+    #[test]
+    fn legacy_cursors_load_without_offsets_and_gain_them_on_save() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        for text in ["a", "b", "c"] {
+            hub.append(&message("#general", "x", text)).unwrap();
+        }
+        let legacy = r##"{"read": {"#general": 2}, "notified": {"#general": 3}}"##;
+        fs::write(hub.cursor_path("me"), legacy).unwrap();
+        let mut cursors = hub.cursors("me").unwrap();
+        assert_eq!(cursors.read["#general"], 2);
+        assert_eq!(cursors.notified["#general"], 3);
+        assert_eq!(cursors.read_offset("#general"), None);
+        assert_eq!(cursors.notified_offset("#general"), None);
+        assert_eq!(
+            cursors.read_offset("#other").map(|offset| offset.bytes),
+            Some(0)
+        );
+
+        let slice = hub
+            .messages_from_offset("#general", 2, cursors.read_offset("#general"), None)
+            .unwrap();
+        assert_eq!(texts(&slice.messages), vec!["c"]);
+        let after_two = hub
+            .messages_from_offset("#general", 0, None, Some(2))
+            .unwrap()
+            .next_byte_offset;
+        cursors.set_read("#general", 2, after_two);
+        let _cursor_lock = hub.lock_cursors("me").unwrap();
+        hub.save_cursors("me", &cursors).unwrap();
+        let saved = hub.cursors("me").unwrap();
+        assert_eq!(saved.read["#general"], 2);
+        let offset = saved.read_offset("#general");
+        let seeked = hub
+            .messages_from_offset("#general", 2, offset, None)
+            .unwrap();
+        assert_eq!(seeked.messages, slice.messages);
+
+        // A count that moved without its offset makes the offset unknown.
+        let mut moved = saved.clone();
+        moved.read.insert("#general".to_string(), 1);
+        assert_eq!(moved.read_offset("#general"), None);
+        moved.set_read("#general", 3, None);
+        assert!(!moved.read_bytes.contains_key("#general"));
+    }
+
+    /// Purpose: Check that persisted offsets cannot skip replacement messages.
+    /// Input: A cursor whose old byte offset spans two replacement messages.
+    /// Output: None. The test fails if either read cursor skips the second message.
+    #[test]
+    fn persisted_offsets_scan_replaced_or_truncated_files_by_line_count() {
+        for mode in ["truncate", "replace", "legacy"] {
+            let root = tempfile::tempdir().unwrap();
+            let hub = Hub::create(root.path(), "h").unwrap();
+            let short = line("#general", "new");
+            let mut old_message = message("#general", "a", "old");
+            old_message.text.clear();
+            let overhead = serde_json::to_string(&old_message).unwrap().len() + 1;
+            old_message.text = "x".repeat(2 * short.len() - overhead);
+            let old = format!("{}\n", serde_json::to_string(&old_message).unwrap());
+            assert_eq!(old.len(), 2 * short.len());
+            append_raw(&hub, "#general", old.as_bytes());
+            append_raw(&hub, "#general", old.as_bytes());
+            let first = hub
+                .messages_from_offset("#general", 0, None, Some(1))
+                .unwrap();
+            let mut cursors = Cursors::default();
+            cursors.set_read("#general", 1, first.next_byte_offset);
+            cursors.set_notified("#general", 1, first.next_byte_offset);
+            let mut saved = serde_json::to_value(&cursors).unwrap();
+            if mode == "legacy" {
+                for key in ["read_bytes", "notified_bytes"] {
+                    saved[key]["#general"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("stamp");
+                }
+            }
+            let cursors: Cursors = serde_json::from_value(saved).unwrap();
+            let path = hub.conv_path("#general").unwrap();
+            let _original = File::open(&path).unwrap();
+            let replacement = if mode == "replace" {
+                path.with_extension("replacement")
+            } else {
+                path.clone()
+            };
+            fs::write(&replacement, short.repeat(3)).unwrap();
+            File::open(&replacement)
+                .unwrap()
+                .set_modified(first.stamp.modified.unwrap() + std::time::Duration::from_secs(1))
+                .unwrap();
+            if mode == "replace" {
+                fs::rename(&replacement, &path).unwrap();
+            }
+            for offset in [
+                cursors.read_offset("#general"),
+                cursors.notified_offset("#general"),
+            ] {
+                let slice = hub
+                    .messages_from_offset("#general", 1, offset, None)
+                    .unwrap();
+                assert_eq!(texts(&slice.messages), ["new", "new"], "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_of_one_process_do_not_collide() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("value.json");
+        let mut workers = Vec::new();
+        for worker in 0..8u64 {
+            let path = path.clone();
+            workers.push(std::thread::spawn(move || {
+                for step in 0..50u64 {
+                    let value = BTreeMap::from([("n".to_string(), worker * 1000 + step)]);
+                    write_json_atomic(&path, &value).unwrap();
+                    let read: BTreeMap<String, u64> = read_json(&path).unwrap();
+                    assert!(read.contains_key("n"));
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let names: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec!["value.json"], "no temp file is left");
+    }
+
+    #[test]
+    fn member_token_files_add_to_the_legacy_hub_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        hub.update_meta(|meta| {
+            meta.tokens.insert("#general".to_string(), 100);
+        })
+        .unwrap();
+        let costs = BTreeMap::from([("#general".to_string(), 5), (DM_TOKENS_KEY.to_string(), 7)]);
+        hub.add_member_tokens("a/b", &costs).unwrap();
+        hub.add_member_tokens("a/b", &costs).unwrap();
+        hub.add_member_tokens("c", &costs).unwrap();
+        hub.add_member_tokens("d", &BTreeMap::new()).unwrap();
+        let meta = hub.meta().unwrap();
+        assert_eq!(meta.tokens["#general"], 100, "hub.json does not change");
+        let tokens = hub.tokens(&meta).unwrap();
+        assert_eq!(tokens["#general"], 115);
+        assert_eq!(tokens[DM_TOKENS_KEY], 21);
+    }
+
+    #[test]
+    fn file_stamps_change_on_append_and_new_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        let empty = hub.file_stamps();
+        assert_eq!(empty.len(), 1, "only hub.json");
+        hub.append(&message("#general", "a", "one")).unwrap();
+        let one = hub.file_stamps();
+        assert_ne!(one, empty);
+        assert_eq!(hub.file_stamps(), one);
+        hub.append(&message("#general", "a", "two")).unwrap();
+        assert_ne!(hub.file_stamps(), one);
     }
 
     #[test]

@@ -55,6 +55,34 @@ bladerunner agent stdio
 
 For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
+## Autonomous goals
+
+`/goal <objective>` automatically retries temporary network, timeout, rate-limit,
+and server failures. It permits eight consecutive retries, with exponential
+backoff from 15 seconds to five minutes and 20% jitter. A server `Retry-After`
+value sets the minimum wait and can exceed the backoff cap. A successful goal
+round resets the retry count. Set `GROK_GOAL_MAX_CONSECUTIVE_RETRIES` before launch to
+change the limit; `0` disables these retries. The sampler also has its own
+request retry budget, so total recovery time includes both layers.
+
+`/goal pause`, `/goal stop`, and Ctrl+C interrupt a retry wait. `/goal resume`
+starts a fresh retry budget after a pause. Authentication, configuration, and
+invalid-request errors pause the goal immediately.
+
+## Review a GitHub pull request
+
+In a fullscreen session, type `/pr`, `/pr 42`, or `/pr <GitHub PR URL>`.
+The corner card shows the PR state, changes, checks, and open thread count.
+Click **[-]** to minimize it to a chip or **[x]** to close it. Click the chip
+or type `/pr` to bring back the card. **Refresh** fetches the latest state.
+
+Choose **Fullscreen** (or type `/pr open`) to read the description, diffs, and
+review discussions alongside a dedicated review chat. Use ←/→ for tabs, ↑/↓ to
+select a file or thread, and `[` / `]` for diff hunks. Press `?` to ask about
+the selection, or `d` for an AI digest of the PR. Tab returns focus to the PR
+and Esc returns to the card. The viewer uses your GitHub CLI sign-in
+(`gh auth login`).
+
 ## Hubs
 
 Agent threads can talk to each other in a hub, with channels and DMs. In one
