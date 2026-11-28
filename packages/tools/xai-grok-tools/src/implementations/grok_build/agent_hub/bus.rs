@@ -1500,19 +1500,19 @@ pub fn mark_read(hub: &Hub, handle: &str, conv: &str, count: usize) -> Result<()
 /// Input: As `mark_read`, plus the byte offset after `count` complete lines
 ///     of the conversation file, when the caller knows it.
 /// Output: Ok when the cursor is saved. A cursor never moves back. An equal
-///     count only adds an offset that the cursor does not have yet.
+///     count can replace a missing offset or an obsolete file stamp.
 pub fn mark_read_at(
     hub: &Hub,
     handle: &str,
     conv: &str,
     count: usize,
-    offset: Option<u64>,
+    offset: Option<store::LineOffset>,
 ) -> Result<()> {
     let _lock = hub.lock_cursors(handle)?;
     let mut cursors = hub.cursors(handle)?;
     let read = cursors.read.get(conv).copied().unwrap_or(0);
-    let has_offset = cursors.read_offset(conv).is_some();
-    if read > count || (read == count && (offset.is_none() || has_offset)) {
+    let saved_offset = cursors.read_offset(conv);
+    if read > count || (read == count && (offset.is_none() || saved_offset == offset)) {
         return Ok(());
     }
     cursors.set_read(conv, count, offset);
@@ -1746,7 +1746,34 @@ mod tests {
         let len = std::fs::metadata(hub.dir().join("channels/general.jsonl"))
             .unwrap()
             .len();
-        assert_eq!(cursors.read_offset("#general"), Some(len));
+        assert_eq!(
+            cursors.read_offset("#general").map(|offset| offset.bytes),
+            Some(len)
+        );
+    }
+
+    /// Purpose: Check that an equal read count can save a replacement file stamp.
+    /// Input: A hub with one read message and an atomic file replacement.
+    /// Output: None. The test fails if the old file stamp remains on disk.
+    #[test]
+    fn an_equal_read_count_updates_the_replacement_file_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        post_as_person(&hub, "me", "#general", "hello", &[]).unwrap();
+        let before = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        mark_read_at(&hub, "me", "#general", 1, before.next_byte_offset).unwrap();
+        let path = hub.dir().join("channels/general.jsonl");
+        let replacement = path.with_extension("replacement");
+        let _original = std::fs::File::open(&path).unwrap();
+        std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        assert_ne!(before.stamp, after.stamp);
+        mark_read_at(&hub, "me", "#general", 1, after.next_byte_offset).unwrap();
+        assert_eq!(
+            hub.cursors("me").unwrap().read_offset("#general"),
+            after.next_byte_offset
+        );
     }
 
     #[test]
@@ -1767,7 +1794,11 @@ mod tests {
         assert_eq!(texts(&bus.inbox("a").unwrap()), vec!["@a two"]);
         let cursors = hub.cursors("a").unwrap();
         assert_eq!(cursors.notified["#general"], 2);
-        assert!(cursors.notified_offset("#general").is_some_and(|o| o > 0));
+        assert!(
+            cursors
+                .notified_offset("#general")
+                .is_some_and(|offset| offset.bytes > 0)
+        );
         bus.send("b", "#general", "@a three", None, &[])
             .into_result()
             .unwrap();

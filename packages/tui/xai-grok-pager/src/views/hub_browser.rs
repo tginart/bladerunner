@@ -126,7 +126,7 @@ pub struct ReadMark {
     pub conv: String,
     pub count: usize,
     /// The byte offset after `count` complete lines.
-    pub offset: Option<u64>,
+    pub offset: Option<store::LineOffset>,
 }
 
 /// The inputs of a background refresh. It holds no reference to the browser.
@@ -1758,7 +1758,7 @@ impl HubBrowserState {
         if self.is_person_view() && self.thread.is_none() && self.search.is_none() {
             let count = total;
             if is_person_member(&self.snapshot.meta, &self.person) {
-                self.save_read(conv, count, Some(loaded.tail.byte_offset))?;
+                self.save_read(conv, count, Some(loaded.tail.offset()))?;
             } else {
                 self.unsaved_read.insert(conv.to_string(), count);
             }
@@ -1772,7 +1772,12 @@ impl HubBrowserState {
     /// Input: The conversation, the message count, and its byte offset.
     /// Output: Ok, or the write error. While a background refresh applies,
     ///     a forward move waits in `deferred_marks` and nothing is written.
-    fn save_read(&mut self, conv: &str, count: usize, offset: Option<u64>) -> Result<()> {
+    fn save_read(
+        &mut self,
+        conv: &str,
+        count: usize,
+        offset: Option<store::LineOffset>,
+    ) -> Result<()> {
         let Some(marks) = self.deferred_marks.as_mut() else {
             return agent_hub::mark_read_at(&self.hub, &self.person, conv, count, offset);
         };
@@ -1827,7 +1832,7 @@ fn unread_tail(
     conv: &str,
     perspective: &str,
     read: usize,
-    read_offset: Option<u64>,
+    read_offset: Option<store::LineOffset>,
     cached: Option<UnreadTail>,
 ) -> Result<Option<UnreadTail>> {
     let from_others = |messages: &[store::Message]| {
@@ -4175,10 +4180,15 @@ mod tests {
         let len = std::fs::metadata(hub.dir().join("channels/general.jsonl"))
             .unwrap()
             .len();
+        let offset = hub
+            .messages_from_offset("#general", 0, None, None)
+            .unwrap()
+            .next_byte_offset;
+        assert_eq!(offset.map(|offset| offset.bytes), Some(len));
         let mark = ReadMark {
             conv: "#general".to_string(),
             count: 2,
-            offset: Some(len),
+            offset,
         };
         assert_eq!(marks, vec![mark]);
         // The apply wrote no cursor: the caller saves the marks off-thread.

@@ -157,10 +157,9 @@ pub struct Message {
 }
 
 /// Per-member positions, counted in messages (lines) per conversation.
-/// Note: The byte offsets are only a fast path. An offset is used only while
-///     its `lines` value is equal to the count in `read` or `notified`. A
-///     writer that changes only a count (an older binary, for example) thus
-///     makes the next reader scan from line 0 once.
+/// Note: A byte offset is a fast path. Its line count must match the cursor,
+///     and its file stamp must retain the same file prefix. Older cursor files
+///     without a stamp, or count-only changes, require a scan from line 0.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursors {
     /// Messages the member has read with `read` or `inbox`.
@@ -182,26 +181,29 @@ pub struct Cursors {
 pub struct LineOffset {
     pub lines: usize,
     pub bytes: u64,
+    /// The file stamp that validates this offset. Older cursors have no stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<FileStamp>,
 }
 
 impl Cursors {
     /// The byte offset after the read messages of `conv`, when it is known.
-    pub fn read_offset(&self, conv: &str) -> Option<u64> {
+    pub fn read_offset(&self, conv: &str) -> Option<LineOffset> {
         known_offset(&self.read, &self.read_bytes, conv)
     }
 
     /// The byte offset after the notified messages of `conv`, when it is known.
-    pub fn notified_offset(&self, conv: &str) -> Option<u64> {
+    pub fn notified_offset(&self, conv: &str) -> Option<LineOffset> {
         known_offset(&self.notified, &self.notified_bytes, conv)
     }
 
     /// Set the read count of `conv`, with its byte offset when it is known.
-    pub fn set_read(&mut self, conv: &str, count: usize, offset: Option<u64>) {
+    pub fn set_read(&mut self, conv: &str, count: usize, offset: Option<LineOffset>) {
         set_position(&mut self.read, &mut self.read_bytes, conv, count, offset);
     }
 
     /// Set the notified count of `conv`, with its byte offset when it is known.
-    pub fn set_notified(&mut self, conv: &str, count: usize, offset: Option<u64>) {
+    pub fn set_notified(&mut self, conv: &str, count: usize, offset: Option<LineOffset>) {
         set_position(
             &mut self.notified,
             &mut self.notified_bytes,
@@ -221,7 +223,8 @@ pub struct MemberTokens {
 }
 
 /// The size, change time and identity of a file, from one `stat`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FileStamp {
     pub len: u64,
     pub modified: Option<SystemTime>,
@@ -230,13 +233,25 @@ pub struct FileStamp {
     pub identity: Option<(u64, u64)>,
 }
 
+impl FileStamp {
+    /// Purpose: Check whether an append-only writer retains the saved prefix.
+    /// Input: The current and previous file stamps.
+    /// Output: True for an unchanged file or growth of the same file.
+    fn retains_prefix(self, previous: Self) -> bool {
+        self == previous
+            || (self.identity == previous.identity
+                && self.created == previous.created
+                && self.len > previous.len)
+    }
+}
+
 /// Messages of one conversation, read from a line index or a byte offset.
 #[derive(Debug, Clone, Default)]
 pub struct MessagesSlice {
     pub messages: Vec<Message>,
     /// Byte offset after the last returned message. `None` when the file
     /// has fewer complete lines than the start line.
-    pub next_byte_offset: Option<u64>,
+    pub next_byte_offset: Option<LineOffset>,
     /// Complete messages after the limit that were not returned.
     pub remaining: usize,
     /// The file stamp from before the read.
@@ -247,7 +262,7 @@ impl MessagesSlice {
     /// The tail after the returned messages, for a read from `start_line`.
     pub fn tail(&self, start_line: usize) -> Option<ConvTail> {
         Some(ConvTail {
-            byte_offset: self.next_byte_offset?,
+            byte_offset: self.next_byte_offset?.bytes,
             message_count: start_line + self.messages.len(),
             stamp: self.stamp,
         })
@@ -263,6 +278,17 @@ pub struct ConvTail {
     pub message_count: usize,
     /// The file stamp of the last read. An equal stamp means no new bytes.
     pub stamp: FileStamp,
+}
+
+impl ConvTail {
+    /// The file stamp and byte offset after the messages in this tail.
+    pub fn offset(&self) -> LineOffset {
+        LineOffset {
+            lines: self.message_count,
+            bytes: self.byte_offset,
+            stamp: Some(self.stamp),
+        }
+    }
 }
 
 /// The result of [`Hub::read_tail`].
@@ -442,7 +468,8 @@ impl Hub {
     /// Output: The messages, the byte offset after the last of them, and the
     ///     count of complete messages after the limit.
     /// Method:
-    ///     1. If `start_byte` is the start of a line in the file, seek to it.
+    ///     1. If the saved stamp retains its prefix and the offset starts a line,
+    ///        seek to it.
     ///     2. If not (a legacy cursor, or a shorter or replaced file), scan
     ///        from byte 0 past `start_line` lines.
     ///     3. Read complete lines up to `limit`. Stop at a line without a
@@ -451,17 +478,25 @@ impl Hub {
         &self,
         conv: &str,
         start_line: usize,
-        start_byte: Option<u64>,
+        start_byte: Option<LineOffset>,
         limit: Option<usize>,
     ) -> Result<MessagesSlice> {
         let Some((mut file, stamp)) = self.open_conv(conv)? else {
             return Ok(MessagesSlice {
-                next_byte_offset: (start_line == 0).then_some(0),
+                next_byte_offset: (start_line == 0).then_some(LineOffset::default()),
                 ..MessagesSlice::default()
             });
         };
         let seek_to = match start_byte {
-            Some(offset) if is_line_start(&mut file, offset, stamp.len)? => Some(offset),
+            Some(offset)
+                if offset.lines == start_line
+                    && offset
+                        .stamp
+                        .is_some_and(|previous| stamp.retains_prefix(previous))
+                    && is_line_start(&mut file, offset.bytes, stamp.len)? =>
+            {
+                Some(offset.bytes)
+            }
             _ => None,
         };
         let mut reader = BufReader::new(file);
@@ -480,9 +515,14 @@ impl Hub {
         };
         reader.seek(SeekFrom::Start(start))?;
         let (messages, end, remaining) = read_messages(&mut reader, start, limit)?;
+        let next_byte_offset = Some(LineOffset {
+            lines: start_line + messages.len(),
+            bytes: end,
+            stamp: Some(stamp),
+        });
         Ok(MessagesSlice {
             messages,
-            next_byte_offset: Some(end),
+            next_byte_offset,
             remaining,
             stamp,
         })
@@ -508,9 +548,7 @@ impl Hub {
         }
         // Supported writers only append. A new inode or a changed file that
         // did not grow cannot retain the previous file's cached messages.
-        let is_append = stamp.identity == tail.stamp.identity
-            && stamp.created == tail.stamp.created
-            && stamp.len > tail.stamp.len
+        let is_append = stamp.retains_prefix(tail.stamp)
             && is_line_start(&mut file, tail.byte_offset, stamp.len)?;
         let start = if is_append { tail.byte_offset } else { 0 };
         let mut reader = BufReader::new(file);
@@ -1145,15 +1183,15 @@ fn known_offset(
     counts: &BTreeMap<String, usize>,
     offsets: &BTreeMap<String, LineOffset>,
     conv: &str,
-) -> Option<u64> {
+) -> Option<LineOffset> {
     let count = counts.get(conv).copied().unwrap_or(0);
     if count == 0 {
-        return Some(0);
+        return Some(LineOffset::default());
     }
     offsets
         .get(conv)
-        .filter(|offset| offset.lines == count)
-        .map(|offset| offset.bytes)
+        .filter(|offset| offset.lines == count && offset.stamp.is_some())
+        .copied()
 }
 
 fn set_position(
@@ -1161,15 +1199,12 @@ fn set_position(
     offsets: &mut BTreeMap<String, LineOffset>,
     conv: &str,
     count: usize,
-    offset: Option<u64>,
+    offset: Option<LineOffset>,
 ) {
     counts.insert(conv.to_string(), count);
     match offset {
-        Some(bytes) => {
-            let offset = LineOffset {
-                lines: count,
-                bytes,
-            };
+        Some(offset) => {
+            assert_eq!(offset.lines, count);
             offsets.insert(conv.to_string(), offset);
         }
         None => {
@@ -1520,12 +1555,10 @@ mod tests {
         let hub = Hub::create(root.path(), "h").unwrap();
         hub.append(&message("#general", "a", "one")).unwrap();
         hub.append(&message("#general", "a", "two")).unwrap();
-        let first = hub
-            .messages_from_offset("#general", 0, Some(0), None)
-            .unwrap();
+        let first = hub.messages_from_offset("#general", 0, None, None).unwrap();
         assert_eq!(texts(&first.messages), vec!["one", "two"]);
         let offset = first.next_byte_offset.unwrap();
-        assert_eq!(offset, first.stamp.len);
+        assert_eq!(offset.bytes, first.stamp.len);
 
         hub.append(&message("#general", "a", "three")).unwrap();
         let next = hub
@@ -1540,7 +1573,7 @@ mod tests {
         assert_eq!(tail.message_count, 3);
 
         let missing = hub.messages_from_offset("#none", 0, None, None).unwrap();
-        assert_eq!(missing.next_byte_offset, Some(0));
+        assert_eq!(missing.next_byte_offset.map(|offset| offset.bytes), Some(0));
         let past_end = hub.messages_from_offset("#general", 9, None, None).unwrap();
         assert!(past_end.messages.is_empty());
         assert_eq!(past_end.next_byte_offset, None);
@@ -1558,7 +1591,10 @@ mod tests {
 
         let slice = hub.messages_from_offset("#general", 0, None, None).unwrap();
         assert_eq!(texts(&slice.messages), vec!["one"]);
-        assert_eq!(slice.next_byte_offset, Some(full.len() as u64));
+        assert_eq!(
+            slice.next_byte_offset.map(|offset| offset.bytes),
+            Some(full.len() as u64)
+        );
         let mut tail = slice.tail(0).unwrap();
         assert_eq!(
             hub.read_tail("#general", &mut tail).unwrap(),
@@ -1587,12 +1623,12 @@ mod tests {
             hub.append(&message("#general", "x", text)).unwrap();
         }
         let first = hub
-            .messages_from_offset("#general", 0, Some(0), Some(1))
+            .messages_from_offset("#general", 0, None, Some(1))
             .unwrap();
         assert_eq!(texts(&first.messages), vec!["a"]);
         assert_eq!(first.remaining, 2);
         assert_eq!(
-            first.next_byte_offset,
+            first.next_byte_offset.map(|offset| offset.bytes),
             Some(line("#general", "a").len() as u64)
         );
         let rest = hub
@@ -1617,7 +1653,16 @@ mod tests {
 
         // A saved offset past the end falls back to a scan by line count.
         let slice = hub
-            .messages_from_offset("#general", 0, Some(old_offset), None)
+            .messages_from_offset(
+                "#general",
+                0,
+                Some(LineOffset {
+                    lines: 0,
+                    bytes: old_offset,
+                    stamp: Some(tail.stamp),
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(texts(&slice.messages), vec!["new"]);
         let read = hub.read_tail("#general", &mut tail).unwrap();
@@ -1626,7 +1671,16 @@ mod tests {
 
         // An offset that is not at a line start is not used either.
         let mid_line = hub
-            .messages_from_offset("#general", 0, Some(3), None)
+            .messages_from_offset(
+                "#general",
+                0,
+                Some(LineOffset {
+                    lines: 0,
+                    bytes: 3,
+                    stamp: Some(slice.stamp),
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(texts(&mid_line.messages), vec!["new"]);
 
@@ -1723,7 +1777,10 @@ mod tests {
         assert_eq!(cursors.notified["#general"], 3);
         assert_eq!(cursors.read_offset("#general"), None);
         assert_eq!(cursors.notified_offset("#general"), None);
-        assert_eq!(cursors.read_offset("#other"), Some(0));
+        assert_eq!(
+            cursors.read_offset("#other").map(|offset| offset.bytes),
+            Some(0)
+        );
 
         let slice = hub
             .messages_from_offset("#general", 2, cursors.read_offset("#general"), None)
@@ -1750,6 +1807,66 @@ mod tests {
         assert_eq!(moved.read_offset("#general"), None);
         moved.set_read("#general", 3, None);
         assert!(!moved.read_bytes.contains_key("#general"));
+    }
+
+    /// Purpose: Check that persisted offsets cannot skip replacement messages.
+    /// Input: A cursor whose old byte offset spans two replacement messages.
+    /// Output: None. The test fails if either read cursor skips the second message.
+    #[test]
+    fn persisted_offsets_scan_replaced_or_truncated_files_by_line_count() {
+        for mode in ["truncate", "replace", "legacy"] {
+            let root = tempfile::tempdir().unwrap();
+            let hub = Hub::create(root.path(), "h").unwrap();
+            let short = line("#general", "new");
+            let mut old_message = message("#general", "a", "old");
+            old_message.text.clear();
+            let overhead = serde_json::to_string(&old_message).unwrap().len() + 1;
+            old_message.text = "x".repeat(2 * short.len() - overhead);
+            let old = format!("{}\n", serde_json::to_string(&old_message).unwrap());
+            assert_eq!(old.len(), 2 * short.len());
+            append_raw(&hub, "#general", old.as_bytes());
+            append_raw(&hub, "#general", old.as_bytes());
+            let first = hub
+                .messages_from_offset("#general", 0, None, Some(1))
+                .unwrap();
+            let mut cursors = Cursors::default();
+            cursors.set_read("#general", 1, first.next_byte_offset);
+            cursors.set_notified("#general", 1, first.next_byte_offset);
+            let mut saved = serde_json::to_value(&cursors).unwrap();
+            if mode == "legacy" {
+                for key in ["read_bytes", "notified_bytes"] {
+                    saved[key]["#general"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("stamp");
+                }
+            }
+            let cursors: Cursors = serde_json::from_value(saved).unwrap();
+            let path = hub.conv_path("#general").unwrap();
+            let _original = File::open(&path).unwrap();
+            let replacement = if mode == "replace" {
+                path.with_extension("replacement")
+            } else {
+                path.clone()
+            };
+            fs::write(&replacement, short.repeat(3)).unwrap();
+            File::open(&replacement)
+                .unwrap()
+                .set_modified(first.stamp.modified.unwrap() + std::time::Duration::from_secs(1))
+                .unwrap();
+            if mode == "replace" {
+                fs::rename(&replacement, &path).unwrap();
+            }
+            for offset in [
+                cursors.read_offset("#general"),
+                cursors.notified_offset("#general"),
+            ] {
+                let slice = hub
+                    .messages_from_offset("#general", 1, offset, None)
+                    .unwrap();
+                assert_eq!(texts(&slice.messages), ["new", "new"], "{mode}");
+            }
+        }
     }
 
     #[test]
