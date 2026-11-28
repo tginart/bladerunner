@@ -1190,6 +1190,11 @@ impl SessionActor {
             sampler_config.doom_loop_recovery = None;
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
+        // The turn now owns the retry budget. Avoid another full sampler
+        // retry cycle for each resubmit during the same recovery episode.
+        if self.transient_retry.get().step_attempts > 0 {
+            sampler_config.max_retries = Some(0);
+        }
         self.sampler_handle.update_config(sampler_config);
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of

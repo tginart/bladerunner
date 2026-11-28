@@ -3,8 +3,8 @@
 //! length-salvage flow (continuation, complete truncated tool calls).
 //!
 //! Ported from upstream `transient_retry_loop_tests.rs` and
-//! `turn/length_salvage_tests.rs`. Upstream drives a 503; here the sampler
-//! owns HTTP 5xx, so the transient case is an in-stream `overloaded_error`.
+//! `turn/length_salvage_tests.rs`. Cover HTTP server errors and in-stream
+//! errors, with one sampler attempt per turn-level resubmit.
 //! The clock is paused, so the 2/10/30 s backoff costs no wall time.
 
 use super::support::*;
@@ -92,11 +92,13 @@ fn retrying_events(updates: &XaiUpdates) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// Actor on the Messages backend with an API key, a real sampler that does
-/// no retries of its own, and the transient-retry switch as given.
+/// Purpose: Create an actor with a real sampler on the mock Messages backend.
+/// Input: The server, the turn retry switch, and the sampler retry cap.
+/// Output: The actor and the captured client updates.
 async fn messages_actor(
     server: &MockInferenceServer,
     transient_retry_enabled: bool,
+    max_retries: u32,
 ) -> (Arc<SessionActor>, XaiUpdates) {
     let sampling_cfg = xai_grok_sampler::SamplerConfig {
         api_key: Some("test-key".to_string()),
@@ -104,7 +106,7 @@ async fn messages_actor(
         model: MODEL.to_string(),
         api_backend: xai_grok_sampler::ApiBackend::Messages,
         context_window: 256_000,
-        max_retries: Some(0),
+        max_retries: Some(max_retries),
         idle_timeout_secs: Some(30),
         ..Default::default()
     };
@@ -113,7 +115,7 @@ async fn messages_actor(
     let sampler_handle = xai_grok_sampler::SamplerActor::spawn(
         sampling_cfg,
         xai_grok_sampler::RetryPolicy {
-            max_retries: 0,
+            max_retries,
             rate_limit_retry_threshold: 0,
             ..Default::default()
         },
@@ -127,9 +129,7 @@ async fn messages_actor(
 
     let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
     actor.sampler_handle = sampler_handle;
-    // The per-turn config push carries the actor's max_retries; keep the
-    // sampler from retrying so each submission is one request.
-    actor.max_retries = 0;
+    actor.max_retries = max_retries;
     actor.transient_retry.set(if transient_retry_enabled {
         TransientRetryState::for_session(false)
     } else {
@@ -293,6 +293,125 @@ async fn messages_server() -> MockInferenceServer {
     .expect("mock inference server")
 }
 
+fn server_error_response(status: u16) -> ScriptedResponse {
+    ScriptedResponse::json(
+        status,
+        serde_json::json!({"error": {"message": "internal server error"}}),
+    )
+}
+
+/// Purpose: Verify recovery from transient HTTP server errors.
+/// Input: Two failed requests per status, then a successful response.
+/// Output: Three requests and two retry updates per status.
+#[test]
+fn transient_http_server_errors_resubmit_until_success() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            for status in [500, 502, 503, 504] {
+                let server = messages_server().await;
+                for _ in 0..2 {
+                    server.enqueue_response("/v1/messages", server_error_response(status));
+                }
+                let (actor, updates) = messages_actor(&server, true, 0).await;
+
+                let outcome = run_prompt(&actor, "http-recovers").await;
+
+                assert!(outcome.is_ok(), "HTTP {status}: {outcome:?}");
+                assert_eq!(turn_requests(&server).len(), 3, "HTTP {status}");
+                assert_eq!(retrying_events(&updates), vec![(1, 3), (2, 3)]);
+            }
+        });
+    });
+}
+
+/// Purpose: Verify that turn retries do not multiply the sampler retry cap.
+/// Input: Four server failures, then success. A sampler cap of two attempts.
+/// Output: Five requests and three turn retries. A new prompt restores the cap.
+#[test]
+fn server_recovery_uses_one_sampler_attempt_per_resubmit() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            let server = messages_server().await;
+            for _ in 0..4 {
+                server.enqueue_response("/v1/messages", server_error_response(500));
+            }
+            let (actor, updates) = messages_actor(&server, true, 2).await;
+
+            let outcome = run_prompt(&actor, "http-sampler-budget").await;
+
+            assert!(outcome.is_ok(), "the fifth attempt succeeds: {outcome:?}");
+            assert_eq!(turn_requests(&server).len(), 5);
+            assert_eq!(
+                retrying_events(&updates),
+                vec![(1, 2), (1, 3), (2, 3), (3, 3)]
+            );
+
+            server.enqueue_response("/v1/messages", server_error_response(500));
+            let outcome = run_prompt(&actor, "http-new-prompt").await;
+
+            assert!(outcome.is_ok(), "the next prompt recovers: {outcome:?}");
+            assert_eq!(turn_requests(&server).len(), 7);
+            assert_eq!(retrying_events(&updates).last(), Some(&(1, 2)));
+        });
+    });
+}
+
+/// Purpose: Verify the request limit during a persistent server outage.
+/// Input: Five server failures and a sampler cap of two attempts.
+/// Output: A terminal failure after five requests.
+#[test]
+fn transient_http_server_error_exhausts_to_the_terminal_failure() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            let server = messages_server().await;
+            for _ in 0..5 {
+                server.enqueue_response("/v1/messages", server_error_response(500));
+            }
+            let (actor, updates) = messages_actor(&server, true, 2).await;
+
+            let outcome = run_prompt(&actor, "http-exhausts").await;
+
+            assert!(outcome.is_err(), "the fifth failure ends the turn");
+            assert_eq!(
+                turn_requests(&server).len(),
+                5,
+                "two sampler attempts + three resubmits"
+            );
+            assert_eq!(
+                retrying_events(&updates),
+                vec![(1, 2), (1, 3), (2, 3), (3, 3)]
+            );
+        });
+    });
+}
+
+/// Purpose: Verify that both retry layers obey a server retry veto.
+/// Input: A server failure with the x-should-retry header set to false.
+/// Output: A terminal failure after one request and no retry updates.
+#[test]
+fn http_server_retry_veto_is_terminal() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            let server = messages_server().await;
+            let mut response = ScriptedResponse::json(
+                500,
+                serde_json::json!({"error": {"message": "invalid request"}}),
+            );
+            response
+                .headers
+                .push(("x-should-retry".to_string(), "false".to_string()));
+            server.enqueue_response("/v1/messages", response);
+            let (actor, updates) = messages_actor(&server, true, 2).await;
+
+            let outcome = run_prompt(&actor, "http-veto").await;
+
+            assert!(outcome.is_err(), "a server veto ends the turn");
+            assert_eq!(turn_requests(&server).len(), 1);
+            assert!(retrying_events(&updates).is_empty());
+        });
+    });
+}
+
 #[test]
 fn transient_mid_stream_error_resubmits_until_success() {
     on_session_stack(|| {
@@ -300,7 +419,7 @@ fn transient_mid_stream_error_resubmits_until_success() {
             let server = messages_server().await;
             server.enqueue_response("/v1/messages", overloaded_mid_stream());
             server.enqueue_response("/v1/messages", overloaded_mid_stream());
-            let (actor, updates) = messages_actor(&server, true).await;
+            let (actor, updates) = messages_actor(&server, true, 0).await;
 
             let outcome = run_prompt(&actor, "transient-recovers").await;
 
@@ -319,7 +438,7 @@ fn transient_mid_stream_error_exhausts_to_the_terminal_failure() {
             for _ in 0..4 {
                 server.enqueue_response("/v1/messages", overloaded_mid_stream());
             }
-            let (actor, updates) = messages_actor(&server, true).await;
+            let (actor, updates) = messages_actor(&server, true, 0).await;
 
             let outcome = run_prompt(&actor, "transient-exhausts").await;
 
@@ -340,7 +459,7 @@ fn transient_retry_switched_off_fails_on_the_first_error() {
         run_paused(|| async {
             let server = messages_server().await;
             server.enqueue_response("/v1/messages", overloaded_mid_stream());
-            let (actor, updates) = messages_actor(&server, false).await;
+            let (actor, updates) = messages_actor(&server, false, 0).await;
 
             let outcome = run_prompt(&actor, "transient-off").await;
 
@@ -360,7 +479,7 @@ fn length_truncated_answer_continues_with_user_terminated_requests() {
         run_paused(|| async {
             let server = messages_server().await;
             server.set_messages_stop_reason("max_tokens");
-            let (actor, _updates) = messages_actor(&server, true).await;
+            let (actor, _updates) = messages_actor(&server, true, 0).await;
 
             let outcome = run_prompt(&actor, "length-continues").await;
 
@@ -396,7 +515,7 @@ fn complete_truncated_tool_call_runs() {
         run_paused(|| async {
             let server = messages_server().await;
             server.enqueue_response("/v1/messages", tool_call_cut_at_max_tokens());
-            let (actor, _updates) = messages_actor(&server, true).await;
+            let (actor, _updates) = messages_actor(&server, true, 0).await;
 
             let outcome = run_prompt(&actor, "length-tool-call").await;
 
