@@ -17,6 +17,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -218,11 +220,14 @@ pub struct MemberTokens {
     pub by_conv: BTreeMap<String, u64>,
 }
 
-/// The size and change time of a file, from one `stat`.
+/// The size, change time and identity of a file, from one `stat`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileStamp {
     pub len: u64,
     pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
+    /// Device and inode on Unix. Other platforms use the creation time.
+    pub identity: Option<(u64, u64)>,
 }
 
 /// Messages of one conversation, read from a line index or a byte offset.
@@ -501,7 +506,12 @@ impl Hub {
         if stamp == tail.stamp {
             return Ok(TailRead::Unchanged);
         }
-        let is_append = is_line_start(&mut file, tail.byte_offset, stamp.len)?;
+        // Supported writers only append. A new inode or a changed file that
+        // did not grow cannot retain the previous file's cached messages.
+        let is_append = stamp.identity == tail.stamp.identity
+            && stamp.created == tail.stamp.created
+            && stamp.len > tail.stamp.len
+            && is_line_start(&mut file, tail.byte_offset, stamp.len)?;
         let start = if is_append { tail.byte_offset } else { 0 };
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(start))?;
@@ -1172,6 +1182,11 @@ fn file_stamp(metadata: &fs::Metadata) -> FileStamp {
     FileStamp {
         len: metadata.len(),
         modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        identity: Some((metadata.dev(), metadata.ino())),
+        #[cfg(not(unix))]
+        identity: None,
     }
 }
 
@@ -1621,6 +1636,77 @@ mod tests {
             TailRead::Reset(Vec::new())
         );
         assert_eq!(tail, ConvTail::default());
+    }
+
+    /// Purpose: Check that a same-size rewrite replaces the cached messages.
+    /// Input: A temporary hub with one message and a cached tail.
+    /// Output: None. The test fails if the old message remains.
+    #[test]
+    fn a_same_size_in_place_rewrite_resets_the_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        append_raw(&hub, "#general", line("#general", "old").as_bytes());
+        let mut tail = ConvTail::default();
+        hub.read_tail("#general", &mut tail).unwrap();
+        let path = hub.conv_path("#general").unwrap();
+        let replacement = line("#general", "new");
+        assert_eq!(replacement.len() as u64, tail.stamp.len);
+        fs::write(&path, replacement).unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(tail.stamp.modified.unwrap() + std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let TailRead::Reset(messages) = hub.read_tail("#general", &mut tail).unwrap() else {
+            panic!("a same-size rewrite must replace the cached messages");
+        };
+        assert_eq!(texts(&messages), ["new"]);
+        assert_eq!(tail.message_count, 1);
+        assert_eq!(
+            hub.read_tail("#general", &mut tail).unwrap(),
+            TailRead::Unchanged
+        );
+    }
+
+    /// Purpose: Check that file identity detects replacements of equal or greater size.
+    /// Input: A temporary hub with a cached tail and a replacement file.
+    /// Output: None. The test fails if the previous file's messages remain.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_identity_resets_same_size_and_longer_replacements() {
+        for extra in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let hub = Hub::create(root.path(), "h").unwrap();
+            append_raw(&hub, "#general", line("#general", "old").as_bytes());
+            let mut tail = ConvTail::default();
+            hub.read_tail("#general", &mut tail).unwrap();
+            let path = hub.conv_path("#general").unwrap();
+            let replacement_path = path.with_extension("replacement");
+            // Keep the old file open so its inode cannot be reused.
+            let _original = File::open(&path).unwrap();
+            let mut replacement = line("#general", "new");
+            assert_eq!(replacement.len() as u64, tail.byte_offset);
+            if extra {
+                replacement.push_str(&line("#general", "extra"));
+            }
+            fs::write(&replacement_path, replacement).unwrap();
+            File::open(&replacement_path)
+                .unwrap()
+                .set_modified(tail.stamp.modified.unwrap())
+                .unwrap();
+            fs::rename(&replacement_path, &path).unwrap();
+
+            let TailRead::Reset(messages) = hub.read_tail("#general", &mut tail).unwrap() else {
+                panic!("a replacement must discard the previous file's messages");
+            };
+            let expected = if extra {
+                vec!["new", "extra"]
+            } else {
+                vec!["new"]
+            };
+            assert_eq!(texts(&messages), expected);
+            assert_eq!(tail.message_count, expected.len());
+        }
     }
 
     #[test]
