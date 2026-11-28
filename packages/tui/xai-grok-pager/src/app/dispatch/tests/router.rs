@@ -2266,6 +2266,158 @@ fn focus_hub_member_opens_a_subagent_of_another_tab() {
         "the child's own browser must not cover it"
     );
 }
+/// A hub browser on a throwaway hub, to read the notices that a stop sets.
+fn hub_browser_for_test() -> (
+    tempfile::TempDir,
+    crate::views::hub_browser::HubBrowserState,
+) {
+    let hubs = tempfile::tempdir().unwrap();
+    let hub = xai_grok_tools::implementations::grok_build::agent_hub::store::Hub::create(
+        hubs.path(),
+        "demo",
+    )
+    .unwrap();
+    let browser = crate::views::hub_browser::HubBrowserState::open(hub, "me", None).unwrap();
+    (hubs, browser)
+}
+
+/// An app with the active tab 0 (with an open hub browser) and a second tab 1
+/// whose root session is `other-root`.
+fn app_with_hub_browser_and_other_tab() -> (tempfile::TempDir, AppView) {
+    let mut app = test_app_with_agent();
+    let (hubs, browser) = hub_browser_for_test();
+    app.agents.get_mut(&AgentId(0)).unwrap().hub_browser = Some(browser);
+    let other = AgentId(1);
+    let session = make_test_agent_session(&app, other, "other-root");
+    app.agents
+        .insert(other, AgentView::new(session, ScrollbackState::new()));
+    (hubs, app)
+}
+
+fn hub_notice(app: &AppView) -> Option<String> {
+    app.agents[&AgentId(0)].hub_browser.as_ref()?.notice.clone()
+}
+
+fn stop_hub_member(app: &mut AppView, session_id: &str, handle: &str) -> Vec<Effect> {
+    let action = Action::StopHubMember {
+        session_id: session_id.to_string(),
+        handle: handle.to_string(),
+    };
+    dispatch(action, app)
+}
+
+/// `x x` on a member that runs in another tab cancels that tab's turn in
+/// place: the view stays, and no cancel chooser opens on the hidden tab.
+#[test]
+fn stop_hub_member_cancels_a_turn_of_another_tab_in_place() {
+    let (_hubs, mut app) = app_with_hub_browser_and_other_tab();
+    let other = AgentId(1);
+    {
+        let agent = app.agents.get_mut(&other).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        // A running subagent would open the chooser in the shown tab.
+        agent
+            .subagent_sessions
+            .insert("kid".to_string(), make_test_subagent("kid", "kid"));
+    }
+    let effects = stop_hub_member(&mut app, "other-root", "backend");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CancelTurn { session_id, cancel_subagents: false, .. }]
+                if &*session_id.0 == "other-root"
+        ),
+        "{effects:?}"
+    );
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    let agent = &app.agents[&other];
+    assert!(
+        agent.cancel_turn_view.is_none(),
+        "no chooser on a hidden tab"
+    );
+    assert!(agent.session.state.is_cancelling());
+    assert!(hub_notice(&app).is_some_and(|n| n.contains("Stopping @backend")));
+
+    app.agents.get_mut(&other).unwrap().session.state = AgentState::Idle;
+    let effects = stop_hub_member(&mut app, "other-root", "backend");
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(hub_notice(&app).as_deref(), Some("@backend is idle."));
+}
+
+/// The stop of a hidden tab follows the always-stop preference.
+#[test]
+fn stop_hub_member_of_another_tab_follows_the_subagent_preference() {
+    let (_hubs, mut app) = app_with_hub_browser_and_other_tab();
+    let agent = app.agents.get_mut(&AgentId(1)).unwrap();
+    agent.session.state = AgentState::TurnRunning;
+    agent.cancel_subagents_preference = Some(true);
+    let effects = stop_hub_member(&mut app, "other-root", "backend");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CancelTurn {
+                cancel_subagents: true,
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
+}
+
+/// `x x` on a subagent that another tab owns kills it through that tab's
+/// session, also when no view of the child is open.
+#[test]
+fn stop_hub_member_kills_a_subagent_of_another_tab() {
+    let (_hubs, mut app) = app_with_hub_browser_and_other_tab();
+    app.agents
+        .get_mut(&AgentId(1))
+        .unwrap()
+        .subagent_sessions
+        .insert(
+            "child-sid".to_string(),
+            make_test_subagent("child-sid", "sub-7"),
+        );
+    let effects = stop_hub_member(&mut app, "child-sid", "backend/scout");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::KillSubagent { session_id, subagent_id }]
+                if &*session_id.0 == "other-root" && subagent_id == "sub-7"
+        ),
+        "{effects:?}"
+    );
+    assert!(app.agents[&AgentId(1)].subagent_sessions["child-sid"].pending_kill);
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+}
+
+/// A member that no tab of this window runs gets the other-process notice.
+#[test]
+fn stop_hub_member_outside_this_window_names_the_other_process() {
+    let (_hubs, mut app) = app_with_hub_browser_and_other_tab();
+    let effects = stop_hub_member(&mut app, "elsewhere", "far");
+    assert!(effects.is_empty());
+    assert_eq!(
+        hub_notice(&app).as_deref(),
+        Some("@far runs in another process. Stop it from that window.")
+    );
+}
+
+/// A hub jump to another tab closes the browser of the tab it leaves, so
+/// no browser covers either prompt.
+#[test]
+fn focus_hub_member_closes_the_browser_of_the_tab_it_leaves() {
+    let (_hubs, mut app) = app_with_hub_browser_and_other_tab();
+    let (_other_hubs, browser) = hub_browser_for_test();
+    app.agents.get_mut(&AgentId(1)).unwrap().hub_browser = Some(browser);
+    super::super::session::load::dispatch_focus_hub_member(
+        &mut app,
+        "other-root".to_string(),
+        "backend".to_string(),
+    );
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(1)));
+    assert!(app.agents[&AgentId(0)].hub_browser.is_none());
+    assert!(app.agents[&AgentId(1)].hub_browser.is_none());
+}
 /// Launch-time blocked `--yolo` in the TUI: the one-shot notice is
 /// surfaced (toast + durable system line) on the first agent view and
 /// consumed so later switches stay quiet.

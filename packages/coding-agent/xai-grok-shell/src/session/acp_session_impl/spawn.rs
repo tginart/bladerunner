@@ -2129,7 +2129,9 @@ pub(crate) async fn spawn_session_actor(
                             tool_call_id.clone(),
                             crate::session::pending_interaction::PendingKind::Question,
                         );
-                    let _hub_input_guard = session_for_hooks.hub_input_guard();
+                    let _hub_input_guard = session_for_hooks.hub_input_guard(
+                        xai_grok_tools::implementations::grok_build::agent_hub::store::InputReason::Question,
+                    );
                     tokio::select! {
                         biased;
                         () = request.result_tx.closed() => {

@@ -1433,7 +1433,9 @@ impl SessionActor {
                         tool_call_id.to_string(),
                         crate::session::pending_interaction::PendingKind::Permission,
                     );
-                let _hub_input_guard = self.hub_input_guard();
+                let _hub_input_guard = self.hub_input_guard(
+                    xai_grok_tools::implementations::grok_build::agent_hub::store::InputReason::Permission,
+                );
                 self.permissions
                     .request_with_path_context_resolved(
                         access_kind.clone(),
@@ -1775,7 +1777,9 @@ impl SessionActor {
                 tool_call_id.to_string(),
                 crate::session::pending_interaction::PendingKind::PlanApproval,
             );
-            let _hub_input_guard = self.hub_input_guard();
+            let _hub_input_guard = self.hub_input_guard(
+                xai_grok_tools::implementations::grok_build::agent_hub::store::InputReason::PlanApproval,
+            );
             self.notifications.gateway.ext_method(ext_request).await
         };
         let raw = match resp {

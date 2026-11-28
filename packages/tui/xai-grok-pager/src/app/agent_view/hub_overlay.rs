@@ -9,7 +9,7 @@ use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crate::key;
 use crate::scrollback::block::RenderBlock;
-use crate::views::hub_browser::{HubBrowserState, HubKeyOutcome};
+use crate::views::hub_browser::{HubBrowserState, HubKeyOutcome, toggle_person_alerts};
 
 impl AgentView {
     /// Open the browser on a hub: the named hub, or this session's hub when
@@ -21,6 +21,7 @@ impl AgentView {
             Ok(mut browser) => {
                 browser.composer.set_history(self.hub_post_history.clone());
                 browser.is_bot_thinking = self.is_bot_thinking_in(&browser.hub);
+                browser.session_hub = self.private_hub_name(&browser.hubs_root());
                 self.hub_browser = Some(browser);
                 self.show_goal_detail = false;
                 self.show_workflows = false;
@@ -64,10 +65,7 @@ impl AgentView {
         }
         let browser = self.hub_browser.as_mut()?;
         match outcome {
-            HubKeyOutcome::Close => {
-                self.hub_post_history = browser.composer.history().to_vec();
-                self.hub_browser = None;
-            }
+            HubKeyOutcome::Close => self.close_hub_browser(),
             HubKeyOutcome::Changed => {}
             HubKeyOutcome::Unchanged => return Some(InputOutcome::Unchanged),
             HubKeyOutcome::OpenLink(target) => {
@@ -75,6 +73,15 @@ impl AgentView {
             }
             HubKeyOutcome::GoToMember(handle) => return Some(self.go_to_hub_member(&handle)),
             HubKeyOutcome::StopMember(handle) => return Some(self.stop_hub_member(&handle)),
+            HubKeyOutcome::CreateChannel { name, purpose } => {
+                let result = browser.hub.create_channel(&name, &purpose);
+                browser.finish_create_channel(result);
+            }
+            HubKeyOutcome::ToggleHere => {
+                let result = toggle_person_alerts(&browser.hub);
+                browser.finish_toggle_here(result);
+            }
+            HubKeyOutcome::SwitchHub(name) => self.switch_hub_browser(&name),
             HubKeyOutcome::Post { to, text } | HubKeyOutcome::Reply { to, text, .. }
                 if is_bot_target(&to) =>
             {
@@ -145,6 +152,41 @@ impl AgentView {
         InputOutcome::Action(Action::AskHubBot { hub, request })
     }
 
+    /// Close the browser and keep its post history for the next one.
+    pub(crate) fn close_hub_browser(&mut self) {
+        if let Some(browser) = self.hub_browser.take() {
+            self.hub_post_history = browser.composer.history().to_vec();
+        }
+    }
+
+    /// Purpose: Show another hub in the open browser (`H`).
+    /// Input: The `Hub::name` of the hub.
+    /// Output: None. On failure the browser stays on its hub with a notice.
+    /// Note: This only views the hub. The session does not join it.
+    fn switch_hub_browser(&mut self, name: &str) {
+        let Some(browser) = self.hub_browser.as_mut() else {
+            return;
+        };
+        let result =
+            open_hub_by_name(&browser.hubs_root(), name).and_then(|hub| browser.switch_hub(hub));
+        if let Err(error) = result {
+            browser.notice = Some(format!("Could not show hub {name}: {error}"));
+            return;
+        }
+        let hub = browser.hub.clone();
+        let is_bot_thinking = self.is_bot_thinking_in(&hub);
+        if let Some(browser) = self.hub_browser.as_mut() {
+            browser.is_bot_thinking = is_bot_thinking;
+        }
+    }
+
+    /// The `Hub::name` of the private hub of this session, when it exists.
+    fn private_hub_name(&self, root: &std::path::Path) -> Option<String> {
+        let session_id = self.session.session_id.as_ref()?;
+        let hub = store::Hub::open_existing_session_hub(root, &session_id.0).ok()?;
+        Some(hub.name().to_string())
+    }
+
     /// True while a hub-bot question about `hub` runs.
     pub(crate) fn is_bot_thinking_in(&self, hub: &store::Hub) -> bool {
         self.hub_bot_children.values().any(|dir| dir == hub.dir())
@@ -178,7 +220,8 @@ impl AgentView {
     /// Purpose: Stop the running turn of a hub member.
     /// Input: The member handle.
     /// Output: A cancel for this session or a kill for one of its subagents.
-    ///     Other sessions only get a notice, because their turns run elsewhere.
+    ///     Any other session goes to the app, which stops it when another tab
+    ///     of this window runs it.
     fn stop_hub_member(&mut self, handle: &str) -> InputOutcome {
         let Some(session_id) = self.hub_member_session(handle) else {
             return InputOutcome::Changed;
@@ -192,12 +235,10 @@ impl AgentView {
             self.hub_browser = None;
             return InputOutcome::Action(Action::CancelTurn);
         }
-        if let Some(browser) = self.hub_browser.as_mut() {
-            browser.notice = Some(format!(
-                "@{handle} runs in another session. Stop it from that session."
-            ));
-        }
-        InputOutcome::Changed
+        InputOutcome::Action(Action::StopHubMember {
+            session_id,
+            handle: handle.to_string(),
+        })
     }
 
     /// The session id of a member, or a notice in the browser when it has none.
@@ -274,6 +315,18 @@ fn open_hub_of_session(root: &std::path::Path, session_id: &str) -> anyhow::Resu
     )?;
     // An empty session hub stays free of a person, so the prune can remove it.
     if hub.has_messages() {
+        agent_hub::ensure_person(&hub, &store::person_handle())?;
+    }
+    Ok(hub)
+}
+
+/// Purpose: Open a hub for the hub switcher, as `/hub open` does.
+/// Input: The hubs root and the `Hub::name` of a named hub or a session hub.
+/// Output: The hub. The person becomes a member of a session hub that holds
+///     messages, as in `open_hub_of_session`.
+fn open_hub_by_name(root: &std::path::Path, name: &str) -> anyhow::Result<store::Hub> {
+    let hub = store::Hub::open_by_name(root, name)?;
+    if hub.meta()?.is_session_hub() && hub.has_messages() {
         agent_hub::ensure_person(&hub, &store::person_handle())?;
     }
     Ok(hub)
@@ -406,6 +459,59 @@ mod tests {
     }
 
     #[test]
+    fn c_and_h_change_the_shown_hub_through_the_controller() {
+        let (_root, mut view, bus) = browser_with_agent();
+        view.handle_hub_browser_input(&key_event(KeyCode::Char('c')));
+        view.handle_hub_browser_input(&Event::Paste("auth-fix".to_string()));
+        view.handle_hub_browser_input(&key_event(KeyCode::Tab));
+        view.handle_hub_browser_input(&Event::Paste("login work".to_string()));
+        view.handle_hub_browser_input(&key_event(KeyCode::Enter));
+        let meta = bus.hub().meta().unwrap();
+        let channel = meta.channels.iter().find(|c| c.name == "auth-fix");
+        assert_eq!(channel.map(|c| c.purpose.as_str()), Some("login work"));
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert!(browser.channel_form.is_none());
+        assert_eq!(
+            browser.selected_row(),
+            Some(crate::views::hub_browser::Row::Channel(
+                "auth-fix".to_string()
+            ))
+        );
+
+        assert!(meta.person_posts_alert_all);
+        view.handle_hub_browser_input(&key_event(KeyCode::Char('h')));
+        assert!(!bus.hub().meta().unwrap().person_posts_alert_all);
+        let notice = view.hub_browser.as_ref().unwrap().notice.clone();
+        assert!(notice.is_some_and(|n| n.starts_with("/hub here off")));
+    }
+
+    #[test]
+    fn switch_hub_shows_another_hub_in_place_and_keeps_the_history() {
+        let (root, mut view, bus) = browser_with_agent();
+        store::Hub::create(root.path(), "other").unwrap();
+        let browser = view.hub_browser.as_mut().unwrap();
+        browser
+            .composer
+            .set_history(vec!["earlier post".to_string()]);
+        view.switch_hub_browser("other");
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert_eq!(browser.hub.name(), "other");
+        assert_eq!(browser.person_name(), "me");
+        assert_eq!(browser.composer.history(), ["earlier post".to_string()]);
+        assert!(browser.is_person_view());
+
+        view.switch_hub_browser("missing");
+        let browser = view.hub_browser.as_ref().unwrap();
+        assert_eq!(browser.hub.name(), "other", "a failed switch keeps the hub");
+        assert!(browser.notice.as_ref().unwrap().contains("missing"));
+        assert_eq!(
+            bus.hub().name(),
+            "team",
+            "viewing a hub does not move the session"
+        );
+    }
+
+    #[test]
     fn oversized_post_keeps_the_draft_until_a_successful_retry() {
         let (_root, mut view, bus) = browser_with_agent();
         view.handle_hub_browser_input(&key_event(KeyCode::Tab));
@@ -475,11 +581,12 @@ mod tests {
             }
             other => panic!("expected a focus action, got {other:?}"),
         }
-        assert!(matches!(
-            view.stop_hub_member("worker"),
-            InputOutcome::Changed
-        ));
-        let notice = view.hub_browser.as_ref().unwrap().notice.clone();
-        assert!(notice.is_some_and(|n| n.contains("another session")));
+        match view.stop_hub_member("worker") {
+            InputOutcome::Action(Action::StopHubMember { session_id, handle }) => {
+                assert_eq!(session_id, "root");
+                assert_eq!(handle, "worker");
+            }
+            other => panic!("expected a stop action for the app, got {other:?}"),
+        }
     }
 }

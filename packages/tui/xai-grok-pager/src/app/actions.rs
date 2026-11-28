@@ -155,6 +155,13 @@ pub enum Action {
         session_id: String,
         handle: String,
     },
+    /// Stop a hub member from the hub browser: a turn of another tab of this
+    /// window, or a subagent that another tab owns. A session that is not
+    /// open here gets a notice, because another process runs it.
+    StopHubMember {
+        session_id: String,
+        handle: String,
+    },
     /// Welcome Local workspace ACK confirmed (y); write ack + start session.
     #[cfg(feature = "local-workspace")]
     ConfirmWelcomeLocalWorkspaceAck,

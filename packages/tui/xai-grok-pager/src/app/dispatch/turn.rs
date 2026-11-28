@@ -761,6 +761,192 @@ pub(super) fn dispatch_kill_subagent(app: &mut AppView, subagent_id: String) -> 
     }]
 }
 
+/// Purpose: Stop a hub member that runs in this window, from the hub browser.
+/// Input: The app, the member session id, and the member handle for notices.
+/// Output: The cancel or kill effects.
+/// Method:
+///     1. A tab whose root session is the member: the shown tab cancels as
+///        Esc does. A hidden tab cancels its turn in place.
+///     2. A subagent of any tab: kill it through the session of that tab.
+///     3. Else another process runs the member, and a notice says so.
+/// Note: A stop never changes `app.active_view`, and never opens the cancel
+///     chooser on a hidden tab.
+pub(super) fn dispatch_stop_hub_member(
+    app: &mut AppView,
+    session_id: String,
+    handle: String,
+) -> Vec<Effect> {
+    let root_tab = app
+        .agents
+        .iter()
+        .find(|(_, agent)| {
+            agent
+                .session
+                .session_id
+                .as_ref()
+                .is_some_and(|sid| *sid.0 == *session_id)
+        })
+        .map(|(id, _)| *id);
+    if let Some(id) = root_tab {
+        return stop_hub_member_turn(app, id, &handle);
+    }
+    if let Some((owner, subagent_id)) = find_subagent_owner(app, &session_id) {
+        return kill_hub_subagent(app, owner, subagent_id, &handle);
+    }
+    set_hub_notice(
+        app,
+        format!("@{handle} runs in another process. Stop it from that window."),
+    );
+    vec![]
+}
+
+/// Purpose: Cancel the turn of the root session of tab `id`.
+/// Input: The app, the tab, and the member handle.
+/// Output: The cancel effects. A notice in the shown hub browser tells the result.
+/// Note: A hidden tab takes the subagent choice from the preference, else it
+///     keeps its subagents, because no chooser can open there.
+fn stop_hub_member_turn(app: &mut AppView, id: AgentId, handle: &str) -> Vec<Effect> {
+    let is_shown = app.active_view == ActiveView::Agent(id)
+        && app
+            .agents
+            .get(&id)
+            .is_some_and(|agent| agent.active_subagent.is_none());
+    if is_shown {
+        // The cancel can open the subagent chooser, which the browser would cover.
+        if let Some(agent) = app.agents.get_mut(&id) {
+            agent.close_hub_browser();
+        }
+        return dispatch_cancel_turn(app);
+    }
+    let ui_pref = effective_cancel_subagents_preference(None, &app.current_ui);
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let cancel_subagents = agent
+        .cancel_subagents_preference
+        .or(ui_pref)
+        .unwrap_or(false);
+    let effect = cancel_turn_in_place(agent, cancel_subagents);
+    let notice = match effect {
+        Some(_) => format!("Stopping @{handle} in its tab."),
+        None => format!("@{handle} is idle."),
+    };
+    set_hub_notice(app, notice);
+    effect.into_iter().collect()
+}
+
+/// Purpose: Cancel what runs in an agent view that is not on screen.
+/// Input: The agent view and the subagent choice for the cancel.
+/// Output: The cancel effect, or None when nothing runs.
+/// Note: The order is the in-pane order: compact, then a wake, then a turn.
+///     There is no rewind, because the person does not see that composer.
+fn cancel_turn_in_place(
+    agent: &mut crate::app::agent_view::AgentView,
+    cancel_subagents: bool,
+) -> Option<Effect> {
+    let session_id = agent.session.session_id.clone()?;
+    if agent.session.state.is_compact_running() {
+        agent.session.cancel_compact_command();
+    } else if agent.running_wake_turn.is_some() {
+        agent.mark_wake_cancel_sent();
+    } else if agent.session.state.is_turn_running() {
+        agent.session.cancel_turn(&mut agent.scrollback);
+        if let Some(mut pav) = agent.plan_approval_view.take() {
+            pav.send_stale_cancel();
+            agent.plan_next_comment_id = pav.next_comment_id;
+            agent.prompt.restore(pav.stashed_prompt);
+            agent.line_viewer = None;
+        }
+    } else if !agent.session.state.is_cancelling() {
+        return None;
+    }
+    agent.cancel_turn_view = None;
+    agent.cancel_turn_buttons.clear();
+    drain_permission_queue(agent);
+    agent.clear_send_now_expectation();
+    Some(emit_cancel_turn(
+        agent,
+        session_id,
+        cancel_subagents,
+        /* rewind_if_no_output */ false,
+    ))
+}
+
+/// The tab that owns the subagent with this session id, and its subagent id.
+/// A child view with no tracking info uses its session id as the subagent id.
+fn find_subagent_owner(app: &AppView, session_id: &str) -> Option<(AgentId, String)> {
+    for (id, agent) in &app.agents {
+        let info = agent.subagent_sessions.get(session_id).or_else(|| {
+            agent
+                .subagent_sessions
+                .values()
+                .find(|info| &*info.subagent_id == session_id)
+        });
+        if let Some(info) = info {
+            return Some((*id, info.subagent_id.to_string()));
+        }
+        if agent.subagent_views.contains_key(session_id) {
+            return Some((*id, session_id.to_string()));
+        }
+    }
+    None
+}
+
+/// Purpose: Kill a subagent of tab `owner` through the session of that tab.
+/// Input: The app, the owner tab, the subagent id, and the member handle.
+/// Output: The kill effect, or none for a finished subagent. A notice tells the result.
+fn kill_hub_subagent(
+    app: &mut AppView,
+    owner: AgentId,
+    subagent_id: String,
+    handle: &str,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&owner) else {
+        return vec![];
+    };
+    let Some(session_id) = agent.session.session_id.clone() else {
+        return vec![];
+    };
+    let info = agent
+        .subagent_sessions
+        .values_mut()
+        .find(|info| *info.subagent_id == *subagent_id);
+    if let Some(info) = info {
+        if !info.is_running() {
+            set_hub_notice(app, format!("@{handle} is idle."));
+            return vec![];
+        }
+        info.pending_kill = true;
+        info.kill_requested_at = Some(Instant::now());
+    }
+    set_hub_notice(app, format!("Stopping @{handle}."));
+    vec![Effect::KillSubagent {
+        session_id,
+        subagent_id,
+    }]
+}
+
+/// Show `notice` in the hub browser on screen: the one of the shown subagent
+/// view, else the one of the active tab. With no browser, show a toast.
+fn set_hub_notice(app: &mut AppView, notice: String) {
+    let ActiveView::Agent(id) = app.active_view else {
+        app.show_toast(&notice);
+        return;
+    };
+    let browser = app.agents.get_mut(&id).and_then(|agent| {
+        let child = agent.active_subagent.clone();
+        let child = child.and_then(|sid| agent.subagent_views.get_mut(&sid));
+        match child {
+            Some(child) if child.hub_browser.is_some() => child.hub_browser.as_mut(),
+            _ => agent.hub_browser.as_mut(),
+        }
+    });
+    match browser {
+        Some(browser) => browser.notice = Some(notice),
+        None => app.show_toast(&notice),
+    }
+}
+
 pub(super) fn dispatch_demote_to_background(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
