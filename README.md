@@ -10,13 +10,21 @@ commands, and works with MCP servers and skills.
 
 Prebuilt beta releases support **Apple Silicon macOS** and **x86_64 Linux** (glibc 2.17+).
 
-On Apple Silicon macOS, install with Homebrew:
+### Homebrew (Apple Silicon macOS)
+
+Install [Homebrew](https://brew.sh/) first if needed. Then install and verify
+Blade Runner:
 
 ```sh
 brew install tginart/tap/bladerunner
+bladerunner --version
 ```
 
-Or use the shell installer on macOS and Linux:
+Homebrew automatically adds the [Blade Runner tap](https://github.com/tginart/homebrew-tap).
+Upgrade with `brew upgrade tginart/tap/bladerunner`. For removal or switching
+from the shell installer, see [Homebrew setup notes](docs/updates.md#homebrew-apple-silicon-macos).
+
+### Shell installer (macOS and Linux)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tginart/bladerunner/main/install.sh | sh
