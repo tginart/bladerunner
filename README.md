@@ -55,6 +55,20 @@ bladerunner agent stdio
 
 For source builds and contributions, see [Contributing](CONTRIBUTING.md).
 
+## Autonomous goals
+
+`/goal <objective>` automatically retries temporary network, timeout, rate-limit,
+and server failures. It permits eight consecutive retries, with exponential
+backoff from 15 seconds to five minutes and 20% jitter. A server `Retry-After`
+value sets the minimum wait and can exceed the backoff cap. A successful goal
+round resets the retry count. Set `GROK_GOAL_MAX_CONSECUTIVE_RETRIES` before launch to
+change the limit; `0` disables these retries. The sampler also has its own
+request retry budget, so total recovery time includes both layers.
+
+`/goal pause`, `/goal stop`, and Ctrl+C interrupt a retry wait. `/goal resume`
+starts a fresh retry budget after a pause. Authentication, configuration, and
+invalid-request errors pause the goal immediately.
+
 ## Review a GitHub pull request
 
 In a fullscreen session, type `/pr`, `/pr 42`, or `/pr <GitHub PR URL>`.

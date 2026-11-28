@@ -1635,6 +1635,8 @@ impl SessionActor {
         // must see as the current turn text.
         let mut round_user_text = user_text.to_string();
         let mut outer_round: u32 = 0;
+        let goal_cancel = self.goal_tracker.lock().retry_cancel();
+        let mut goal_retry = super::goal_retry::GoalRetryState::from_env();
         loop {
             if self.goal_harness_enabled() {
                 let goal_loop_active = self.goal_tracker.lock().status()
@@ -1651,6 +1653,38 @@ impl SessionActor {
                     outer_round,
                 )
                 .await;
+            if let Err(error) = &round
+                && self.goal_harness_enabled()
+                && let Some(cancel) = &goal_cancel
+                && !cancel.is_cancelled()
+            {
+                let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+                if !self.enforce_goal_token_budget(current_tokens).await
+                    && let Some((attempt, max_retries, delay)) =
+                        goal_retry.try_retry(error, rand::random())
+                {
+                    let detail =
+                        Self::turn_error_detail(error).unwrap_or_else(|| error.message.clone());
+                    let notice = format!(
+                        "Transient turn error ({}); retrying in {:.0}s (attempt {attempt}/{max_retries}).",
+                        crate::util::truncate(&detail, 200),
+                        delay.as_secs_f64(),
+                    );
+                    tracing::warn!(attempt, max_retries, delay_secs = delay.as_secs_f64(), %detail, "goal turn retry");
+                    self.send_slash_command_output(&notice).await;
+                    if !super::goal_retry::wait_for_retry(delay, cancel).await {
+                        return Ok(TurnOutcome::Cancelled {
+                            category: None,
+                            context: None,
+                        });
+                    }
+                    outer_round = outer_round.saturating_add(1);
+                    continue;
+                }
+            }
+            if round.is_ok() {
+                goal_retry.on_success();
+            }
             if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
                 break round;
             }

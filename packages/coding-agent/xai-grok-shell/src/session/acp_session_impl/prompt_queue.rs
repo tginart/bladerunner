@@ -115,6 +115,18 @@ impl SessionActor {
             self.invalidate_side_calls_for_new_prompt();
         }
 
+        // A queued pause cannot reach the slash handler until the sleeping
+        // turn ends. Apply its goal transition now to wake that turn.
+        if !origin.is_synthetic()
+            && matches!(prompt_mode, PromptMode::Agent)
+            && self.goal_harness_enabled()
+            && Self::extract_bash_command(&prompt_blocks).is_none()
+            && slash_commands::is_goal_pause_command(&prompt_blocks)
+        {
+            self.auto_pause_goal_if_active(crate::session::goal_tracker::GoalPauseReason::User)
+                .await;
+        }
+
         // Don't write synthetic auto-wake prompts to prompt history.
         if !origin.is_synthetic() && !raw_prompt_text.is_empty() && !self.startup_hints.is_subagent
         {
