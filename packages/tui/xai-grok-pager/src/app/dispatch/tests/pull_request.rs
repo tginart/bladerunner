@@ -359,6 +359,79 @@ fn corner_controls_leave_the_main_draft_intact_and_restore_the_same_pr() {
     assert_eq!(app.agents[&id].prompt.text(), "draft for main");
 }
 
+/// Purpose: Verify PR card controls in the dashboard session popup.
+/// Input: Mouse clicks on a loaded PR card and a session draft.
+/// Output: Each control changes the attached session and preserves its draft.
+#[test]
+fn dashboard_popup_routes_pr_controls_to_the_attached_session() {
+    use crate::views::pull_request::{Viewer, summary::Display};
+    use ratatui::layout::Rect;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let mut viewer = Viewer::loading();
+    viewer.target = "8".into();
+    viewer.data = Some(snapshot());
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.pull_request = Some(Box::new(viewer));
+    agent.prompt.set_text("draft for main");
+    app.active_view = ActiveView::AgentDashboard;
+    ensure_dashboard_state(&mut app);
+    let dashboard = app.dashboard.as_mut().unwrap();
+    dashboard.attached_agent = Some(id);
+    dashboard.popup_outer_rect = Some(Rect::new(0, 0, 132, 38));
+
+    for (label, expected) in [
+        ("[-]", Display::Chip),
+        ("[+]", Display::Card),
+        ("[x]", Display::Closed),
+    ] {
+        let action = click_label(&mut app, label);
+        assert!(dispatch(action, &mut app).is_empty());
+        assert!(
+            app.agents[&id]
+                .pull_request
+                .as_ref()
+                .unwrap()
+                .summary
+                .display
+                == expected
+        );
+    }
+    assert!(dispatch(Action::OpenPullRequest(String::new()), &mut app).is_empty());
+    let action = click_label(&mut app, "[Refresh]");
+    let effects = dispatch(action, &mut app);
+    let [
+        Effect::FetchPullRequest {
+            agent_id,
+            request_id,
+            target,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("refresh must fetch the attached session's PR: {effects:?}");
+    };
+    assert_eq!(*agent_id, id);
+    assert_eq!(target, "8");
+    dispatch_task_result(
+        TaskResult::PullRequestLoaded {
+            agent_id: id,
+            request_id: *request_id,
+            result: Ok(snapshot()),
+        },
+        &mut app,
+    );
+    let action = click_label(&mut app, "[Fullscreen]");
+    dispatch(action, &mut app);
+    assert!(matches!(
+        app.agents[&id].active_modal,
+        Some(ActiveModal::PullRequest)
+    ));
+    assert!(matches!(app.active_view, ActiveView::AgentDashboard));
+    assert_eq!(app.agents[&id].prompt.text(), "draft for main");
+}
+
 #[test]
 fn close_during_fetch_caches_the_result_without_reopening_the_overlay() {
     use crate::views::pull_request::summary::{Control, Display};

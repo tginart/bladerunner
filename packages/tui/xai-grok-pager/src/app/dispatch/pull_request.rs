@@ -14,11 +14,16 @@ use crate::views::{
     },
 };
 
+/// Purpose: Open the PR for the visible session, including a dashboard popup.
+/// Input: The application state and the requested PR.
+/// Output: A visible card and an optional fetch effect.
 pub(super) fn open(app: &mut AppView, target: String) -> Vec<Effect> {
-    let ActiveView::Agent(id) = app.active_view else {
-        return vec![];
+    let id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        ActiveView::AgentDashboard => app.dashboard.as_ref().and_then(|d| d.attached_agent),
+        ActiveView::Welcome => None,
     };
-    let Some(agent) = app.agents.get_mut(&id) else {
+    let Some(agent) = id.and_then(|id| app.agents.get_mut(&id)) else {
         return vec![];
     };
     if target.is_empty()
@@ -34,10 +39,12 @@ pub(super) fn open(app: &mut AppView, target: String) -> Vec<Effect> {
 /// Purpose: Activate a PR control from either the mouse or a slash command.
 /// Input: The active session and user action. Output: UI state and optional fetch.
 pub(super) fn control(app: &mut AppView, control: Control) -> Vec<Effect> {
-    let ActiveView::Agent(id) = app.active_view else {
-        return vec![];
+    let id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        ActiveView::AgentDashboard => app.dashboard.as_ref().and_then(|d| d.attached_agent),
+        ActiveView::Welcome => None,
     };
-    let Some(agent) = app.agents.get_mut(&id) else {
+    let Some(agent) = id.and_then(|id| app.agents.get_mut(&id)) else {
         return vec![];
     };
     if control == Control::Refresh {
