@@ -106,6 +106,57 @@ fn selected_hunk_reaches_review_chat_and_answer_survives_closing_viewer() {
 }
 
 #[test]
+fn cancelled_handoff_keeps_the_next_question_on_the_selected_hunk() {
+    use crate::views::pull_request::{Outcome, Viewer};
+    use crate::views::review_chat::{ReviewChatOutcome, ReviewChatState};
+    use std::{cell::RefCell, path::Path, rc::Rc};
+    use xai_grok_shell::extensions::review_chat::AskResponse;
+
+    let chat = Rc::new(RefCell::new(ReviewChatState::new(
+        "parent".into(),
+        Path::new("."),
+    )));
+    let mut viewer = Viewer::loading();
+    viewer.chat = Some(chat.clone());
+    viewer.data = Some(snapshot());
+    viewer.enter_fullscreen();
+    let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    viewer.key(&press(KeyCode::Right));
+    viewer.key(&press(KeyCode::Char('?')));
+    chat.borrow_mut().paste("Explain the first hunk");
+    let Outcome::Chat(ReviewChatOutcome::Ask(first)) = viewer.key(&press(KeyCode::Enter)) else {
+        panic!("expected a review question");
+    };
+    assert!(first.anchor.patch.contains("+first"));
+    chat.borrow_mut().finish(Ok(AskResponse {
+        child_id: first.child_id,
+        success: true,
+        output: "First hunk explained".into(),
+        error: None,
+    }));
+    viewer.key(&KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    viewer.key(&press(KeyCode::Tab));
+    viewer.key(&press(KeyCode::Char(']')));
+    viewer.key(&press(KeyCode::Char('?')));
+    chat.borrow_mut().paste("Share this answer");
+    let Outcome::Chat(ReviewChatOutcome::Forward(handoff)) =
+        viewer.key(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+    else {
+        panic!("expected the draft to retain its source");
+    };
+    assert!(handoff.contains("+first"));
+    assert!(!handoff.contains("+second"));
+    viewer.key(&press(KeyCode::Esc));
+    viewer.key(&press(KeyCode::Char('?')));
+    chat.borrow_mut().paste("Explain this hunk too");
+    let Outcome::Chat(ReviewChatOutcome::Ask(next)) = viewer.key(&press(KeyCode::Enter)) else {
+        panic!("expected a follow-up question");
+    };
+    assert!(next.anchor.patch.contains("+second"));
+    assert!(!next.anchor.patch.contains("+first"));
+}
+
+#[test]
 fn old_fetch_cannot_replace_newer_or_dismissed_viewer() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);

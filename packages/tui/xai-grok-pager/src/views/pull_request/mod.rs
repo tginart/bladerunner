@@ -391,9 +391,7 @@ impl Viewer {
     }
 
     fn update_chat_anchor(&self) {
-        if let Some(chat) = &self.chat
-            && chat.borrow().draft.is_none()
-        {
+        if let Some(chat) = &self.chat {
             chat.borrow_mut().question_anchor = self.anchor(self.window.active_tab == 0);
         }
     }

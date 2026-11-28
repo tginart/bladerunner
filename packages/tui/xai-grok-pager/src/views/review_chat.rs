@@ -315,7 +315,6 @@ impl ReviewChatState {
         self.draft_scrollback
             .push_block(RenderBlock::system(exchange.anchor.patch.clone()));
         self.draft_scrollback.goto_top();
-        self.question_anchor = Some(exchange.anchor.clone());
         self.visible = true;
         self.focused = true;
         self.message = None;
