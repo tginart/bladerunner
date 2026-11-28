@@ -141,7 +141,12 @@ impl TransientRetryState {
         {
             return None;
         }
-        let delay = transient_backoff_delay(self.step_attempts);
+        let delay = error
+            .retry_after_secs
+            .map(|secs| {
+                std::time::Duration::from_secs(secs).min(xai_grok_sampler::retry::MAX_RETRY_BACKOFF)
+            })
+            .unwrap_or_else(|| transient_backoff_delay(self.step_attempts));
         let next = Self {
             step_attempts: self.step_attempts + 1,
             prompt_attempts: self.prompt_attempts + 1,
@@ -392,6 +397,27 @@ mod tests {
             state.try_grant(&stall, IDLE).is_none(),
             "the fourth stall in one step must fail the turn"
         );
+    }
+
+    /// Purpose: Preserve the sampler's capped server cooldown for turn retries.
+    /// Input: A server error with an optional Retry-After header.
+    /// Output: The header delay, capped at 30 seconds, or the normal backoff.
+    #[test]
+    fn server_retry_after_sets_the_capped_retry_delay() {
+        for (retry_after_secs, expected_secs) in [
+            (None, 2),
+            (Some(0), 0),
+            (Some(15), 15),
+            (Some(30), 30),
+            (Some(120), 30),
+        ] {
+            let mut error = error(SamplingErrorKind::Api, Some(503));
+            error.message = "server unavailable".into();
+            error.is_retryable = true;
+            error.retry_after_secs = retry_after_secs;
+            let (_, grant) = enabled().try_grant(&error, IDLE).unwrap();
+            assert_eq!(grant.delay.as_secs(), expected_secs);
+        }
     }
 
     #[test]
