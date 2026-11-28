@@ -1,0 +1,90 @@
+name: Update Homebrew tap
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_DEPLOY_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published stable release tag (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: verify and update Apple Silicon formula
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Validate release tag and deploy key
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import os, re; assert re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", os.environ["RELEASE_TAG"]), "expected stable release tag vX.Y.Z"'
+          test -n "$TAP_DEPLOY_KEY" || { echo "HOMEBREW_TAP_DEPLOY_KEY is not configured" >&2; exit 1; }
+      - uses: actions/checkout@v5
+        with:
+          repository: tginart/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      - name: Download published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease --jq '[.isDraft,.isPrerelease] | any')" = false
+          mkdir dist
+          gh release download "$RELEASE_TAG" --dir dist \
+            --pattern "bladerunner-${RELEASE_TAG#v}-aarch64-apple-darwin.tar.gz" \
+            --pattern SHA256SUMS
+      - name: Generate verified formula
+        run: |
+          python3 -B packaging/homebrew/update_formula.py \
+            --version "$RELEASE_TAG" \
+            --archive "dist/bladerunner-${RELEASE_TAG#v}-aarch64-apple-darwin.tar.gz" \
+            --sums dist/SHA256SUMS \
+            --output homebrew-tap/Formula/bladerunner.rb
+      - name: Test formula and packaged CLI
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s packaging/homebrew -v
+          brew tap tginart/tap "$GITHUB_WORKSPACE/homebrew-tap"
+          cp homebrew-tap/Formula/bladerunner.rb "$(brew --repository tginart/tap)/Formula/bladerunner.rb"
+          brew install --formula tginart/tap/bladerunner
+          brew test tginart/tap/bladerunner
+          brew audit --formula tginart/tap/bladerunner
+      - name: Push formula update
+        working-directory: homebrew-tap
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/bladerunner.rb; then
+            echo "Tap already has this release or a newer release"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/bladerunner.rb
+          git commit -m "Update bladerunner to ${RELEASE_TAG#v}"
+          git push origin HEAD:main

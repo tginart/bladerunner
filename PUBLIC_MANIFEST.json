@@ -15,9 +15,21 @@
       "mode": "0644"
     },
     {
+      "path": ".github/workflows/homebrew-check.yml",
+      "bytes": 486,
+      "sha256": "4cb13cd4ebea2472290977fb589e4ecbdf7ff1bd6fa39ddf8e99335488f36243",
+      "mode": "0644"
+    },
+    {
+      "path": ".github/workflows/homebrew.yml",
+      "bytes": 3264,
+      "sha256": "8204ed6c374f2ae70c159e5d68c787ec9f37cdfd8a32eea4d3546584bc7d8dc5",
+      "mode": "0644"
+    },
+    {
       "path": ".github/workflows/release.yml",
-      "bytes": 16611,
-      "sha256": "06354826daa7d63f0f13d36332680ed3239eee338cae437ba46423079acadeeb",
+      "bytes": 16853,
+      "sha256": "453d13af609e382d07890d3437ffb6504cb4313e31ba8b0759837309fc27dd93",
       "mode": "0644"
     },
     {
@@ -58,8 +70,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 3848,
-      "sha256": "d0ea5c12049b5f58b4ddd409c29426af0e7412518dd07abca1efc2cc51f095a7",
+      "bytes": 3992,
+      "sha256": "03bafb4da626bb40b3c76a1b3012ed080904862ad827b494e514f3e21b171d8a",
       "mode": "0644"
     },
     {
@@ -1198,8 +1210,8 @@
     },
     {
       "path": "docs/updates.md",
-      "bytes": 949,
-      "sha256": "1d151656e17eb8ac20e3b273f739cfcf272c137f38b175871b0996a2467c20e7",
+      "bytes": 1923,
+      "sha256": "3f047bcc4afb5ba7e1b256f02dd4e84dc425d4f80594c6687beff6ec650cfd2a",
       "mode": "0644"
     },
     {
@@ -19626,6 +19638,30 @@
       "path": "packages/tui/xai-tty-utils/src/runtime_tests.rs",
       "bytes": 5868,
       "sha256": "698b6959c3891735dc2a59ebfbdfbd8061d676c2376935f19868aa7a72484391",
+      "mode": "0644"
+    },
+    {
+      "path": "packaging/homebrew/README.md",
+      "bytes": 1348,
+      "sha256": "a54d2ed2207af7eaa4344bc4a2c97913cd68cb42d119fe7db74bc918b9a7dd50",
+      "mode": "0644"
+    },
+    {
+      "path": "packaging/homebrew/bladerunner.rb.in",
+      "bytes": 3783,
+      "sha256": "1fda17a8418d89f388b2b5aa4b1d9aba6d4f2a7218ad5fbfa9534fd3e107f5a2",
+      "mode": "0644"
+    },
+    {
+      "path": "packaging/homebrew/test_homebrew.py",
+      "bytes": 6956,
+      "sha256": "2a698728fe1fed4d9b0b33f3060009f12f84eb28a78dc6247e8415a8beb8901c",
+      "mode": "0644"
+    },
+    {
+      "path": "packaging/homebrew/update_formula.py",
+      "bytes": 3583,
+      "sha256": "d8d6279e4a1479523b321271d2cd47cf0b41298fda5658a50715efe4f9d3f963",
       "mode": "0644"
     },
     {

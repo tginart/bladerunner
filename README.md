@@ -10,6 +10,14 @@ commands, and works with MCP servers and skills.
 
 Prebuilt beta releases support **Apple Silicon macOS** and **x86_64 Linux** (glibc 2.17+).
 
+On Apple Silicon macOS, install with Homebrew:
+
+```sh
+brew install tginart/tap/bladerunner
+```
+
+Or use the shell installer on macOS and Linux:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tginart/bladerunner/main/install.sh | sh
 export PATH="$HOME/.bladerunner/bin:$PATH"

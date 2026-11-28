@@ -1,0 +1,96 @@
+# Purpose: Install the verified Apple Silicon CLI and its packaged assets.
+# Input: A versioned release archive from tginart/bladerunner.
+# Output: A Homebrew command with per-user state outside the package.
+class Bladerunner < Formula
+  desc "Terminal coding agent for OpenAI Codex and Palantir AIP"
+  homepage "https://github.com/tginart/bladerunner"
+  url "https://github.com/tginart/bladerunner/releases/download/v@VERSION@/bladerunner-@VERSION@-aarch64-apple-darwin.tar.gz"
+  sha256 "@SHA256@"
+  license "Apache-2.0"
+
+  depends_on arch: :arm64
+  depends_on :macos
+
+  # Purpose: Install the release and a launcher for per-user asset discovery.
+  # Input: The verified Apple Silicon release archive.
+  # Output: A command and its bundled assets in the Homebrew prefix.
+  def install
+    libexec.install "bladerunner", "bundled"
+    prefix.install "LICENSE", "NOTICE", "THIRD-PARTY-NOTICES"
+    (bin/"bladerunner").write <<~EOS
+      #!/bin/sh
+      set -eu
+
+      if [ "${1:-}" = update ]; then
+        echo "Homebrew manages this installation. Run: brew upgrade tginart/tap/bladerunner" >&2
+        exit 1
+      fi
+
+      # The CLI discovers bundled assets below its per-user state directory.
+      state_dir="${BLADERUNNER_HOME:-$HOME/.bladerunner}"
+      bundle="$state_dir/bundled"
+      packaged_bundle="#{opt_libexec}/bundled"
+      if [ ! -L "$bundle" ] || [ "$(readlink "$bundle")" != "$packaged_bundle" ]; then
+        mkdir -p "$state_dir"
+        lock="$state_dir/.homebrew-bundle-lock"
+        attempts=0
+        until mkdir "$lock" 2>/dev/null; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 10 ]; then
+            echo "Cannot lock bundled assets. If no launch is active, remove $lock and retry." >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        trap 'rmdir "$lock"' EXIT
+        trap 'exit 1' HUP INT TERM
+        if [ ! -L "$bundle" ] || [ "$(readlink "$bundle")" != "$packaged_bundle" ]; then
+          if [ -e "$bundle" ] || [ -L "$bundle" ]; then
+            backup="$state_dir/bundled.before-homebrew"
+            if [ -e "$backup" ] || [ -L "$backup" ]; then
+              echo "Cannot link bundled assets: $backup already exists. Move it aside and retry." >&2
+              exit 1
+            fi
+            mv "$bundle" "$backup"
+          fi
+          ln -s "$packaged_bundle" "$bundle"
+        fi
+        rmdir "$lock"
+        trap - EXIT HUP INT TERM
+      fi
+
+      export BLADERUNNER_HOME="$state_dir"
+      export BLADERUNNER_DISABLE_AUTOUPDATER=1
+      export GROK_DISABLE_AUTOUPDATER=1
+      exec "#{opt_libexec}/bladerunner" "$@"
+    EOS
+  end
+
+  def caveats
+    <<~EOS
+      Upgrade with: brew upgrade tginart/tap/bladerunner
+      If you used the shell installer, ensure Homebrew's bin comes before
+      ~/.bladerunner/bin in PATH.
+
+      On first launch, bundled assets are linked from Homebrew. Any previous
+      bundle is preserved at $BLADERUNNER_HOME/bundled.before-homebrew
+      (default: ~/.bladerunner/bundled.before-homebrew).
+    EOS
+  end
+
+  test do
+    state = testpath/"state with spaces"
+    state.mkpath
+    (state/"bundled").mkpath
+    (state/"bundled/previous.txt").write "keep"
+    (state/"config.toml").write "# keep user configuration\n"
+    ENV["BLADERUNNER_HOME"] = state.to_s
+    assert_match version.to_s, shell_output("#{bin}/bladerunner --version")
+    assert_match "Usage", shell_output("#{bin}/bladerunner --help")
+    assert_predicate state/"bundled", :symlink?
+    assert_predicate state/"bundled/skills", :directory?
+    assert_equal "keep", (state/"bundled.before-homebrew/previous.txt").read
+    assert_equal "# keep user configuration\n", (state/"config.toml").read
+    assert_match "brew upgrade", shell_output("#{bin}/bladerunner update 2>&1", 1)
+  end
+end

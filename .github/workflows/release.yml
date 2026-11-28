@@ -423,3 +423,12 @@ jobs:
             The release contains an Apple Silicon macOS CLI archive, an x86_64 Linux
             (glibc 2.17+) CLI archive, and `SHA256SUMS`. Desktop, Intel macOS, ARM Linux,
             and Windows binary releases are not included.
+
+  homebrew:
+    name: update Homebrew tap
+    needs: [publish]
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets:
+      HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
