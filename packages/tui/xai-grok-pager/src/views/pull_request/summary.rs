@@ -8,6 +8,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
 
@@ -36,6 +37,13 @@ pub struct Summary {
 }
 
 impl Summary {
+    pub fn button_at(&self, pos: (u16, u16)) -> Option<(Rect, Control)> {
+        self.buttons
+            .iter()
+            .copied()
+            .find(|(rect, _)| rect.contains(pos.into()))
+    }
+
     pub fn clear_hits(&mut self) {
         self.area = Rect::default();
         self.buttons.clear();
@@ -47,12 +55,7 @@ impl Summary {
             return None;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            return Some(
-                self.buttons
-                    .iter()
-                    .find(|(rect, _)| rect.contains(point))
-                    .map(|(_, c)| *c),
-            );
+            return Some(self.button_at((mouse.column, mouse.row)).map(|(_, c)| c));
         }
         Some(None)
     }
@@ -137,7 +140,19 @@ impl Viewer {
                 buf,
             );
         if let Some(pr) = &self.data {
-            Paragraph::new(pr.stats.as_str()).style(base).render(
+            let files = if pr.changed_files == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            let stats = Line::from(vec![
+                Span::raw(format!("{} {files} · ", pr.changed_files)),
+                Span::styled(format!("+{}", pr.additions), base.fg(theme.accent_success)),
+                Span::raw(" "),
+                Span::styled(format!("−{}", pr.deletions), base.fg(theme.accent_error)),
+                Span::raw(format!(" · {}", pr.thread_status)),
+            ]);
+            Paragraph::new(stats).style(base).render(
                 Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
                 buf,
             );

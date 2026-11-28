@@ -10,9 +10,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::Line,
-    widgets::{Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 use xai_grok_shell::extensions::review_chat::ReviewAnchor;
 
@@ -191,8 +191,10 @@ impl Viewer {
                 id,
             })
             .collect();
+        let title =
+            crate::util::truncate_to_width(title, usize::from(area.width.saturating_sub(14)));
         let config = ModalWindowConfig {
-            title,
+            title: &title,
             tabs: self.data.as_ref().map(|_| tabs.as_slice()),
             shortcuts: &shortcuts,
             sizing: ModalSizing {
@@ -251,14 +253,32 @@ impl Viewer {
                 .spacing(1)
                 .areas(area)
         } else {
+            let rows = self.items().len().min(6) as u16;
             Layout::vertical([
-                Constraint::Length((area.height / 3).min(6)),
+                Constraint::Length((area.height / 3).min(rows)),
                 Constraint::Fill(1),
             ])
             .spacing(1)
             .areas(area)
         };
         self.list_area = list;
+        if self.window.active_tab == 2 && !list.is_empty() && !detail.is_empty() {
+            let (divider, border) = if list.y == detail.y {
+                (
+                    Rect::new(list.right(), list.y, 1, list.height),
+                    Borders::LEFT,
+                )
+            } else {
+                (
+                    Rect::new(list.x, list.bottom(), list.width, 1),
+                    Borders::TOP,
+                )
+            };
+            Block::default()
+                .borders(border)
+                .border_style(Style::default().fg(theme.gray_dim))
+                .render(divider, buf);
+        }
         let h = usize::from(list.height.max(1));
         self.first_row = self
             .first_row
@@ -273,9 +293,17 @@ impl Viewer {
                 Style::default().fg(theme.text_secondary)
             };
             let row = Rect::new(list.x, list.y + (y - self.first_row) as u16, list.width, 1);
-            Paragraph::new(item.label.as_str())
-                .style(style)
-                .render(row, buf);
+            let label = if self.window.active_tab == 2 {
+                let marker = if self.selected == y { "▸ " } else { "  " };
+                let title = crate::util::truncate_to_width(
+                    &item.label,
+                    usize::from(list.width.saturating_sub(2)),
+                );
+                Line::from(vec![marker.into(), title.into()])
+            } else {
+                Line::from(item.label.as_str())
+            };
+            Paragraph::new(label).style(style).render(row, buf);
         }
         detail
     }
@@ -294,7 +322,11 @@ impl Viewer {
         let [header, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         Paragraph::new(heading)
-            .style(Style::default().fg(theme.accent_user))
+            .style(
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            )
             .render(header, buf);
         if body.is_empty() {
             return;
@@ -305,9 +337,9 @@ impl Viewer {
             .is_none_or(|(width, _)| *width != body.width)
         {
             let text = &item.parts[self.part];
-            let lines = if self.window.active_tab == 0 {
+            let lines = if self.window.active_tab != 1 {
                 use crate::scrollback::blocks::markdown_content::MarkdownContent;
-                MarkdownContent::new(text.clone())
+                MarkdownContent::new_with_table_width(text.clone(), Some(usize::from(body.width)))
                     .output(usize::from(body.width))
                     .lines
                     .into_iter()

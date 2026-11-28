@@ -16440,6 +16440,7 @@ dependencies = [
  "flate2",
  "git2",
  "globset",
+ "htmd",
  "ignore",
  "image",
  "indexmap",

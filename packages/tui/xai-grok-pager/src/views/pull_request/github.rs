@@ -5,15 +5,17 @@
 use std::{path::Path, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
+use htmd::{Element, HtmlToMarkdown, element_handler::Handlers};
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::process::Command;
 use url::Url;
 
 const FIELDS: &str = "id,url,number,title,body,state,isDraft,author,baseRefName,baseRefOid,headRefName,headRefOid,reviewDecision,additions,deletions,changedFiles";
+const DISCUSSION_MEDIA_TYPE: &str = "Accept: application/vnd.github.full+json";
 const THREADS: &str = "query($id:ID!, $endCursor:String) {
   node(id:$id) { ... on PullRequest { reviewThreads(first:50, after:$endCursor) {
     nodes { id path line originalLine isResolved isOutdated comments(first:100) {
-      totalCount repliesPage: pageInfo { hasNextPage next: endCursor } nodes { author { login } body createdAt diffHunk }
+      totalCount repliesPage: pageInfo { hasNextPage next: endCursor } nodes { author { login } bodyHtml: bodyHTML createdAt diffHunk }
     } }
     pageInfo { hasNextPage endCursor }
   } } }
@@ -21,7 +23,7 @@ const THREADS: &str = "query($id:ID!, $endCursor:String) {
 
 const REPLIES: &str = "query($id:ID!, $after:String!) {
   node(id:$id) { ... on PullRequestReviewThread { comments(first:100, after:$after) {
-    totalCount pageInfo { hasNextPage next: endCursor } nodes { author { login } body createdAt }
+    totalCount pageInfo { hasNextPage next: endCursor } nodes { author { login } bodyHtml: bodyHTML createdAt }
   } } }
 }";
 
@@ -29,7 +31,10 @@ const REPLIES: &str = "query($id:ID!, $after:String!) {
 pub struct Snapshot {
     pub badge: String,
     pub subject: String,
-    pub stats: String,
+    pub changed_files: usize,
+    pub additions: usize,
+    pub deletions: usize,
+    pub thread_status: String,
     pub checks: String,
     pub url: String,
     pub title: String,
@@ -113,8 +118,16 @@ pub async fn load(cwd: &Path, target: &str) -> Result<Snapshot> {
     ];
     let (files, comments, reviews, threads) = tokio::join!(
         pages::<File>(cwd, &host, [files_path.as_str()]),
-        pages::<Comment>(cwd, &host, [comments_path.as_str()]),
-        pages::<Review>(cwd, &host, [reviews_path.as_str()]),
+        pages::<Comment>(
+            cwd,
+            &host,
+            ["-H", DISCUSSION_MEDIA_TYPE, comments_path.as_str()]
+        ),
+        pages::<Review>(
+            cwd,
+            &host,
+            ["-H", DISCUSSION_MEDIA_TYPE, reviews_path.as_str()]
+        ),
         read_threads(cwd, &host, thread_args),
     );
     // A push during pagination can mix patches from different revisions.
@@ -180,10 +193,6 @@ pub async fn load(cwd: &Path, target: &str) -> Result<Snapshot> {
         },
     );
     let threads = section(threads, "Inline threads", &mut overview);
-    let stats = format!(
-        "{} files · +{} −{} · {thread_status}",
-        pr.changed_files, pr.additions, pr.deletions
-    );
     let mut checks = check_summary(latest.status_check_rollup.as_deref());
     if !pr.review_decision.is_empty() {
         checks = format!(
@@ -204,7 +213,10 @@ pub async fn load(cwd: &Path, target: &str) -> Result<Snapshot> {
             if pr.is_draft { "DRAFT" } else { &pr.state }
         ),
         subject: pr.title,
-        stats,
+        changed_files: pr.changed_files,
+        additions: pr.additions,
+        deletions: pr.deletions,
+        thread_status,
         checks,
         url: pr.url,
         title,
@@ -241,33 +253,97 @@ fn discussion_items(
     reviews: Vec<Review>,
     threads: Vec<Thread>,
 ) -> Vec<Item> {
+    let converter = discussion_converter();
     let mut discussion = Vec::new();
     for c in comments {
-        let label = format!("@{} · comment", login(&c.user));
-        discussion.push((
-            c.created_at.clone(),
-            Item::single(
-                label,
-                "Conversation".into(),
-                format!("{}\n\n{}", c.created_at, c.body),
-            ),
-        ));
+        let item = discussion_item("Comment", &c.user, &c.created_at, c.body, &converter);
+        discussion.push((c.created_at, item));
     }
     for r in reviews {
-        let label = format!("@{} · {}", login(&r.user), r.state.replace('_', " "));
-        let body = r.body.unwrap_or_default();
-        if body.trim().is_empty() && r.state == "COMMENTED" {
-            continue;
-        }
+        let kind = match r.state.as_str() {
+            "COMMENTED" => "Review",
+            "APPROVED" => "Approved",
+            "CHANGES_REQUESTED" => "Changes requested",
+            "DISMISSED" => "Dismissed",
+            state => state,
+        };
         let date = r.submitted_at.unwrap_or_default();
-        discussion.push((
-            date.clone(),
-            Item::single(label, "Review".into(), format!("{date}\n\n{body}")),
-        ));
+        let item = discussion_item(kind, &r.user, &date, r.body, &converter);
+        if r.state != "COMMENTED" || !item.parts[0].trim().is_empty() {
+            discussion.push((date, item));
+        }
     }
-    discussion.extend(threads.into_iter().map(Thread::into_item));
+    discussion.extend(
+        threads
+            .into_iter()
+            .map(|thread| thread.into_item(&converter)),
+    );
     discussion.sort_by(|a, b| a.0.cmp(&b.0));
     discussion.into_iter().map(|(_, item)| item).collect()
+}
+
+/// Purpose: Translate GitHub's rendered HTML to the terminal's Markdown dialect.
+/// Input: GitHub supplies visible text and sanitized markup. Output: A local converter.
+fn discussion_converter() -> HtmlToMarkdown {
+    HtmlToMarkdown::builder()
+        .add_handler(
+            vec!["summary"],
+            |handlers: &dyn Handlers, element: Element| {
+                let title = handlers.walk_children(element.node).content;
+                Some(format!("\n\n### {}\n\n", title.trim()).into())
+            },
+        )
+        .add_handler(
+            vec!["relative-time"],
+            |handlers: &dyn Handlers, element: Element| {
+                let text = handlers.walk_children(element.node).content;
+                Some(display_time(text.trim()).into())
+            },
+        )
+        .build()
+}
+
+fn display_time(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value).map_or_else(
+        |_| value.to_owned(),
+        |date| date.to_utc().format("%Y-%m-%d %H:%M UTC").to_string(),
+    )
+}
+
+fn discussion_item(
+    kind: &str,
+    user: &Option<Author>,
+    date: &str,
+    body: DiscussionBody,
+    converter: &HtmlToMarkdown,
+) -> Item {
+    let author = format!("@{}", login(user));
+    let preview = body
+        .body_text
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(&author);
+    let label = format!("{kind} · {preview}");
+    let byline = if date.is_empty() {
+        author
+    } else {
+        format!("{author} · {}", display_time(date))
+    };
+    let markdown = match body.body_html {
+        Some(html) => discussion_markdown(converter, &html),
+        None => body.body_text.or(body.body).unwrap_or_default(),
+    };
+    Item::single(label, byline, markdown)
+}
+
+fn discussion_markdown(converter: &HtmlToMarkdown, html: &str) -> String {
+    // Conversion reads only the bytes already in memory.
+    converter
+        .convert(html)
+        .expect("in-memory GitHub HTML is readable")
 }
 
 fn pr_location(input: &str) -> Result<(String, String, u64)> {
@@ -477,10 +553,18 @@ fn login(author: &Option<Author>) -> &str {
 }
 
 #[derive(Deserialize)]
+struct DiscussionBody {
+    body: Option<String>,
+    body_html: Option<String>,
+    body_text: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct Comment {
     user: Option<Author>,
     created_at: String,
-    body: String,
+    #[serde(flatten)]
+    body: DiscussionBody,
 }
 
 #[derive(Deserialize)]
@@ -488,7 +572,8 @@ struct Review {
     user: Option<Author>,
     submitted_at: Option<String>,
     state: String,
-    body: Option<String>,
+    #[serde(flatten)]
+    body: DiscussionBody,
 }
 
 #[derive(Deserialize)]
@@ -564,20 +649,21 @@ struct PageInfo {
 #[serde(rename_all = "camelCase")]
 struct Reply {
     author: Option<Author>,
-    body: String,
+    body_html: String,
     created_at: String,
     diff_hunk: Option<String>,
 }
 
 impl Thread {
     /// Keep the original code excerpt and all returned replies together.
-    fn into_item(self) -> (String, Item) {
+    fn into_item(self, converter: &HtmlToMarkdown) -> (String, Item) {
         let mut location = self.path;
         if let Some(line) = self.line.or(self.original_line) {
             location.push_str(&format!(":{line}"));
         }
+        let file = location.rsplit('/').next().unwrap_or(&location);
         let label = format!(
-            "{} · {location}{}",
+            "{} · {file}{}",
             if self.is_resolved { "Resolved" } else { "Open" },
             if self.is_outdated { " (outdated)" } else { "" }
         );
@@ -590,10 +676,10 @@ impl Thread {
                 body.push_str("\n\n");
             }
             body.push_str(&format!(
-                "@{} · {}\n{}",
+                "### @{} · {}\n\n{}",
                 login(&reply.author),
-                reply.created_at,
-                reply.body
+                display_time(&reply.created_at),
+                discussion_markdown(converter, &reply.body_html)
             ));
         }
         if replies.len() < self.comments.total_count {
@@ -604,8 +690,9 @@ impl Thread {
             ));
         }
         if let Some(excerpt) = first.and_then(|r| r.diff_hunk.as_deref()) {
-            body.push_str("\n\nReferenced diff\n");
+            body.push_str("\n\n### Referenced diff\n\n```diff\n");
             body.push_str(excerpt);
+            body.push_str("\n```");
         }
         (date, Item::single(label, location, body))
     }
@@ -654,19 +741,72 @@ mod tests {
     }
 
     #[test]
+    fn bot_comment_renders_its_heading_status_table_and_literal_code() {
+        use crate::scrollback::blocks::markdown_content::MarkdownContent;
+        let comment = Comment {
+            user: Some(Author { login: "review-bot".into() }),
+            created_at: "2026-11-28T01:31:14Z".into(),
+            body: DiscussionBody {
+                body: None,
+                body_text: Some("Codex Review Summary\nCompleted".into()),
+                body_html: Some(r#"<!-- codex-review-state: hidden metadata -->
+                    <details><summary><strong>Codex Review Summary</strong></summary>
+                    <table><thead><tr><th>Status</th><th>Commit</th></tr></thead>
+                    <tbody><tr><td>Completed</td><td><code>bf7b348</code></td></tr></tbody></table>
+                    <p><relative-time datetime="2026-11-28T01:44:23Z">2026-11-28T01:44:23Z</relative-time></p>
+                    <p>Keep the literal <code>&lt;widget&gt;</code>.</p></details>"#.into()),
+            }
+        };
+        let item = discussion_items(vec![comment], vec![], vec![])
+            .pop()
+            .unwrap();
+        assert_eq!(item.label, "Comment · Codex Review Summary");
+        assert_eq!(item.location, "@review-bot · 2026-11-28 01:31 UTC");
+        for width in [34, 88] {
+            let output = MarkdownContent::new(item.parts[0].clone()).output(width);
+            let frame = output
+                .lines
+                .iter()
+                .map(|line| line.content.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for visible in [
+                "Codex Review Summary",
+                "Status",
+                "Completed",
+                "bf7b348",
+                "<widget>",
+                "01:44 UTC",
+            ] {
+                assert!(frame.contains(visible), "{frame}");
+            }
+            for hidden in [
+                "<details",
+                "<summary",
+                "<relative-time",
+                "hidden metadata",
+                "**",
+                "--- |",
+            ] {
+                assert!(!frame.contains(hidden), "{frame}");
+            }
+        }
+    }
+
+    #[test]
     fn inline_discussion_keeps_status_authors_replies_and_original_code_together() {
         let thread: Thread = serde_json::from_value(serde_json::json!({
             "id":"thread-test", "path":"app.rs", "originalLine":8, "isResolved":true, "isOutdated":true,
             "comments":{"totalCount":2,"pageInfo":{"hasNextPage":false},"nodes":[
-                {"author":{"login":"jo"}, "body":"Could this block?", "createdAt":"2026-01-01", "diffHunk":"@@ -8 +8 @@\n+wait()"},
-                {"author":null, "body":"Fixed in the next commit.", "createdAt":"2026-01-02"}
+                {"author":{"login":"jo"}, "bodyHtml":"<p>Could this block?</p>", "createdAt":"2026-01-01", "diffHunk":"@@ -8 +8 @@\n+wait()"},
+                {"author":null, "bodyHtml":"<p>Fixed in the next commit.</p>", "createdAt":"2026-01-02"}
             ]}
         })).unwrap();
-        let (_, item) = thread.into_item();
+        let (_, item) = thread.into_item(&discussion_converter());
         assert!(item.label.contains("Resolved · app.rs:8 (outdated)"));
         let body = &item.parts[0];
-        assert!(body.contains("@jo · 2026-01-01\nCould this block?"));
-        assert!(body.contains("@deleted · 2026-01-02\nFixed in the next commit."));
+        assert!(body.contains("@jo · 2026-01-01\n\nCould this block?"));
+        assert!(body.contains("@deleted · 2026-01-02\n\nFixed in the next commit."));
         assert!(body.contains("+wait()"));
     }
 }

@@ -2720,6 +2720,7 @@ impl AppView {
             }
             return InputOutcome::Unchanged;
         }
+        let previous_mouse_pos = self.last_mouse_pos;
         if let Event::Mouse(mouse) = ev {
             self.last_mouse_pos = Some((mouse.column, mouse.row));
             let is_mouse_action = matches!(
@@ -3322,6 +3323,25 @@ impl AppView {
         }
         if !matches!(outcome, InputOutcome::Unchanged) {
             return outcome;
+        }
+        // A move onto empty scrollback must also erase the overlay's previous highlight.
+        if matches!(ev, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved)
+            && let Some(id) = (match self.active_view {
+                ActiveView::Agent(id) => Some(id),
+                ActiveView::AgentDashboard => {
+                    self.dashboard.as_ref().and_then(|d| d.attached_agent)
+                }
+                ActiveView::Welcome => None,
+            })
+            && let Some(pr) = self
+                .agents
+                .get(&id)
+                .and_then(|agent| agent.pull_request.as_ref())
+            && previous_mouse_pos
+                .and_then(|pos| pr.summary.button_at(pos))
+                .is_some()
+        {
+            return InputOutcome::Changed;
         }
         if matches!(ev, Event::Resize(_, _)) {
             return InputOutcome::Changed;
@@ -5339,33 +5359,38 @@ impl AppView {
                                 self.dashboard_sessions_loading,
                                 dash_upgrade_cta,
                             );
-                            let (popup_cursor, popup_post_flush, drawn_popup_agent) =
-                                if let Some(agent_id) = dashboard.attached_agent {
-                                    let theme = crate::theme::Theme::current();
-                                    let popup_area = crate::views::dashboard::popup_rect(view_area);
-                                    let title = agents
-                                        .get(&agent_id)
-                                        .map(crate::views::session_title::entry_title)
-                                        .unwrap_or_else(|| "(session)".to_string());
-                                    let bundle_state = &self.bundle_state;
-                                    let (cursor, post_flush, drawn) =
-                                        crate::views::dashboard::render_popup_overlay(
-                                            f.buffer_mut(),
-                                            popup_area,
-                                            &theme,
-                                            &title,
-                                            dashboard,
-                                            |inner, buf| {
-                                                if let Some(agent) = agents.get_mut(&agent_id) {
-                                                    agent.draw(
+                            let (popup_cursor, popup_post_flush, drawn_popup_agent) = if let Some(
+                                agent_id,
+                            ) =
+                                dashboard.attached_agent
+                            {
+                                let theme = crate::theme::Theme::current();
+                                let popup_area = crate::views::dashboard::popup_rect(view_area);
+                                let title = agents
+                                    .get(&agent_id)
+                                    .map(crate::views::session_title::entry_title)
+                                    .unwrap_or_else(|| "(session)".to_string());
+                                let bundle_state = &self.bundle_state;
+                                let (cursor, post_flush, drawn) =
+                                    crate::views::dashboard::render_popup_overlay(
+                                        f.buffer_mut(),
+                                        popup_area,
+                                        &theme,
+                                        &title,
+                                        dashboard,
+                                        |inner, buf| {
+                                            if let Some(agent) = agents.get_mut(&agent_id) {
+                                                agent.draw(
                                                     inner,
                                                     buf,
                                                     registry,
                                                     scratch,
                                                     None,
                                                     false,
-                                                    crate::app::agent_view::BannerSlotParams::none(
-                                                    ),
+                                                    crate::app::agent_view::BannerSlotParams {
+                                                        mouse_pos: agent_mouse_pos,
+                                                        ..crate::app::agent_view::BannerSlotParams::none()
+                                                    },
                                                     bundle_state,
                                                     false,
                                                     false,
@@ -5375,15 +5400,15 @@ impl AppView {
                                                         ..Default::default()
                                                     },
                                                 )
-                                                } else {
-                                                    (None, None)
-                                                }
-                                            },
-                                        );
-                                    (cursor, post_flush, drawn.then_some(agent_id))
-                                } else {
-                                    (None, None, None)
-                                };
+                                            } else {
+                                                (None, None)
+                                            }
+                                        },
+                                    );
+                                (cursor, post_flush, drawn.then_some(agent_id))
+                            } else {
+                                (None, None, None)
+                            };
                             let stale_clears =
                                 Self::dashboard_stale_image_clears(agents, drawn_popup_agent);
                             let popup_post_flush =

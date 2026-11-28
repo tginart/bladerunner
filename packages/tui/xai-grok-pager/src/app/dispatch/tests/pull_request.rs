@@ -5,13 +5,18 @@ use crate::views::{
     modal::ActiveModal,
     pull_request::github::{Item, Snapshot},
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 fn snapshot() -> Snapshot {
     Snapshot {
         badge: "PR #8 · OPEN".into(),
         subject: "Fix resume".into(),
-        stats: "1 file · +2 −0".into(),
+        changed_files: 1,
+        additions: 2,
+        deletions: 0,
+        thread_status: "0 open threads".into(),
         checks: "Checks · 3 passed".into(),
         url: "https://github.example/test/repo/pull/8".into(),
         title: "Fix resume".into(),
@@ -203,10 +208,7 @@ fn file_view_renders_selected_hunk_at_wide_and_narrow_widths() {
     }
 }
 
-/// Input: A displayed label in the normal agent frame.
-/// Output: The mouse action produced by the same input handler as the terminal.
-fn click_label(app: &mut AppView, label: &str) -> Action {
-    use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+fn agent_frame(app: &mut AppView) -> ratatui::buffer::Buffer {
     use ratatui::{buffer::Buffer, layout::Rect};
     let agent = app.agents.get_mut(&AgentId(0)).unwrap();
     let area = Rect::new(0, 0, 132, 38);
@@ -219,31 +221,92 @@ fn click_label(app: &mut AppView, label: &str) -> Action {
         &mut crate::scrollback::render::ScratchBuffer::new(),
         None,
         false,
-        crate::app::agent_view::BannerSlotParams::none(),
+        crate::app::agent_view::BannerSlotParams {
+            mouse_pos: app.last_mouse_pos,
+            ..crate::app::agent_view::BannerSlotParams::none()
+        },
         &crate::app::bundle::BundleState::default(),
         false,
         false,
         &mut vec![],
         crate::app::agent_view::AppRenderParams::default(),
     );
-    let rows: Vec<String> = (0..area.height)
-        .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
-        .collect();
-    for (row, line) in rows.iter().enumerate() {
-        if let Some(byte) = line.find(label) {
-            let click = Event::Mouse(MouseEvent {
-                column: line[..byte].chars().count() as u16,
-                row: row as u16,
-                kind: MouseEventKind::Down(MouseButton::Left),
-                modifiers: KeyModifiers::NONE,
-            });
-            let InputOutcome::Action(action) = agent.handle_input(&click, &registry) else {
-                panic!("inactive {label}")
-            };
-            return action;
+    buf
+}
+
+fn label_position(buf: &ratatui::buffer::Buffer, label: &str) -> (u16, u16) {
+    for y in buf.area.y..buf.area.bottom() {
+        let row: String = (buf.area.x..buf.area.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect();
+        if let Some(byte) = row.find(label) {
+            return (buf.area.x + row[..byte].chars().count() as u16, y);
         }
     }
-    panic!("Missing {label} in frame:\n{}", rows.join("\n"));
+    panic!("Missing {label} from frame");
+}
+
+fn pointer_event(kind: MouseEventKind, (column, row): (u16, u16)) -> Event {
+    Event::Mouse(MouseEvent {
+        column,
+        row,
+        kind,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn click_label(app: &mut AppView, label: &str) -> Action {
+    let pos = label_position(&agent_frame(app), label);
+    let event = pointer_event(MouseEventKind::Down(MouseButton::Left), pos);
+    let InputOutcome::Action(action) = app.handle_input(&event) else {
+        panic!("inactive {label}")
+    };
+    action
+}
+
+#[test]
+fn overlay_colors_both_counts_and_highlights_only_the_control_under_the_pointer() {
+    use crate::views::pull_request::Viewer;
+    use ratatui::style::Modifier;
+    let mut app = test_app_with_agent();
+    let mut viewer = Viewer::loading();
+    viewer.data = Some(snapshot());
+    app.agents.get_mut(&AgentId(0)).unwrap().pull_request = Some(Box::new(viewer));
+    let theme = crate::theme::Theme::current();
+    let mut frame = agent_frame(&mut app);
+    for (label, color) in [("+2", theme.accent_success), ("−0", theme.accent_error)] {
+        let (x, y) = label_position(&frame, label);
+        assert_eq!(frame[(x, y)].fg, color);
+        assert_eq!(frame[(x + 1, y)].fg, color);
+        assert_eq!(frame[(x - 1, y)].fg, theme.text_primary);
+    }
+    let mut previous = None;
+    for label in ["[-]", "[x]", "[Fullscreen]", "[Refresh]"] {
+        let pos = label_position(&frame, label);
+        assert!(matches!(
+            app.handle_input(&pointer_event(MouseEventKind::Moved, pos)),
+            InputOutcome::Changed
+        ));
+        frame = agent_frame(&mut app);
+        assert!(frame[pos].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(frame[pos].bg, theme.bg_highlight);
+        if let Some(old) = previous {
+            assert_eq!(frame[old].bg, theme.bg_dark);
+        }
+        previous = Some(pos);
+    }
+    let exit = pointer_event(MouseEventKind::Moved, (0, 0));
+    assert!(matches!(app.handle_input(&exit), InputOutcome::Changed));
+    assert_eq!(agent_frame(&mut app)[previous.unwrap()].bg, theme.bg_dark);
+
+    let minimize = click_label(&mut app, "[-]");
+    dispatch(minimize, &mut app);
+    let pos = label_position(&agent_frame(&mut app), "[+]");
+    assert!(matches!(
+        app.handle_input(&pointer_event(MouseEventKind::Moved, pos)),
+        InputOutcome::Changed
+    ));
+    assert_eq!(agent_frame(&mut app)[pos].bg, theme.bg_highlight);
 }
 
 #[test]

@@ -26,7 +26,7 @@ use crate::views::shortcuts_bar::{HintItem, PendingHint, ShortcutsBar};
 use crate::views::{agent, turn_status};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use std::collections::HashSet;
@@ -4627,6 +4627,15 @@ impl AgentView {
             && let Some(viewer) = &mut self.pull_request
             && let Some(covered) = viewer.draw_summary(buf, layout.scrollback_content, &theme)
         {
+            if let Some((button, _)) = mouse_pos.and_then(|pos| viewer.summary.button_at(pos)) {
+                buf.set_style(
+                    button,
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .bg(theme.bg_highlight)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                );
+            }
             self.frame_occluder_rects.push(covered);
         }
         if self.show_goal_detail
