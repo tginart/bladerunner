@@ -1493,6 +1493,8 @@ pub struct AgentView {
     pub subagent_sessions: HashMap<String, SubagentInfo>,
     /// Temporary UI-owned review conversation; never restored from session logs.
     pub review_chat: Option<crate::views::review_chat::SharedReviewChat>,
+    pub(crate) pull_request: Option<Box<crate::views::pull_request::Viewer>>,
+    pub(crate) pr_chats: HashMap<String, crate::views::review_chat::SharedReviewChat>,
     /// Child subagent views. Keyed by child_session_id.
     /// Created eagerly on SubagentSpawned so updates are tracked from the start.
     pub subagent_views: HashMap<String, Box<AgentView>>,

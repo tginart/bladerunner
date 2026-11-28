@@ -1,4 +1,8 @@
 //! Native Google Gemini GenerateContent REST/SSE adapter.
+//!
+//! Purpose: This module builds Google requests and obtains Vertex ADC tokens.
+//! Input: Conversation requests, endpoint configuration, and ADC credentials.
+//! Output: Google requests, response events, and typed authentication errors.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,7 +14,6 @@ use futures_util::stream::{BoxStream, Stream};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use token_source::TokenSourceProvider;
 
 use xai_grok_sampling_types::{
     AssistantItem, ContentPart, ConversationItem, ConversationRequest, ConversationResponse,
@@ -24,11 +27,10 @@ use crate::types::RequestId;
 
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const VERTEX_EXPRESS_BASE_URL: &str = "https://aiplatform.googleapis.com";
-// ADC failures are configuration errors, not `SamplingError::Auth`: an auth
-// error makes the client show "Run /login", which cannot fix Google ADC.
-// The underlying error goes to the log.
+// ADC errors must not trigger Bladerunner's unrelated /login flow.
 const ADC_SETUP_MESSAGE: &str = "Google ADC is not set up. Run `gcloud auth application-default login`, or set GOOGLE_APPLICATION_CREDENTIALS to a service account key.";
-const ADC_TOKEN_MESSAGE: &str = "Could not get a Google ADC access token. Run `gcloud auth application-default login` and try again.";
+const ADC_TOKEN_MESSAGE: &str =
+    "Could not get a Google ADC access token. Check your ADC credentials and configuration.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoogleEndpointKind {
@@ -720,9 +722,12 @@ pub fn sse_stream(
         .boxed()
 }
 
+/// Purpose: This provider caches the ADC source and shares it across requests.
+/// Input: The standard Google ADC environment and credential files.
+/// Output: Access tokens, with transient failures available for request retries.
 #[derive(Debug)]
 pub struct VertexAdcTokenProvider {
-    inner: tokio::sync::OnceCell<Arc<dyn token_source::TokenSource>>,
+    inner: tokio::sync::OnceCell<Arc<dyn gcloud_auth::token_source::TokenSource>>,
 }
 
 impl VertexAdcTokenProvider {
@@ -736,30 +741,18 @@ impl VertexAdcTokenProvider {
     ///
     /// Purpose: This function gives the bare access token for the
     /// `Authorization` header.
-    /// Output: The access token without a scheme prefix, or a configuration
-    /// error.
-    /// Note: `gcloud-auth` returns `"Bearer <token>"`. This function removes
-    /// the prefix, because `apply_google_auth_headers` adds it.
+    /// Output: The bare access token, a configuration error, or a refresh error.
+    /// Note: Failed initialization leaves the cell empty, so a retry can succeed.
     pub async fn token(&self) -> Result<String> {
         let source = self
             .inner
             .get_or_try_init(|| async {
-                let scopes = [GOOGLE_SCOPE];
-                let config = gcloud_auth::project::Config::default().with_scopes(&scopes);
-                let provider = gcloud_auth::token::DefaultTokenSourceProvider::new(config)
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "failed to initialize Google ADC");
-                        SamplingError::InvalidConfiguration(ADC_SETUP_MESSAGE)
-                    })?;
-                Ok::<Arc<dyn token_source::TokenSource>, SamplingError>(provider.token_source())
+                let project = gcloud_auth::project::project().await.map_err(adc_error)?;
+                create_adc_token_source(&project).await
             })
             .await?;
-        let token = source.token().await.map_err(|e| {
-            tracing::warn!(error = %e, "failed to mint Google ADC token");
-            SamplingError::InvalidConfiguration(ADC_TOKEN_MESSAGE)
-        })?;
-        Ok(strip_bearer_prefix(&token).to_owned())
+        let token = source.token().await.map_err(adc_error)?;
+        Ok(token.access_token)
     }
 }
 
@@ -769,11 +762,90 @@ impl Default for VertexAdcTokenProvider {
     }
 }
 
-fn strip_bearer_prefix(token: &str) -> &str {
-    let token = token.trim();
-    match token.split_once(' ') {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim_start(),
-        _ => token,
+async fn create_adc_token_source(
+    project: &gcloud_auth::project::Project,
+) -> Result<Arc<dyn gcloud_auth::token_source::TokenSource>> {
+    let scopes = [GOOGLE_SCOPE];
+    let config = gcloud_auth::project::Config::default().with_scopes(&scopes);
+    gcloud_auth::project::create_token_source_from_project(project, config)
+        .await
+        .map(Arc::from)
+        .map_err(adc_error)
+}
+
+/// Purpose: This function preserves transient ADC failures for the retry loop.
+/// Input: A typed error from ADC discovery or token refresh.
+/// Output: A safe diagnostic and the retry policy for that error.
+/// Note: Token server response bodies can contain secrets. Only logs receive the original error.
+fn adc_error(error: gcloud_auth::error::Error) -> SamplingError {
+    use gcloud_auth::error::Error;
+    use gcloud_auth::token_source::external_account_source::error::Error as ExternalError;
+
+    tracing::warn!(error = %error, "failed to obtain Google ADC token");
+    if matches!(
+        error,
+        Error::CredentialsIOError(_) | Error::NoCredentialsFileFound | Error::NoHomeDirectoryFound
+    ) {
+        return SamplingError::InvalidConfiguration(ADC_SETUP_MESSAGE);
+    }
+
+    let http_error = match &error {
+        Error::HttpError(error) | Error::ExternalAccountSource(ExternalError::HttpError(error)) => {
+            Some(error)
+        }
+        _ => None,
+    };
+    if let Some(error) = http_error {
+        let retryable =
+            error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+        let message = if error.is_timeout() {
+            "Google ADC token request timed out. Check the network and try again."
+        } else if retryable {
+            "Google ADC token request failed. Check the network and try again."
+        } else {
+            "Google ADC token server returned an invalid response. Check your ADC credentials."
+        };
+        if let Some(status) = error.status() {
+            return adc_status_error(status.as_u16());
+        }
+        return SamplingError::CredentialRefresh {
+            message: message.into(),
+            retryable,
+        };
+    }
+
+    let status = match error {
+        Error::TokenErrorResponse { status, .. }
+        | Error::UnexpectedImpersonateTokenResponse(status, _)
+        | Error::ExternalAccountSource(
+            ExternalError::UnexpectedStatusOnGetRoleName(status)
+            | ExternalError::UnexpectedStatusOnGetSessionToken(status)
+            | ExternalError::UnexpectedStatusOnGetCredentials(status)
+            | ExternalError::UnexpectedStatusOnGetRegion(status)
+            | ExternalError::UnexpectedStatusOnGetSubjectToken(status, _),
+        ) => Some(status),
+        _ => None,
+    };
+    match status {
+        Some(status) => adc_status_error(status),
+        None => SamplingError::CredentialRefresh {
+            message: ADC_TOKEN_MESSAGE.into(),
+            retryable: false,
+        },
+    }
+}
+
+fn adc_status_error(status: u16) -> SamplingError {
+    let retryable = reqwest::StatusCode::from_u16(status)
+        .is_ok_and(xai_grok_sampling_types::is_retryable_api_status);
+    let advice = if retryable {
+        "The token service is temporarily unavailable. Try again."
+    } else {
+        "Check your ADC credentials with `gcloud auth application-default login`."
+    };
+    SamplingError::CredentialRefresh {
+        message: format!("Google ADC token server returned HTTP {status}. {advice}"),
+        retryable,
     }
 }
 
@@ -803,24 +875,256 @@ pub fn apply_google_auth_headers(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use xai_grok_sampling_types::{ConversationItem, ReasoningEffort};
 
-    #[test]
-    fn adc_token_is_sent_with_exactly_one_bearer_prefix() {
-        for raw in [
-            "Bearer ya29.abc",
-            "bearer ya29.abc",
-            "ya29.abc",
-            " Bearer  ya29.abc ",
-        ] {
+    /// Purpose: This function serves test tokens without real credentials or network access.
+    /// Input: A local token endpoint handler.
+    /// Output: Test ADC credentials and the server task.
+    async fn mock_adc_server(
+        app: Router,
+    ) -> (gcloud_auth::project::Project, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let credentials = serde_json::from_value(json!({
+            "type": "authorized_user",
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+            "refresh_token": "test-refresh",
+            "token_uri": format!("http://{address}/token"),
+        }))
+        .unwrap();
+        (
+            gcloud_auth::project::Project::FromFile(Box::new(credentials)),
+            server,
+        )
+    }
+
+    /// Purpose: Confirm that a slow token response succeeds and the token stays cached.
+    /// Input: A token endpoint with a four-second response delay.
+    /// Output: One token request and two valid bearer headers.
+    #[tokio::test]
+    async fn adc_accepts_token_responses_slower_than_three_seconds_and_caches_token() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    Json(json!({
+                        "access_token": "test-access-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    }))
+                }
+            }),
+        );
+        let (project, server) = mock_adc_server(app).await;
+        let provider = VertexAdcTokenProvider::new();
+        provider
+            .inner
+            .set(create_adc_token_source(&project).await.unwrap())
+            .unwrap();
+        for _ in 0..2 {
+            let token = provider.token().await.unwrap();
+            assert_eq!(token, "test-access-token");
             let mut headers = HeaderMap::new();
-            apply_google_auth_headers(&mut headers, None, Some(strip_bearer_prefix(raw)));
-            assert_eq!(
-                headers[AUTHORIZATION], "Bearer ya29.abc",
-                "raw token {raw:?}"
-            );
+            apply_google_auth_headers(&mut headers, None, Some(&token));
+            assert_eq!(headers[AUTHORIZATION], "Bearer test-access-token");
         }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// Purpose: Confirm that the initial token request can recover from a server failure.
+    /// Input: A token endpoint that returns 503 once, then a valid token.
+    /// Output: A retryable error, then a valid access token.
+    #[tokio::test]
+    async fn adc_initial_token_failure_is_retryable_and_next_attempt_succeeds() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "unavailable"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "access_token": "test-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                        })),
+                    )
+                }
+            }),
+        );
+        let (project, server) = mock_adc_server(app).await;
+        let error = create_adc_token_source(&project).await.unwrap_err();
+        assert!(error.is_retryable());
+        assert!(!error.is_auth_error());
+        assert!(!error.to_string().contains("ADC is not set up"));
+        assert!(error.to_string().contains("503"));
+        let source = create_adc_token_source(&project).await.unwrap();
+        assert_eq!(
+            source.token().await.unwrap().access_token,
+            "test-access-token"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// Purpose: Confirm that a cached source can recover from a refresh failure.
+    /// Input: An expired token, a 429 response, and a valid token.
+    /// Output: A retryable error, then a cached access token.
+    #[tokio::test]
+    async fn adc_cached_source_retries_refresh_after_server_failure() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 1 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({"error": "busy"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "access_token": "test-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": if attempt == 0 { 0 } else { 3600 },
+                        })),
+                    )
+                }
+            }),
+        );
+        let (project, server) = mock_adc_server(app).await;
+        let provider = VertexAdcTokenProvider::new();
+        provider
+            .inner
+            .set(create_adc_token_source(&project).await.unwrap())
+            .unwrap();
+        let error = provider.token().await.unwrap_err();
+        assert!(error.is_retryable());
+        assert!(SamplingErrorInfo::from(&error).is_retryable);
+        assert!(!error.is_auth_error());
+        assert_eq!(provider.token().await.unwrap(), "test-access-token");
+        assert_eq!(provider.token().await.unwrap(), "test-access-token");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    /// Purpose: Confirm that a token timeout has an accurate diagnostic and permits a retry.
+    /// Input: A token endpoint that does not respond.
+    /// Output: A retryable timeout without ADC setup guidance.
+    #[tokio::test]
+    async fn adc_token_timeout_is_retryable_without_a_setup_error() {
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let accepted_tx = Arc::new(std::sync::Mutex::new(Some(accepted_tx)));
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                accepted_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                std::future::pending::<StatusCode>()
+            }),
+        );
+        let (project, server) = mock_adc_server(app).await;
+        let request = tokio::spawn(async move { create_adc_token_source(&project).await });
+        accepted_rx.await.unwrap();
+        // The request deadline exists before the server accepts the request.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.is_retryable());
+        assert!(!error.is_auth_error());
+        assert!(error.to_string().contains("timed out"));
+        assert!(!error.to_string().contains("ADC is not set up"));
+        server.abort();
+    }
+
+    /// Purpose: Confirm that a rejected credential stays fatal without the Bladerunner login flow.
+    /// Input: A token endpoint that rejects a refresh token.
+    /// Output: A non-retryable error without the server response body.
+    #[tokio::test]
+    async fn adc_rejected_credentials_are_fatal_without_bladerunner_login() {
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid_grant",
+                        "error_description": "test secret must not reach the UI",
+                    })),
+                )
+            }),
+        );
+        let (project, server) = mock_adc_server(app).await;
+        let error = create_adc_token_source(&project).await.unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(!error.is_auth_error());
+        assert!(error.to_string().contains("400"));
+        assert!(!error.to_string().contains("test secret"));
+        assert!(!SamplingErrorInfo::from(&error).is_retryable);
+        server.abort();
+    }
+
+    #[test]
+    fn adc_missing_credentials_keep_setup_guidance() {
+        let error = adc_error(gcloud_auth::error::Error::NoCredentialsFileFound);
+        assert!(matches!(
+            error,
+            SamplingError::InvalidConfiguration(ADC_SETUP_MESSAGE)
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    /// Purpose: Confirm that typed service-account and external-account errors retain their retry policy.
+    /// Input: Rejected credentials and transient token endpoint failures.
+    /// Output: Correct retry decisions without token server response bodies.
+    #[test]
+    fn adc_service_account_and_external_errors_preserve_retry_policy() {
+        for status in [400, 401, 403, 429, 500, 503] {
+            let error = adc_error(gcloud_auth::error::Error::TokenErrorResponse {
+                status,
+                error: "test-error".into(),
+                error_description: "test secret must not reach the UI".into(),
+            });
+            assert_eq!(error.is_retryable(), status == 429 || status >= 500);
+            assert!(!error.to_string().contains("test secret"));
+        }
+        let error = adc_error(gcloud_auth::error::Error::ExternalAccountSource(
+            gcloud_auth::token_source::external_account_source::error::Error::UnexpectedStatusOnGetSubjectToken(503, "test secret".into())
+        ));
+        assert!(error.is_retryable());
+        assert!(!error.to_string().contains("test secret"));
     }
 
     #[test]

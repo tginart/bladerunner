@@ -2100,7 +2100,7 @@ pub(crate) async fn run(
             app.gboom_release_all_games();
         }
 
-        let is_hub_browser_open = app.agents.values().any(|a| a.hub_browser.is_some());
+        let is_hub_browser_open = app.agents.values().any(|a| a.has_hub_browser());
         if hub_label_poll_at.is_none()
             && (is_hub_browser_open || crate::hub_status::any_session_in_hub())
         {
@@ -2643,12 +2643,14 @@ pub(crate) async fn run(
             _ = hub_label_poll => {
                 hub_label_poll_at = None;
                 crate::hub_status::refresh_hub_labels();
-                let mut is_refreshed = false;
-                for agent in app.agents.values_mut() {
-                    is_refreshed |= agent.refresh_hub_browser();
+                // Hub browsers read their files off this thread. The results
+                // come back as `TaskResult::HubBrowserRefreshed`.
+                let mut effs = Vec::new();
+                for (agent_id, agent) in app.agents.iter_mut() {
+                    effs.extend(agent.hub_browser_refreshes(*agent_id));
                 }
-                if is_refreshed {
-                    presenter.request(false);
+                if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                    break;
                 }
             }
 

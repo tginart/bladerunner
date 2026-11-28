@@ -45,6 +45,8 @@ This header is from the system, not from a hub member. The hub messages follow i
 - If no reply is needed, do not call message_agents. Continue your current work, or end your turn with a one-line note.";
 /// How often the watcher checks the hub for new DMs and mentions.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// How often the watcher checks the hub even when no hub file changed.
+const WATCH_FULL_INTERVAL: Duration = Duration::from_secs(10);
 /// How often `wait` re-checks the hub when no in-process send wakes it.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -420,6 +422,7 @@ impl AgentBus {
         let (hub, handle, is_session_hub) = self.peer_context(id)?;
         let meta = hub.meta()?;
         let cursors = hub.cursors(&handle)?;
+        let tokens = hub.tokens(&meta)?;
         let mut channels = Vec::new();
         for channel in &meta.channels {
             let conv = format!("#{}", channel.name);
@@ -430,7 +433,7 @@ impl AgentBus {
                 purpose: channel.purpose.clone(),
                 messages,
                 unread: messages - read,
-                tokens: meta.tokens.get(&conv).copied().unwrap_or(0),
+                tokens: tokens.get(&conv).copied().unwrap_or(0),
             });
         }
         Ok(HubView {
@@ -440,7 +443,7 @@ impl AgentBus {
             members: meta.members.clone(),
             channels,
             paused: meta.agent_wake_streak >= LOOP_GUARD_WAKES,
-            dm_tokens: meta.tokens.get(store::DM_TOKENS_KEY).copied().unwrap_or(0),
+            dm_tokens: tokens.get(store::DM_TOKENS_KEY).copied().unwrap_or(0),
         })
     }
 
@@ -495,8 +498,8 @@ impl AgentBus {
         if let Some(cursors) = cursors {
             hub.save_cursors(&handle, &cursors)?;
         }
+        record_tokens(&hub, &handle, &pending)?;
         drop(cursor_lock);
-        record_tokens(&hub, &pending)?;
         Ok(pending)
     }
 
@@ -535,21 +538,29 @@ impl AgentBus {
         let (hub, handle, _) = self.peer_context(id)?;
         let conv = resolve_read_conv(&hub.meta()?, &handle, channel)?;
         if store::split_dm_conv(&conv).is_some() {
-            return read_dm(&hub, &conv, limit, since);
+            return read_dm(&hub, &handle, &conv, limit, since);
         }
         let cursor_lock = hub.lock_cursors(&handle)?;
         let mut cursors = hub.cursors(&handle)?;
-        let start = since.unwrap_or_else(|| cursors.read.get(&conv).copied().unwrap_or(0));
-        let mut messages = hub.messages(&conv, start)?;
-        let remaining = messages.len().saturating_sub(limit);
-        messages.truncate(limit);
+        let read = cursors.read.get(&conv).copied().unwrap_or(0);
+        let start = since.unwrap_or(read);
+        // The saved byte offset belongs to the cursor. Another `since` scans.
+        let start_byte = (start == read)
+            .then(|| cursors.read_offset(&conv))
+            .flatten();
+        let slice = hub.messages_from_offset(&conv, start, start_byte, Some(limit))?;
+        let end = start + slice.messages.len();
         // A read of old messages with `since` must not move the cursor back.
-        let read = cursors.read.entry(conv).or_default();
-        *read = (*read).max(start + messages.len());
-        hub.save_cursors(&handle, &cursors)?;
+        if end >= read {
+            let before = cursors.clone();
+            cursors.set_read(&conv, end, slice.next_byte_offset);
+            if cursors != before {
+                hub.save_cursors(&handle, &cursors)?;
+            }
+        }
+        record_tokens(&hub, &handle, &slice.messages)?;
         drop(cursor_lock);
-        record_tokens(&hub, &messages)?;
-        Ok((messages, remaining))
+        Ok((slice.messages, slice.remaining))
     }
 
     /// Purpose: Read one thread for peer `id`.
@@ -571,7 +582,7 @@ impl AgentBus {
         for conv in agent_convs(&hub, &meta, &handle)? {
             let messages = hub.messages(&conv, 0)?;
             if let Some((thread, omitted)) = thread_window(&messages, message_id, limit) {
-                record_tokens(&hub, &thread)?;
+                record_tokens(&hub, &handle, &thread)?;
                 return Ok((thread, omitted));
             }
         }
@@ -601,7 +612,7 @@ impl AgentBus {
             can_agent_access_conv(&handle, &m.conv)
                 && scope.as_ref().is_none_or(|conv| *conv == m.conv)
         })?;
-        record_tokens(&hub, &hits)?;
+        record_tokens(&hub, &handle, &hits)?;
         Ok(hits)
     }
 
@@ -902,10 +913,14 @@ fn task_summary(prompt: &str) -> Option<String> {
 /// Input: A weak reference to the bus state.
 /// Method:
 ///     1. Every WATCH_INTERVAL, list the running peers that have a wake hook.
-///     2. For each peer, collect the DMs and mentions after its notify cursor.
-///     3. Apply the loop guard to messages that only agents wrote.
-///     4. Save the cursors and call the wake hook with the framed messages.
+///     2. Stat the hub files. If no file and no target changed since the last
+///        clean tick, do nothing more. Every WATCH_FULL_INTERVAL, check anyway.
+///     3. For each peer, collect the DMs and mentions after its notify cursor.
+///     4. Apply the loop guard to messages that only agents wrote.
+///     5. Save the cursors and call the wake hook with the framed messages.
 async fn watch(weak: Weak<Mutex<BusInner>>) {
+    let mut last_stamp: Option<WatchStamp> = None;
+    let mut last_full_tick = Instant::now();
     loop {
         tokio::time::sleep(WATCH_INTERVAL).await;
         let Some(inner) = weak.upgrade() else {
@@ -913,11 +928,52 @@ async fn watch(weak: Weak<Mutex<BusInner>>) {
         };
         let (hub, targets) = inner.lock().expect("agent bus lock").delivery_snapshot();
         drop(inner);
-        let result = tokio::task::spawn_blocking(move || deliver(&hub, &targets)).await;
-        if let Ok(Err(e)) = result {
-            tracing::debug!(error = %e, "agent_hub: watcher tick failed");
+        // Some file systems keep change times in whole seconds, so a stat
+        // check alone could miss a same-size rewrite of `hub.json`.
+        let is_full_tick = last_full_tick.elapsed() >= WATCH_FULL_INTERVAL;
+        if is_full_tick {
+            last_full_tick = Instant::now();
+        }
+        let previous = last_stamp.take().filter(|_| !is_full_tick);
+        let result =
+            tokio::task::spawn_blocking(move || deliver_if_changed(&hub, &targets, previous)).await;
+        match result {
+            Ok(Ok(stamp)) => last_stamp = Some(stamp),
+            Ok(Err(e)) => tracing::debug!(error = %e, "agent_hub: watcher tick failed"),
+            Err(e) => tracing::debug!(error = %e, "agent_hub: watcher tick panicked"),
         }
     }
+}
+
+/// The hub files and the delivery targets of one watcher tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchStamp {
+    hub_dir: PathBuf,
+    handles: Vec<String>,
+    files: Vec<(PathBuf, store::FileStamp)>,
+}
+
+/// Purpose: Deliver new DMs and mentions only when the hub changed.
+/// Input: The hub, the delivery targets, and the stamp of the last clean tick.
+/// Output: The stamp of this tick, for the next tick to compare with.
+/// Note: The stamp is read before the delivery, so a write during the
+///     delivery changes the stamp of the next tick. An unchanged stamp takes
+///     no cursor lock and reads no conversation.
+fn deliver_if_changed(
+    hub: &Hub,
+    targets: &[(String, PeerWakeFn)],
+    previous: Option<WatchStamp>,
+) -> Result<WatchStamp> {
+    let stamp = WatchStamp {
+        hub_dir: hub.dir().to_path_buf(),
+        handles: targets.iter().map(|(handle, _)| handle.clone()).collect(),
+        files: hub.file_stamps(),
+    };
+    if previous.as_ref() == Some(&stamp) {
+        return Ok(stamp);
+    }
+    deliver(hub, targets)?;
+    Ok(stamp)
 }
 
 fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
@@ -950,8 +1006,8 @@ fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
         if let Some(cursors) = cursors {
             hub.save_cursors(handle, &cursors)?;
         }
+        record_tokens(hub, handle, &pending)?;
         drop(cursor_lock);
-        record_tokens(hub, &pending)?;
         wake(
             format_messages(hub, &meta, &pending),
             image_paths(hub, &pending),
@@ -964,7 +1020,9 @@ fn deliver(hub: &Hub, targets: &[(String, PeerWakeFn)]) -> Result<()> {
 /// Input: The hub and the member handle.
 /// Output: The messages to deliver, oldest first per conversation, and the
 ///     cursors moved past every message that was checked (`None` if unchanged).
-/// Note: Messages from before the member joined are not delivered.
+/// Note: Messages from before the member joined are not delivered. The read
+///     starts at the saved byte offset of the notify cursor, so only new
+///     bytes are read. A cursor without an offset scans from line 0 once.
 fn collect_pending(hub: &Hub, handle: &str) -> Result<(Vec<Message>, Option<Cursors>)> {
     let meta = hub.meta()?;
     let joined_ms = meta.member(handle).map(|m| m.joined_ms).unwrap_or(0);
@@ -974,12 +1032,13 @@ fn collect_pending(hub: &Hub, handle: &str) -> Result<(Vec<Message>, Option<Curs
 
     for conv in hub.dm_convs_for(handle)? {
         let start = cursors.notified.get(&conv).copied().unwrap_or(0);
-        let messages = hub.messages(&conv, start)?;
-        let end = start + messages.len();
-        cursors.notified.insert(conv.clone(), end);
-        cursors.read.insert(conv, end);
+        let slice = hub.messages_from_offset(&conv, start, cursors.notified_offset(&conv), None)?;
+        let end = start + slice.messages.len();
+        cursors.set_notified(&conv, end, slice.next_byte_offset);
+        cursors.set_read(&conv, end, slice.next_byte_offset);
         pending.extend(
-            messages
+            slice
+                .messages
                 .into_iter()
                 .filter(|m| m.from != handle && m.ts_unix_ms >= joined_ms),
         );
@@ -988,9 +1047,9 @@ fn collect_pending(hub: &Hub, handle: &str) -> Result<(Vec<Message>, Option<Curs
     for channel in &meta.channels {
         let conv = format!("#{}", channel.name);
         let start = cursors.notified.get(&conv).copied().unwrap_or(0);
-        let messages = hub.messages(&conv, start)?;
-        cursors.notified.insert(conv, start + messages.len());
-        pending.extend(messages.into_iter().filter(|m| {
+        let slice = hub.messages_from_offset(&conv, start, cursors.notified_offset(&conv), None)?;
+        cursors.set_notified(&conv, start + slice.messages.len(), slice.next_byte_offset);
+        pending.extend(slice.messages.into_iter().filter(|m| {
             m.from != handle
                 && m.ts_unix_ms >= joined_ms
                 && m.mentions.iter().any(|h| h == handle || h == HERE_MENTION)
@@ -1319,6 +1378,7 @@ fn is_bare_member(meta: &HubMeta, raw: &str) -> bool {
 ///     messages, because `inbox` and wakes already move the DM read cursor.
 fn read_dm(
     hub: &Hub,
+    handle: &str,
     conv: &str,
     limit: usize,
     since: Option<usize>,
@@ -1330,7 +1390,7 @@ fn read_dm(
     let mut window = messages.split_off(start);
     let remaining = window.len().saturating_sub(limit);
     window.truncate(limit);
-    record_tokens(hub, &window)?;
+    record_tokens(hub, handle, &window)?;
     Ok((window, remaining))
 }
 
@@ -1498,8 +1558,10 @@ pub fn image_paths(hub: &Hub, messages: &[Message]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Add the estimated context cost of delivered messages to the hub's counts.
-fn record_tokens(hub: &Hub, messages: &[Message]) -> Result<()> {
+/// Add the estimated context cost of delivered messages to the token file of
+/// the member. The caller holds the member's cursor lock; `hub.json` and the
+/// hub lock are not touched.
+fn record_tokens(hub: &Hub, handle: &str, messages: &[Message]) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
@@ -1511,11 +1573,7 @@ fn record_tokens(hub: &Hub, messages: &[Message]) -> Result<()> {
             + xai_token_estimation::estimate_image_tokens(m.images.len() as u64);
         *costs.entry(store::tokens_key(&m.conv)).or_default() += cost;
     }
-    hub.update_meta(|meta| {
-        for (key, cost) in costs {
-            *meta.tokens.entry(key).or_default() += cost;
-        }
-    })
+    hub.add_member_tokens(handle, &costs)
 }
 
 fn open_with_suggestion(hubs_root: &Path, name: &str) -> Result<Hub> {
@@ -1657,13 +1715,29 @@ pub fn person_handle_in(meta: &HubMeta, person: &str) -> String {
 /// Input: The hub, the member handle, the conversation key, and the message count read.
 /// Output: Ok when the cursor is saved. A cursor never moves back.
 pub fn mark_read(hub: &Hub, handle: &str, conv: &str, count: usize) -> Result<()> {
+    mark_read_at(hub, handle, conv, count, None)
+}
+
+/// Purpose: Move a member's read cursor forward, with its byte offset.
+/// Input: As `mark_read`, plus the byte offset after `count` complete lines
+///     of the conversation file, when the caller knows it.
+/// Output: Ok when the cursor is saved. A cursor never moves back. An equal
+///     count can replace a missing offset or an obsolete file stamp.
+pub fn mark_read_at(
+    hub: &Hub,
+    handle: &str,
+    conv: &str,
+    count: usize,
+    offset: Option<store::LineOffset>,
+) -> Result<()> {
     let _lock = hub.lock_cursors(handle)?;
     let mut cursors = hub.cursors(handle)?;
-    let read = cursors.read.entry(conv.to_string()).or_default();
-    if *read >= count {
+    let read = cursors.read.get(conv).copied().unwrap_or(0);
+    let saved_offset = cursors.read_offset(conv);
+    if read > count || (read == count && (offset.is_none() || saved_offset == offset)) {
         return Ok(());
     }
-    *read = count;
+    cursors.set_read(conv, count, offset);
     hub.save_cursors(handle, &cursors)
 }
 
@@ -1914,7 +1988,12 @@ mod tests {
         let bus = bus_with_private_dms(root.path());
         let hub = bus.hub();
         let cursors = hub.cursors(MAIN_PEER_ID).unwrap();
-        let tokens = |hub: &Hub| hub.meta().unwrap().tokens.values().sum::<u64>();
+        let tokens = |hub: &Hub| {
+            hub.tokens(&hub.meta().unwrap())
+                .unwrap()
+                .values()
+                .sum::<u64>()
+        };
         let tokens_before = tokens(&hub);
         // The two newer private hits drop out before the limit of 3.
         let hits = bus.search(MAIN_PEER_ID, "AUTH", None, 3).unwrap();
@@ -2084,6 +2163,145 @@ mod tests {
         // An empty reply_to is no reply.
         let plain = delivered(bus.send("a", "#general", "plain", Some("  "), &[]));
         assert_eq!(stored(&hub, "#general", &plain).reply_to, None);
+    }
+
+    #[test]
+    fn read_with_a_limit_saves_the_offset_after_the_last_returned_message() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register(MAIN_PEER_ID, "main", None);
+        let hub = bus.hub();
+        for text in ["a", "b", "c"] {
+            post_as_person(&hub, "me", "#general", text, &[]).unwrap();
+        }
+        let handle = bus.view(MAIN_PEER_ID).unwrap().handle;
+        let (first, remaining) = bus.read(MAIN_PEER_ID, "general", 2, None).unwrap();
+        assert_eq!((texts(&first), remaining), (vec!["a", "b"], 1));
+        let cursors = hub.cursors(&handle).unwrap();
+        let after_two = hub
+            .messages_from_offset("#general", 0, None, Some(2))
+            .unwrap()
+            .next_byte_offset;
+        assert_eq!(cursors.read["#general"], 2);
+        assert_eq!(cursors.read_offset("#general"), after_two);
+
+        post_as_person(&hub, "me", "#general", "d", &[]).unwrap();
+        let (rest, remaining) = bus.read(MAIN_PEER_ID, "general", 10, None).unwrap();
+        assert_eq!((texts(&rest), remaining), (vec!["c", "d"], 0));
+        let cursors = hub.cursors(&handle).unwrap();
+        assert_eq!(cursors.read["#general"], 4);
+        let len = std::fs::metadata(hub.dir().join("channels/general.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            cursors.read_offset("#general").map(|offset| offset.bytes),
+            Some(len)
+        );
+    }
+
+    /// Purpose: Check that an equal read count can save a replacement file stamp.
+    /// Input: A hub with one read message and an atomic file replacement.
+    /// Output: None. The test fails if the old file stamp remains on disk.
+    #[test]
+    fn an_equal_read_count_updates_the_replacement_file_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let hub = Hub::create(root.path(), "h").unwrap();
+        post_as_person(&hub, "me", "#general", "hello", &[]).unwrap();
+        let before = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        mark_read_at(&hub, "me", "#general", 1, before.next_byte_offset).unwrap();
+        let path = hub.dir().join("channels/general.jsonl");
+        let replacement = path.with_extension("replacement");
+        let _original = std::fs::File::open(&path).unwrap();
+        std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = hub.messages_from_offset("#general", 0, None, None).unwrap();
+        assert_ne!(before.stamp, after.stamp);
+        mark_read_at(&hub, "me", "#general", 1, after.next_byte_offset).unwrap();
+        assert_eq!(
+            hub.cursors("me").unwrap().read_offset("#general"),
+            after.next_byte_offset
+        );
+    }
+
+    #[test]
+    fn legacy_notify_cursors_do_not_deliver_old_messages_again() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        for text in ["@a one", "@a two"] {
+            bus.send("b", "#general", text, None, &[])
+                .into_result()
+                .unwrap();
+        }
+        let hub = bus.hub();
+        // A cursor file from before byte offsets: counts only.
+        let legacy = r##"{"read": {}, "notified": {"#general": 1}}"##;
+        std::fs::write(hub.dir().join("cursors/a.json"), legacy).unwrap();
+        assert_eq!(texts(&bus.inbox("a").unwrap()), vec!["@a two"]);
+        let cursors = hub.cursors("a").unwrap();
+        assert_eq!(cursors.notified["#general"], 2);
+        assert!(
+            cursors
+                .notified_offset("#general")
+                .is_some_and(|offset| offset.bytes > 0)
+        );
+        bus.send("b", "#general", "@a three", None, &[])
+            .into_result()
+            .unwrap();
+        assert_eq!(texts(&bus.inbox("a").unwrap()), vec!["@a three"]);
+    }
+
+    #[test]
+    fn inbox_read_and_delivery_do_not_take_the_hub_lock() {
+        use fs2::FileExt;
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("c", "c", None);
+        let hub = bus.hub();
+        hub.update_meta(|meta| {
+            meta.tokens.insert("#general".to_string(), 1000);
+        })
+        .unwrap();
+        // A person post wakes every member, so `a` and `c` both have mail.
+        for text in ["one", "two", "three"] {
+            post_as_person(&hub, "me", "#general", text, &[]).unwrap();
+        }
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let wake: PeerWakeFn = Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let hub_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(hub.dir().join("hub.lock"))
+            .unwrap();
+        hub_lock.lock_exclusive().unwrap();
+        let worker_bus = bus.clone();
+        let worker_hub = hub.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            deliver(&worker_hub, &[("a".to_string(), wake)]).unwrap();
+            let read = worker_bus.read("a", "general", 10, None).unwrap().0.len();
+            let inbox = worker_bus.inbox("c").unwrap().len();
+            done_tx.send((read, inbox)).unwrap();
+        });
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        // Release the lock before any assert, so a blocked worker can end.
+        hub_lock.unlock().unwrap();
+        worker.join().unwrap();
+        assert_eq!(done.expect("no read path waits for hub.lock"), (3, 3));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+
+        let meta = hub.meta().unwrap();
+        assert_eq!(
+            meta.tokens["#general"], 1000,
+            "hub.json keeps the old count"
+        );
+        let view = bus.view("a").unwrap();
+        // Three reads of three messages, each about 20 tokens or more.
+        assert!(view.channels[0].tokens >= 1000 + 9 * 20);
     }
 
     #[test]
@@ -3087,6 +3305,90 @@ mod tests {
         assert!(body.contains("schema is ready"), "{body}");
         assert!(!body.contains("status only"), "{body}");
         assert!(backend.inbox(MAIN_PEER_ID).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_hub_skips_delivery_and_a_change_delivers_on_the_next_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = session_bus(root.path(), "s1");
+        bus.register("a", "a", None);
+        bus.register("b", "b", None);
+        let hub = bus.hub();
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = bodies.clone();
+        let wake: PeerWakeFn = Arc::new(move |body, _| sink.lock().unwrap().push(body));
+        let targets = vec![("a".to_string(), wake)];
+        let delivered = || std::mem::take(&mut *bodies.lock().unwrap());
+
+        bus.send("b", "@a", "first", None, &[]);
+        let stamp = deliver_if_changed(&hub, &targets, None).unwrap();
+        assert_eq!(delivered().len(), 1);
+        // The loop guard of that delivery wrote hub.json after the stamp, so
+        // one more tick runs and finds nothing new.
+        let stamp = deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+        assert!(delivered().is_empty());
+
+        // No file changed: the tick takes no cursor lock, so it does not wait.
+        let cursor_lock = hub.lock_cursors("a").unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let hub = hub.clone();
+            let targets = targets.clone();
+            let stamp = stamp.clone();
+            move || {
+                let next = deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+                done_tx.send(next).unwrap();
+            }
+        });
+        let unchanged = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(cursor_lock);
+        worker.join().unwrap();
+        assert_eq!(unchanged.expect("an idle tick never waits"), stamp);
+
+        // An append by another process: a raw write to the DM file.
+        let dm = store::dm_conv("a", "b");
+        let message = Message {
+            id: new_message_id(),
+            conv: dm.clone(),
+            from: "b".to_string(),
+            text: "second".to_string(),
+            reply_to: None,
+            mentions: Vec::new(),
+            images: Vec::new(),
+            ts_unix_ms: store::now_ms(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&message).unwrap());
+        let path = std::fs::read_dir(hub.dir().join("dms"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+        let stamp = deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+        let bodies_now = delivered();
+        assert_eq!(bodies_now.len(), 1);
+        assert!(bodies_now[0].contains("second"), "{}", bodies_now[0]);
+
+        // A truncated file changes the stamp. The line-count cursor (2)
+        // still holds, so only the third line of the new file is new.
+        std::fs::write(&path, "").unwrap();
+        for text in ["skip-one", "skip-two", "third"] {
+            let mut next = message.clone();
+            next.id = new_message_id();
+            next.text = text.to_string();
+            hub.append(&next).unwrap();
+        }
+        deliver_if_changed(&hub, &targets, Some(stamp)).unwrap();
+        let bodies_now = delivered();
+        assert_eq!(bodies_now.len(), 1);
+        assert!(bodies_now[0].contains("third"), "{}", bodies_now[0]);
+        assert!(!bodies_now[0].contains("skip-two"), "{}", bodies_now[0]);
+        assert_eq!(hub.cursors("a").unwrap().notified[&dm], 3);
     }
 
     #[test]

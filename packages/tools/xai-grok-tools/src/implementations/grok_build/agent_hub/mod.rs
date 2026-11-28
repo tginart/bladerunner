@@ -8,6 +8,7 @@ mod bus;
 mod read_tool;
 pub mod store;
 
+pub use bus::mark_read_at;
 pub use bus::{
     AgentBus, ChannelView, DeliveredMessage, Delivery, HubView, JoinOutcome, LOOP_GUARD_WAKES,
     MAIN_PEER_ID, MAX_MESSAGE_BYTES, PeerStatus, PeerWakeFn, SendOutcome, answer_as_bot, ask_bot,
